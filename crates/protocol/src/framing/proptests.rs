@@ -57,7 +57,7 @@ proptest! {
 
     #[test]
     fn decode_message_garbage_never_panics(data in proptest::collection::vec(any::<u8>(), 0..256)) {
-        use crate::ProbeMessage;
-        let _ = decode_message::<ProbeMessage>(&data);
+        use crate::ClientMessage;
+        let _ = decode_message::<ClientMessage>(&data);
     }
 }

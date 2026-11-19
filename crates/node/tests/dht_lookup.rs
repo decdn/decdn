@@ -34,9 +34,9 @@ use std::time::Duration;
 use decdn_common::config::ResolvedSecurity;
 use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::{
-    AttestedBy, ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig, NegativeProbeCache,
-    RecordStore, RecordStoreConfig, RoutingTable, StakerSet, client, lookup::MAX_LOOKUP_ROUNDS,
-    rate_limit::DhtRateLimitConfig,
+    AttestedBy, ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig,
+    NegativeCandidateCache, RecordStore, RecordStoreConfig, RoutingTable, StakerSet, client,
+    lookup::MAX_LOOKUP_ROUNDS, rate_limit::DhtRateLimitConfig,
 };
 
 /// [`decdn_node::dht::find_providers`] checking attestations against the
@@ -46,7 +46,7 @@ async fn find_providers(
     conns: &decdn_client::Connections,
     routing: &Arc<Mutex<RoutingTable>>,
     staker_set: &Arc<dyn StakerSet>,
-    neg: &NegativeProbeCache,
+    neg: &NegativeCandidateCache,
     requester: NodeId,
     target: ContentHash,
     cfg: LookupConfig,
@@ -308,7 +308,7 @@ async fn find_providers_returns_directly_reachable_provider() -> anyhow::Result<
     let mut client_staked = HashSet::new();
     client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
 
     let providers = find_providers(
         &support::dht_conns(&client_ep),
@@ -361,7 +361,7 @@ async fn find_providers_drops_providers_in_negative_cache() -> anyhow::Result<()
     let mut client_staked = HashSet::new();
     client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
     // Pre-record a failure for (provider, target).
     neg.record_failure(
         NodeId::from_bytes(*provider.id.as_bytes()),
@@ -418,7 +418,7 @@ async fn find_providers_drops_non_staked_provider() -> anyhow::Result<()> {
 
     // Client's staker set is empty — every peer is filtered out.
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
 
     let providers = find_providers(
         &support::dht_conns(&client_ep),
@@ -492,7 +492,7 @@ async fn find_providers_drops_a_provider_whose_attestation_does_not_verify() -> 
         &support::dht_conns(&client_ep),
         &routing,
         &staker_set,
-        &NegativeProbeCache::new(),
+        &NegativeCandidateCache::new(),
         NodeId::from_bytes(*client_id.as_bytes()),
         ContentHash::from_bytes(target),
         lookup_cfg_for_test(),
@@ -522,7 +522,7 @@ async fn find_providers_with_empty_routing_table_returns_empty() -> anyhow::Resu
         *client_id.as_bytes(),
     ))));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::empty());
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
 
     let providers = find_providers(
         &support::dht_conns(&client_ep),
@@ -560,7 +560,7 @@ fn xor_distance(id: &[u8; 32], target: &[u8; 32]) -> [u8; 32] {
 ///
 /// This is the load-bearing half of the outer-pull-deadline formula, and it had no test at
 /// all. `PULL_THROUGH_OUTER_SLACK` is now DERIVED as
-/// `PROBE_TIMEOUT + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so the slack is only a valid
+/// `OPEN_CEILING + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so the slack is only a valid
 /// budget if the lookup really honours that ceiling. An arithmetic assertion cannot check
 /// that — it would just restate the definition (`A >= A`), which is exactly what the test
 /// this replaces did. The only thing that can break is the LOOP, so the loop is what is
@@ -639,7 +639,7 @@ async fn find_providers_stops_at_the_round_ceiling_even_while_still_finding_clos
         .expect("routing mutex poisoned")
         .insert(NodeId::from_bytes(*first.id.as_bytes()));
 
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
     let metrics = Arc::new(Metrics::new());
     let providers = tokio::time::timeout(
         Duration::from_mins(1),

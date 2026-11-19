@@ -332,13 +332,14 @@ async fn run_journey() -> anyhow::Result<()> {
     //
     // The node advertises its configured rate verbatim — the delivery floor is
     // a redemption-time credit clamp, not a quote gate — so it is enough here
-    // that a servable node signs a probe response carrying a real rate.
-    let probe = client.probe(&node, hash).await?;
-    assert!(probe.body.has_blob, "the node holds the blob");
+    // that a servable node answers a discovery open with a real rate.
+    let opened = client.discovery_open(&chain, &node, hash).await?;
+    let answer = opened.response().body.clone();
+    opened.cancel();
+    assert!(answer.ok, "the node holds the blob");
     assert!(
-        probe.body.rate_per_mb > 0,
-        "a signed quote must carry a real rate: {:?}",
-        probe.body
+        answer.rate_per_mb > 0,
+        "a signed quote must carry a real rate: {answer:?}"
     );
     // Registry view (Step 3.3): the node counts itself among the active stakers
     // it will admit DHT records from. Blacklist sync (Step 3.2) needs no

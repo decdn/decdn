@@ -1892,10 +1892,11 @@ impl Gateway {
 
     /// Learn the verified size of the blob `uri` names before its response,
     /// on `paying`'s lanes: the worker runs a fetch that resolves the holders
-    /// and takes the first size one proves, and writes no byte. The size
-    /// joins the verified sizes ([`PullWorker::size`]). When no probe answer
-    /// proves the size, it opens the blob's first byte, which pays for one
-    /// chunk group at most.
+    /// with discovery opens that name `paying`'s pool, takes the size the
+    /// winning holder's answer proves, cancels every open, and writes no
+    /// byte. The size joins the verified sizes ([`PullWorker::size`]). When
+    /// no answer proves the size, it opens the blob's first byte, which pays
+    /// for one chunk group at most.
     ///
     /// # Errors
     ///

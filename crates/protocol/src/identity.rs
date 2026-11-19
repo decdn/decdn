@@ -18,7 +18,7 @@
 //!
 //! A plain [`NodeId`] is freely constructible from wire bytes *by design*:
 //! Kademlia legitimately learns peer ids from `FindNode` responses and inserts
-//! them as probe candidates. The authenticated-identity boundary is enforced
+//! them as lookup candidates. The authenticated-identity boundary is enforced
 //! one layer up by `decdn_node::dht::AuthenticatedNodeId`, which can only be
 //! minted from a live QUIC connection's `remote_id()`.
 

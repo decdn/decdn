@@ -37,7 +37,7 @@
 //!
 //! **Enforcement** runs after every snapshot and poll: deny every live in-scope
 //! hash and evict it (the eviction is durable and sticky, and cascades to DHT
-//! announce suppression, probe `has_blob: false` and delivery refusal), lift the
+//! announce suppression and delivery refusal, opens included), lift the
 //! governance deny on a hash that is no longer live in scope, and publish the
 //! live address union to the delivery path's origin deny-set.
 

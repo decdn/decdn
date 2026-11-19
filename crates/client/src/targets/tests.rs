@@ -1,25 +1,46 @@
 use super::*;
 use crate::ProvenSize;
 use anyhow::Context as _;
+use iroh::Endpoint;
 use std::sync::Arc;
-use std::time::Instant;
 
-/// A node that sheds this client's probes is named as rate-limited, apart
+/// [`no_serve_target_error`] over the five counts a discovery round tallies.
+fn nst(
+    asked: usize,
+    unreachable: usize,
+    rate_limited: usize,
+    unverifiable: usize,
+    clock_skewed: usize,
+) -> anyhow::Error {
+    no_serve_target_error(Dropouts {
+        asked,
+        unreachable,
+        rate_limited,
+        unverifiable,
+        clock_skewed,
+        ..Dropouts::default()
+    })
+}
+
+/// A node that sheds this client's requests is named as rate-limited, apart
 /// from the silent ones; with none, the message keeps its two counts.
 #[test]
 fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
-    let msg = no_serve_target_error(3, 1, 2, 0, 0).to_string();
+    let msg = nst(3, 1, 2, 0, 0).to_string();
     assert!(msg.contains("1 did not answer"), "{msg}");
-    assert!(msg.contains("2 rate-limited this client's probes"), "{msg}");
+    assert!(
+        msg.contains("2 rate-limited this client's requests"),
+        "{msg}"
+    );
     assert!(msg.contains("0 answered but were unusable"), "{msg}");
 
-    let msg = no_serve_target_error(3, 3, 0, 0, 0).to_string();
+    let msg = nst(3, 3, 0, 0, 0).to_string();
     assert!(!msg.contains("rate-limited"), "{msg}");
     assert!(!msg.contains("timestamp"), "{msg}");
     assert!(msg.contains("3 did not answer, 0 answered"), "{msg}");
 }
 
-/// When at least three probed nodes, and most of them, refuse this machine's
+/// When at least three opened nodes, and most of them, refuse this machine's
 /// timestamp, the failure is a [`ResolveConfigFault`] that names the clock and
 /// ends the command. Below that threshold any node can send the unsigned code
 /// at will, so one or two refusals stay the ordinary error, which counts them
@@ -27,15 +48,15 @@ fn no_serve_target_error_names_rate_limited_nodes_apart_from_silent_ones() {
 #[test]
 fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp() {
     assert_eq!(CLOCK_SKEW_FATAL_MIN, 3);
-    for (probed, unreachable, skewed) in [(3, 0, 3), (4, 1, 3), (5, 0, 4)] {
-        let err = no_serve_target_error(probed, unreachable, 0, 0, skewed);
+    for (opened, unreachable, skewed) in [(3, 0, 3), (4, 1, 3), (5, 0, 4)] {
+        let err = nst(opened, unreachable, 0, 0, skewed);
         assert!(
             err.downcast_ref::<ResolveConfigFault>().is_some(),
-            "{skewed} of {probed} clock refusals is this machine's fault: {err:#}"
+            "{skewed} of {opened} clock refusals is this machine's fault: {err:#}"
         );
         let msg = err.to_string();
         assert!(
-            msg.contains(&format!("{skewed} of {probed} probed node(s) refused")),
+            msg.contains(&format!("{skewed} of {opened} asked node(s) refused")),
             "{msg}"
         );
         assert!(msg.contains("Check this machine's clock"), "{msg}");
@@ -43,7 +64,7 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
     }
     // The clock check runs before the unverifiable one: a wrong clock leaves
     // nothing to verify.
-    let err = no_serve_target_error(3, 0, 0, 1, 3);
+    let err = nst(3, 0, 0, 1, 3);
     assert!(
         err.to_string().contains("Check this machine's clock"),
         "{err:#}"
@@ -51,11 +72,11 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
 
     // One or two refusers never end the command, even as a majority; three
     // that are not a majority do not either.
-    for (probed, unreachable, skewed) in [(1, 0, 1), (2, 0, 2), (3, 1, 2), (4, 3, 1), (7, 4, 3)] {
-        let err = no_serve_target_error(probed, unreachable, 0, 0, skewed);
+    for (opened, unreachable, skewed) in [(1, 0, 1), (2, 0, 2), (3, 1, 2), (4, 3, 1), (7, 4, 3)] {
+        let err = nst(opened, unreachable, 0, 0, skewed);
         assert!(
             err.downcast_ref::<ResolveConfigFault>().is_none(),
-            "{skewed} of {probed} refusals must not end the command: {err:#}"
+            "{skewed} of {opened} refusals must not end the command: {err:#}"
         );
         let msg = err.to_string();
         assert!(
@@ -74,88 +95,68 @@ fn no_serve_target_error_names_the_clock_when_enough_nodes_refuse_the_timestamp(
         );
     }
     assert!(
-        !no_serve_target_error(3, 3, 0, 0, 0)
-            .to_string()
-            .contains("time server"),
+        !nst(3, 3, 0, 0, 0).to_string().contains("time server"),
         "no refusal, no clock hint"
     );
 }
 
-/// A probe the node refused with `APP_ERR_TIMESTAMP_SKEW` classifies as
-/// [`ProbeOutcome::ClockSkewed`], not as an unreachable node, so the terminal
-/// error can name the clock.
+/// A round tallies a clock-skew refusal apart from an unreachable node, so
+/// the terminal error can name the clock.
 #[test]
-fn classify_probe_types_a_timestamp_refusal_as_clock_skewed() {
-    let cand = NodeCandidate {
-        node_id: node_key(1),
-        eth_address: Address::repeat_byte(1),
-        region_hint: None,
-        multiaddrs: Bytes::new(),
-    };
-    let domain = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x0D));
-    let refused: ProbeResult = Err(anyhow::Error::new(crate::UpstreamTimestampRejected {
-        label: Some("probe-error".to_owned()),
-    })
-    .context("read response"));
-    assert!(matches!(
-        classify_probe(&cand, refused, [7; 32], micros_now(), &domain),
-        ProbeOutcome::ClockSkewed
-    ));
-    let silent: ProbeResult = Err(anyhow::anyhow!("connect failed: timed out"));
-    assert!(matches!(
-        classify_probe(&cand, silent, [7; 32], micros_now(), &domain),
-        ProbeOutcome::Unreachable
-    ));
-    let tally = ProbeTally::of(vec![ProbeOutcome::ClockSkewed, ProbeOutcome::Unreachable]);
-    assert_eq!((tally.clock_skewed, tally.unreachable), (1, 1));
+fn a_round_tallies_a_timestamp_refusal_apart_from_silence() {
+    let tally = OpenTally::of(2, vec![OpenOutcome::ClockSkewed, OpenOutcome::Unreachable]);
+    assert_eq!(
+        (tally.dropouts.clock_skewed, tally.dropouts.unreachable),
+        (1, 1)
+    );
 }
 
-/// A probe outcome after `ms` on the paused clock: `(id, holder)`.
+/// An open outcome after `ms` on the paused clock: `(id, holder)`.
 async fn answer_after(ms: u64, id: u32, holder: bool) -> (u32, bool) {
     tokio::time::sleep(Duration::from_millis(ms)).await;
     (id, holder)
 }
 
-/// Every probe that answers within the grace after the first holder is kept.
+/// Every open that answers within the grace after the first holder is kept.
 #[tokio::test(start_paused = true)]
 async fn settle_keeps_every_answer_inside_the_grace() {
     let grace = Duration::from_millis(250);
-    let probes = vec![
+    let opens = vec![
         answer_after(20, 1, true),
         answer_after(150, 2, false),
         answer_after(260, 3, true),
     ];
-    let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(opens, grace, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false), (3, true)]);
     assert!(tail.is_empty());
 }
 
-/// A probe still pending at the first holder's answer plus the grace is
+/// An open still pending at the first holder's answer plus the grace is
 /// left in the tail, and the round ends at that moment.
 #[tokio::test(start_paused = true)]
 async fn settle_leaves_a_straggler_past_the_grace_in_the_tail() {
     let grace = Duration::from_millis(250);
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, true),
         answer_after(170, 2, false),
         answer_after(1850, 3, true),
     ];
-    let (mut got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(opens, grace, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false)]);
     assert_eq!(tail.len(), 1);
     assert_eq!(started.elapsed(), Duration::from_millis(275));
 }
 
-/// With no holder, the round waits for every probe.
+/// With no holder, the round waits for every open.
 #[tokio::test(start_paused = true)]
-async fn settle_waits_for_every_probe_without_a_holder() {
+async fn settle_waits_for_every_open_without_a_holder() {
     let grace = Duration::from_millis(250);
     let started = tokio::time::Instant::now();
-    let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-    let (got, tail) = settle_probes(probes, grace, None, |&(_, h)| h, |_| true).await;
+    let opens = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+    let (got, tail) = settle_opens(opens, grace, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
     assert_eq!(started.elapsed(), Duration::from_millis(1850));
@@ -167,12 +168,12 @@ async fn settle_waits_for_every_probe_without_a_holder() {
 async fn settle_streams_from_the_first_holder() {
     use futures_util::StreamExt as _;
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, true),
         answer_after(170, 2, false),
         answer_after(1850, 3, true),
     ];
-    let (got, mut tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+    let (got, mut tail) = settle_opens(opens, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, true)]);
     assert_eq!(started.elapsed(), Duration::from_millis(25));
     let mut late = Vec::new();
@@ -186,22 +187,22 @@ async fn settle_streams_from_the_first_holder() {
 /// left in the tail.
 #[tokio::test(start_paused = true)]
 async fn settle_collects_answers_ready_with_the_first_holder() {
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, true),
         answer_after(25, 2, false),
         answer_after(900, 3, true),
     ];
-    let (mut got, tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+    let (mut got, tail) = settle_opens(opens, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     got.sort_unstable();
     assert_eq!(got, vec![(1, true), (2, false)]);
     assert_eq!(tail.len(), 1);
 }
 
-/// A late probe that records when it answers, then reports `Unreachable`.
-fn recording_probe(
+/// A late open that records when it answers, then reports `Unreachable`.
+fn recording_open(
     after: Duration,
     answered: &Arc<std::sync::Mutex<Option<Duration>>>,
-) -> impl std::future::Future<Output = ProbeOutcome> + Send + 'static {
+) -> impl std::future::Future<Output = OpenOutcome> + Send + 'static {
     let answered = Arc::clone(answered);
     let started = tokio::time::Instant::now();
     async move {
@@ -209,7 +210,7 @@ fn recording_probe(
         if let Ok(mut slot) = answered.lock() {
             *slot = Some(started.elapsed());
         }
-        ProbeOutcome::Unreachable
+        OpenOutcome::Unreachable
     }
 }
 
@@ -221,46 +222,46 @@ fn no_warming() -> ProxyWarmingParams {
     }
 }
 
-/// A streamed round's pending probes keep running while nothing polls the
-/// tail, so a slow unlock between the round and the fetch neither times
+/// A streamed round's pending opens keep running while nothing polls the
+/// tail, so a slow lane build between the round and the fetch neither times
 /// them out nor inflates their RTT. The answer waits in the tail.
 #[tokio::test(start_paused = true)]
-async fn late_probes_run_while_the_tail_is_not_polled() {
+async fn late_opens_run_while_the_tail_is_not_polled() {
     use futures_util::StreamExt as _;
     let answered = Arc::new(std::sync::Mutex::new(None));
     let tail: futures_util::stream::FuturesUnordered<_> =
-        std::iter::once(recording_probe(Duration::from_millis(100), &answered)).collect();
-    let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+        std::iter::once(recording_open(Duration::from_millis(100), &answered)).collect();
+    let slot = late_stream_slot(OpenRound::Stream, false, tail, &[], no_warming());
 
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(*answered.lock().unwrap(), Some(Duration::from_millis(100)));
     let mut late = slot.take().expect("a streamed round keeps its tail");
     assert!(matches!(
         late.tail.next().await,
-        Some(ProbeOutcome::Unreachable)
+        Some(OpenOutcome::Unreachable)
     ));
     assert!(late.tail.next().await.is_none());
 }
 
-/// Dropping the late probes stops the ones still running.
+/// Dropping the late opens stops the ones still running.
 #[tokio::test(start_paused = true)]
-async fn late_probes_stop_when_dropped() {
+async fn late_opens_stop_when_dropped() {
     let answered = Arc::new(std::sync::Mutex::new(None));
     let tail: futures_util::stream::FuturesUnordered<_> =
-        std::iter::once(recording_probe(Duration::from_secs(1), &answered)).collect();
-    let slot = late_slot(ProbeRound::Stream, tail, &[], no_warming());
+        std::iter::once(recording_open(Duration::from_secs(1), &answered)).collect();
+    let slot = late_stream_slot(OpenRound::Stream, false, tail, &[], no_warming());
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(slot);
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(*answered.lock().unwrap(), None);
 }
 
-/// Without a cold cutoff, a round with no holder waits for every probe and
+/// Without a cold cutoff, a round with no holder waits for every open and
 /// leaves no tail.
 #[tokio::test(start_paused = true)]
-async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
-    let probes = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
-    let (got, tail) = settle_probes(probes, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
+async fn settle_without_a_cold_cutoff_waits_for_every_open() {
+    let opens = vec![answer_after(25, 1, false), answer_after(1850, 2, false)];
+    let (got, tail) = settle_opens(opens, Duration::ZERO, None, |&(_, h)| h, |_| true).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
 }
@@ -271,13 +272,13 @@ async fn settle_without_a_cold_cutoff_waits_for_every_probe() {
 async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
     use futures_util::StreamExt as _;
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, false),
         answer_after(100, 2, false),
         answer_after(1850, 3, true),
     ];
     let cold = Some(Duration::from_millis(250));
-    let (got, mut tail) = settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+    let (got, mut tail) = settle_opens(opens, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, false), (2, false)]);
     assert_eq!(started.elapsed(), Duration::from_millis(275));
     assert_eq!(tail.next().await, Some((3, true)));
@@ -288,46 +289,40 @@ async fn settle_cold_cutoff_returns_the_non_holders_in_hand() {
 #[tokio::test(start_paused = true)]
 async fn settle_cold_cutoff_yields_to_a_holder() {
     let started = tokio::time::Instant::now();
-    let probes = vec![
+    let opens = vec![
         answer_after(25, 1, false),
         answer_after(120, 2, true),
         answer_after(1850, 3, false),
     ];
     let cold = Some(Duration::from_millis(250));
-    let (got, tail) = settle_probes(probes, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
+    let (got, tail) = settle_opens(opens, Duration::ZERO, cold, |&(_, h)| h, |_| true).await;
     assert_eq!(got, vec![(1, false), (2, true)]);
     assert_eq!(started.elapsed(), Duration::from_millis(120));
     assert_eq!(tail.len(), 1);
 }
 
-/// Only a verified answer opens the cold window: a failed probe does not.
+/// Only a verified answer opens the cold window: a failed open does not.
 #[tokio::test(start_paused = true)]
-async fn settle_cold_cutoff_ignores_failed_probes() {
+async fn settle_cold_cutoff_ignores_failed_opens() {
     let started = tokio::time::Instant::now();
-    // `(id, holder)`; id 9 stands for a failed probe.
-    let probes = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
+    // `(id, holder)`; id 9 stands for a failed open.
+    let opens = vec![answer_after(10, 9, false), answer_after(600, 1, false)];
     let cold = Some(Duration::from_millis(250));
-    let (got, tail) = settle_probes(
-        probes,
-        Duration::ZERO,
-        cold,
-        |&(_, h)| h,
-        |&(id, _)| id != 9,
-    )
-    .await;
+    let (got, tail) =
+        settle_opens(opens, Duration::ZERO, cold, |&(_, h)| h, |&(id, _)| id != 9).await;
     assert_eq!(got.len(), 2);
     assert!(tail.is_empty());
     assert_eq!(started.elapsed(), Duration::from_millis(600));
 }
 
-/// A loopback probe server that closes every connection with `code`, and
-/// counts the connections it saw.
-async fn closing_probe_server(
+/// A loopback `cdn/client/v1` server that closes every connection with
+/// `code`, and counts the connections it saw.
+async fn closing_server(
     code: u32,
 ) -> (Endpoint, EndpointAddr, Arc<std::sync::atomic::AtomicUsize>) {
     use iroh::endpoint::{RelayMode, presets};
     let ep = Endpoint::builder(presets::Minimal)
-        .alpns(vec![decdn_protocol::ALPN_PROBE.to_vec()])
+        .alpns(vec![decdn_protocol::ALPN_CLIENT.to_vec()])
         .relay_mode(RelayMode::Disabled)
         .bind_addr(std::net::SocketAddrV4::new(
             std::net::Ipv4Addr::LOCALHOST,
@@ -354,8 +349,7 @@ async fn closing_probe_server(
             let Ok(conn) = incoming.await else { continue };
             count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             conn.close(code.into(), b"per_peer");
-            // Wait for the close to reach the client before the next accept,
-            // as the node's probe limiter does.
+            // Wait for the close to reach the client before the next accept.
             conn.closed().await;
         }
     });
@@ -376,59 +370,12 @@ async fn client_endpoint() -> Endpoint {
         .unwrap()
 }
 
-/// A candidate that sheds every probe with `APP_ERR_RATE_LIMITED` is probed
-/// once plus once after each backoff, and its error still reads as a shed —
-/// so `probe_and_order` counts it as rate-limited, not silent.
+/// A pinned node that sheds its open stays the fetch's only holder, with no
+/// size hint and no stream (#2619). It is opened once, at its `--addr`, and
+/// the shed open is not retried: the lane opens its own leg.
 #[tokio::test(flavor = "multi_thread")]
-async fn probe_candidate_retries_a_shedding_candidate_then_reports_the_shed() {
-    let (server, target, seen) = closing_probe_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
-    let client = client_endpoint().await;
-    let started = Instant::now();
-    let started_us = micros_now();
-
-    let (timestamp_us, res) = probe_candidate(&client, target, [7; 32]).await;
-
-    let err = res.expect_err("every probe was shed");
-    assert!(probe_shed(&err), "the shed survives the retries: {err:#}");
-    assert_eq!(
-        seen.load(std::sync::atomic::Ordering::SeqCst),
-        PROBE_SHED_BACKOFFS_MS.len() + 1
-    );
-    let waited: u64 = PROBE_SHED_BACKOFFS_MS.iter().sum();
-    assert!(started.elapsed() >= Duration::from_millis(waited));
-    // Each attempt stamps its own timestamp, and the one returned is the last
-    // attempt's: it was taken after every backoff, not at the first attempt.
-    assert!(
-        timestamp_us >= started_us + waited * 1_000,
-        "the returned timestamp {timestamp_us} is the first attempt's, not the last's \
-         (started at {started_us}, waited {waited} ms)"
-    );
-    client.close().await;
-    server.close().await;
-}
-
-/// Any other failure returns at once: a node that closes with a code other
-/// than `APP_ERR_RATE_LIMITED` is not probed again.
-#[tokio::test(flavor = "multi_thread")]
-async fn probe_candidate_does_not_retry_a_failure_that_is_not_a_shed() {
-    let (server, target, seen) = closing_probe_server(0).await;
-    let client = client_endpoint().await;
-
-    let (_, res) = probe_candidate(&client, target, [7; 32]).await;
-
-    let err = res.expect_err("the connection was closed");
-    assert!(!probe_shed(&err), "{err:#}");
-    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
-    client.close().await;
-    server.close().await;
-}
-
-/// A pinned node that sheds its size probe stays the fetch's only holder,
-/// with no size hint (#2619). It is probed once, at its `--addr`, and a shed
-/// probe is not retried: the hint is worth no backoff.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
-    let (server, target, seen) = closing_probe_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
+async fn a_pinned_node_that_sheds_its_open_stays_the_holder_with_no_hint() {
+    let (server, target, seen) = closing_server(decdn_protocol::APP_ERR_RATE_LIMITED).await;
     let client = client_endpoint().await;
     let provider = Address::repeat_byte(0x42);
     let pinned = PinnedNode {
@@ -436,10 +383,19 @@ async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
         provider,
         addr: target.ip_addrs().next().copied(),
     };
-    let targets = probe_pinned(&client, &offline_chain(), None, pinned, [7; 32], None).await;
+    let conns = crate::Connections::new(client.clone());
+    let ctx = open_ctx();
+    let open = OpenOpts {
+        marks: None,
+        round: OpenRound::Stream,
+        known_size: None,
+        spec: spec(&conns, &ctx, 0),
+    };
+    let targets = open_pinned(&offline_chain(), None, pinned, [7; 32], open).await;
 
     assert!(targets.pinned);
     assert!(targets.size_hint.is_none());
+    assert_eq!(targets.opened.len(), 0);
     assert_eq!(
         targets
             .candidates
@@ -448,17 +404,17 @@ async fn a_pinned_node_that_sheds_its_probe_stays_the_holder_with_no_hint() {
             .collect::<Vec<_>>(),
         vec![(server.id(), provider)]
     );
-    // One probe: a shed one is not retried.
+    // One connection: a shed open is not retried.
     assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     client.close().await;
     server.close().await;
 }
 
 /// A pinned fetch that knows the blob's size (a gateway's manifest entry)
-/// takes it as the first size claim and probes nothing (#2619).
+/// takes it as the first size claim and opens nothing (#2619).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
-    let (server, target, seen) = closing_probe_server(0).await;
+async fn a_pinned_fetch_with_a_known_size_opens_nothing() {
+    let (server, target, seen) = closing_server(0).await;
     let client = client_endpoint().await;
     let site_dir = tempfile::tempdir().unwrap();
     let opts = DiscoveryOptions {
@@ -474,22 +430,18 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
         region: None,
         region_allowlist: Vec::new(),
     };
-    let probe = ProbeOpts {
+    let conns = crate::Connections::new(client.clone());
+    let ctx = open_ctx();
+    let open = OpenOpts {
         marks: None,
-        round: ProbeRound::Stream,
+        round: OpenRound::Stream,
         known_size: Some(ProvenSize::assume_for_tests(4096)),
+        spec: spec(&conns, &ctx, 0),
     };
 
-    let targets = resolve_target_node(
-        &opts,
-        (&offline_chain(), &site),
-        &client,
-        &[],
-        [7; 32],
-        probe,
-    )
-    .await
-    .unwrap();
+    let targets = resolve_target_node(&opts, (&offline_chain(), &site), &[], [7; 32], open)
+        .await
+        .unwrap();
 
     assert!(targets.pinned);
     assert_eq!(targets.size_hint, Some(ProvenSize::assume_for_tests(4096)));
@@ -498,7 +450,7 @@ async fn a_pinned_fetch_with_a_known_size_probes_nothing() {
     server.close().await;
 }
 
-/// A chain no test reaches: the pinned probe verifies answers against its
+/// A chain no test reaches: the pinned open verifies answers against its
 /// slash domain and reads nothing else from it.
 fn offline_chain() -> ChainConfig {
     crate::session::test_support::one_chain(
@@ -530,13 +482,15 @@ fn harvest_candidate(b: u8) -> NodeCandidate {
 async fn harvest_persists_identity_and_stats() {
     let dir = tempfile::tempdir().expect("tempdir");
     let regs = vec![harvest_candidate(1), harvest_candidate(2)];
-    let probed = vec![(harvest_key(1), 42.0_f64, 9_u64)];
-    let handle = spawn_harvest(dir.path(), regs, probed);
+    let discovered = vec![(harvest_key(1), 42.0_f64, 9_u64)];
+    let handle = spawn_harvest(dir.path(), regs, discovered);
     handle.await.expect("harvest task join");
 
     let store = crate::PeerStore::open(dir.path());
     assert!(store.get(&harvest_key(2)).is_some());
-    let r = store.get(&harvest_key(1)).expect("probed peer persisted");
+    let r = store
+        .get(&harvest_key(1))
+        .expect("discovered peer persisted");
     assert_eq!(r.latency_ms, Some(42.0));
     assert_eq!(r.rate_per_mb, Some(9));
 }
@@ -548,9 +502,9 @@ fn harvest_counts_every_write_the_store_refuses() {
     std::fs::write(dir.path().join("peers"), b"").expect("block the store dir");
     let store = crate::PeerStore::open(dir.path());
     let regs = vec![harvest_candidate(1), harvest_candidate(2)];
-    let probed = vec![(harvest_key(1), 42.0_f64, 9_u64)];
+    let discovered = vec![(harvest_key(1), 42.0_f64, 9_u64)];
     let cfg = crate::StoreConfig::default();
-    let tally = harvest(&store, &regs, probed, now_secs(), &cfg);
+    let tally = harvest(&store, &regs, discovered, now_secs(), &cfg);
     assert_eq!(
         tally,
         HarvestTally {
@@ -589,7 +543,7 @@ fn select_with_widening_widens_when_allowlist_starves() {
 
 /// `identity_fresh_candidates` gathers cached peers whose identity is fresh
 /// (within the refresh horizon) and not suppressed/prunable, regardless of
-/// latency freshness — the set the registry-read-skip path re-probes.
+/// latency freshness — the set the registry-read-skip path re-opens.
 #[test]
 fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()> {
     let cfg = crate::StoreConfig::default();
@@ -621,8 +575,8 @@ fn identity_fresh_candidates_gathers_latency_stale_peers() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A pinned `--node-id` is one probed-as-holder candidate. It carries no size
-/// hint of its own (#2218): a blob fetch takes its probe's ([`probe_pinned`]).
+/// A pinned `--node-id` is one candidate that counts as a holder. It carries no size
+/// hint of its own (#2218): a blob fetch takes its open's ([`open_pinned`]).
 #[test]
 fn a_pinned_node_resolves_with_no_size_hint() {
     let provider = Address::repeat_byte(0x42);
@@ -636,20 +590,23 @@ fn a_pinned_node_resolves_with_no_size_hint() {
     );
 }
 
-/// A pinned node's probe gives the first size claim only when it verifies as
-/// a holder that names a size (#2619). Any other outcome leaves the claim to a
-/// header-only open.
+/// A pinned node's open gives the first size claim only when it verifies as
+/// a holder that proves a size (#2619). Any other outcome leaves the claim to
+/// the lane's own open.
 #[test]
-fn a_pinned_probe_hints_only_a_verified_holder_size() {
+fn a_pinned_open_hints_only_a_verified_holder_size() {
     let sample = (harvest_key(7), 5.0, 1);
     let sized = holder(7, 5.0);
     let size = sized.total_bytes;
     assert!(size.is_some());
-    assert_eq!(probed_size_hint(&ProbeOutcome::Holder(sized, sample)), size);
+    assert_eq!(
+        answered_size_hint(&OpenOutcome::Holder(sized, sample)),
+        size
+    );
     let mut unsized_holder = holder(7, 5.0);
     unsized_holder.total_bytes = None;
     assert_eq!(
-        probed_size_hint(&ProbeOutcome::Holder(unsized_holder, sample)),
+        answered_size_hint(&OpenOutcome::Holder(unsized_holder, sample)),
         None
     );
     let non_holder = discovery::WarmingCandidate {
@@ -660,22 +617,24 @@ fn a_pinned_probe_hints_only_a_verified_holder_size() {
         payment_pools: None,
     };
     for outcome in [
-        ProbeOutcome::NonHolder(non_holder, sample),
-        ProbeOutcome::Unreachable,
-        ProbeOutcome::RateLimited,
-        ProbeOutcome::ClockSkewed,
-        ProbeOutcome::Unverifiable,
-        ProbeOutcome::Unusable,
+        OpenOutcome::NonHolder(non_holder, sample),
+        OpenOutcome::Unreachable,
+        OpenOutcome::RateLimited,
+        OpenOutcome::ClockSkewed,
+        OpenOutcome::Unverifiable,
+        OpenOutcome::Unusable,
+        OpenOutcome::Declined,
+        OpenOutcome::OverCeiling,
     ] {
-        assert_eq!(probed_size_hint(&outcome), None);
+        assert_eq!(answered_size_hint(&outcome), None);
     }
 }
 
 /// `store_fast_path` ranks selectable records by latency and excludes a
 /// suppressed one, and refuses to engage below `min_fresh_candidates`. It
-/// probes nothing, so it carries no size hint (#2218).
+/// opens nothing, so it carries no size hint (#2218).
 /// It takes no [`Endpoint`], so it structurally cannot issue a network
-/// probe — this is the probe-less fast path itself, not merely tested
+/// open — this is the open-less fast path itself, not merely tested
 /// without one.
 #[test]
 fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
@@ -700,10 +659,11 @@ fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
     assert_eq!(targets.candidates[1].node_id, harvest_key(3));
     assert_eq!(targets.candidates[2].node_id, harvest_key(1));
     assert!(targets.coverage_by_node.is_empty());
-    assert!(targets.probed_samples.is_empty());
+    assert!(targets.samples.is_empty());
+    assert_eq!(targets.opened.len(), 0, "the fast path opens nothing");
     assert!(
         targets.size_hint.is_none(),
-        "nothing was probed, so the first claim comes from a header open"
+        "nothing was opened, so the first claim comes from a header open"
     );
 
     // Only two selectable records -> below min_fresh_candidates -> None.
@@ -719,7 +679,7 @@ fn fast_path_needs_min_fresh_and_ranks_by_latency() -> anyhow::Result<()> {
 
 /// #2196: nearby nodes serving cold misses from a distant origin open slowly,
 /// but a stream open is not a distance sample. After repeated opens on the
-/// near nodes, the fast path still ranks them by probe RTT, ahead of the
+/// near nodes, the fast path still ranks them by path RTT, ahead of the
 /// origin.
 #[test]
 fn stream_opens_do_not_rank_near_nodes_behind_the_origin() -> anyhow::Result<()> {
@@ -727,7 +687,7 @@ fn stream_opens_do_not_rank_near_nodes_behind_the_origin() -> anyhow::Result<()>
     let dir = tempfile::tempdir()?;
     let store = crate::PeerStore::open(dir.path());
     let now = now_secs();
-    // Probe RTTs: two nearby caches and the transatlantic origin.
+    // Path RTTs: two nearby caches and the transatlantic origin.
     for (b, rtt) in [(1u8, 57.0), (2, 78.0), (3, 394.0)] {
         store.upsert_identity(&harvest_candidate(b), now)?;
         store.record_sample(&harvest_key(b), rtt, 1, now, &cfg)?;
@@ -753,7 +713,7 @@ fn stream_opens_do_not_rank_near_nodes_behind_the_origin() -> anyhow::Result<()>
 }
 
 /// A failed first open stamps the peer, so the fast path skips it, and
-/// leaves its probe RTT alone.
+/// leaves its path RTT alone.
 #[test]
 fn failed_first_open_suppresses_the_peer() -> anyhow::Result<()> {
     let cfg = crate::StoreConfig::default();
@@ -783,7 +743,7 @@ fn node_key(seed: u8) -> PublicKey {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn holder(seed: u8, rtt_ms: f64) -> discovery::Probed {
+fn holder(seed: u8, rtt_ms: f64) -> discovery::DiscoveredHolder {
     super::tests_support::holder(seed, rtt_ms)
 }
 
@@ -883,7 +843,7 @@ fn failover_order_no_qualifying_proxy_is_holders_only() {
 /// origin-only with zero cache holders, so an empty holder set is the normal
 /// first-fetch state, not a terminal error. The fallback is independent of
 /// proxy warming — here warming is off — and reports no lead, size, or
-/// holder coverage, since nothing answered `has_blob`.
+/// holder coverage, since nothing answered `ok`.
 #[test]
 fn failover_order_empty_holders_falls_back_to_non_holders_by_rtt() {
     let non_holders = vec![
@@ -955,7 +915,7 @@ fn failover_order_carries_registry_multiaddrs() -> anyhow::Result<()> {
 }
 
 /// With neither a holder nor a reachable non-holder, the order is empty —
-/// the genuinely terminal case `probe_and_order` turns into an error before
+/// the genuinely terminal case `open_and_order` turns into an error before
 /// it ever calls this.
 #[test]
 fn failover_order_empty_when_no_holder_and_no_non_holder() {
@@ -967,7 +927,7 @@ fn failover_order_empty_when_no_holder_and_no_non_holder() {
 /// `failover_order`'s `coverage_by_node` carries each holder's REAL measured
 /// coverage (#1506) — not `Coverage::full` for every lane: disjoint
 /// per-holder coverage {block0}/{block1} survives into the map keyed by
-/// `node_id`, and a node that was never probed (e.g. a proxy) has no entry
+/// `node_id`, and a node that was never opened (e.g. a proxy) has no entry
 /// at all.
 #[test]
 fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
@@ -983,199 +943,605 @@ fn failover_order_coverage_by_node_carries_each_holders_real_coverage() {
     // Sanity: the two holders' coverage is genuinely different, not both
     // collapsed to the same (e.g. full) value.
     assert_ne!(h1.coverage, h2.coverage);
-    // A node that was never probed has no entry.
+    // A node that was never opened has no entry.
     assert!(!out.coverage_by_node.contains_key(&node_key(99)));
 }
 
-/// #2471: a holder of the empty root answers `has_blob: true` over an empty
-/// coverage, because the blob spans no block. The consumer takes that answer
-/// as a holder with a size hint of 0 for the empty root, takes a node that
-/// signs `has_blob: false` over the same coverage as a non-holder, and drops
-/// the `has_blob: true` pairing as malformed for every other hash.
-#[test]
-fn an_empty_coverage_holder_is_taken_for_the_empty_root_only() -> anyhow::Result<()> {
-    use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::{ProbeSlashData, slash_judge_domain};
-    use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
-    use decdn_protocol::{Coverage, EMPTY_ROOT, ProbeResponseExt};
-
-    const TS: u64 = 1_700_000_000_000_000;
-    let signer = PrivateKeySigner::random();
-    let domain = slash_judge_domain(421_614, alloy::primitives::Address::repeat_byte(0x0D));
-    let cand = NodeCandidate {
-        node_id: node_key(1),
-        eth_address: signer.address(),
-        region_hint: None,
-        multiaddrs: alloy::primitives::Bytes::new(),
-    };
-    let answer = |hash: [u8; 32],
-                  has_blob: bool|
-     -> anyhow::Result<(ProbeResponse, ProbeResponseExt, crate::probe::ProbeRtt)> {
-        let body = ProbeResponseBody {
-            hash,
-            has_blob,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        };
-        let slash_sig = ProbeSlashData {
-            hash: hash.into(),
-            has_blob,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        }
-        .sign(&signer, &domain)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?
-        .as_bytes()
-        .to_vec();
-        Ok((
-            ProbeResponse { body, slash_sig },
-            ProbeResponseExt {
-                coverage: Coverage::empty(),
-                size_proof: Some(decdn_protocol::SizeProof::default()),
-                payment_pools: None,
-            },
-            crate::probe::ProbeRtt {
-                ms: 5.0,
-                direct: true,
-            },
-        ))
-    };
-
-    match classify_probe(&cand, answer(EMPTY_ROOT, true), EMPTY_ROOT, TS, &domain) {
-        ProbeOutcome::Holder(probed, _) => {
-            assert_eq!(probed.total_bytes, Some(ProvenSize::assume_for_tests(0)));
-            assert!(probed.coverage.is_empty());
-        }
-        _ => anyhow::bail!("the empty root's holder must classify as a holder"),
-    }
-    assert!(
-        matches!(
-            classify_probe(&cand, answer(EMPTY_ROOT, false), EMPTY_ROOT, TS, &domain),
-            ProbeOutcome::NonHolder(..)
-        ),
-        "a chain-stale or opted-out node signs has_blob:false for the empty root and is a \
-         non-holder, not a malformed answer"
-    );
-    let other_hash = [0x11u8; 32];
-    assert!(
-        matches!(
-            classify_probe(&cand, answer(other_hash, true), other_hash, TS, &domain),
-            ProbeOutcome::Unusable
-        ),
-        "an empty coverage with has_blob:true is malformed for a non-empty root"
-    );
-    Ok(())
-}
-
-/// A probe answer states a size only in its proof, and keeps it only when the
-/// proof verifies under the hash. A wrong size with real but mismatched proof
-/// bytes and a 2^60 size with garbage proof bytes both drop the answer, so the
-/// size never reaches a plan.
-#[test]
-fn a_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
-    use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::{ProbeSlashData, slash_judge_domain};
-    use decdn_protocol::message::{ProbeResponse, ProbeResponseBody};
-    use decdn_protocol::{Coverage, ProbeResponseExt, SizeProof};
-
-    const TS: u64 = 1_700_000_000_000_000;
-    let blob: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
-    let size = u64::try_from(blob.len())?;
-    let hash = *blake3::hash(&blob).as_bytes();
-    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
-        .size_proof
-        .to_vec();
-    let proof = SizeProof::new(size, proof_bytes.clone())?;
-    let signer = PrivateKeySigner::random();
-    let domain = slash_judge_domain(421_614, alloy::primitives::Address::repeat_byte(0x0D));
-    let cand = NodeCandidate {
-        node_id: node_key(1),
-        eth_address: signer.address(),
-        region_hint: None,
-        multiaddrs: alloy::primitives::Bytes::new(),
-    };
-    let answer = |size_proof: Option<SizeProof>| -> anyhow::Result<(
-        ProbeResponse,
-        ProbeResponseExt,
-        crate::probe::ProbeRtt,
-    )> {
-        let body = ProbeResponseBody {
-            hash,
-            has_blob: true,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        };
-        let slash_sig = ProbeSlashData {
-            hash: hash.into(),
-            has_blob: true,
-            rate_per_mb: 10,
-            timestamp_us: TS,
-        }
-        .sign(&signer, &domain)
-        .map_err(|e| anyhow::anyhow!("sign: {e}"))?
-        .as_bytes()
-        .to_vec();
-        Ok((
-            ProbeResponse { body, slash_sig },
-            ProbeResponseExt {
-                coverage: Coverage::full(1),
-                size_proof,
-                payment_pools: None,
-            },
-            crate::probe::ProbeRtt {
-                ms: 5.0,
-                direct: true,
-            },
-        ))
-    };
-    let classify = |size_proof| classify_probe(&cand, answer(size_proof), hash, TS, &domain);
-
-    match classify(Some(proof)) {
-        ProbeOutcome::Holder(probed, _) => {
-            assert_eq!(probed.total_bytes.map(ProvenSize::get), Some(size));
-        }
-        _ => anyhow::bail!("a proven size keeps the holder"),
-    }
-    match classify(None) {
-        ProbeOutcome::Holder(probed, _) => assert_eq!(probed.total_bytes, None),
-        _ => anyhow::bail!("a holder that states no size is still a holder"),
-    }
-    for (what, size_proof) in [
-        (
-            "a wrong size",
-            SizeProof::new(size + 1, proof_bytes.clone())?,
-        ),
-        ("a huge size", SizeProof::new(1u64 << 60, vec![0xAB; 4000])?),
-    ] {
-        assert!(
-            matches!(classify(Some(size_proof)), ProbeOutcome::Unusable),
-            "{what} drops the answer"
-        );
-    }
-    Ok(())
-}
-
-/// A candidate's rate hint is its probe sample from this resolve, else the
+/// A candidate's rate hint is its answer's sample from this resolve, else the
 /// peer store's last rate; a candidate with neither is left out, and the
 /// order stays the failover order.
 #[test]
-fn rate_hints_prefer_the_probe_then_the_store() -> anyhow::Result<()> {
+fn rate_hints_prefer_the_answer_then_the_store() -> anyhow::Result<()> {
     let (mut targets, node_a, node_b) = tests_support::two_holder_targets();
     let dir = tempfile::tempdir()?;
     let store = crate::PeerStore::open(dir.path());
     let cfg = crate::StoreConfig::default();
-    // The store knows b at 40; a's probe sample (1) wins over its store rate.
+    // The store knows b at 40; a's discovery sample (1) wins over its store rate.
     store.record_sample(&node_a.node_id, 10.0, 99, now_secs(), &cfg)?;
     store.record_sample(&node_b.node_id, 20.0, 40, now_secs(), &cfg)?;
-    targets.probed_samples = vec![(node_a.node_id, 10.0, 1)];
+    targets.samples = vec![(node_a.node_id, 10.0, 1)];
     let hints = targets.rate_hints(&store);
     let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
     assert_eq!(got, vec![(node_a.eth_address, 1), (node_b.eth_address, 40)]);
 
-    // A node neither probed nor recorded gives no hint.
+    // A node neither opened nor recorded gives no hint.
     let empty = tempfile::tempdir()?;
     let hints = targets.rate_hints(&crate::PeerStore::open(empty.path()));
     let got: Vec<_> = hints.iter().map(|h| (h.provider, h.rate_per_mb)).collect();
     assert_eq!(got, vec![(node_a.eth_address, 1)]);
+    Ok(())
+}
+
+/// A payer context for discovery opens in these tests.
+fn open_ctx() -> PoolContext {
+    PoolContext::new(
+        alloy::primitives::B256::repeat_byte(0x11),
+        alloy::primitives::U256::ZERO,
+        Arc::new(alloy::signers::local::PrivateKeySigner::random()),
+        decdn_incentive::voucher_domain(1, Address::repeat_byte(0x33)),
+    )
+}
+
+/// The whole-blob open spec over `conns` and `ctx`, at `max_rate_per_mb`.
+fn spec<'a>(conns: &'a Connections, ctx: &'a PoolContext, max_rate_per_mb: u64) -> OpenSpec<'a> {
+    OpenSpec {
+        conns,
+        ctx,
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        span: (0, 0),
+        max_rate_per_mb,
+    }
+}
+
+fn open_domain() -> alloy::sol_types::Eip712Domain {
+    decdn_incentive::slash_judge_domain(31_337, Address::repeat_byte(0x02))
+}
+
+fn served_blob() -> Vec<u8> {
+    (0..70_000u32).map(|i| (i % 251) as u8).collect()
+}
+
+/// Wait until `cond` holds, for at most two seconds.
+async fn eventually(what: &str, cond: impl Fn() -> bool) -> anyhow::Result<()> {
+    for _ in 0..200 {
+        if cond() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::bail!("timed out waiting for {what}")
+}
+
+/// A discovery open's failure classifies by what the node did: a shed is
+/// rate-limited, a timestamp refusal clock-skewed, an answer that does not
+/// verify unverifiable, and anything else unreachable.
+#[test]
+fn classify_open_types_each_failure() {
+    type Case = (anyhow::Error, fn(&OpenOutcome) -> bool);
+    let cand = harvest_candidate(1);
+    let cases: Vec<Case> = vec![
+        (
+            anyhow::Error::new(crate::UpstreamRateLimited { label: None }).context("open_bi"),
+            |o| matches!(o, OpenOutcome::RateLimited),
+        ),
+        (
+            anyhow::Error::new(crate::UpstreamTimestampRejected { label: None })
+                .context("read response"),
+            |o| matches!(o, OpenOutcome::ClockSkewed),
+        ),
+        (
+            anyhow::anyhow!("slash_sig verification failed").context(UnverifiedAnswer),
+            |o| matches!(o, OpenOutcome::Unverifiable),
+        ),
+        (anyhow::anyhow!("connect failed: timed out"), |o| {
+            matches!(o, OpenOutcome::Unreachable)
+        }),
+    ];
+    for (err, is) in cases {
+        let what = format!("{err:#}");
+        let (outcome, stream) = classify_open(&cand, Err(err), 0);
+        assert!(is(&outcome), "{what}");
+        assert!(stream.is_none());
+    }
+}
+
+/// A node that misses the blob answers a signed `NotFound`: it is a
+/// non-holder, kept as a pull-through target with its sample, and its stream
+/// is not kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_answer_is_a_warming_candidate() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let node = FakeNode::spawn(
+        Answer::Refuse {
+            error: decdn_protocol::client::StreamError::NotFound,
+            rate: 6,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let targets = open_and_order(
+        std::slice::from_ref(&cand),
+        None,
+        [7; 32],
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Stream,
+    )
+    .await?;
+    assert_eq!(
+        targets
+            .candidates
+            .iter()
+            .map(|c| c.node_id)
+            .collect::<Vec<_>>(),
+        vec![cand.node_id],
+        "the non-holder is the cold pull-through target"
+    );
+    assert!(
+        targets.coverage_by_node.is_empty(),
+        "a non-holder has no coverage"
+    );
+    assert!(targets.size_hint.is_none());
+    assert_eq!(targets.opened.len(), 0, "a refusal leaves no stream");
+    assert!(
+        targets
+            .samples
+            .iter()
+            .any(|&(id, _, rate)| id == cand.node_id && rate == 6),
+        "a non-holder's verified answer is sampled"
+    );
+    client.close().await;
+    Ok(())
+}
+
+/// A holder that quotes above `--max-rate-per-mb` is left out and its stream
+/// reset; a holder under the ceiling stays. With every holder over it, the
+/// terminal error names the ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_over_max_quote_is_excluded() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let serve = |rate| Answer::Serve {
+        blob: blob.clone(),
+        rate,
+    };
+    let dear = FakeNode::spawn(serve(50), open_domain()).await?;
+    let cheap = FakeNode::spawn(serve(5), open_domain()).await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let candidates = vec![dear.candidate()?, cheap.candidate()?];
+    let targets = open_and_order(
+        &candidates,
+        None,
+        hash,
+        spec(&conns, &ctx, 10),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await?;
+    assert_eq!(
+        targets
+            .candidates
+            .iter()
+            .map(|c| c.node_id)
+            .collect::<Vec<_>>(),
+        vec![cheap.endpoint.id()],
+        "only the holder under the ceiling is ordered"
+    );
+    eventually("the over-ceiling stream reset", || {
+        Seen::count(&dear.seen.resets) == 1
+    })
+    .await?;
+    drop(targets);
+
+    let err = open_and_order(
+        &candidates[..1],
+        None,
+        hash,
+        spec(&conns, &ctx, 10),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("no holder under the ceiling"))?;
+    assert!(
+        err.to_string()
+            .contains("1 quoted above the --max-rate-per-mb ceiling"),
+        "{err:#}"
+    );
+    client.close().await;
+    Ok(())
+}
+
+/// An answer whose coverage disagrees with its signed `ok` is unverifiable,
+/// which the terminal error reports as a configuration fault to check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_coverage_inconsistent_answer_is_unverifiable() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(Answer::Inconsistent { blob }, open_domain()).await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let res = open_candidate(
+        &cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        hash,
+        false,
+    )
+    .await;
+    let (outcome, stream) = classify_open(&cand, res, 0);
+    assert!(matches!(outcome, OpenOutcome::Unverifiable));
+    assert!(stream.is_none());
+    let err = open_and_order(
+        std::slice::from_ref(&cand),
+        None,
+        hash,
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("an unverifiable answer serves nothing"))?;
+    assert!(
+        err.downcast_ref::<ResolveConfigFault>().is_some(),
+        "{err:#}"
+    );
+    client.close().await;
+    Ok(())
+}
+
+/// A node that declines the blob is counted apart in the terminal error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_answer_is_named_in_the_terminal_error() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let node = FakeNode::spawn(
+        Answer::Refuse {
+            error: decdn_protocol::client::StreamError::Declined,
+            rate: 6,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let err = open_and_order(
+        &[node.candidate()?],
+        None,
+        [7; 32],
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a declining node serves nothing"))?;
+    assert!(err.to_string().contains("1 declined the blob"), "{err:#}");
+    client.close().await;
+    Ok(())
+}
+
+/// A node that refuses the open's payment pool says nothing about the blob:
+/// it is a serve target, not a decline, and the round keeps the pools it
+/// names as its `payment_pools` hint, so a later pass on one of them pays it
+/// (ADR 005 § Payment pool routing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_that_refuses_the_pool_is_routed_by_its_hint() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let accepted = vec![decdn_protocol::PoolAccount::eip155(8_453, [0xB1; 20])];
+    let node = FakeNode::spawn(
+        Answer::DeclinePool {
+            accepted: accepted.clone(),
+            rate: 6,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let res = open_candidate(
+        &cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        [7; 32],
+        false,
+    )
+    .await;
+    let (outcome, stream) = classify_open(&cand, res, 0);
+    match outcome {
+        OpenOutcome::NonHolder(candidate, _) => {
+            assert_eq!(candidate.payment_pools.as_ref(), Some(&accepted));
+        }
+        _ => anyhow::bail!("a node that refuses the pool is a serve target"),
+    }
+    assert!(stream.is_none());
+    let targets = open_and_order(
+        std::slice::from_ref(&cand),
+        None,
+        [7; 32],
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await?;
+    assert_eq!(targets.pool_hints.get(&cand.node_id), Some(&accepted));
+    client.close().await;
+    Ok(())
+}
+
+/// A round keeps each holder's stream open for the fetch to adopt, and a
+/// stream nobody takes is reset when the targets drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_round_keeps_each_holders_stream_until_the_targets_drop() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let targets = open_and_order(
+        &[node.candidate()?],
+        None,
+        hash,
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Stream,
+    )
+    .await?;
+    assert_eq!(targets.opened.len(), 1);
+    assert_eq!(
+        targets.size_hint.map(ProvenSize::get),
+        Some(u64::try_from(blob.len())?)
+    );
+    assert!(targets.samples.iter().any(|&(_, rtt, _)| rtt < f64::MAX));
+    assert_eq!(Seen::count(&node.seen.resets), 0);
+    drop(targets);
+    eventually("the unadopted stream reset", || {
+        Seen::count(&node.seen.resets) == 1
+    })
+    .await?;
+    client.close().await;
+    Ok(())
+}
+
+/// A late answer keeps its verified facts and its stream is cancelled as it
+/// arrives: the fetch adopts only a first-round stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_answer_keeps_its_facts_and_cancels_its_stream() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    use futures_util::StreamExt as _;
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let cand = node.candidate()?;
+    let res = open_candidate(
+        &cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        hash,
+        false,
+    )
+    .await;
+    let (outcome, stream) = classify_open(&cand, res, 0);
+    let tail: futures_util::stream::FuturesUnordered<_> =
+        std::iter::once(std::future::ready((cand.node_id, outcome, stream))).collect();
+    let slot = late_slot(OpenRound::Stream, tail, &[], no_warming());
+    let mut late = slot
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("a streamed tail"))?;
+    match late.tail.next().await {
+        Some(OpenOutcome::Holder(discovered, _)) => {
+            assert_eq!(
+                discovered.total_bytes.map(ProvenSize::get),
+                Some(u64::try_from(blob.len())?)
+            );
+            assert_eq!(discovered.rate_per_mb, 4);
+            assert!(!discovered.coverage.is_empty());
+        }
+        _ => anyhow::bail!("the late holder keeps its facts"),
+    }
+    eventually("the late stream reset", || {
+        Seen::count(&node.seen.resets) == 1
+    })
+    .await?;
+    client.close().await;
+    Ok(())
+}
+
+/// A pinned `--node-id` opens once, with pull-through, for the fetch's first
+/// leg: its proven size is the fetch's first size, and its stream is kept for
+/// the fetch to adopt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_open_asks_pull_through_and_keeps_its_stream() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode, Seen};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let chain = offline_chain();
+    let domain = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
+    let node = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        domain,
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let pinned = PinnedNode {
+        node_id: node.endpoint.id(),
+        provider: node.operator_address(),
+        addr: node.addr.ip_addrs().next().copied(),
+    };
+    let open = OpenOpts {
+        marks: None,
+        round: OpenRound::Stream,
+        known_size: None,
+        spec: spec(&conns, &ctx, 0),
+    };
+    let targets = open_pinned(&chain, None, pinned, hash, open).await;
+    assert!(targets.pinned);
+    assert_eq!(
+        targets.size_hint.map(ProvenSize::get),
+        Some(u64::try_from(blob.len())?)
+    );
+    assert_eq!(targets.opened.len(), 1);
+    assert_eq!(Seen::count(&node.seen.opens), 1);
+    let pull_through = node
+        .seen
+        .requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .first()
+        .map(|(_, ext)| ext.pull_through);
+    assert_eq!(pull_through, Some(true));
+    drop(targets);
+    client.close().await;
+    Ok(())
+}
+
+/// Within one RTT band the cheaper quote leads, then the wider coverage; a
+/// nearer band always leads whatever its quote.
+#[test]
+fn holders_rank_by_rtt_band_then_quote_then_coverage() {
+    let mut near_dear = holder(1, 5.0);
+    near_dear.rate_per_mb = 9;
+    let mut near_cheap = holder(2, 15.0);
+    near_cheap.rate_per_mb = 3;
+    let mut near_cheap_wide = holder(3, 18.0);
+    near_cheap_wide.rate_per_mb = 3;
+    near_cheap_wide.coverage = decdn_protocol::Coverage::full(4);
+    let mut far_cheapest = holder(4, 45.0);
+    far_cheapest.rate_per_mb = 1;
+    let out = super::failover_order(
+        vec![far_cheapest, near_dear, near_cheap, near_cheap_wide],
+        &[],
+        warming_params(false),
+    );
+    let ids: Vec<_> = out.order.iter().map(|c| c.node_id).collect();
+    assert_eq!(
+        ids,
+        vec![node_key(3), node_key(2), node_key(1), node_key(4)],
+        "band 0 by quote then coverage, then band 2"
+    );
+}
+
+/// A node that holds part of the blob and does not cover the span refuses it
+/// `NotFound` with the blocks it holds: discovery reads it as a holder of
+/// those blocks, with no stream, so the multi-source plan stripes across it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_not_found_with_held_blocks_is_a_partial_holder() -> anyhow::Result<()> {
+    use crate::opened::fake_node::{Answer, FakeNode};
+    let blob = served_blob();
+    let hash = *blake3::hash(&blob).as_bytes();
+    let held = decdn_protocol::Coverage::from_block_indices(4, [0, 1].into_iter());
+    let full = FakeNode::spawn(
+        Answer::Serve {
+            blob: blob.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let partial = FakeNode::spawn(
+        Answer::Partial {
+            coverage: held.clone(),
+            rate: 4,
+        },
+        open_domain(),
+    )
+    .await?;
+    let client = client_endpoint().await;
+    let conns = Connections::new(client.clone());
+    let ctx = open_ctx();
+    let (full_cand, partial_cand) = (full.candidate()?, partial.candidate()?);
+    let res = open_candidate(
+        &partial_cand,
+        None,
+        spec(&conns, &ctx, 0),
+        &open_domain(),
+        hash,
+        false,
+    )
+    .await;
+    match classify_open(&partial_cand, res, 0) {
+        (OpenOutcome::Holder(discovered, _), None) => {
+            assert_eq!(discovered.coverage, held);
+            assert!(discovered.total_bytes.is_none(), "a refusal proves no size");
+        }
+        _ => anyhow::bail!("a NotFound with held blocks is a partial holder with no stream"),
+    }
+    let targets = open_and_order(
+        &[full_cand.clone(), partial_cand.clone()],
+        None,
+        hash,
+        spec(&conns, &ctx, 0),
+        no_warming(),
+        &open_domain(),
+        OpenRound::Settle,
+    )
+    .await?;
+    assert_eq!(targets.candidates.len(), 2, "both holders are ordered");
+    assert_eq!(
+        targets.coverage_by_node.get(&partial_cand.node_id),
+        Some(&held)
+    );
+    assert_eq!(
+        targets.opened.len(),
+        1,
+        "only the serving holder's stream is kept"
+    );
+    let holders =
+        crate::lane_sources::holders_from(&targets, &mut std::collections::HashMap::new());
+    let partial_holder = holders
+        .iter()
+        .find(|h| h.provider == partial_cand.eth_address)
+        .ok_or_else(|| anyhow::anyhow!("the partial holder is a holder"))?;
+    assert!(partial_holder.discovered_holder);
+    assert_eq!(partial_holder.coverage.as_ref(), Some(&held));
+    client.close().await;
     Ok(())
 }

@@ -34,9 +34,6 @@ pub struct FileConfig {
     /// `cdn/dht/v1` Kademlia DHT settings (ADR 022). Absent => defaults
     /// from the ADR 022 §DHT Rate Limiting table.
     pub dht: Option<DhtConfig>,
-    /// `cdn/probe/v1` settings (ADR 005). Absent => defaults from the
-    /// ADR 005 §Probe rate limiting table.
-    pub probe: Option<ProbeConfig>,
     /// `cdn/client/v1` serve-path settings (ADR 005). Absent => defaults from
     /// the ADR 005 §Request rate limiting table.
     pub serve: Option<ServeConfig>,
@@ -66,15 +63,15 @@ pub struct IdentityConfig {
 
 /// Client-scoped section of the config file. Independent of the
 /// node-scoped `[network.discovery]` (address discovery) — this narrows which
-/// peers a client discovers/probes, never ranks them.
+/// peers a client discovers and opens, never ranks them.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    /// Regions to restrict discovery/probing to; empty/absent = no filter.
+    /// Regions to restrict discovery to; empty/absent = no filter.
     ///
     /// This is a DISCOVERY-TIME filter only: it narrows the pool the client
-    /// probes/rediscovers, for a single fetch and for every entry's candidate
-    /// sample in a bundle pull alike. It does NOT apply to the probe-less
+    /// opens/rediscovers, for a single fetch and for every entry's candidate
+    /// sample in a bundle pull alike. It does NOT apply to the open-less
     /// peer-store fast path, where measured latency ranking already governs
     /// which peers are near, so a warm store selects by latency without
     /// consulting this list.
@@ -162,8 +159,8 @@ pub struct DiscoveryPeer {
 ///
 /// The section's own fields name the **governance chain**: the chain that runs
 /// `CapacityBond`, `SlashJudge`, `ContentBlacklist` and the other protocol
-/// contracts, whose chain id binds every slash, probe, stream, attestation,
-/// bind-node and pointer signature. Payments run on one or more **payment
+/// contracts, whose chain id binds every slash, stream, attestation, bind-node
+/// and pointer signature. Payments run on one or more **payment
 /// chains**, each a `[[blockchain.payment_chains]]` entry naming its own RPC
 /// endpoint, chain id and the `PaymentPool` contracts this node accepts there
 /// ([`PaymentChainConfig`]).
@@ -211,7 +208,7 @@ pub struct BlockchainConfig {
     /// the node runtime.
     pub publisher_registry_address: Option<String>,
     /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
-    /// `ProbeResponse` / `StreamResponse` `slash_sig` signatures (ADR 014
+    /// `StreamResponse` `slash_sig` signatures (ADR 014
     /// §1–2). Required: a wrong/zero address silently produces signatures no
     /// verifier accepts, so resolution fails fast when it is missing rather
     /// than defaulting.
@@ -236,8 +233,8 @@ pub struct BlockchainConfig {
     /// sync cannot reach the RPC, every chain-derived serve guard — the
     /// deny-set, pool solvency, per-signer caps — answers from stale state, so a
     /// takedown that lands during the outage would go unenforced and serving it
-    /// past the compliance window is slashable. Past this window the serve and
-    /// probe paths refuse rather than sign evidence the node can no longer
+    /// past the compliance window is slashable. Past this window the serve
+    /// path refuses rather than sign evidence the node can no longer
     /// vouch for. Always evaluated (there is no on/off flag); set it large to
     /// opt out. Absent => [`super::DEFAULT_CHAIN_STALENESS_GRACE_SEC`] (1800s /
     /// 30 min). Must not be `0` (that would refuse every serve). Only consulted
@@ -379,8 +376,8 @@ pub struct CacheConfig {
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same
     /// per-MB units as the wire `StreamResponse.rate_per_mb`. Absent / `0` =
     /// unlimited. Bounds what this node, as a BUYER on a cache-miss pull, will
-    /// accept a provider to quote — on top of the always-applied probe-relative
-    /// bound. This is a buyer-side ceiling; the node never bounds its own
+    /// accept a provider to quote — on top of the always-applied bound to the
+    /// rate the chosen candidate quoted at discovery. This is a buyer-side ceiling; the node never bounds its own
     /// sell rate (a rate below the on-chain delivery floor still sells and
     /// settles, with only its vote-weight byte credit clamped at redemption).
     pub max_rate_per_mb: Option<u64>,
@@ -494,7 +491,7 @@ pub struct CacheConfig {
     /// Interval between origin-held-index rescans in seconds (#1130). Absent =>
     /// [`crate::config::DEFAULT_FS_RESCAN_INTERVAL_SEC`]. The node re-walks its
     /// `fs` origin directory (and re-checks present pins) at this cadence so a
-    /// file dropped into the origin becomes discoverable — probe `has_blob` +
+    /// file dropped into the origin becomes discoverable — open answers +
     /// DHT announce — within one interval, without a restart or reload. `0`
     /// disables the periodic rescan (startup + `decdn node reload` still run
     /// it). Shorter intervals pick up new files faster at the cost of more
@@ -502,19 +499,19 @@ pub struct CacheConfig {
     pub fs_rescan_interval_sec: Option<u64>,
     /// TTL, in seconds, for a memoised positive live-origin probe answer (#1130
     /// pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A
-    /// probe for a hash absent from the `fs`-enumeration ∪ pins index falls back
-    /// to a live `HEAD`/`HeadObject` against the http/s3 origin; a present-with-
-    /// size answer is cached for this long so a non-pinned bucket object is
-    /// discoverable without a per-probe origin round-trip on every probe.
+    /// request for a hash absent from the `fs`-enumeration ∪ pins index falls
+    /// back to a live `HEAD`/`HeadObject` against the http/s3 origin; a
+    /// present-with-size answer is cached for this long so a non-pinned bucket
+    /// object is discoverable without an origin round-trip on every request.
     /// Shorter TTLs track origin deletions faster at the cost of more `HEAD`
     /// traffic. See `origin_probe_negative_ttl_sec` for the absent-answer TTL.
     pub origin_probe_ttl_sec: Option<u64>,
     /// TTL, in seconds, for a memoised negative (absent) live-origin probe
     /// answer (#1130 pt3). Absent =>
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC`] (2). Caching the
-    /// negative answer is what blunts a random-hash probe flood; keeping this
+    /// negative answer is what blunts a random-hash request flood; keeping this
     /// TTL short bounds how long a stale `Absent` can hide newly-available own
-    /// content from a probe.
+    /// content from a request.
     pub origin_probe_negative_ttl_sec: Option<u64>,
     /// TTL, in seconds, for a memoised fault live-origin probe answer (#1130
     /// pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC`]
@@ -525,24 +522,22 @@ pub struct CacheConfig {
     /// Rejected unless `origin_probe_negative_ttl_sec <=
     /// origin_probe_fault_ttl_sec <= origin_probe_ttl_sec`.
     pub origin_probe_fault_ttl_sec: Option<u64>,
-    /// Per-probe ceiling, in milliseconds, on the live-origin `HEAD`/`HeadObject`
-    /// (#1130 pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
-    /// (2000). A slow origin must never stall the probe hot path; on timeout the
-    /// probe answers `has_blob: false` (safe — never slashable) and
-    /// the miss is memoised as absent for one TTL.
+    /// Per-request ceiling, in milliseconds, on the live-origin
+    /// `HEAD`/`HeadObject` (#1130 pt3). Absent =>
+    /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`] (2000). A slow origin
+    /// must never stall the serve hot path; on timeout the node does not
+    /// advertise the blob and memoises the fault for one fault TTL.
     pub origin_probe_timeout_ms: Option<u64>,
     /// Maximum distinct hashes held in the live-origin probe memo (#1130 pt3).
     /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`] (4096).
-    /// Bounds memo memory under a random-hash probe flood; the cache is
+    /// Bounds memo memory under a random-hash request flood; the cache is
     /// best-effort, so at capacity one arbitrary entry is dropped to admit a new
     /// answer (expired entries reclaimed first).
     pub origin_probe_memo_capacity: Option<u64>,
     /// Cache eviction driver: percent of [`Self::cache_size_mb`] above which
     /// the driver actively evicts (#1173, ADR 040). Absent =>
     /// [`crate::config::DEFAULT_EVICTION_HIGH_WATER_PCT`] (90). Hard bounds
-    /// `[60, 95]`; set above the 25% probe-hold recommendation so a full hold
-    /// budget plus in-flight writes don't trip it, below 95% for write
-    /// headroom between sweeps.
+    /// `[60, 95]`; below 95% for write headroom between sweeps.
     pub eviction_high_water_pct: Option<u64>,
     /// LRU eviction driver: percent of [`Self::cache_size_mb`] the driver
     /// evicts down to before returning to idle (#1173). Absent =>
@@ -569,32 +564,9 @@ pub struct CacheConfig {
     /// cache holding many blobs,
     /// raise this to trade eviction latency for steady-state store load.
     pub eviction_tick_secs: Option<u64>,
-    /// Maximum number of concurrently held (eviction-exempt) blobs for the
-    /// probe-triggered hold (ADR 005 §Hold budget, #318). Holds are
-    /// per-blob: multiple peers probing the same hash share one slot. When the
-    /// budget is exhausted, a probe for a blob that is present but gets no slot
-    /// still advertises (`has_blob: true`) and places no eviction hold — the
-    /// blob may be LRU-evicted before the pull, costing one wasted round trip
-    /// (never a slash). Absent => [`crate::config::DEFAULT_MAX_PROBE_HOLDS`]
-    /// (256). `0` is the operator opt-out: holds are disabled and probes answer
-    /// `has_blob: false` for store-backed content — content servable from a
-    /// configured origin takes no hold and is still advertised. Operators with
-    /// small caches SHOULD set this to ≤25% of cache capacity.
-    pub max_probe_holds: Option<u64>,
-    /// Number of probe-hold slots reserved for the **stake lane** —
-    /// registered operators issuing node-to-node cache-miss probes (#757,
-    /// ADR 003 §Admission and Priority). An end-client probe places no eviction
-    /// hold once usage reaches `max_probe_holds - stake_lane_reserved_holds` (it
-    /// still advertises `has_blob: true` if the blob is present), keeping the
-    /// last `stake_lane_reserved_holds` slots available for node-to-node probes
-    /// so end-client load cannot starve their holds. Absent / `0` (the default)
-    /// disables the reservation entirely — a single-lane node is unaffected.
-    /// Values `>= max_probe_holds` reserve the whole budget for the stake lane:
-    /// no end-client probe takes a hold slot, regardless of current usage.
-    pub stake_lane_reserved_holds: Option<u64>,
     /// Enable node-to-node paid cache-miss pull-through (#831, ADR 001/022).
     /// When on *and* the buyer pool service bootstrapped, a miss triggers DHT
-    /// provider discovery → probe → ranked paid pull from an upstream node,
+    /// provider discovery → discovery open → ranked paid pull from an upstream node,
     /// which populates the cache and is then served. When off, a cache miss
     /// serves `NotFound`. Absent resolves to a role-derived default: on when no
     /// origin backend is configured (a cache node exists to fill misses), off
@@ -612,13 +584,13 @@ pub struct CacheConfig {
     /// configured, `true` (relay) when none is. Set this explicitly to
     /// override either default. Node-local; `cache.*` is restart-required.
     pub relay_foreign_namespaces: Option<bool>,
-    /// Number of discovered providers to probe before ranking on a
-    /// node-to-node pull (#831). Absent =>
-    /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`] (5). Higher widens
-    /// provider choice at the cost of more probe round trips per miss; `0`
-    /// probes none, so no pull can succeed (a way to disable the pull while
+    /// Number of discovered providers a node-to-node pull opens a
+    /// voucher-less discovery stream on before ranking (#831). Absent =>
+    /// [`crate::config::DEFAULT_NODE_PULL_OPEN_FANOUT`] (5). Higher widens
+    /// provider choice at the cost of more discovery opens per miss; `0`
+    /// opens none, so no pull can succeed (a way to disable the pull while
     /// keeping the feature flag on).
-    pub node_pull_probe_fanout: Option<usize>,
+    pub node_pull_open_fanout: Option<usize>,
     /// Wall-clock timeout in seconds for the STREAM-OPEN stage of a single upstream pull
     /// on a node-to-node miss (#831) — connect, handshake, and the
     /// signed `StreamResponse`. It does NOT bound the buyer pool open, which precedes
@@ -649,7 +621,7 @@ pub struct CacheConfig {
     ///
     /// "Longer" is multiplied, not added. A silent candidate costs one full window of this,
     /// and the derived outer deadline budgets that for EVERY candidate, so a second here is
-    /// ~3 seconds of worst-case client wait on a total miss (168 s at defaults).
+    /// ~3 seconds of worst-case client wait on a total miss (169.5 s at defaults).
     ///
     /// It also sets the head start of the time budget for each own-origin range-pull read
     /// (ADR 037): one `{H}.obao4` fetch or one data window of at most 4 MiB. That budget is
@@ -1035,50 +1007,10 @@ pub struct DhtRateLimitConfig {
     pub max_tracked_per_peer: Option<usize>,
 }
 
-/// `[probe]` section — `cdn/probe/v1` settings (ADR 005).
-///
-/// The rate-limit knobs nest under `[probe.rate_limit]` to match ADR 005
-/// §Probe rate limiting and to leave room for other future `probe.*` top-level knobs without
-/// breaking the operator key path.
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProbeConfig {
-    /// Rate-limiter settings (ADR 005 §Probe rate limiting). Absent =>
-    /// the defaults from the ADR (5/1000 req/s with 5/2000 bursts).
-    pub rate_limit: Option<ProbeRateLimitConfig>,
-}
-
-/// `[probe.rate_limit]` — two-layer token-bucket settings (ADR 005 §Probe
-/// rate limiting).
-///
-/// Mirrors `[dht.rate_limit]` in shape; only the defaults differ (ADR 005
-/// specifies a tighter per-peer cap than ADR 022's DHT layer because a probe
-/// is unauthenticated and cheaper to flood). Setting any `*_rate_per_sec` to
-/// `0.0` disables that layer (operator opt-out), whatever its `*_burst`. A
-/// nonzero rate needs a nonzero burst: the resolver rejects `rate > 0,
-/// burst == 0` as a deny-all, the same way `dht.rate_limit.*` is paired.
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProbeRateLimitConfig {
-    /// Per-peer (source `NodeId`) sustained rate. Absent => 5 req/s
-    /// (ADR 005 §Probe rate limiting). `0.0` disables the layer.
-    pub per_peer_rate_per_sec: Option<f64>,
-    /// Per-peer burst capacity. Absent => 5. Required `> 0` when
-    /// `per_peer_rate_per_sec > 0`.
-    pub per_peer_burst: Option<u32>,
-    /// Global inbound probe sustained rate. Absent => 1000 req/s.
-    pub global_rate_per_sec: Option<f64>,
-    /// Global inbound probe burst capacity. Absent => 2000.
-    pub global_burst: Option<u32>,
-    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map. Absent =>
-    /// 4096. `0` makes the map unbounded (#645).
-    pub max_tracked_per_peer: Option<usize>,
-}
-
 /// `[serve]` section — inbound `cdn/client/v1` settings (ADR 005).
 ///
 /// The rate-limit knobs nest under `[serve.rate_limit]`, like
-/// `[probe.rate_limit]` and `[dht.rate_limit]`. `[client]` names the `decdn`
+/// `[dht.rate_limit]`. `[client]` names the `decdn`
 /// requester's own settings, so the serving side is `[serve]`.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1091,10 +1023,10 @@ pub struct ServeConfig {
 /// `[serve.rate_limit]` — two-layer token-bucket settings for inbound
 /// `cdn/client/v1` requests (ADR 005 §Request rate limiting).
 ///
-/// Mirrors `[probe.rate_limit]` in shape; only the defaults differ. One
+/// Mirrors `[dht.rate_limit]` in shape; only the defaults differ. One
 /// request is one stream, and an honest client opens many of them (one per
 /// pull leg, up to 100 at once on one connection), so the caps sit well above
-/// the probe ones. Setting any `*_rate_per_sec` to `0.0` disables that layer,
+/// the DHT ones. Setting any `*_rate_per_sec` to `0.0` disables that layer,
 /// whatever its `*_burst`. A nonzero rate needs a nonzero burst: the resolver
 /// rejects `rate > 0, burst == 0` as a deny-all.
 #[derive(Debug, Default, Serialize, Deserialize)]

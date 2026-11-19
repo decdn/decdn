@@ -533,6 +533,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
                 binding_signature,
             }),
             capability: None,
+            pull_through: true,
         };
         let req_bytes = encode_stream_request(&req, Some(&ext))
             .map_err(|e| anyhow::anyhow!("encode request: {e}"))?;

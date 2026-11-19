@@ -7,7 +7,7 @@
 A deCDN node has two observation points today:
 
 - A loopback-only `/metrics` HTTP endpoint (hyper on `observability.metrics_port`, default `9090`) emitting OpenMetrics text — text-only, aggregate, read-only by design.
-- The `cdn/probe/v1` ALPN, hittable by any remote iroh peer for latency/availability checks — not a local control channel, no auth beyond "anyone with an iroh connection".
+- The `cdn/client/v1` ALPN, where any remote iroh peer can send a discovery open for latency and availability — not a local control channel, no auth beyond a client binding that any key can make.
 
 Neither fits when a same-host operator must **read live internal state** (readiness, lane state) or **trigger a local control action** (graceful drain). A control-plane surface is therefore needed; this appendix pins its shape so every `admin_v1_…` method shares a common transport.
 
@@ -88,7 +88,7 @@ CLI shape:
 ## Consequences
 
 - The node opens one additional TCP socket by default; operators wanting zero extra listeners set `observability.admin_port = 0`.
-- `decdn node <sub>` commands are the operator-preferred way to read live state; `/metrics` stays focused on time-series aggregates (Prometheus scrapes) and `cdn/probe/v1` on remote peer-health checks.
+- `decdn node <sub>` commands are the operator-preferred way to read live state; `/metrics` stays focused on time-series aggregates (Prometheus scrapes) and `cdn/client/v1` discovery opens on remote peer-health checks.
 - Future operational routes (drain, reload) ship here by default — resisting the "new surface per command" drift that produces a half-dozen ops-tooling sockets per node.
 - The bind is hardcoded to `127.0.0.1` in `crates/node/src/runtime/mod.rs`, so exposing internal state on a non-loopback address is a code change rather than a config mistake.
 

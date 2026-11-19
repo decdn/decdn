@@ -7,8 +7,8 @@ fn nid(byte: u8) -> NodeId {
 fn h(byte: u8) -> Hash {
     Hash::from_bytes([byte; 32])
 }
-fn p(byte: u8) -> ProbedProvider {
-    ProbedProvider {
+fn p(byte: u8) -> CachedCandidate {
+    CachedCandidate {
         node_id: nid(byte),
         rate_per_mb: u64::from(byte),
         rtt_ms: u32::from(byte),
@@ -19,40 +19,39 @@ fn p(byte: u8) -> ProbedProvider {
     }
 }
 
-/// ADR 005 §Derived constants: `probe_cache_ttl = PROBE_SLASH_WINDOW / 2`.
-/// Pins the DERIVATION, not the number: a literal `15s` passes an
-/// `== Duration::from_secs(15)` assertion and then silently fails to move
-/// when governance changes the slashing window — the one thing ADR 005
-/// explicitly asks implementations to get right.
+/// An entry ages on the same clock as `node_origin`'s short refusal
+/// suppression: both read [`DISCOVERY_ANSWER_TTL`], so a holder the cache
+/// still names is never one the suppression has already forgotten refusing.
+/// Pins the shared constant and its value.
 #[test]
-fn ttl_is_derived_from_the_probe_slash_window() {
-    assert_eq!(DEFAULT_TTL * 2, PROBE_SLASH_WINDOW);
-    assert_eq!(DEFAULT_TTL, Duration::from_secs(15));
+fn ttl_is_the_discovery_answer_ttl() {
+    assert_eq!(DEFAULT_TTL, DISCOVERY_ANSWER_TTL);
+    assert_eq!(DISCOVERY_ANSWER_TTL, Duration::from_secs(30));
 }
 
 #[test]
 fn absent_hash_returns_none() {
-    let c = PositiveProbeCache::new();
+    let c = CandidateCache::new();
     assert!(c.get(&h(1)).is_none());
     assert!(c.is_empty());
 }
 
 #[test]
 fn insert_then_get_returns_providers_in_order() {
-    let c = PositiveProbeCache::new();
+    let c = CandidateCache::new();
     c.insert(h(1), vec![p(1), p(2)]);
     assert_eq!(c.get(&h(1)), Some(vec![p(1), p(2)]));
     assert!(c.get(&h(2)).is_none());
     assert_eq!(c.len(), 1);
 }
 
-/// ADR 001 §Probe cache: "Each hash entry retains at most 10 responses (top
-/// 10 by selection score)." This truncation is what bounds the cache at the
-/// ADR's stated ~1 MB; without it a hash with a large probe fanout is
+/// ADR 001 §Candidate cache: "Each hash entry retains at most 10 responses
+/// (top 10 by selection score)." This truncation is what bounds the cache at
+/// the ADR's stated ~1 MB; without it a hash with a large open fan-out is
 /// unbounded.
 #[test]
 fn insert_keeps_only_the_top_ten_providers() {
-    let c = PositiveProbeCache::new();
+    let c = CandidateCache::new();
     let many: Vec<_> = (1..=25u8).map(p).collect();
     c.insert(h(1), many);
     let got = c.get(&h(1)).unwrap();
@@ -66,7 +65,7 @@ fn insert_keeps_only_the_top_ten_providers() {
 /// nothing — strictly worse than no entry.
 #[test]
 fn inserting_no_providers_is_a_no_op() {
-    let c = PositiveProbeCache::new();
+    let c = CandidateCache::new();
     c.insert(h(1), vec![]);
     assert!(c.is_empty());
     assert!(c.get(&h(1)).is_none());
@@ -76,7 +75,7 @@ fn inserting_no_providers_is_a_no_op() {
 fn expired_entry_returns_none_and_is_evicted() {
     // Margins kept generous (TTL 500ms, sleep 750ms) so loaded CI runners
     // with cargo-nextest parallelism don't flake on wall-clock checks.
-    let c = PositiveProbeCache::with_capacity_and_ttl(8, Duration::from_millis(500));
+    let c = CandidateCache::with_capacity_and_ttl(8, Duration::from_millis(500));
     c.insert(h(1), vec![p(1)]);
     assert!(c.get(&h(1)).is_some());
     thread::sleep(Duration::from_millis(750));
@@ -84,13 +83,13 @@ fn expired_entry_returns_none_and_is_evicted() {
     assert!(c.is_empty(), "expired entry should be evicted on read");
 }
 
-/// ADR 001 §Probe cache anchors the TTL at insertion. A read that re-stamped
-/// expiry during the LRU bump would keep a hot hash's probe results alive
-/// indefinitely — exactly the staleness the 15s window exists to bound, and
-/// it would ship green without this test.
+/// ADR 001 §Candidate cache anchors the TTL at insertion. A read that
+/// re-stamped expiry during the LRU bump would keep a hot hash's answers alive
+/// indefinitely — exactly the staleness the TTL exists to bound, and it would
+/// ship green without this test.
 #[test]
 fn read_hit_does_not_refresh_ttl() {
-    let c = PositiveProbeCache::with_capacity_and_ttl(8, Duration::from_millis(500));
+    let c = CandidateCache::with_capacity_and_ttl(8, Duration::from_millis(500));
     c.insert(h(1), vec![p(1)]);
     thread::sleep(Duration::from_millis(250));
     assert!(c.get(&h(1)).is_some());
@@ -103,7 +102,7 @@ fn read_hit_does_not_refresh_ttl() {
 
 #[test]
 fn lru_eviction_at_cap_drops_oldest() {
-    let c = PositiveProbeCache::with_capacity(2);
+    let c = CandidateCache::with_capacity(2);
     c.insert(h(1), vec![p(1)]);
     c.insert(h(2), vec![p(2)]);
     c.insert(h(3), vec![p(3)]);
@@ -119,7 +118,7 @@ fn lru_eviction_at_cap_drops_oldest() {
 /// test does not cover this one.
 #[test]
 fn read_hit_bumps_lru_so_oldest_eviction_changes() {
-    let c = PositiveProbeCache::with_capacity(2);
+    let c = CandidateCache::with_capacity(2);
     c.insert(h(1), vec![p(1)]);
     c.insert(h(2), vec![p(2)]);
     assert!(c.get(&h(1)).is_some()); // bump h(1) → h(2) becomes LRU
@@ -131,7 +130,7 @@ fn read_hit_bumps_lru_so_oldest_eviction_changes() {
 
 #[test]
 fn reinsert_replaces_providers_and_does_not_grow_len() {
-    let c = PositiveProbeCache::with_capacity(4);
+    let c = CandidateCache::with_capacity(4);
     c.insert(h(1), vec![p(1), p(2)]);
     c.insert(h(1), vec![p(3)]);
     assert_eq!(c.get(&h(1)), Some(vec![p(3)]));
@@ -140,7 +139,7 @@ fn reinsert_replaces_providers_and_does_not_grow_len() {
 
 #[test]
 fn invalidate_removes_the_entry() {
-    let c = PositiveProbeCache::new();
+    let c = CandidateCache::new();
     c.insert(h(1), vec![p(1)]);
     c.invalidate(&h(1));
     assert!(c.get(&h(1)).is_none());
@@ -151,7 +150,7 @@ fn invalidate_removes_the_entry() {
 /// needs to exist for production code to eventually call.
 #[test]
 fn a_zero_ttl_cache_never_hits() {
-    let c = PositiveProbeCache::with_capacity_and_ttl(8, Duration::ZERO);
+    let c = CandidateCache::with_capacity_and_ttl(8, Duration::ZERO);
     c.insert(h(1), vec![p(1)]);
     assert!(c.get(&h(1)).is_none());
 }

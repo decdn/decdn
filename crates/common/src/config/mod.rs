@@ -23,8 +23,8 @@ pub use resolved::{
     LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
     ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
     ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPaymentChain,
-    ResolvedProbe, ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity,
-    ResolvedServe, ResolvedServeEconomics, ResolvedTinyLfu,
+    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServe,
+    ResolvedServeEconomics, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
 
@@ -195,19 +195,6 @@ const DEFAULT_DHT_GLOBAL_BURST: u32 = 2000;
 /// Default hard cap on tracked per-peer (`NodeId`) entries in the DHT
 /// keyed limiter (#645).
 const DEFAULT_DHT_MAX_TRACKED_PER_PEER: usize = 4096;
-/// Default sustained per-peer (`NodeId`) rate for `cdn/probe/v1` inbound
-/// (ADR 005 §Probe rate limiting). Tighter than the DHT layer because a
-/// probe is unauthenticated and cheaper to flood.
-const DEFAULT_PROBE_PER_PEER_RATE_PER_SEC: f64 = 5.0;
-/// Default per-peer burst capacity for `cdn/probe/v1`. ADR 005 default: 5.
-const DEFAULT_PROBE_PER_PEER_BURST: u32 = 5;
-/// Default sustained global rate for `cdn/probe/v1`. ADR 005 default: 1000.
-const DEFAULT_PROBE_GLOBAL_RATE_PER_SEC: f64 = 1000.0;
-/// Default global burst capacity for `cdn/probe/v1`. ADR 005 default: 2000.
-const DEFAULT_PROBE_GLOBAL_BURST: u32 = 2000;
-/// Default hard cap on tracked per-peer (`NodeId`) entries in the probe
-/// keyed limiter (#645).
-const DEFAULT_PROBE_MAX_TRACKED_PER_PEER: usize = 4096;
 /// Default sustained per-peer (`NodeId`) rate for inbound `cdn/client/v1`
 /// requests (ADR 005 §Request rate limiting). One request is one stream, and
 /// a pull opens one per leg.
@@ -258,8 +245,8 @@ pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
 
 /// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
 /// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
-/// origin-set staleness; 5 min matches the negative
-/// probe cache order of magnitude.
+/// origin-set staleness (there is no event tail); 5 min matches the negative
+/// candidate cache order of magnitude.
 pub const DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC: u64 = 300;
 /// Negative-hit TTL: how long "this namespace has no origins / does not
 /// exist" is cached. Shorter than the positive TTL so a namespace that later
@@ -367,30 +354,17 @@ pub const DEFAULT_CHAIN_ID: u64 = 421_614;
 pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 300;
 
 /// Default seconds the node may go without a successful chain read before the
-/// serve and probe paths refuse (ADR 011 § Serving while chain-stale). Thirty
+/// serve path refuses (ADR 011 § Serving while chain-stale). Thirty
 /// minutes: comfortably inside the one-hour compliance-window floor, so a node
 /// stops serving well before an outage-hidden takedown could cross into
 /// slashable territory, while short RPC blips never take the node dark.
 pub const DEFAULT_CHAIN_STALENESS_GRACE_SEC: u64 = 1800;
 
-/// Default maximum concurrently held (eviction-exempt) blobs for the
-/// probe-triggered hold (ADR 005 §Hold budget, #318). Per-blob holds: many
-/// peers probing one hash share a single slot. Re-exported from the
-/// `decdn_config_types` leaf crate (its canonical home, #578) so
-/// the config default and the cache engine's own default (used by
-/// direct `CacheEngine::open` callers) cannot drift apart.
-pub const DEFAULT_MAX_PROBE_HOLDS: usize = decdn_config_types::DEFAULT_MAX_PROBE_HOLDS;
-
-/// Default probe-hold slots reserved for the stake lane (#757). `0` keeps
-/// the stake-lane reservation off by default, so a node that does not opt in
-/// shares every probe-hold slot across all peers — the reservation is strictly
-/// operator opt-in.
-pub const DEFAULT_STAKE_LANE_RESERVED_HOLDS: usize = 0;
-
-/// Default providers probed before ranking on a node-to-node cache-miss pull
-/// (#831). Five is enough to find a healthy upstream in a tens-of-nodes
-/// network without spending the miss-latency budget on a wide probe fan-out.
-pub const DEFAULT_NODE_PULL_PROBE_FANOUT: usize = 5;
+/// Default providers a node-to-node cache-miss pull opens a voucher-less
+/// discovery stream on before ranking (#831). Five is enough to find a
+/// healthy upstream in a tens-of-nodes network without spending the
+/// miss-latency budget on a wide open fan-out.
+pub const DEFAULT_NODE_PULL_OPEN_FANOUT: usize = 5;
 /// Default wall-clock bound (seconds) on the STREAM-OPEN stage of a single upstream
 /// pull during a node-to-node cache-miss fill (#831) — connect, handshake, signed
 /// `StreamResponse`. Matches the integration-test budget; a slow upstream is abandoned
@@ -422,7 +396,7 @@ pub const DEFAULT_NODE_PULL_TIMEOUT_SEC: u64 = 20;
 /// candidates — otherwise a single silent peer eats the whole deadline and the fallback
 /// loop never reaches the others (#859, and the reason this knob is an argument to that
 /// function). So each second added here adds ~3 to the worst-case wait a client can see on
-/// a total miss: 168 s at defaults.
+/// a total miss: 169.5 s at defaults.
 pub const DEFAULT_NODE_PULL_STALL_WINDOW_SEC: u64 = 20;
 /// Default minimum sustained upstream throughput (bytes/sec) over
 /// [`DEFAULT_NODE_PULL_STALL_WINDOW_SEC`] (#1797). At ~40× a 100 B/s drip and far below any
@@ -538,7 +512,6 @@ pub fn resolve_config(
     let security = resolve_security_into(file.security.as_ref(), &mut bag);
     let load_shed = resolve_load_shed_into(file.load_shed.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
-    let probe = resolve_probe_into(file.probe.as_ref(), &mut bag);
     let serve = resolve_serve_into(file.serve.as_ref(), &mut bag);
     let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
     let content = resolve_content_into(file.content.as_ref(), &mut bag);
@@ -563,7 +536,6 @@ pub fn resolve_config(
             security,
             load_shed,
             dht,
-            probe,
             serve,
             receipts,
             content,
@@ -1155,7 +1127,8 @@ fn resolve_rpc_url(
 /// Resolve the `[[blockchain.payment_chains]]` entries. At least one entry;
 /// each names an http(s) `rpc_url`, a nonzero `chain_id` no other entry
 /// names, and at least one nonzero, checksummed `PaymentPool` address no
-/// other entry or position names. Problems record under
+/// other entry or position names. All entries together name at most
+/// [`decdn_protocol::MAX_PAYMENT_POOLS`] pools. Problems record under
 /// `blockchain.payment_chains[i].<field>`.
 fn resolve_payment_chains(
     entries: &[types::PaymentChainConfig],
@@ -1234,6 +1207,19 @@ fn resolve_payment_chains(
             payment_pools,
         });
     }
+    // Every stream answer lists the pools a node accepts, and a receiver keeps
+    // the first `MAX_PAYMENT_POOLS` of them (ADR 005 § Payment pool routing).
+    let pools: usize = out.iter().map(|chain| chain.payment_pools.len()).sum();
+    bag.check_with(
+        pools <= decdn_protocol::MAX_PAYMENT_POOLS,
+        "blockchain.payment_chains",
+        || {
+            format!(
+                "blockchain.payment_chains lists {pools} payment pools; name at most {}",
+                decdn_protocol::MAX_PAYMENT_POOLS
+            )
+        },
+    );
     out
 }
 
@@ -1529,7 +1515,7 @@ fn resolve_blockchain_into(
         .and_then(|b| b.origin_directory_cache_capacity)
         .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY);
     // No `!= 0` rejection: a `0` TTL is a valid "disable caching" choice
-    // (every entry reads as already-expired, matching `probe_cache`'s
+    // (every entry reads as already-expired, matching `candidate_cache`'s
     // documented zero-TTL behavior), and the cache clamps capacity to `>= 1`
     // itself.
 
@@ -1838,7 +1824,7 @@ fn resolve_cache_into(
         .unwrap_or(DEFAULT_FS_RESCAN_INTERVAL_SEC);
 
     // Live-origin probe memo knobs (#1130 pt3). No range checks: a `0` TTL simply
-    // memoises nothing (every probe re-HEADs), a `0` timeout is clamped to a live
+    // memoises nothing (every request re-HEADs), a `0` timeout is clamped to a live
     // future by `tokio::time::timeout`, and a `0` capacity is floored to 1 by
     // `OriginProbeMemo::new` — all degenerate-but-safe, so there is no invalid
     // value to reject.
@@ -1956,20 +1942,6 @@ fn resolve_cache_into(
         },
     );
 
-    let max_probe_holds = cli
-        .max_probe_holds
-        .or_else(|| file.and_then(|c| c.max_probe_holds))
-        .map_or(DEFAULT_MAX_PROBE_HOLDS, |v| {
-            usize::try_from(v).unwrap_or(usize::MAX)
-        });
-
-    let stake_lane_reserved_holds = cli
-        .stake_lane_reserved_holds
-        .or_else(|| file.and_then(|c| c.stake_lane_reserved_holds))
-        .map_or(DEFAULT_STAKE_LANE_RESERVED_HOLDS, |v| {
-            usize::try_from(v).unwrap_or(usize::MAX)
-        });
-
     let node_to_node_pull_through_enabled = role_derived_pull_through(
         file.and_then(|c| c.node_to_node_pull_through_enabled),
         !origins.is_empty(),
@@ -1980,9 +1952,9 @@ fn resolve_cache_into(
         // its own namespace; a node with no origin is a pure relay edge and relays.
         // Explicit config overrides either way.
         .unwrap_or(origins.is_empty());
-    let node_pull_probe_fanout = file
-        .and_then(|c| c.node_pull_probe_fanout)
-        .unwrap_or(DEFAULT_NODE_PULL_PROBE_FANOUT);
+    let node_pull_open_fanout = file
+        .and_then(|c| c.node_pull_open_fanout)
+        .unwrap_or(DEFAULT_NODE_PULL_OPEN_FANOUT);
     let node_pull_timeout_sec = file
         .and_then(|c| c.node_pull_timeout_sec)
         .unwrap_or(DEFAULT_NODE_PULL_TIMEOUT_SEC);
@@ -2165,11 +2137,9 @@ fn resolve_cache_into(
         eviction_target_pct,
         eviction_per_sweep_budget,
         eviction_tick_secs,
-        max_probe_holds,
-        stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
-        node_pull_probe_fanout,
+        node_pull_open_fanout,
         node_pull_timeout_sec,
         node_pull_stall_window_sec,
         node_pull_min_throughput_bps,
@@ -2798,8 +2768,8 @@ fn resolve_content_into(
 /// silently degrade the network.
 ///
 /// Rejects `rate_per_mb > MAX_RATE_PER_MB` (issue #378): the wire boundary
-/// enforces the same ceiling on inbound `ProbeResponse`s, so an operator
-/// configuring a rate above this would publish probe responses that every
+/// enforces the same ceiling on inbound `StreamResponse`s, so an operator
+/// configuring a rate above this would publish stream responses that every
 /// honest client decoder rejects — fail at startup rather than silently
 /// emit unparseable wire traffic. The bound is also a defense-in-depth
 /// against the selection-score overflow path (issue #322).
@@ -2839,7 +2809,7 @@ pub fn resolve_payment_into(
         || {
             format!(
                 "payment.rate_per_mb {rate_per_mb} exceeds protocol MAX_RATE_PER_MB ({}); \
-             honest clients reject `ProbeResponse`s above this ceiling (issue #378)",
+             honest clients reject `StreamResponse`s above this ceiling (issue #378)",
                 decdn_protocol::MAX_RATE_PER_MB,
             )
         },
@@ -3257,85 +3227,11 @@ pub fn resolve_dht(file: Option<&types::DhtConfig>) -> anyhow::Result<ResolvedDh
     one_section(|bag| resolve_dht_into(file, bag))
 }
 
-/// Resolve the `[probe.rate_limit]` section into [`ResolvedProbe`], applying
-/// the ADR 005 §Probe rate limiting defaults and the same validation the DHT
-/// layer uses: each `*_rate_per_sec` finite and `>= 0` (0 disables the layer),
-/// and the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all).
-/// Mirrors [`resolve_dht_into`]; only the
-/// defaults and the `probe.rate_limit.*` field keys differ.
-#[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
-pub fn resolve_probe_into(
-    file: Option<&types::ProbeConfig>,
-    bag: &mut ConfigDiagnostics,
-) -> ResolvedProbe {
-    // ADR 005 nests the rate-limit knobs under `probe.rate_limit.*`.
-    let rate_limit = file.and_then(|p| p.rate_limit.as_ref());
-    let per_peer_rate_per_sec = rate_limit
-        .and_then(|r| r.per_peer_rate_per_sec)
-        .unwrap_or(DEFAULT_PROBE_PER_PEER_RATE_PER_SEC);
-    bag.check(
-        per_peer_rate_per_sec.is_finite() && per_peer_rate_per_sec >= 0.0,
-        "probe.rate_limit.per_peer_rate_per_sec",
-        "probe.rate_limit.per_peer_rate_per_sec must be a finite non-negative number (0 disables the layer)",
-    );
-    let per_peer_burst = rate_limit
-        .and_then(|r| r.per_peer_burst)
-        .unwrap_or(DEFAULT_PROBE_PER_PEER_BURST);
-    bag.check(
-        per_peer_rate_per_sec == 0.0 || per_peer_burst > 0,
-        "probe.rate_limit.per_peer_burst",
-        "probe.rate_limit.per_peer_burst must be > 0 when per_peer_rate_per_sec > 0 (set both to 0 to disable)",
-    );
-
-    let global_rate_per_sec = rate_limit
-        .and_then(|r| r.global_rate_per_sec)
-        .unwrap_or(DEFAULT_PROBE_GLOBAL_RATE_PER_SEC);
-    bag.check(
-        global_rate_per_sec.is_finite() && global_rate_per_sec >= 0.0,
-        "probe.rate_limit.global_rate_per_sec",
-        "probe.rate_limit.global_rate_per_sec must be a finite non-negative number (0 disables the layer)",
-    );
-    let global_burst = rate_limit
-        .and_then(|r| r.global_burst)
-        .unwrap_or(DEFAULT_PROBE_GLOBAL_BURST);
-    bag.check(
-        global_rate_per_sec == 0.0 || global_burst > 0,
-        "probe.rate_limit.global_burst",
-        "probe.rate_limit.global_burst must be > 0 when global_rate_per_sec > 0 (set both to 0 to disable)",
-    );
-
-    let max_tracked_per_peer = rate_limit
-        .and_then(|r| r.max_tracked_per_peer)
-        .unwrap_or(DEFAULT_PROBE_MAX_TRACKED_PER_PEER);
-    if max_tracked_per_peer == 0 {
-        bag.warn(
-            "probe.rate_limit.max_tracked_per_peer",
-            "0: per-peer bookkeeping map is unbounded; an attacker churning NodeIds can \
-             grow it without limit",
-        );
-    }
-
-    ResolvedProbe {
-        per_peer_rate_per_sec,
-        per_peer_burst,
-        global_rate_per_sec,
-        global_burst,
-        max_tracked_per_peer,
-    }
-}
-
-/// Convenience wrapper for [`resolve_probe_into`] that takes a fresh
-/// `ConfigDiagnostics`. Test-only.
-#[cfg(test)]
-pub fn resolve_probe(file: Option<&types::ProbeConfig>) -> anyhow::Result<ResolvedProbe> {
-    one_section(|bag| resolve_probe_into(file, bag))
-}
-
 /// Resolve the `[serve.rate_limit]` section into [`ResolvedServe`], applying
 /// the ADR 005 §Request rate limiting defaults and the same validation the DHT
 /// layer uses: each `*_rate_per_sec` finite and `>= 0` (0 disables the layer),
 /// and the matching `*_burst > 0` whenever its rate is `> 0` (no deny-all).
-/// Mirrors [`resolve_probe_into`]; only the
+/// Mirrors [`resolve_dht_into`]; only the
 /// defaults and the `serve.rate_limit.*` field keys differ.
 #[allow(clippy::cognitive_complexity)] // linear "default-or-file → validate" rows.
 pub fn resolve_serve_into(

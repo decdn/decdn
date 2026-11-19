@@ -11,7 +11,7 @@
 //!   `providers` leave out a record whose attesting origin lost its seat;
 //!   its `closer_nodes` name only bonded peers (ADR 022 §Routing Table); per
 //!   ADR 022 §Lookup integrity the requester-side filters (XOR-distance,
-//!   active-staker, negative-probe-cache, randomisation) stay the
+//!   active-staker, negative-cache, randomisation) stay the
 //!   requester's job and live in the iterative-lookup module
 //!   ([`crate::dht::lookup`]).
 //! - `BatchStore` admission (ADR 022 §Batch token accounting, #648):
@@ -92,8 +92,8 @@ const fn accept_timeout(served: u32) -> Duration {
     }
 }
 
-// ADR 013 application error codes (also defined in `handlers::probe`; the
-// codes are protocol-wide constants, not per-ALPN values).
+// ADR 013 application error codes (protocol-wide constants, not per-ALPN
+// values).
 const APP_ERR_UNSUPPORTED_MESSAGE: u32 = 0x01;
 const APP_ERR_MESSAGE_TOO_LARGE: u32 = 0x02;
 const APP_ERR_MALFORMED_MESSAGE: u32 = 0x03;
@@ -208,9 +208,8 @@ impl DhtHandler {
         Arc::clone(&self.routing)
     }
 
-    // Linear protocol sequence — same rationale as `ProbeHandler::serve`
-    // for keeping the ADR 013 error-code mapping and the ADR 022 admission
-    // order in one auditable function.
+    // Linear protocol sequence: keeps the ADR 013 error-code mapping and the
+    // ADR 022 admission order in one auditable function.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     async fn serve(&self, conn: Connection) -> anyhow::Result<()> {
         // Layer 1: dispatch limiter (connection-level cap).
@@ -668,8 +667,7 @@ impl DhtHandler {
     ///    new) or `not accepted` (cap) on the wire.
     // Linear admission sequence (auth check → staker filter → insert →
     // counter bump per outcome). Splitting would scatter the ADR 022
-    // §STORE Flow rule order across helpers; same rationale as the
-    // `ProbeHandler::serve` cognitive-complexity allow upstream.
+    // §STORE Flow rule order across helpers.
     #[allow(clippy::cognitive_complexity)]
     fn handle_store(&self, peer: AuthenticatedNodeId, req: wire::StoreRequest) -> wire::StoreAck {
         // Step 1: holder must equal the QUIC-bound peer NodeId.
@@ -765,7 +763,7 @@ impl DhtHandler {
     /// the responder returns its known holders for `hash` plus the
     /// K-closest bonded peers from the routing table. Per ADR 022 §Lookup
     /// integrity, requester-side filtering (XOR-distance check, active-
-    /// staker filter, negative-probe-cache consultation, randomisation)
+    /// staker filter, negative-cache consultation, randomisation)
     /// stays the requester's job: this node filters only its own
     /// `closer_nodes` against its staker set, and does not filter `providers`.
     fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {

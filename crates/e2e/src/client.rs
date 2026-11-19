@@ -20,8 +20,9 @@ use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_client::buyer_pool::{OwnedPayer, open_pool, self_owned_lane_ctx};
 use decdn_client::{
-    BlobTooLarge, HashMismatch, PoolContext, PullDeadlines, UpstreamRefused,
-    UpstreamVoucherRejected, VoucherProgress, sign_client_binding, stream_fetch_tracked,
+    BlobTooLarge, Connections, HashMismatch, OpenedStream, PoolContext, PullDeadlines,
+    UpstreamRefused, UpstreamVoucherRejected, VoucherProgress, sign_client_binding,
+    stream_fetch_tracked,
 };
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
@@ -66,6 +67,9 @@ const WIRE_TAP_IDLE: Duration = Duration::from_secs(5);
 /// `cache.node_pull_timeout_sec`), not on an idle pause — a tapped blob is
 /// deliberately absent from the store.
 const WIRE_TAP_FIRST_FRAME: Duration = Duration::from_secs(30);
+/// How long [`ClientFixture::discovery_open`] waits for the dial, and again
+/// for the answer.
+const DISCOVERY_OPEN: Duration = Duration::from_secs(10);
 
 /// One open payment pool, reusable across several single-shot fetches
 /// ([`ClientFixture::fetch_once`]) and the raw wire tap
@@ -563,14 +567,14 @@ impl ClientFixture {
     }
 
     /// Capture the daemon's signed `StreamResponse { ok: true }` for a **held**
-    /// blob at a caller-chosen `timestamp_us` — the delivery side of a real
-    /// rate-manipulation evidence pair (#1042).
+    /// blob at a caller-chosen `timestamp_us` — real blacklist-violation evidence
+    /// once the hash is blacklisted (#1042).
     ///
     /// The node signs the open-stage `StreamResponse` (committing to deliver at
     /// its *current* rate) before any voucher is exchanged, so this reads only
     /// the first frame and never pays. Unlike [`Self::capture_delivery_wire`] the
-    /// timestamp is caller-controlled, so the response lands inside the 30s
-    /// probe↔stream slashing window; unlike [`Self::refused_stream`] it requires
+    /// timestamp is caller-controlled, so the caller knows exactly when the
+    /// evidence says the node served; unlike [`Self::refused_stream`] it requires
     /// the node to actually deliver (`ok == true`) — a refusal here means the
     /// blob was not held or the pool was not yet served, a setup failure.
     pub async fn capture_delivery_response(
@@ -697,79 +701,81 @@ impl ClientFixture {
         })
     }
 
-    /// Probe `node` for `hash` over `cdn/probe/v1` and return the signed
-    /// response. Unpaid (no pool) — used to assert the daemon's probe handler
-    /// reports `has_blob: false` after a blacklist eviction (the
-    /// blacklist-violation compliance seam).
-    pub async fn probe(
-        &self,
-        node: &NodeFixture,
-        hash: Hash,
-    ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        self.probe_at(node, hash, timestamp_now_us()).await
-    }
-
-    /// [`Self::probe`] with a caller-chosen `timestamp_us`.
+    /// Open `hash` on `node`, at the identity it serves under now, with a
+    /// voucher-less discovery open ([`decdn_client::discovery_open`]) that asks
+    /// no pull-through, and return the stream with its verified answer.
     ///
-    /// The probe timestamp is requester-generated and echoed back *inside* the
-    /// signed body (ADR 005), so it is what anchors the pair on-chain: the
-    /// `SlashJudge` 30s window and the evidence-staleness bound are both computed
-    /// from it. The node signs it only when it sits inside its clock-skew bound
-    /// at capture time, so a journey testing the judge's *window* spreads the
-    /// pair's two capture-time-valid timestamps across the window instead of
-    /// stamping one far in the past (#1042).
-    pub async fn probe_at(
+    /// The open names a placeholder pool under this client's key: a node answers
+    /// an open that does no fill work before it reads the pool, so the answer
+    /// needs no funded pool. The node holds the stream, and pins the blob, until
+    /// the caller cancels or drops it.
+    pub async fn discovery_open(
         &self,
+        chain: &ChainFixture,
         node: &NodeFixture,
         hash: Hash,
-        timestamp_us: u64,
-    ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        let (resp, _ext, _rtt) = decdn_client::probe::probe_once(
-            &self.endpoint,
-            Self::target(node).await?,
-            *hash.as_bytes(),
-            timestamp_us,
-            Duration::from_secs(10),
-        )
-        .await
-        .context("probe daemon")?;
-        Ok(resp)
+    ) -> anyhow::Result<OpenedStream> {
+        self.discovery_open_to(chain, node, Self::target(node).await?, hash, DISCOVERY_OPEN)
+            .await
     }
 
-    /// Probe an **explicit** iroh identity at a loopback port, rather than
-    /// whichever id a [`NodeFixture`] recorded at launch (#1034).
+    /// [`Self::discovery_open`] to an **explicit** iroh identity at `node`'s
+    /// loopback port, rather than whichever id the daemon serves under now
+    /// (#1034).
     ///
     /// The key-rotation journey needs both directions of this: the retired id
-    /// must stop answering, and the new one must start. Neither is expressible
-    /// through [`Self::probe`], which dials `NodeFixture::node_id()` — a value
-    /// frozen at launch, and therefore the *old* id after a rotation.
-    ///
-    /// A failure here is a genuine "that identity is not reachable at this
-    /// socket": iroh authenticates the peer's public key during the QUIC
-    /// handshake, so dialing a retired id against the same address does not
-    /// silently connect to whoever is listening — it fails to establish.
-    pub async fn probe_node_id(
+    /// must stop answering, and the new one must start. A failure here is a
+    /// genuine "that identity is not reachable at this socket": iroh
+    /// authenticates the peer's public key during the QUIC handshake, so dialing
+    /// a retired id against the same address does not silently connect to
+    /// whoever is listening — it fails to establish.
+    pub async fn discovery_open_at(
         &self,
+        chain: &ChainFixture,
+        node: &NodeFixture,
         node_id: iroh::PublicKey,
-        port: u16,
         hash: Hash,
-    ) -> anyhow::Result<decdn_protocol::ProbeResponse> {
-        let target = EndpointAddr::new(node_id)
-            .with_ip_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
-        let (resp, _ext, _rtt) = decdn_client::probe::probe_once(
-            &self.endpoint,
-            target,
+    ) -> anyhow::Result<OpenedStream> {
+        let target = EndpointAddr::new(node_id).with_ip_addr(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            node.bind_port(),
+        )));
+        // Shorter than `discovery_open`'s bound on purpose: the interesting call
+        // is the one that must NOT connect, and a retired id fails by timing out
+        // on a handshake nobody answers.
+        self.discovery_open_to(chain, node, target, hash, Duration::from_secs(5))
+            .await
+    }
+
+    /// The discovery open behind [`Self::discovery_open`] and
+    /// [`Self::discovery_open_at`]: `open` bounds the dial, and again the
+    /// exchange.
+    async fn discovery_open_to(
+        &self,
+        chain: &ChainFixture,
+        node: &NodeFixture,
+        target: EndpointAddr,
+        hash: Hash,
+        open: Duration,
+    ) -> anyhow::Result<OpenedStream> {
+        let placeholder =
+            decdn_client::funding::predicted_pool_id(self.signer.address(), U256::ZERO);
+        let ctx = self.pool_context(chain, node, placeholder)?;
+        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+        decdn_client::discovery_open(
+            &Connections::new(self.endpoint.clone()),
+            &target,
+            node.operator_addr(),
+            &ctx,
+            &slash_domain,
             *hash.as_bytes(),
-            timestamp_now_us(),
-            // Shorter than `probe_at`'s 10s on purpose: the interesting call is
-            // the one that must NOT connect, and a retired id fails by timing
-            // out on a handshake nobody answers. Ten seconds of that per
-            // assertion is dead wall-clock.
-            Duration::from_secs(5),
+            decdn_protocol::client::NO_NAMESPACE,
+            (0, 0),
+            false,
+            open,
         )
         .await
-        .context("probe explicit node id")?;
-        Ok(resp)
+        .context("discovery open")
     }
 
     /// Run **one** paid-stream open against `node` on an already-open `pool_id`
@@ -858,8 +864,8 @@ impl ClientFixture {
     /// through here, so a rotation journey does not have to special-case the
     /// paid path — and no other journey can quietly start dialing a stale id.
     ///
-    /// The extra admin round trip is paid once per pool open or probe, all of
-    /// which already require a live daemon.
+    /// The extra admin round trip is paid once per pool open or discovery open,
+    /// all of which already require a live daemon.
     async fn target(node: &NodeFixture) -> anyhow::Result<EndpointAddr> {
         Ok(
             EndpointAddr::new(node.current_node_id().await?).with_ip_addr(SocketAddr::V4(
@@ -932,6 +938,7 @@ impl PoolSession {
         StreamRequestExt {
             binding: self.ctx.client_binding.clone(),
             capability: self.ctx.capability.as_ref().map(signed_to_wire_capability),
+            pull_through: true,
         }
     }
 }

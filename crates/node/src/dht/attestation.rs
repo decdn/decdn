@@ -8,7 +8,7 @@
 //! check.
 //!
 //! [`AttestationVerifier`] is the one check every caller shares: the DHT
-//! receiver before it stores a record, the lookup before it probes a provider,
+//! receiver before it stores a record, the lookup before it opens a provider,
 //! and the pull leg before it keeps an upstream's attestation.
 
 use std::sync::Arc;

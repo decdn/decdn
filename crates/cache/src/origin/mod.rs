@@ -432,6 +432,24 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
         Box::pin(async { Ok(OutboardFetch::Unsupported) })
     }
 
+    /// Whether the origin publishes the sibling `{H}.obao4` outboard of the
+    /// blob `hash`, read without its body: an HTTP `HEAD`, an S3
+    /// `HeadObject`, or `fs` metadata. The engine asks before a node answers
+    /// an open from its own origin, so the open reads no outboard before the
+    /// payer's first proof ([`crate::CacheEngine::origin_outboard_published`]).
+    ///
+    /// `Ok(false)` means the origin serves no outboard for the hash, as
+    /// [`Self::fetch_outboard`] answers [`OutboardFetch::NotFound`] or
+    /// [`OutboardFetch::Unsupported`]. A transport fault or a retriable status
+    /// surfaces as [`OriginPullError`]. The default returns `Ok(false)`, as the
+    /// default [`Self::fetch_outboard`] serves none.
+    fn has_outboard(
+        &self,
+        _hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, OriginPullError>> + Send + '_>> {
+        Box::pin(async { Ok(false) })
+    }
+
     /// Fetch the sibling `{H}.sizeproof` object of the blob `hash`: the size
     /// and its proof that `decdn origin import` writes beside the outboard
     /// (ADR 005 § Bounded byte ranges; [`decdn_bao_range::size_proof_object`]).
@@ -488,7 +506,7 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     }
 
     /// Enumerate the hashes this origin currently holds, so a node can
-    /// advertise them (probe `has_blob` / DHT announce) *before* any
+    /// advertise them (open answers / DHT announce) *before* any
     /// pull-through — closing the "cold origin blob is undiscoverable until
     /// first pulled" gap (#1130).
     ///

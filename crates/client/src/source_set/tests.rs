@@ -17,14 +17,14 @@ fn holder(provider: Address, rtt_ms: f64) -> Holder {
         provider,
         coverage: None,
         rtt_ms,
-        probed_holder: true,
+        discovered_holder: true,
     }
 }
 
-/// A provider the probe did not report as a holder: a pull-through target.
+/// A provider discovery did not report as a holder: a pull-through target.
 fn non_holder(provider: Address, rtt_ms: f64) -> Holder {
     Holder {
-        probed_holder: false,
+        discovered_holder: false,
         ..holder(provider, rtt_ms)
     }
 }
@@ -87,6 +87,7 @@ fn pool_declined(accepted: Vec<decdn_protocol::PoolAccount>) -> anyhow::Error {
     crate::UpstreamRefused::open(
         response,
         &decdn_protocol::StreamResponseExt::pool_declined(accepted),
+        &decdn_protocol::PoolAccount::eip155(1, [0xEE; 20]),
     )
 }
 
@@ -453,6 +454,50 @@ async fn every_holder_declining_ends_the_item_with_its_reasons() -> anyhow::Resu
     Ok(())
 }
 
+/// A stream quoted above its node's rate ceiling is refused unpaid, and the
+/// node leaves the fetch with no failure stamp, as a decline does. Once every
+/// holder did, the item ends naming the ceiling.
+#[tokio::test(start_paused = true)]
+async fn a_rate_above_the_ceiling_leaves_the_fetch() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0)],
+    );
+    let now = Instant::now();
+    let above = || {
+        let ceiling = crate::RateCeiling::quoted(0, 5);
+        ceiling
+            .admit(6)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("6 is above 5"))
+    };
+    let fault = set.record_fault(A, &above()?, None, now, U256::ZERO);
+    assert_eq!(fault, Fault::Source);
+    assert!(
+        p.faults.lock().is_ok_and(|f| f.is_empty()),
+        "no failure stamp"
+    );
+    let later = now + Duration::from_hours(1);
+    assert_eq!(
+        set.next_to_start(later, U256::ZERO, &HashSet::new())
+            .map(|h| h.provider),
+        Some(B)
+    );
+    set.record_fault(B, &above()?, None, now, U256::ZERO);
+    let err = set
+        .exhausted(U256::ZERO, false)
+        .ok_or_else(|| anyhow::anyhow!("every holder left"))?;
+    let stop = err
+        .downcast_ref::<super::NoNodeWillServe>()
+        .ok_or_else(|| anyhow::anyhow!("expected NoNodeWillServe, got {err:#}"))?;
+    assert_eq!(stop.reasons, vec![super::DeclineReason::RateAboveCeiling]);
+    assert!(err.to_string().contains("above its rate ceiling"), "{err}");
+    Ok(())
+}
+
 /// A `Declined` refusal from one holder and a funding refusal from the
 /// other: the set is not all-declined, so the funding rule decides.
 #[tokio::test(start_paused = true)]
@@ -483,10 +528,10 @@ async fn a_funding_refusal_outranks_a_decline() {
     assert!(err.is_some_and(|e| e.downcast_ref::<super::NoAffordableSource>().is_some()));
 }
 
-/// A probed holder's `NotFound` is a delivery fault only: it may mean load
+/// A discovered holder's `NotFound` is a delivery fault only: it may mean load
 /// shed or a per-signer cap, so it never marks the holder absent.
 #[tokio::test(start_paused = true)]
-async fn a_probed_holder_saying_not_found_is_never_absent() {
+async fn a_discovered_holder_saying_not_found_is_never_absent() {
     let p = provider(vec![]);
     let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
     let now = Instant::now();
@@ -500,7 +545,7 @@ async fn a_probed_holder_saying_not_found_is_never_absent() {
     assert!(cooled, "the holder cools and comes back");
 }
 
-/// A probed holder of `blocks` of a four-block blob only.
+/// A discovered holder of `blocks` of a four-block blob only.
 fn partial(provider: Address, rtt_ms: f64, blocks: &[u32]) -> Holder {
     Holder {
         coverage: Some(decdn_protocol::Coverage::from_block_indices(
@@ -583,7 +628,7 @@ async fn three_uncovered_refusals_bar_a_partial_holder_from_pull_through() {
 
 /// #2281: a partial holder that refuses a block its coverage claims, three
 /// times, loses that block from its coverage and keeps the others. It is
-/// not barred from pull-through, a probe that reports the stale claim
+/// not barred from pull-through, a discovery answer that reports the stale claim
 /// again does not bring the block back, and the drop ends with its time.
 #[tokio::test(start_paused = true)]
 async fn three_covered_refusals_drop_the_block_from_a_partial_holders_coverage() {
@@ -616,7 +661,10 @@ async fn three_covered_refusals_drop_the_block_from_a_partial_holders_coverage()
     );
 
     set.merge(vec![partial(A, 10.0, &[0, 1])]);
-    assert!(!covers(&set, A, 1), "a probe repeating the stale claim");
+    assert!(
+        !covers(&set, A, 1),
+        "a discovery answer repeating the stale claim"
+    );
     assert!(covers(&set, A, 0));
 
     // A `NotFound` may be transient, so the drop ends with the bar's time,
@@ -722,7 +770,7 @@ async fn a_mid_range_refusal_counts_only_the_blocks_after_what_landed() {
     assert!(!covers(&set, A, 1));
 }
 
-/// #2281: a probe that reports a holder with a dropped block as whole ends
+/// #2281: a discovery answer that reports a holder with a dropped block as whole ends
 /// the drop, so its end does not turn the holder partial again.
 #[tokio::test(start_paused = true)]
 async fn a_holder_reported_whole_keeps_the_whole_blob_when_a_drop_ends() {
@@ -919,7 +967,7 @@ async fn a_barred_holder_with_only_uncovered_work_left_ends_the_item() -> anyhow
     set.discovery_done(Ok(vec![]), now, U256::ZERO);
     assert!(
         set.exhausted(U256::ZERO, true).is_none(),
-        "a first bar may come from load shed: the holder gets its probe"
+        "a first bar may come from load shed: the holder gets its trial"
     );
     let later = now + super::PULL_THROUGH_BAR;
     set.expire_pull_through_bars(later);
@@ -1215,11 +1263,11 @@ async fn the_lane_fault_line_names_the_holder_record() {
         "the held range, what it re-queued, and the pick: {text}"
     );
     assert!(a_line.contains("uncovered=false"), "{text}");
-    assert!(a_line.contains("probed_holder=false"), "{text}");
+    assert!(a_line.contains("discovered_holder=false"), "{text}");
     assert!(a_line.contains("coverage=whole blob"), "{text}");
     assert!(b_line.contains("a lane faulted"), "{text}");
     assert!(b_line.contains(&format!("provider={B}")), "{text}");
-    assert!(b_line.contains("probed_holder=true"), "{text}");
+    assert!(b_line.contains("discovered_holder=true"), "{text}");
     assert!(b_line.contains("coverage=0,2-3"), "{text}");
     assert!(b_source_line.contains("a source faulted"), "{text}");
     assert!(b_source_line.contains("coverage=0,2-3"), "{text}");
@@ -1316,10 +1364,10 @@ async fn a_new_holder_from_discovery_keeps_the_item_alive() {
     assert!(set.exhausted(U256::ZERO, false).is_none());
 }
 
-/// A discovery whose probe now reports an absent provider as a holder
+/// A discovery whose answer now reports an absent provider as a holder
 /// clears its absent mark.
 #[tokio::test(start_paused = true)]
-async fn a_probe_that_reports_the_blob_clears_an_absent_mark() {
+async fn a_discovery_answer_that_reports_the_blob_clears_an_absent_mark() {
     let p = provider(vec![]);
     let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![non_holder(A, 10.0)]);
     let now = Instant::now();

@@ -59,7 +59,7 @@ use crate::selection::MAX_PROVIDER_ATTEMPTS;
 /// survivor; each such round costs the replacement source a resolve, an economic
 /// gate, a pool open, a dial, and a drain, all in front of a client whose stream
 /// is already open. Without a cap the loop would walk EVERY survivor — up to the
-/// ten a probe-cache hit carries — churning that many opens on a pathological set.
+/// ten a candidate-cache hit carries — churning that many opens on a pathological set.
 /// Bounded to [`MAX_PROVIDER_ATTEMPTS`], the same budget the single-source
 /// failover loop and [`super::pull_leg`]'s header handshake spend.
 const MAX_REASSIGN_ATTEMPTS: usize = MAX_PROVIDER_ATTEMPTS;
@@ -154,9 +154,9 @@ pub(crate) enum AssembleOutcome {
     /// The serve leg refuses before `ok: true` when the candidates cannot cover
     /// the missing range at all, so an `Uncovered` end needs the store to have
     /// lost bytes or the candidate set to have shrunk after that check. Origins
-    /// advertise all-ones coverage, and the probe round admits the namespace's
+    /// advertise all-ones coverage, and the open round admits the namespace's
     /// origins only when the discovered holders do not span the blob. So a
-    /// holder that faults after a spanning probe round, or a namespace with no
+    /// holder that faults after a spanning open round, or a namespace with no
     /// reachable origin, can still end here.
     ///
     /// This runs on the serve-miss pull thread, which the serve leg spawns only

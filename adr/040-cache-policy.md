@@ -66,11 +66,11 @@ pub struct EvictionPlan {
 
 Three boundary rules keep the split clean:
 
-- The engine owns every safety exemption: pins, probe-triggered holds, and
-  the deny/takedown set. Eviction candidates arrive to the policy without
-  pinned or probe-held hashes. A deny-listed hash stays a candidate, even when
-  it is pinned: deny wins over pin. A probe-held hash stays out, even when it
-  is deny-listed. The engine refuses to release a pinned hash that is not
+- The engine owns every safety exemption: operator pins, the open-stream
+  pin, and the deny/takedown set. Eviction candidates arrive to the policy
+  without pinned or in-use hashes. A deny-listed hash stays a candidate, even
+  when it is operator-pinned: deny wins over pin. An in-use hash stays out,
+  even when it is deny-listed. The engine refuses to release a pinned hash that is not
   deny-listed, whatever a plan says.
 - The engine owns the store and reclaim path. It exposes generic segment
   primitives and assigns them no meaning of its own; it stores the label
@@ -316,7 +316,7 @@ be crossed briefly under a heavy write burst. `decdn node doctor` reads the same
 free-disk helper to flag a budget or headroom that does not fit the volume
 before boot.
 
-### Pinning, durable operator-evict, and the probe-hold stay engine-enforced
+### Pinning, durable operator-evict, and the open-stream pin stay engine-enforced
 
 Three exemption layers sit above every admission and eviction policy, and the
 cache engine enforces all three regardless of the active policy.
@@ -359,11 +359,13 @@ durable takedown withholds legitimate content permanently. Reclaim needs
 periodic GC. When GC is off, the hash stays quarantined and the bytes stay on
 disk.
 
-**The probe-triggered hold composes above policy.** A hash a node has just
-advertised as present, per [ADR 005 § Probe-Triggered Eviction
-Hold](005-protocol.md#probe-triggered-eviction-hold), is exempt from eviction
-for `probe_hold_duration` regardless of segment or frequency. The hold budget
-(`max_probe_holds`) and its exhaustion behavior are unchanged by this ADR.
+**The open-stream pin composes above policy.** A node pins the blob of each
+open `cdn/client/v1` stream for the life of the stream, per [ADR 005 §
+Open-stream pin](005-protocol.md#open-stream-pin). An in-use hash is exempt
+from cache-pressure eviction regardless of segment or frequency, even when it
+is deny-listed. `CacheEngine::evict` still removes it. The per-connection cap
+on unadmitted streams, the node-wide budget of their pins and the fixed wait
+for their first voucher bound the blobs that unpaid opens pin.
 
 Reputation does not factor into admission or eviction. The unified
 reputation score governs peer *selection*
@@ -383,7 +385,7 @@ retention.
   eviction of the hot working set.
 - The probationary segment bounds one-hit-wonder disk usage to a fixed
   budget.
-- Safety invariants — pins, probe-holds, and the deny set — stay
+- Safety invariants — pins, the open-stream pin, and the deny set — stay
   engine-enforced across every policy combination.
 - The default configuration preserves `lru`/`always` recency-only behavior
   exactly; adopting the new policies is opt-in.
@@ -428,10 +430,11 @@ retention.
    set survives a cold scan.
 6. Shipped policies emit only whole-blob eviction targets. Range reclaim is
    documented as blocked on an upstream `iroh-blobs` primitive.
-7. Pins and probe-holds are never evicted, regardless of the active policy.
-   A deny-listed hash is always evictable, even when it is pinned. A probe-hold
-   is the one exception: it keeps a hash out of cache-pressure eviction until
-   the hold expires, and `CacheEngine::evict` reclaims a denied hash regardless.
+7. Pinned and in-use hashes are never evicted by cache pressure, regardless of
+   the active policy. A deny-listed hash is always evictable, even when it is
+   pinned. An in-use hash is the one exception: it stays out of cache-pressure
+   eviction while a stream on it is open, and `CacheEngine::evict` reclaims a
+   denied hash regardless.
    The engine enforces these rules independent of any plan.
 8. An unknown policy name is a config error at load, with no silent
    fallback.

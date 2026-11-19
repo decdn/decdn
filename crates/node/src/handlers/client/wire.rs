@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use anyhow::Context as _;
 use bytes::Bytes;
 
+use decdn_protocol::Coverage;
 use decdn_protocol::client::StreamOutcome;
 use iroh::endpoint::WriteError;
 
@@ -57,11 +58,16 @@ impl ClientHandler {
     /// checks the proof before it reaches here, so a missing proof is this
     /// node's fault and fails the signing: the node states no size it cannot
     /// prove, and a served response always carries one.
+    ///
+    /// `coverage` is the discovery blocks the node serves. It covers every
+    /// block of the requested span, or the payer drops the answer
+    /// (`StreamResponseExt::consistent_with`).
     pub(super) async fn sign_served(
         &self,
         req: &StreamRequest,
         rate_per_mb: u64,
         total_bytes: u64,
+        coverage: Coverage,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         let proof = self
             .cache
@@ -80,15 +86,19 @@ impl ClientHandler {
             rate_per_mb,
             timestamp_us: req.timestamp_us,
         };
-        self.sign_response(body, StreamOutcome::Served(size_proof))
+        self.sign_response(body, StreamOutcome::Served(size_proof), coverage)
     }
 
-    /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`.
+    /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`,
+    /// advertising `coverage`: no block, or the blocks a partial holder holds
+    /// ([`Self::miss_coverage`]). The coverage never covers the requested
+    /// span, or the payer drops the answer.
     pub(super) fn sign_refusal(
         &self,
         req: &StreamRequest,
         rate_per_mb: u64,
         error: StreamError,
+        coverage: Coverage,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         let body = StreamResponseBody {
             hash: req.hash,
@@ -96,7 +106,7 @@ impl ClientHandler {
             rate_per_mb,
             timestamp_us: req.timestamp_us,
         };
-        self.sign_response(body, StreamOutcome::Refused(error))
+        self.sign_response(body, StreamOutcome::Refused(error), coverage)
     }
 
     /// Sign a `StreamResponse` body and assemble the frozen base plus its
@@ -107,6 +117,7 @@ impl ClientHandler {
         &self,
         body: StreamResponseBody,
         outcome: StreamOutcome,
+        coverage: Coverage,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         // Every stream signature passes through here, and every caller echoes
         // the dispatch-gated first request's `timestamp_us`
@@ -139,7 +150,8 @@ impl ClientHandler {
             StreamResponseExt {
                 outcome,
                 origin_attestation,
-                payment_pools: None,
+                coverage,
+                payment_pools: self.payment_pools_hint(),
             },
         ))
     }
@@ -184,14 +196,24 @@ impl ClientHandler {
         reason: ServeRejectReason,
         rate_per_mb: u64,
     ) -> anyhow::Result<super::outcome::ServeEnd> {
-        let (resp, mut resp_ext) = self
-            .sign_refusal(req, rate_per_mb, reason.wire_error())
+        self.respond_refusal(send, req, reason, rate_per_mb, Coverage::empty())
+            .await
+    }
+
+    /// [`Self::respond_error`] advertising `coverage` in the refusal: the
+    /// blocks a partial holder holds, on a miss that asks for no
+    /// pull-through.
+    pub(super) async fn respond_refusal(
+        &self,
+        send: &mut SendStream,
+        req: &StreamRequest,
+        reason: ServeRejectReason,
+        rate_per_mb: u64,
+        coverage: Coverage,
+    ) -> anyhow::Result<super::outcome::ServeEnd> {
+        let (resp, resp_ext) = self
+            .sign_refusal(req, rate_per_mb, reason.wire_error(), coverage)
             .with_context(|| format!("sign the {reason:?} refusal"))?;
-        // An unaccepted pool's refusal names the pools this node does accept
-        // (ADR 005 § Payment pool routing).
-        if reason == ServeRejectReason::UnacceptedPool {
-            resp_ext = StreamResponseExt::pool_declined(self.accepted_pools());
-        }
         tolerate_departed_peer(
             self.write_stream_response(send, &resp, &resp_ext).await,
             "refusal",
@@ -425,7 +447,7 @@ pub(super) fn record_stream_error(detail: impl std::fmt::Display) {
 /// refusal. `reason` is the same snake-case value the `serve_stream` span
 /// records; `namespace_id` is the request's, as a decimal. A pull-leg miss adds
 /// its `cause` and the walk's trail (`source`, `discovered`, `skipped`,
-/// `probed`, `unreachable`, `absent`, `dropped`, `holders`, `spans`,
+/// `opened`, `unreachable`, `absent`, `dropped`, `holders`, `spans`,
 /// `handshakes`, `last_fault`; #2366); a coverage-gate refusal adds the pull
 /// range, the candidate count and the first uncovered chunk; a throttled line
 /// adds the count of lines it `suppressed`. An absent field is not recorded.
@@ -450,7 +472,7 @@ fn log_miss_refusal(req: &StreamRequest, refusal: MissRefusal, suppressed: Optio
         source = trail.map(|t| t.source.as_str()),
         discovered = trail.map(|t| t.discovered),
         skipped = trail.map(|t| t.skipped),
-        probed = trail.map(|t| t.probed),
+        opened = trail.map(|t| t.opened),
         unreachable = trail.map(|t| t.unreachable),
         absent = trail.map(|t| t.absent),
         dropped = trail.map(|t| t.dropped),
@@ -604,11 +626,13 @@ impl std::error::Error for ClientPaymentFault {}
 ///
 /// The reference requester closes every stream with code `0`, and the node does
 /// not read the code, so it cannot see why a peer left. It can see how far the
-/// stream got. A peer that leaves before paying declined the quote — the routine
-/// shape of a header handshake — and a peer that leaves after paying abandoned a
-/// delivery. Both serve loops attach
-/// this marker at their outer boundary when their paid-byte count is nonzero,
-/// and the dispatch sink reads it to split a peer-attributable end between
+/// stream got. A peer that leaves before it sends a proof did not take the
+/// open; a peer that sends proofs that credit nothing and leaves declined the
+/// quote; and a peer that leaves after paying abandoned a delivery. Both serve
+/// loops attach this marker at their outer boundary when their paid-byte count
+/// is nonzero, and [`FrameSeen`] when a frame followed the request. The
+/// dispatch sink reads both to split a peer-attributable end between
+/// `decdn_serve_stream_unclaimed_total`,
 /// `decdn_serve_stream_client_declined_total` and
 /// `decdn_serve_stream_client_abandoned_total`. Attach it with
 /// [`anyhow::Error::context`] and recover it with `anyhow::Error::is`, or with
@@ -626,6 +650,35 @@ impl std::fmt::Display for PaidProgress {
 }
 
 impl std::error::Error for PaidProgress {}
+
+/// Marker for a serve-stream error that ended after a frame followed the
+/// request: a payment proof, or a frame that failed to decode as one. An error
+/// without it ended before the payer sent anything after its request, which
+/// the dispatch sink counts as an unclaimed open. Attach it with
+/// [`tag_frame_seen`] and recover it with `anyhow::Error::is`.
+#[derive(Debug)]
+pub(super) struct FrameSeen;
+
+impl std::fmt::Display for FrameSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("after the payer's first frame")
+    }
+}
+
+impl std::error::Error for FrameSeen {}
+
+/// Tag a serve loop's error with [`FrameSeen`] when `reader` took a whole frame
+/// off the stream.
+pub(super) fn tag_frame_seen(
+    e: anyhow::Error,
+    reader: &super::BufferedProofReader,
+) -> anyhow::Error {
+    if reader.frame_seen() {
+        e.context(FrameSeen)
+    } else {
+        e
+    }
+}
 
 /// Tag a serve loop's error with [`PaidProgress`] when `paid` — the wire bytes
 /// that accepted vouchers credited on the stream — is nonzero.

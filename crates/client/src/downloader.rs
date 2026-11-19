@@ -161,7 +161,7 @@ impl<P, F> Downloader<P, F> {
     }
 
     /// Start every target from `holders`, in preference order, instead of
-    /// discovering them. A probe's measured holders go here.
+    /// discovering them. A discovery round's measured holders go here.
     #[must_use]
     pub fn holders(mut self, holders: Vec<Holder>) -> Self {
         self.holders = holders;

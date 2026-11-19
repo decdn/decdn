@@ -61,7 +61,7 @@ cap-std = { workspace = true }
 # macOS, so a manifest holding both is rejected (#2691).
 icu_normalizer = { workspace = true }
 iroh = { workspace = true }
-# `discovery::select_candidates` shuffles the probe sample (#1988).
+# `discovery::select_candidates` shuffles the discovery sample (#1988).
 rand = { workspace = true }
 # Peer store (one JSON file per peer under `<data_dir>/peers`) persistence for
 # the ADR 012 bootstrap fallback.

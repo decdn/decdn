@@ -6,11 +6,11 @@
 //! - The daemon slash watcher demuxes the `Slashed` event (filtered to its own
 //!   operator) to surface a slash over the admin RPC.
 //! - The cross-layer e2e drives a real commit-reveal challenge
-//!   (`commitChallenge` → `submitRateChallenge`) to land a slash on-chain.
+//!   (`commitChallenge` → `submitBlacklistChallenge`) to land a slash on-chain.
 //!
-//! The `ProbeMsg` / `StreamMsg` evidence structs mirror the on-chain layout;
-//! the EIP-712 signatures over them are built by [`crate::probe_sig`] /
-//! [`crate::stream_sig`] against [`crate::slash_judge_domain`].
+//! The `StreamMsg` evidence struct mirrors the on-chain layout; the EIP-712
+//! signature over it is built by [`crate::stream_sig`] against
+//! [`crate::slash_judge_domain`].
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing into ABI fixed-size
@@ -36,17 +36,7 @@ mod sol_types {
             /// Offense taxonomy. Ordering is contract-canonical (ADR 014);
             /// mirrors `ISlashJudge.OffenseType`.
             enum OffenseType {
-                RateManipulation,
                 Blacklist
-            }
-
-            /// Signed probe response — evidence a node announced a blob.
-            /// Field order is part of the EIP-712 struct + ABI.
-            struct ProbeMsg {
-                bytes32 hash;
-                bool hasBlob;
-                uint64 ratePerMb;
-                uint64 timestampUs;
             }
 
             /// Signed stream response — evidence of a node's delivery outcome.

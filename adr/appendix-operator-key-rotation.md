@@ -8,8 +8,8 @@ A node operator routinely holds two keys:
 
 | Key | Curve / scheme | Purpose | Where it lives |
 |-----|----------------|---------|----------------|
-| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `ProbeResponse`/`StreamResponse` body attribution is `slash_sig` — see [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
-| **Ethereum signing key** | secp256k1 | On-chain identity for staking, pool ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `ProbeResponse`/`StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). | EVM keystore (EOA) — the default and the only form requesters can verify off-chain — **or** a Safe owner key, if the operator chose a Safe (cold paths only; see [§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional)) |
+| **iroh node-key** | Ed25519 | Wire identity (`NodeId`); authenticates the iroh QUIC handshake ([ADR 005](005-protocol.md#adr-005-wire-protocol)). `StreamResponse` body attribution is `slash_sig` — see [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712). | iroh keystore on the signing host |
+| **Ethereum signing key** | secp256k1 | On-chain identity for staking, pool ops, voucher receipt. Signs EIP-712 `BindNodeId`/`bindingSignature` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) **and** `slash_sig` on every `StreamResponse` ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). | EVM keystore (EOA) — the default and the only form requesters can verify off-chain — **or** a Safe owner key, if the operator chose a Safe (cold paths only; see [§ EOA → Safe migration (one-time, optional)](#eoa--safe-migration-one-time-optional)) |
 
 A node whose serving identity is a smart account — a Safe custodying funds while a hot key signs `slash_sig` — is unimplemented ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)). There is no third operator key and no procedure to rotate one.
 
@@ -79,9 +79,8 @@ Use `--bind-existing` to bind the key that is already at `node.secret`. This rep
 1. **Generate** a new iroh ed25519 key offline on the signing host. Keep the old keystore until rotation completes.
 2. **Drain** the node — refuse new inbound connections, let existing streams complete (`decdn node drain`, surfaced via `admin_v1_drain` in [`appendix-local-admin-http.md`](appendix-local-admin-http.md#appendix-local-admin-http-surface)). Confirm:
    - `decdn_streams_active{direction="inbound"} == 0`
-   - `decdn_probe_hold_slots_used == 0`
 
-   Probe-hold drain is critical: rotating before holds clear means the new node cannot serve blobs the old NodeId just advertised `has_blob: true` for, so those follow-up pulls fail `ok: false` — an availability/reputation ding with the requesters that probed. See [ADR 005 § Probe-Triggered Eviction Hold](005-protocol.md#probe-triggered-eviction-hold).
+   The gauge counts unpaid discovery opens too. Rotating before it reaches zero ends the open streams of requesters that were about to pay on them — an availability/reputation ding with those requesters. See [ADR 005 § Open-stream pin](005-protocol.md#open-stream-pin).
 3. **Stop** the node process.
 4. **Build the two signatures `bindNodeId` requires.** (a) The EIP-712 `BindNodeId` binding signature with the operator's Ethereum key at the current `bindingNonce[ethAddress]` — `bindingSignature = EIP-712 sign(ethKey, BindNodeId { nodeId: newNodeId, nonce: bindingNonce[ethAddress] })`. (b) The ed25519 ownership proof, signed with the **new** iroh ed25519 private key, proving control of the NodeId being bound — `ed25519Signature = ed25519_sign(newIrohKey, keccak256(abi.encodePacked(newNodeId, ethAddress, block.chainid, registrationNonce[newNodeId])))` (see [ADR 003 § NodeId Ownership Verification](003-payments.md#nodeid-ownership-verification) for the exact preimage). Signing over `newNodeId` alone builds the wrong digest and reverts with `InvalidEd25519Signature`; the `ethAddress` in the preimage is the `msg.sender` of the submit in step 5, so both signatures must come from the same operator.
 5. **Submit** `CapacityBond.bindNodeId(newNodeId, bindingSignature, ed25519Signature)`. The transaction must originate from the same Ethereum address that owns the existing binding. Wait one block confirmation and verify the `NodeIdBound` event.
@@ -91,7 +90,7 @@ Use `--bind-existing` to bind the key that is already at `node.secret`. This rep
    - `decdn_node_uptime_seconds` advancing
    - Peers reach the node at the new NodeId once their registry view reflects the `NodeIdBound` event
 8. **Un-drain** — accept inbound connections again.
-9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) [§ SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract) Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, all `SlashJudge` offenses (rate, blacklist) resolve at reveal time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
+9. **Archive** the old iroh keystore offline; retain at least `MAX_EVIDENCE_AGE_US` (default 5 days, governable [1d, 30d] per [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) [§ SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract) Evidence Verification Per Offense Type) — the staleness ceiling beyond which old-key slash evidence cannot be submitted. Retention is forensic-only: `bindNodeId` does not initiate unbonding, the one `SlashJudge` offense (blacklist) resolves at reveal time per [ADR 014 § Bond Handling](014-on-chain-verification.md#bond-handling), and no key-bound counter-evidence flow exists for the old iroh key. Holding longer is harmless.
 
 ### Failure modes
 
@@ -99,7 +98,7 @@ Use `--bind-existing` to bind the key that is already at `node.secret`. This rep
 |---------|--------------|----------|
 | `bindNodeId` reverts `"NodeId bound to another address"` | A separate operator already registered `newNodeId` | Generate a different keypair and retry. The ed25519 ownership proof prevents squatting, but a pre-existing binding by a different *legitimate* owner is a hard collision. |
 | `bindNodeId` reverts `"invalid signature"` | `bindingNonce[ethAddress]` advanced or EIP-712 digest mis-built | Re-read the on-chain nonce, re-sign, resubmit |
-| Restarted node serves `ok: false` for hashes it just probed `has_blob: true` | Probe holds not drained before stop | Availability/reputation ding only — the just-advertised blobs did not survive the restart. Let the probe hold window (35s per [ADR 005](005-protocol.md#adr-005-wire-protocol)) elapse before re-advertising; drain probe holds first next rotation |
+| Requesters report open streams cut at the rotation | Inbound streams not drained before stop | Availability/reputation ding only — the requesters go to other nodes. Wait for `decdn_streams_active{direction="inbound"} == 0` before the stop next rotation |
 
 ## Ethereum signing-key rotation only
 
@@ -149,7 +148,7 @@ Procedure:
 
 After migration, the Safe holds TOKEN and executes `register` / `openPool` / `closePool` / `topUp`. The Safe's owner key rotates thereafter ([§ Safe owner rotation (optional)](#safe-owner-rotation-optional)).
 
-> **Constraint — off-chain `slash_sig`.** A Safe-addressed operator's `StreamResponse` `slash_sig` is verified **off-chain** by the paying client, which recovers the signer from the 65-byte signature and compares it against the registered address. A Safe owner-key signature recovers to the owner, not to the Safe, so the client rejects the response. (The probe leg is shape-checked only today — full attribution there is the on-chain `SlashJudge`'s job — so a Safe-addressed node can be probed but not paid.) A Safe is therefore usable for the **cold** paths — bond, register, pool open/close, unbond — but not as the address a node serves traffic under. Serving from a Safe while a hot key signs `slash_sig` is unimplemented, and the ERC-1271 route that looks obvious is unsound for slash-critical signing ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)). Keep the serving identity on an EOA.
+> **Constraint — off-chain `slash_sig`.** A Safe-addressed operator's `StreamResponse` `slash_sig` is verified **off-chain** by the requester, on a discovery open and on a paid stream alike, which recovers the signer from the 65-byte signature and compares it against the registered address. A Safe owner-key signature recovers to the owner, not to the Safe, so the requester rejects the response, and a Safe-addressed node is neither discovered nor paid. A Safe is therefore usable for the **cold** paths — bond, register, pool open/close, unbond — but not as the address a node serves traffic under. Serving from a Safe while a hot key signs `slash_sig` is unimplemented, and the ERC-1271 route that looks obvious is unsound for slash-critical signing ([ADR 024 § Unimplemented — Operator Custody While Serving](024-account-abstraction.md#unimplemented--operator-custody-while-serving)). Keep the serving identity on an EOA.
 
 ### Safe owner rotation (optional)
 
@@ -188,7 +187,7 @@ Exception: **emergency compromise of the Ethereum key.** Run [§ Ethereum signin
 
 - [ADR 001 — On-chain registry, `registerNode`, NodeId ownership verification](001-network.md#adr-001-network-topology-and-peer-mesh)
 - [ADR 003 — `bindNodeId` rebinding, `nodeIdToAddress`, EIP-712 `BindNodeId` schema](003-payments.md#nodeid-to-ethereum-binding)
-- [ADR 005 — Probe-triggered eviction hold (drain prerequisite)](005-protocol.md#probe-triggered-eviction-hold)
+- [ADR 005 — Open-stream pin (drain prerequisite)](005-protocol.md#open-stream-pin)
 - [ADR 008 — Local per-peer reputation](008-reputation.md#adr-008-reputation-system)
 - [ADR 012 — Client iroh-key rotation analogue](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)
 - [ADR 019 — `registerNode`, `deregisterNode`, re-onboarding flow](019-node-onboarding.md#adr-019-node-onboarding-and-bootstrapping-flow)

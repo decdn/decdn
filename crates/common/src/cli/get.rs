@@ -146,9 +146,10 @@ pub struct GetArgs {
     pub overwrite: bool,
 
     /// Print what the run would pull and its price, then exit. Nothing is
-    /// paid, no keystore is opened and no transaction is sent; the price
-    /// comes from one unpaid probe round of the nodes (`decdn quote`), and the
-    /// node registry is read when the peer store cannot supply it. For a
+    /// paid and no transaction is sent. The price comes from `decdn quote`:
+    /// it unlocks the keystore and names the pool as a pull does, opens one
+    /// stream to each node and cancels it before any voucher, and reads the
+    /// node registry when the peer store cannot supply it. For a
     /// bundle, the plan lists the entries (paths + sizes, after the entry
     /// filters; files already present are still listed) and the price only
     /// when an earlier pull or `decdn quote` into the same output directory

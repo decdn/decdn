@@ -5,8 +5,8 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 > **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
 Shared wire types and ALPN definitions: the postcard-encoded messages exchanged over
-`cdn/probe/v1` (latency and availability probing), `cdn/client/v1` (all paid delivery, both
-client-to-node and node-to-node) and `cdn/dht/v1` (content discovery).
+`cdn/client/v1` (all paid delivery and discovery opens, both client-to-node and node-to-node)
+and `cdn/dht/v1` (content discovery).
 
 This is a leaf crate with deliberately minimal dependencies, so anything that only needs to
 speak the protocol does not pull in a blob store, an Ethereum client or an AWS SDK. Its

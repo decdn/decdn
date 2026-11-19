@@ -96,7 +96,7 @@ use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UnconfirmedEscrows, Untra
 use crate::discovery::{self, NodeCandidate};
 use crate::fault::{carries_untracked_escrow, fold_escrow};
 use crate::funding::RunFunding;
-use crate::lane_sources::{FirstLeg, LaneSources};
+use crate::lane_sources::{FirstLeg, LaneSources, discovery_span};
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
 use crate::pool_route::PoolPasses;
@@ -106,8 +106,8 @@ use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PaymentPoolCh
 use crate::stop::Halted;
 use crate::stream_cap::LaneStreamCap;
 use crate::targets::{
-    ProbeRound, ResolvedTargets, holders_or_none, identity_fresh_candidates, now_secs,
-    probe_and_order, probe_pinned,
+    OpenOpts, OpenRound, OpenSpec, ResolvedTargets, cancel_all, holders_or_none,
+    identity_fresh_candidates, now_secs, open_and_order, open_pinned, pinned_targets,
 };
 use crate::{
     ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
@@ -996,12 +996,13 @@ pub(super) struct Registry {
 }
 
 impl Registry {
-    /// One entry's probe candidates: a fresh sample of the list, same-region
-    /// nodes first, kept to `site.region_allowlist` with the widening rule a
-    /// single fetch applies ([`crate::targets::select_with_widening`]). A
-    /// cached-outage list ignores the allowlist. A sample per entry costs no
-    /// extra probe, because each entry probes its own candidates, and a node
-    /// that one draw leaves out can still reach other entries.
+    /// One entry's discovery candidates: a fresh sample of the list,
+    /// same-region nodes first, kept to `site.region_allowlist` with the
+    /// widening rule a single fetch applies
+    /// ([`crate::targets::select_with_widening`]). A cached-outage list ignores
+    /// the allowlist. A sample per entry costs no extra open, because each
+    /// entry opens its own candidates, and a node that one draw leaves out can
+    /// still reach other entries.
     pub(super) fn entry_candidates(&self, site: &PullSite) -> Vec<NodeCandidate> {
         self.allowed(site, discovery::SELECT_K)
     }
@@ -1795,8 +1796,7 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// sources, and a pinned node's dial address. An entry's first holders
     /// come from [`Self::nodes`].
     pub(super) discovery: DiscoveryOptions,
-    /// The absolute per-MB rate cap, folded per lane with the rate the
-    /// candidate's own probe signed; `0` sets no absolute cap.
+    /// The most a lane pays per MiB; `0` sets no ceiling.
     pub(super) max_rate_per_mb: u64,
     /// The largest blob one entry fetches.
     pub(super) max_blob_bytes: u64,
@@ -1854,7 +1854,7 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// Where every lane keeps the signed messages a pull receipt holds;
     /// `None` keeps nothing.
     pub(super) evidence: Option<Arc<ReceiptEvidence>>,
-    /// `(rtt_ms, rate_per_mb)` of each node the run's probe rounds heard
+    /// `(rtt_ms, rate_per_mb)` of each node the run's discovery rounds heard
     /// from, at its lowest RTT ([`super::BundlePuller::rate_hints`]).
     pub(super) rate_samples: std::sync::Mutex<HashMap<PublicKey, (f64, u64)>>,
 }
@@ -1929,30 +1929,83 @@ impl<P: Provider + Clone> PullCtx<P> {
         .await
     }
 
-    /// One entry's holders: the pinned node, probed for the blob's proven
-    /// size, or a fresh probe of the
-    /// entry's own registry sample (proxy-warming non-holders first when they
-    /// help, then holders nearest RTT first). An entry resolves them once and
-    /// every fetch of the entry reuses them. A resolution that fails for any
-    /// reason but the configuration ([`holders_or_none`]) starts the
+    /// One entry's holders: the pinned node, opened for the blob's proven
+    /// size, or a fresh round of discovery opens over the entry's own
+    /// registry sample (proxy-warming non-holders first when they help, then
+    /// holders by rank). The opens name the run's payer and ask for the whole
+    /// blob, so the entry's first fetch adopts the winner's stream as its
+    /// first leg ([`LaneSources::first_claim`]). An entry resolves them once
+    /// and every fetch of the entry reuses them. A resolution that fails for
+    /// any reason but the configuration ([`holders_or_none`]) starts the
     /// entry with no holder, and its acquire loop discovers them.
     async fn entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
         holders_or_none(self.resolve_entry_targets(hash).await)
     }
 
+    /// The context the run's discovery opens send
+    /// ([`crate::funding::discovery_ctx`]): the run's payer, on the pool a
+    /// built lane of the run already pays from when there is one.
+    async fn discovery_ctx(&self) -> anyhow::Result<crate::PoolContext> {
+        let payer = match &self.payer {
+            RunPayer::Delegated(slot) => LanePayer::Delegated(slot),
+            RunPayer::Owned(payer) => LanePayer::Owned(payer),
+        };
+        crate::funding::discovery_ctx(
+            self.store.as_ref(),
+            &self.pass.contract,
+            payer,
+            (&self.chain.governance, self.pass.pool.deployment),
+            &self.endpoint,
+            &self.pass.voucher_dom,
+            self.pass.funding.pool_id(),
+        )
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("could not name the pool the discovery opens pay from: {err:#}")
+        })
+    }
+
     /// [`Self::entry_targets`] before a failure is sorted into a configuration
     /// fault or an empty start.
     async fn resolve_entry_targets(&self, hash: [u8; 32]) -> anyhow::Result<ResolvedTargets> {
+        let ctx = match (self.discovery_ctx().await, &self.nodes.selection) {
+            (Ok(ctx), _) => ctx,
+            // A pinned node is the entry's only holder whatever its open
+            // says, so a pool the opens cannot name costs only the size
+            // hint: the lane opens its own first leg.
+            (Err(err), Selection::Pinned(pinned)) => {
+                tracing::warn!(
+                    error = %sanitize_err_chain(&err),
+                    "the pinned node is not opened before its lane"
+                );
+                return Ok(pinned_targets(pinned.node_id, pinned.provider));
+            }
+            (Err(err), Selection::Registry(_)) => return Err(err),
+        };
+        let spec = OpenSpec {
+            conns: &self.connections,
+            ctx: &ctx,
+            namespace_id: self.namespace_id,
+            span: discovery_span(hash, FirstLeg::Whole, self.max_blob_bytes),
+            max_rate_per_mb: self.max_rate_per_mb,
+        };
         match &self.nodes.selection {
-            Selection::Pinned(pinned) => Ok(probe_pinned(
-                &self.endpoint,
-                &self.chain,
-                self.relays.first().cloned(),
-                *pinned,
-                hash,
-                None,
-            )
-            .await),
+            Selection::Pinned(pinned) => {
+                let open = OpenOpts {
+                    marks: None,
+                    round: OpenRound::Stream,
+                    known_size: None,
+                    spec,
+                };
+                Ok(open_pinned(
+                    &self.chain,
+                    self.relays.first().cloned(),
+                    *pinned,
+                    hash,
+                    open,
+                )
+                .await)
+            }
             Selection::Registry(registry) => {
                 // With one pool, the entry's round streams: its fetch starts
                 // at the first verified holder, and the holders that answer
@@ -1961,22 +2014,22 @@ impl<P: Provider + Clone> PullCtx<P> {
                 // of them, and leaves the entry to that pool's pass
                 // ([`Self::acquire_entry`]).
                 let round = if self.passes.route().order().len() > 1 {
-                    ProbeRound::Settle
+                    OpenRound::Settle
                 } else {
-                    ProbeRound::Stream
+                    OpenRound::Stream
                 };
                 let candidates = registry.entry_candidates(&self.site);
-                let targets = probe_and_order(
-                    &self.endpoint,
+                let targets = open_and_order(
                     &candidates,
                     self.relays.first(),
                     hash,
+                    spec,
                     self.discovery.proxy_warming,
                     &self.slash_dom,
                     round,
                 )
                 .await?;
-                self.record_rates(&targets.probed_samples);
+                self.record_rates(&targets.samples);
                 Ok(targets)
             }
         }
@@ -2034,7 +2087,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// store beside `staging` through the acquire loop, across `targets`' holders.
     /// The store is promoted to `staging` once every byte is present.
     ///
-    /// The entry's size is a proven one: a probe answer's, or else a
+    /// The entry's size is a proven one: a discovery answer's, or else a
     /// whole-blob first open's header. `total` is the manifest's declared
     /// `size`: `ranges` hold only when it equals the proven size
     /// ([`ranges_at_proven_size`]), and otherwise the entry fetches its whole
@@ -2100,7 +2153,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         // vouchers for recording too.
         let on_drop = SettleOnDrop::new(|| sources.persist_watermarks_detached());
         let result = async {
-            // The entry's size is a proven one: a probe answer's, or a
+            // The entry's size is a proven one: a discovery answer's, or a
             // whole-blob open's header. A manifest's size is declared, and it
             // plans nothing. Ranges planned from it hold only when it is the
             // proven size; otherwise the whole blob is fetched.
@@ -2473,7 +2526,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// staging file under `out_root` and reading it back is cheap; it also
     /// means a manifest fetch runs the same acquire loop, under the same
     /// health table and progress clock, as every entry. The fetch takes a
-    /// proven size (a probe answer's, a pinned node's included, or a
+    /// proven size (a discovery answer's, a pinned node's included, or a
     /// whole-blob open's when there is none).
     /// The fetch runs under [`manifest_cap_bytes`], so a blob past the
     /// largest manifest fails once the fetch holds the cap, and pays for at
@@ -2868,7 +2921,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let resumed = resumed_spans_off_runtime(staging, hash).await;
 
         // Until the first byte lands, the entry is discovering holders — surfaced so
-        // a slow or stalling probe (a blob no probed node answers for) does not look
+        // a slow or stalling discovery (a blob no asked node answers for) does not look
         // like a frozen empty bar. The delivery callback switches the row to its
         // download counts on the first chunk.
         if let Some(f) = file {
@@ -2921,8 +2974,12 @@ impl<P: Provider + Clone> PullCtx<P> {
 
         // Resolve the entry's holders ONCE and reuse them across every drive
         // below (complement, donor re-fetch, whole-blob re-drive), so the entry
-        // probes exactly once.
+        // discovers exactly once. The drives fetch ranges and can wait on a
+        // sibling's chunks between them, so no drive adopts a whole-blob
+        // discovery stream: the streams are cancelled here, which frees each
+        // node's discovery-open permits, and each drive opens its own legs.
         let targets = self.entry_targets(hash).await?;
+        cancel_all(targets.opened.take());
         let driver = AcquireRangeDriver {
             ctx: self,
             targets: &targets,
@@ -3249,7 +3306,7 @@ impl FileBar {
         self.cb.as_ref()
     }
 
-    /// Report that the entry probes its holders before any byte arrives.
+    /// Report that the entry discovers its holders before any byte arrives.
     fn set_discovering(&self) {
         if let Some(file) = &self.file {
             file.discovering();

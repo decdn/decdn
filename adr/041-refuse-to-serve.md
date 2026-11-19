@@ -140,12 +140,11 @@ governance concern.
   The node holds no hardcoded split.
 - **Heat.** The frequency estimate from the [ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)
   `FrequencyEstimator`. That estimator observes one sighting per served request
-  at the serve chokepoint. Fills and probes emit no sighting. A node therefore
+  at the serve chokepoint. Fills and discovery opens that end without a serve emit no sighting. A node therefore
   cannot raise a blob's heat without serving, and paying for, real requests.
 - **Candidate prices.** The signed per-MB rate each candidate returns on its
-  probe. The node reuses its short-lived probe cache and adds no probe fan-out
-  for the gate. A candidate with no fresh cached rate is unqualified for the
-  gate and is skipped.
+  discovery open, or that the candidate cache holds from a recent one. The
+  node adds no fan-out for the gate.
 
 ### Composition and enforcement
 
@@ -153,9 +152,10 @@ governance concern.
 already applies: the effective ceiling is the minimum of `cache.max_rate_per_mb`
 and `max_buy`, with zero meaning unbounded on each input. The node enforces the
 effective ceiling at the point it commits the buy, not only at ranking. A
-candidate that quotes a low rate on its probe and then returns a higher rate in
-its signed response exceeds the ceiling and the node aborts that leg. The signed
-probe rate also makes a low-quote, high-deliver node slashable.
+candidate that quotes a low rate on its discovery open and then returns a
+higher rate on a later stream exceeds the ceiling, and the node aborts that leg.
+The node also signs its price into each voucher, so a node that asks more than
+its quote is refused and paid nothing more. There is no rate slash.
 
 ### No route is a valid outcome
 
@@ -237,7 +237,7 @@ buy ceiling is at most `max(sell, amortized)`, so a quote above that is refused.
 At a cold `n_hat = 1` the ceiling is the market price. To lift it, the attacker
 must lift `n_hat`, and heat rises only on served, paid requests: the
 [ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies) estimator observes one sighting per serve at the
-serve chokepoint, never on a fill or a probe. Inflating `n_hat` therefore forces
+serve chokepoint, never on a fill or a discovery open that ends without a serve. Inflating `n_hat` therefore forces
 the attacker to pay the victim real margin first, and heat and eviction read the
 same signal, so a hot blob stays cached and triggers no second buy. `n_max` and
 `discount` bound the residual gap between the estimate and realized serves.
@@ -264,8 +264,8 @@ deposit.
 - The policy plugs in behind a trait, mirrors the [ADR 040](040-cache-policy.md#adr-040-pluggable-cache-admission-and-eviction-policies)
   seam, and is unit-testable as a pure function over its context. The allowance
   is a small node-local per-source accumulator.
-- The gate reuses the existing probe cache, rank order, and lower-of ceiling
-  path. It adds no wire surface and no probe fan-out.
+- The gate reuses the existing discovery answers, candidate cache, rank order,
+  and lower-of ceiling path. It adds no wire surface and no discovery fan-out.
 - Refusal reuses the existing `NotFound` outcome, so the node leaks no pricing
   floor and clients re-route through existing failover.
 

@@ -1,21 +1,20 @@
 //! The retrieval flags of `decdn get`: the client-side paid pull over
 //! `cdn/client/v1` (issues #391, #940, #2449).
 //!
-//! The paying sibling of [`super::probe::ProbeArgs`]: a one-shot client pull
-//! that dials a node by explicit `--node-id`/`--addr`/`--relay-url` (or
-//! auto-discovers one, #936) and pays per-MB from the caller's own
-//! `PaymentPool` deposit. The pool is **auto-opened and reused**: the pull
-//! looks up the caller's live pool in its persistent buyer-pool store, resuming
-//! its per-`(signer, provider)` lane watermark for the chosen provider; if none
-//! exists it opens (and funds) one on-chain and records it. One pool fans out
+//! A one-shot client pull that dials a node by explicit
+//! `--node-id`/`--addr`/`--relay-url` (or auto-discovers one, #936) and pays
+//! per-MB from the caller's own `PaymentPool` deposit. The pool is
+//! **auto-opened and reused**: the pull looks up the caller's live pool in its
+//! persistent buyer-pool store, resuming its per-`(signer, provider)` lane
+//! watermark for the chosen provider; if none exists it opens (and funds) one
+//! on-chain and records it. One pool fans out
 //! to every provider the caller pays (ADR 003) — there is no per-provider open.
 //!
 //! The on-chain coordinates (RPC, contract addresses, chain id, keystore, data
 //! dir) resolve **flag > `[blockchain]`/`[identity]` config > default**, so a
 //! configured client runs `decdn get decdn:<hash> -o …` with no chain flags.
-//! Fields are kept as `String`/`Option` (mirroring
-//! [`super::probe::ProbeArgs`]); the `cli` binary parses addresses and merges
-//! the config.
+//! Fields are kept as `String`/`Option`; the `cli` binary parses addresses and
+//! merges the config.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -55,12 +54,12 @@ fn parse_region_flag(raw: &str) -> Result<String, String> {
 pub struct ClientFetchArgs {
     /// Target node id (iroh `EndpointId`, z-base32). Omit it to auto-discover:
     /// the active node set is read from `CapacityBond`, the region-nearest
-    /// candidates probed, and one that holds the blob picked (#936). When set,
+    /// candidates opened, and one that holds the blob picked (#936). When set,
     /// `--provider-address` is required (they pair).
     #[arg(long, value_name = "ID", requires = "provider_address")]
     pub node_id: Option<String>,
 
-    /// Ignore the persisted peer store for selection this run and re-probe/discover
+    /// Ignore the persisted peer store for selection this run and discover
     /// afresh; the store is still updated from what this fetch learns.
     #[arg(long, action = clap::ArgAction::SetTrue)]
     pub rediscover: bool,
@@ -215,12 +214,10 @@ pub struct ClientFetchArgs {
 
     /// Refuse a provider that quotes a per-MB stream rate above this many USDC
     /// base units **before** paying any voucher (#1375). `0` (the default) = no
-    /// absolute ceiling. For a bundle this applies per entry. Each lane is also
-    /// capped at the rate the candidate's own probe signed — the quote the node
-    /// was selected on — as the node's automatic node-to-node pull caps its upstream, so
-    /// a provider that quotes low on the probe then high on the stream is refused
-    /// even at the default. A pull that harvests no probe rate (the peer-store
-    /// fast path, a pinned `--node-id`) is bounded by this value alone.
+    /// ceiling. For a bundle this applies per entry. Every stream answer carries
+    /// the node's signed quote, so the fetch sees the rate before it pays:
+    /// discovery leaves out a node that quotes above the ceiling, and a lane
+    /// refuses a stream whose quote is above it.
     #[arg(long, value_name = "UNITS", default_value_t = 0)]
     pub max_rate_per_mb: u64,
 
@@ -255,8 +252,8 @@ pub struct ClientFetchArgs {
     ///
     /// Exceeding this budget on the registry read (including its retry schedule) is treated
     /// as a read failure, so a cached peer list is still used if one is present. It does NOT
-    /// bound the probe fan-out that ranks candidates either — probing is bounded per node by
-    /// the probe timeout, not by this flag.
+    /// bound the discovery opens that rank candidates either — each open is bounded per node
+    /// by its own timeout, not by this flag.
     #[arg(long, value_name = "MS", default_value_t = 3_600_000, value_parser = clap::value_parser!(u64).range(1..))]
     pub timeout_ms: u64,
 
@@ -288,9 +285,9 @@ impl ClientFetchArgs {
     ///
     /// # What this does NOT bound
     ///
-    /// The probe fan-out. A blob fetch probes `SELECT_K` candidates after the read,
-    /// and a bundle pull probes per entry; neither is inside this budget. Named here because
-    /// the obvious reading of "discovery" includes probing, and it does not.
+    /// The discovery opens. A blob fetch opens `SELECT_K` candidates after the read,
+    /// and a bundle pull opens them per entry; neither is inside this budget. Named here
+    /// because the obvious reading of "discovery" includes the opens, and it does not.
     #[must_use]
     pub const fn discovery_cap(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)

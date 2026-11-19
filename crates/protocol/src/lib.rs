@@ -1,11 +1,10 @@
 //! The deCDN wire protocol: the ALPN identifiers, the message types each ALPN
 //! carries, and the framing that puts them on a QUIC stream.
 //!
-//! deCDN speaks three ALPNs ([ADR 005]):
+//! deCDN speaks two ALPNs ([ADR 005]):
 //!
 //! | ALPN | Constant | Messages | Purpose |
 //! |---|---|---|---|
-//! | `cdn/probe/v1` | [`ALPN_PROBE`] | [`ProbeMessage`] | Latency and availability probing |
 //! | `cdn/client/v1` | [`ALPN_CLIENT`] | [`ClientMessage`] | All paid delivery, client to node and node to node |
 //! | `cdn/dht/v1` | [`ALPN_DHT`] | [`DhtMessage`] | Content discovery over a Kademlia DHT ([ADR 022]) |
 //!
@@ -14,7 +13,6 @@
 //! | Module | Contents |
 //! |---|---|
 //! | [`framing`] | The length-prefixed frame, [`encode_message`] / [`decode_message`], and the async [`read_frame`] / [`write_frame`] |
-//! | [`message`] | `cdn/probe/v1`: [`ProbeRequest`], [`ProbeResponse`] |
 //! | [`client`] | `cdn/client/v1`: [`StreamRequest`], [`StreamResponse`], [`ChunkData`], the wire [`Voucher`], [`StreamError`] |
 //! | [`dht`] | `cdn/dht/v1`: store and find requests, provider records, closer-node lists |
 //! | [`coverage`] | The block coverage bitmap a partial holder advertises |
@@ -23,30 +21,35 @@
 //! | [`chain_id`] | The CAIP-2 [`ChainId`] of a chain |
 //! | [`pool_account`] | The CAIP-10 [`PoolAccount`] that names a `PaymentPool` contract |
 //! | [`region`] | ISO 3166-1 alpha-2 [`Region`] codes |
+//! | [`message`] | Items every signed message shares: [`MAX_RATE_PER_MB`], [`SLASH_SIG_LEN`], [`MessageValidationError`], [`EMPTY_ROOT`] |
 //!
 //! # Frames and extensions
 //!
 //! Every message is a postcard encoding behind a varint length prefix. Each read
-//! caps the prefix at its frame ceiling — [`MAX_PROBE_FRAME`],
-//! [`MAX_CLIENT_CONTROL_FRAME`], [`MAX_STREAM_RESPONSE_FRAME`],
-//! [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
+//! caps the prefix at its frame ceiling — [`MAX_CLIENT_CONTROL_FRAME`],
+//! [`MAX_STREAM_RESPONSE_FRAME`], [`MAX_CHUNK_FRAME`] or [`MAX_DHT_FRAME`]
 //! ([ADR 013 § Wire Framing]). A signed message has a frozen
 //! base: the fields its signature covers. Unsigned fields travel as trailing
 //! bytes after the base. [`decode_message`] returns them as a remainder, and the
 //! `parse_*_ext` functions read them ([ADR 013 § Three Tiers of Evolution]).
 //!
 //! ```
-//! use decdn_protocol::{ProbeMessage, ProbeRequest, decode_message, encode_message};
+//! use decdn_protocol::{ClientMessage, StreamRequest, decode_message, encode_message};
 //!
-//! let request = ProbeMessage::Request(ProbeRequest {
+//! let request = ClientMessage::StreamRequest(StreamRequest {
 //!     hash: [7; 32],
+//!     namespace_id: [0; 32],
+//!     payment_pool: "eip155:421614:0x0000000000000000000000000000000000000001".parse()?,
+//!     pool_id: [9; 32],
+//!     byte_offset: 0,
+//!     byte_len: 0,
 //!     timestamp_us: 1_700_000_000_000_000,
 //! });
 //! let frame = encode_message(&request)?;
-//! let (decoded, remainder) = decode_message::<ProbeMessage>(&frame)?;
+//! let (decoded, remainder) = decode_message::<ClientMessage>(&frame)?;
 //! assert_eq!(decoded, request);
 //! assert!(remainder.is_empty());
-//! # Ok::<(), decdn_protocol::FrameError>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
 //! This crate holds no cryptography. The signatures carried in these messages
@@ -80,7 +83,9 @@ pub use client::{
     encode_stream_request, encode_stream_response, parse_stream_request_ext,
     parse_stream_response_ext,
 };
-pub use coverage::{Coverage, DISCOVERY_BLOCK_BYTES, discovery_block_bytes, num_blocks};
+pub use coverage::{
+    Coverage, DISCOVERY_BLOCK_BYTES, byte_range_blocks, discovery_block_bytes, num_blocks,
+};
 #[cfg(feature = "test-support")]
 pub use coverage::{TestBlockSizeGuard, override_discovery_block_bytes_for_test};
 pub use dht::{
@@ -96,17 +101,10 @@ pub use framing::{
     write_frame,
 };
 pub use identity::{ContentHash, ID_LEN, NodeId};
-pub use message::{
-    EMPTY_ROOT, MAX_PROBE_FRAME, MAX_PROBE_REQUEST_FRAME, MAX_RATE_PER_MB, MessageValidationError,
-    ProbeMessage, ProbeRequest, ProbeResponse, ProbeResponseBody, ProbeResponseExt, SLASH_SIG_LEN,
-    encode_probe_response, parse_probe_response_ext,
-};
+pub use message::{EMPTY_ROOT, MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
 pub use pool_account::{MAX_PAYMENT_POOLS, MAX_POOL_ACCOUNT_LEN, PoolAccount, PoolAccountError};
 pub use region::{InvalidRegion, Region, is_valid_region};
 pub use size_proof::{MAX_SIZE_PROOF_BYTES, SizeProof, SizeProofTooLong};
-
-/// ALPN protocol identifier for latency and availability probing.
-pub const ALPN_PROBE: &[u8] = b"cdn/probe/v1";
 
 /// ALPN protocol identifier for paid blob delivery (client-to-node and node-to-node).
 pub const ALPN_CLIENT: &[u8] = b"cdn/client/v1";
@@ -132,12 +130,11 @@ pub const APP_ERR_RATE_LIMITED: u32 = 0x10;
 
 /// Request refused because its `timestamp_us` differs from the node's clock
 /// by more than 30 seconds (ADR 013 §Application Error Codes; ADR 005
-/// §`cdn/probe/v1` and §`cdn/client/v1`). The signed response bodies echo the
-/// requester's timestamp into the slash-evidence set, so a node refuses such a
-/// request with no signed response.
+/// §`cdn/client/v1`). The signed response body echoes the requester's
+/// timestamp into the slash-evidence set, so a node refuses such a request
+/// with no signed response.
 ///
-/// Delivered as a `RESET_STREAM` on `cdn/client/v1`. On `cdn/probe/v1` it
-/// travels in the `CONNECTION_CLOSE` frame only. The usual cause is the
+/// Delivered as a `RESET_STREAM` on `cdn/client/v1`. The usual cause is the
 /// requester's clock. If only one node refuses, that node's clock is wrong.
 /// The requester side (`decdn-client`) types this code as
 /// `UpstreamTimestampRejected` so the failure names the clock instead of

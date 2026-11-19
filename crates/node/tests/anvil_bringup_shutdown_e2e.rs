@@ -69,8 +69,8 @@ use decdn_common::admin::{AdminRpcClient, DrainRequest, HealthResponse};
 use decdn_common::cli::run::ObservabilityArgs;
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
-    ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedProbe,
-    ResolvedReceipts, ResolvedSecurity,
+    ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedReceipts,
+    ResolvedSecurity,
 };
 use decdn_incentive::eth_identity;
 use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
@@ -411,11 +411,9 @@ fn build_config(
             eviction_target_pct: 80,
             eviction_per_sweep_budget: 16,
             eviction_tick_secs: 1,
-            max_probe_holds: decdn_common::config::DEFAULT_MAX_PROBE_HOLDS,
-            stake_lane_reserved_holds: decdn_common::config::DEFAULT_STAKE_LANE_RESERVED_HOLDS,
             node_to_node_pull_through_enabled: false,
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
-            node_pull_probe_fanout: decdn_common::config::DEFAULT_NODE_PULL_PROBE_FANOUT,
+            node_pull_open_fanout: decdn_common::config::DEFAULT_NODE_PULL_OPEN_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             node_pull_stall_window_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC,
             node_pull_min_throughput_bps:
@@ -455,7 +453,6 @@ fn build_config(
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         content: decdn_common::config::ResolvedContent::default(),
         dht: ResolvedDht::default(),
-        probe: ResolvedProbe::default(),
         serve: decdn_common::config::ResolvedServe::default(),
         receipts: ResolvedReceipts::default(),
     }

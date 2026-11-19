@@ -31,7 +31,7 @@ fn metric_value(text: &str, name: &str) -> Option<u64> {
 #[test]
 fn latency_histograms_export_buckets_sum_and_count() {
     const HISTOGRAMS: [&str; 10] = [
-        "decdn_probe_collection_latency_seconds",
+        "decdn_open_collection_latency_seconds",
         "decdn_serve_first_byte_hit_seconds",
         "decdn_serve_first_byte_miss_seconds",
         "decdn_node_pull_first_byte_seconds",
@@ -64,7 +64,7 @@ fn latency_histograms_export_buckets_sum_and_count() {
 
     // 40 ms: above the 0.025 bucket, inside the 0.05 bucket of both sets.
     let elapsed = Duration::from_millis(40);
-    metrics.probe_collection_latency(elapsed);
+    metrics.open_collection_latency(elapsed);
     metrics.node_pull_first_byte(elapsed);
     let now = Instant::now();
     FirstByteClock::new(now, now, RequestClass::CacheHit).record(&metrics);
@@ -126,6 +126,58 @@ fn first_byte_clock_records_each_phase_once() {
     ] {
         assert!(has_metric_line(&text, name, count), "{name} != {count}");
     }
+}
+
+/// The payer's wait for its first proof is not this node's latency. A hit
+/// that answers before admission and waits ten seconds for the payer's first
+/// proof records only the node's own time: 2 ms to the tier pick, 3 ms to the
+/// response, and 5 ms of admission and first frame after the proof.
+#[test]
+fn first_byte_clock_leaves_out_the_payers_wait() {
+    let metrics = Metrics::new();
+    let ms = Duration::from_millis;
+    let decoded = Instant::now();
+    let mut hit = FirstByteClock::new(decoded, decoded + ms(2), RequestClass::CacheHit);
+    hit.mark_responded_at(decoded + ms(5));
+    hit.mark_first_proof_at(decoded + ms(5) + Duration::from_secs(10));
+    hit.record_at(&metrics, decoded + ms(10) + Duration::from_secs(10));
+
+    let text = metrics.encode().unwrap();
+    for (name, sum) in [
+        ("decdn_serve_first_byte_hit_seconds_sum", 0.01),
+        ("decdn_serve_admission_seconds_sum", 0.002),
+        ("decdn_serve_response_hit_seconds_sum", 0.003),
+        ("decdn_serve_first_frame_hit_seconds_sum", 0.005),
+    ] {
+        let got = text
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok())
+            .unwrap_or(f64::NAN);
+        assert!((got - sum).abs() < 1e-9, "{name}: {got} != {sum}");
+    }
+    // 10 ms lands in the 0.01 bucket, far below the payer's ten seconds.
+    assert!(has_metric_line(
+        &text,
+        "decdn_serve_first_byte_hit_seconds_bucket{le=\"0.01\"}",
+        1
+    ));
+}
+
+/// A serve with no response mark has no payer wait to leave out.
+#[test]
+fn first_byte_clock_without_a_response_ignores_a_proof_mark() {
+    let metrics = Metrics::new();
+    let decoded = Instant::now();
+    let mut clock = FirstByteClock::new(decoded, decoded, RequestClass::CacheMiss);
+    clock.mark_first_proof_at(decoded + Duration::from_secs(1));
+    clock.record_at(&metrics, decoded + Duration::from_millis(40));
+
+    let text = metrics.encode().unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l == "decdn_serve_first_byte_miss_seconds_sum 0.04"),
+        "the total keeps its 40 ms"
+    );
 }
 
 /// A client waits on a cache miss for at most the outer pull deadline, so a
@@ -191,42 +243,6 @@ fn set_unredeemed_usdc_publishes_the_total() {
         has_metric_line(&text, "decdn_unredeemed_usdc", 42),
         "gauge must overwrite on the next sweep:\n{text}"
     );
-}
-
-#[test]
-fn probe_hold_unavailable_exports_every_reason_at_zero() {
-    // Pins the pre-materialization in `Metrics::new` (#1443). A `Family`
-    // creates each child series lazily on `get_or_create`, so without that
-    // step a `reason` would be missing from `/metrics` until it first
-    // fired — a dashboard gap where the three `reason` series of
-    // `decdn_probe_hold_unavailable_total` read absent instead of zero, and
-    // a silent hole in the `DecdnProbeHoldViolations` alert's
-    // input. Also pins the rendered series text (label name, snake_case
-    // value encoding, and the `_total` suffix the encoder appends).
-    let metrics = Metrics::new();
-    let text = metrics.encode().unwrap();
-
-    for reason in ["exhausted", "disabled", "stake_lane_reserved"] {
-        let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{reason}\"}}");
-        assert!(
-            has_metric_line(&text, &name, 0),
-            "{name} should be exposed at zero from a fresh registry:\n{text}"
-        );
-    }
-
-    // None of these three names is a valid export; probe-hold reasons ship
-    // only as `reason` labels on the collapsed counter
-    // `decdn_probe_hold_unavailable_total`.
-    for retired in [
-        "decdn_probe_hold_violations_total",
-        "decdn_probe_holds_disabled_total",
-        "decdn_probe_stake_lane_reserved_total",
-    ] {
-        assert!(
-            !text.lines().any(|line| line.starts_with(retired)),
-            "retired metric name {retired} must not be exported:\n{text}"
-        );
-    }
 }
 
 /// Every `(method, outcome)` child of `decdn_rpc_requests_total` and every
@@ -430,35 +446,6 @@ fn staker_set_active_by_region_replaces_the_previous_map() {
     assert!(has("decdn_staker_set_active_unknown_region 0"), "{text}");
 }
 
-#[test]
-fn probe_hold_unavailable_increments_only_the_named_reason() {
-    // The whole point of the label is that each value keeps its own
-    // remedy: `exhausted` drives "raise max_probe_holds", `disabled` is an
-    // intentional operator choice, and `stake_lane_reserved` is a priority
-    // decision taken before the cache is even consulted. Bumping one must
-    // never move another, or the alert filter re-fires on the deliberate
-    // cases the #739/#757 split existed to keep out.
-    let metrics = Metrics::new();
-    metrics.probe_hold_unavailable(ProbeHoldUnavailableReason::Exhausted);
-    let text = metrics.encode().unwrap();
-
-    assert!(
-        has_metric_line(
-            &text,
-            "decdn_probe_hold_unavailable_total{reason=\"exhausted\"}",
-            1
-        ),
-        "the named reason must increment:\n{text}"
-    );
-    for untouched in ["disabled", "stake_lane_reserved"] {
-        let name = format!("decdn_probe_hold_unavailable_total{{reason=\"{untouched}\"}}");
-        assert!(
-            has_metric_line(&text, &name, 0),
-            "{name} must stay at zero:\n{text}"
-        );
-    }
-}
-
 /// Every `reason` of `decdn_capability_intake_dropped_total` exports at zero
 /// from a fresh registry, renders in `snake_case`, and moves only when its own
 /// drop is recorded (#2631).
@@ -657,7 +644,7 @@ fn cache_metrics_counters_start_at_zero() {
 
 #[test]
 fn quic_0rtt_and_session_ticket_series_are_not_exposed() {
-    // The probe path is a plain QUIC handshake: no early-data
+    // Every ALPN runs a plain QUIC handshake: no early-data
     // classification and no session-ticket working-set proxy, so no
     // metric may name either. A partial revert that reintroduces one
     // counter but not its recorder shows up here.
@@ -721,7 +708,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
     // `(no data)`) and each method must bump exactly its own counter.
     let metrics = Metrics::new();
     let reasons = [
-        "decdn_serve_stream_rejected_evicted_since_probe_total",
+        "decdn_serve_stream_rejected_withdrawn_total",
         "decdn_serve_stream_rejected_cache_miss_total",
         "decdn_serve_stream_rejected_internal_error_total",
         "decdn_serve_stream_rejected_unknown_lane_total",
@@ -754,7 +741,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
         );
     }
 
-    metrics.serve_stream_rejected_evicted_since_probe();
+    metrics.serve_stream_rejected_withdrawn();
     metrics.serve_stream_rejected_cache_miss();
     metrics.serve_stream_rejected_internal_error();
     metrics.serve_stream_rejected_unknown_lane();
@@ -1170,54 +1157,6 @@ impl decdn_cache::Origin for StubOrigin {
         };
         Box::pin(async move { result })
     }
-}
-
-/// `decdn_probe_hold_slots_used` tracks hold expiry with no probe
-/// traffic: a hold taken once reads `1` at the next scrape and `0` at a
-/// scrape after `PROBE_HOLD_DURATION` lapses, with nothing but the clock
-/// in between.
-#[tokio::test(start_paused = true)]
-async fn probe_hold_slots_used_drops_to_zero_after_hold_expires() {
-    use std::sync::Arc;
-
-    use decdn_cache::{CacheEngine, PROBE_HOLD_DURATION, ProbeHoldOutcome};
-
-    let payload = b"probe hold gauge".to_vec();
-    let hash = iroh_blobs::Hash::new(&payload);
-    let stub = StubOrigin {
-        data: bytes::Bytes::from(payload),
-        hash,
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(stub) as Arc<dyn decdn_cache::Origin>],
-        10,
-    )
-    .await
-    .unwrap();
-    let _ = engine.get(hash).await.unwrap();
-
-    let metrics = Metrics::new();
-    metrics.attach_probe_holds(engine.clone());
-    assert_eq!(
-        engine.try_probe_hold(hash).await.unwrap(),
-        ProbeHoldOutcome::Held
-    );
-
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_probe_hold_slots_used", 1),
-        "a live hold must read 1:\n{text}"
-    );
-
-    tokio::time::advance(PROBE_HOLD_DURATION + Duration::from_secs(1)).await;
-
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_probe_hold_slots_used", 0),
-        "an expired hold must read 0 with no further probe:\n{text}"
-    );
 }
 
 #[tokio::test]

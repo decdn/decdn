@@ -81,7 +81,7 @@ async fn a_loaded_lane_has_nothing_left_to_claim() {
 }
 
 /// A client that sends garbage on the proof stream is a peer fault, not a node
-/// bug: it must reach `debug!`, not the node-fault counter. The `ProbeRequest`
+/// bug: it must reach `debug!`, not the node-fault counter. The `StreamEnd`
 /// stands in for any `ClientMessage` variant that is not a proof.
 #[tokio::test]
 async fn a_malformed_or_unexpected_proof_frame_is_attributed_to_the_peer() {
@@ -742,7 +742,7 @@ fn takedown_reject_reasons_are_declined() {
         ServeRejectReason::HashDenied,
         ServeRejectReason::ChainHashDenied,
         ServeRejectReason::OriginDenied,
-        ServeRejectReason::EvictedSinceProbe,
+        ServeRejectReason::Withdrawn,
         ServeRejectReason::InternalError,
         ServeRejectReason::BlobTooLarge,
         ServeRejectReason::RangeNotSatisfiable,
@@ -900,6 +900,21 @@ async fn handler_with_pool_view_and_freshness(
     view: Option<Arc<dyn crate::pool_view::PoolView>>,
     freshness: Option<crate::chain_freshness::ChainFreshness>,
 ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+    handler_with_deps(metrics, |deps| {
+        if let Some(pool) = deps.pools.first_mut() {
+            pool.pool_view = view;
+        }
+        deps.chain_freshness = freshness;
+    })
+    .await
+}
+
+/// A handler on one accepted pool with no pool view, after `configure` edits
+/// its dependencies.
+async fn handler_with_deps(
+    metrics: &Arc<Metrics>,
+    configure: impl FnOnce(&mut ClientHandlerDeps),
+) -> (Arc<ClientHandler>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
         .await
@@ -932,12 +947,44 @@ async fn handler_with_pool_view_and_freshness(
         U256::ZERO,
         always_admit_shed(),
     );
-    if let Some(pool) = deps.pools.first_mut() {
-        pool.pool_view = view;
-    }
-    deps.chain_freshness = freshness;
+    configure(&mut deps);
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
+}
+
+/// Every answer lists the accepted pools, cut to `MAX_PAYMENT_POOLS`. A
+/// longer list would push the answer toward its frame limit, and a receiver
+/// keeps only the first `MAX_PAYMENT_POOLS` anyway.
+#[tokio::test]
+async fn the_payment_pools_hint_keeps_max_payment_pools() {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_with_deps(&metrics, |deps| {
+        for i in 1u8..10 {
+            deps.pools.push(PoolRoute::new(
+                decdn_incentive::Deployment {
+                    chain_id: TEST_DEPLOYMENT.chain_id,
+                    payment_pool: Address::repeat_byte(0x60 + i),
+                },
+                Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
+                    as Arc<dyn PoolStateStore>,
+            ));
+        }
+    })
+    .await;
+    assert_eq!(handler.accepted_pools().len(), 10);
+    let hint = handler
+        .payment_pools_hint()
+        .expect("the node accepts pools");
+    assert_eq!(hint.len(), decdn_protocol::MAX_PAYMENT_POOLS);
+    let first: Vec<_> = handler
+        .accepted_pools()
+        .into_iter()
+        .take(decdn_protocol::MAX_PAYMENT_POOLS)
+        .collect();
+    assert_eq!(
+        hint, first,
+        "the hint keeps the first pools in configuration order"
+    );
 }
 
 /// Fix 1 (security): capability intake verifies the owner signature against
@@ -1993,7 +2040,9 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
         byte_len: 0,
         timestamp_us: an_hour_ago,
     };
-    let (resp, _ext) = handler.sign_served(&req, 1, 1024).await?;
+    let (resp, _ext) = handler
+        .sign_served(&req, 1, 1024, decdn_protocol::Coverage::full(1))
+        .await?;
     assert_eq!(resp.body.timestamp_us, an_hour_ago);
     let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
     let recovered = StreamSlashData::from_response_body(&resp.body)
@@ -2024,9 +2073,14 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
         timestamp_us: crate::handlers::timestamp_skew::now_us(),
     };
 
-    let (resp, ext) = handler.sign_served(&req(*hash.as_bytes()), 1, size).await?;
+    let full = || decdn_protocol::Coverage::full(decdn_protocol::num_blocks(size));
+    let (resp, ext) = handler
+        .sign_served(&req(*hash.as_bytes()), 1, size, full())
+        .await?;
     assert!(resp.body.ok);
     assert_eq!(ext.validate(resp.body.ok), Ok(()));
+    assert_eq!(ext.coverage, full(), "the coverage rides as given");
+    assert!(ext.consistent_with(&resp.body, 0, 0));
     let sent = ext
         .size_proof()
         .ok_or_else(|| anyhow::anyhow!("no proof sent"))?;
@@ -2039,13 +2093,13 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
 
     assert!(
         handler
-            .sign_served(&req(*hash.as_bytes()), 1, size + 1)
+            .sign_served(&req(*hash.as_bytes()), 1, size + 1, full())
             .await
             .is_err()
     );
     assert!(
         handler
-            .sign_served(&req([9; 32]), 1, 1 << 60)
+            .sign_served(&req([9; 32]), 1, 1 << 60, full())
             .await
             .is_err()
     );
@@ -2112,4 +2166,40 @@ fn a_zero_share_claims_nothing() {
     let mut lane = paid_lane(MIB);
     assert_eq!(lane.claim(0), 0);
     assert_eq!(lane.unclaimed(), MIB);
+}
+
+/// A blob past `MAX_DISCOVERABLE_BLOB_BYTES` is served with a coverage the
+/// payer decodes: `full_coverage` cuts the bitmap at the wire bound, and the
+/// served answer still agrees with the signed body for any span.
+#[test]
+fn full_coverage_of_a_blob_past_the_wire_bound_decodes() -> anyhow::Result<()> {
+    use decdn_protocol::coverage::{MAX_COVERAGE_BYTES, MAX_DISCOVERABLE_BLOB_BYTES};
+
+    let size = 10 * MAX_DISCOVERABLE_BLOB_BYTES;
+    let coverage = super::fill::full_coverage(size);
+    let encoded = postcard::to_allocvec(&coverage)?;
+    anyhow::ensure!(
+        encoded.len() <= MAX_COVERAGE_BYTES + 2,
+        "{} B",
+        encoded.len()
+    );
+    let decoded: decdn_protocol::Coverage = postcard::from_bytes(&encoded)?;
+    let ext = decdn_protocol::client::StreamResponseExt::served(
+        decdn_protocol::SizeProof::new(size, Vec::new())?,
+        None,
+        decoded,
+    );
+    let body = decdn_protocol::client::StreamResponseBody {
+        hash: [7; 32],
+        ok: true,
+        rate_per_mb: 1,
+        timestamp_us: 0,
+    };
+    anyhow::ensure!(ext.consistent_with(&body, 0, 0));
+    anyhow::ensure!(ext.consistent_with(&body, size - 1, 0));
+    anyhow::ensure!(
+        super::fill::full_coverage(1) == decdn_protocol::Coverage::full(1),
+        "a small blob covers its one block"
+    );
+    Ok(())
 }

@@ -30,7 +30,7 @@ fn an_unreached_mark_is_absent() {
 
     let s = timings.snapshot();
     assert_eq!(s.endpoint, Some(3));
-    assert_eq!(s.probe_start, None);
+    assert_eq!(s.discovery_start, None);
     assert_eq!(s.lane, None);
     assert_eq!(s.first_byte, None);
 }

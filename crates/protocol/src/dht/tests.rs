@@ -588,7 +588,7 @@ fn a_refusal_attests_nothing() {
 fn dht_message_trailing_bytes_tolerated() -> Result<(), postcard::Error> {
     // ADR 013 Tier-1: extension bytes after the message are silently
     // tolerated by `take_from_bytes`. Confirms the DHT enum behaves the
-    // same as ProbeMessage under unknown-extension data.
+    // same as ClientMessage under unknown-extension data.
     let msg = DhtMessage::FindValue(sample_find_value_request());
     let mut bytes = postcard::to_allocvec(&msg)?;
     bytes.extend_from_slice(&[0xAAu8, 0xBB, 0xCC]);

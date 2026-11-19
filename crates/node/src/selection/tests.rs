@@ -2,8 +2,10 @@ use super::*;
 use rand::SeedableRng;
 
 #[test]
-fn probe_timeout_matches_the_adr_collection_ceiling() {
-    assert_eq!(PROBE_TIMEOUT, Duration::from_secs(1));
+fn open_ceiling_is_two_open_timeouts_and_the_path_grace() {
+    assert_eq!(OPEN_TIMEOUT, Duration::from_secs(1));
+    assert_eq!(OPEN_PATH_GRACE, Duration::from_millis(500));
+    assert_eq!(OPEN_CEILING, Duration::from_millis(2_500));
 }
 
 // #859 regression guard: the derived outer pull-through deadline must strictly
@@ -44,10 +46,10 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
 }
 
 // There is deliberately NO unit test here asserting that the slack covers the
-// `discover → probe → rank` overhead it is named for (#1145 review).
+// `discover → open → rank` overhead it is named for (#1145 review).
 //
 // `PULL_THROUGH_OUTER_SLACK` is DEFINED as
-// `PROBE_TIMEOUT + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so a test that recomputes
+// `OPEN_CEILING + DEFAULT_ROUND_TIMEOUT × MAX_LOOKUP_ROUNDS`, so a test that recomputes
 // that expression and asserts the slack is at least as big asserts `A >= A`. It
 // would pass with any value of any of the three constants — which is precisely the sin
 // its own doc comment accused its predecessor of ("proves only that the slack is
@@ -66,7 +68,7 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
 // `node_pull_stall_window_sec = 20` (both `DEFAULT_*` in decdn-common, which this
 // crate does not depend on — hence the literals). Pinned because the worst-case client
 // wait is a user-visible number RESTATED IN PROSE elsewhere. At defaults:
-// (5 + 20 + 20) × 3 + (1 + 4 × 8) = 168 s, where the slack is one `PROBE_TIMEOUT` plus
+// (5 + 20 + 20) × 3 + (2.5 + 4 × 8) = 169.5 s, where the slack is one `OPEN_CEILING` plus
 // `MAX_LOOKUP_ROUNDS` rounds of `DEFAULT_ROUND_TIMEOUT` (#1145 review).
 //
 // The sites that restate it, so the next person to move it can find them all — this list
@@ -76,13 +78,14 @@ fn outer_pull_deadline_exceeds_what_every_candidate_can_actually_cost() {
 //
 //   - `common::config` (the `node_pull_timeout_sec` / `node_pull_stall_window_sec` docs)
 //   - `cli::commands::config` (the DEFAULT_CONFIG template)
+//   - `.config/nextest.toml` (the per-test cap's comment)
 #[test]
-fn outer_pull_deadline_at_defaults_is_168s() {
+fn outer_pull_deadline_at_defaults_is_169_5s() {
     let outer = outer_pull_deadline(Duration::from_secs(20), Duration::from_secs(20));
     assert_eq!(
         outer,
-        Duration::from_secs(168),
-        "(5s + 20s + 20s) × 3 + (1s + 4 × 8s)"
+        Duration::from_millis(169_500),
+        "(5s + 20s + 20s) × 3 + (2.5s + 4 × 8s)"
     );
 }
 
@@ -266,14 +269,14 @@ fn with_coverage(mut c: Candidate, coverage: Coverage) -> Candidate {
 }
 
 /// #1506: `rank_candidates` must carry each candidate's fresh
-/// probe-confirmed coverage through unchanged — ranking reorders on
+/// open-confirmed coverage through unchanged — ranking reorders on
 /// score alone, but the caller downstream (the ranged-drive loop)
 /// needs to read which blocks each ranked candidate holds.
 /// Two providers with disjoint single-block coverage ({block0} vs
 /// {block1}) pin that the field rides alongside the candidate rather
 /// than being dropped or averaged during ranking.
 #[test]
-fn rank_candidates_carries_each_candidates_fresh_probe_coverage() {
+fn rank_candidates_carries_each_candidates_fresh_open_coverage() {
     let block0 = Coverage::from_block_indices(2, [0].into_iter());
     let block1 = Coverage::from_block_indices(2, [1].into_iter());
     // Distinct scores so ordering is deterministic without the tie-breaker.
@@ -444,7 +447,7 @@ fn zero_score_beats_positive_score() {
 
 #[test]
 fn sub_millisecond_rtt_keeps_the_price_signal() {
-    // Both probes truncate to 0 ms. The cheaper peer must win every time,
+    // Both RTTs truncate to 0 ms. The cheaper peer must win every time,
     // not by the tier-3 coin flip.
     for _ in 0..64 {
         let dear = make_candidate(1, 10, 0, 0.5);
@@ -456,7 +459,7 @@ fn sub_millisecond_rtt_keeps_the_price_signal() {
 
 #[test]
 fn sub_millisecond_rtt_does_not_outrank_a_cheaper_peer() {
-    // 0 ms (a sub-ms probe) scores as 1 ms: 10 × 1 = 10 vs 5 × 1 = 5.
+    // 0 ms (a sub-ms RTT) scores as 1 ms: 10 × 1 = 10 vs 5 × 1 = 5.
     let dear_fast = make_candidate(1, 10, 0, 0.5);
     let cheap = make_candidate(2, 5, 1, 0.5);
     let out = rank_candidates(vec![dear_fast, cheap]);

@@ -36,10 +36,8 @@ pub type DhtRejectLayer = RejectLayer;
 /// `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|global)_total"}[1m]))`.
 ///
 /// **This is a choice, not a backend limitation** — `iroh_metrics` supports
-/// per-field labels: `DecdnMetrics::probe_hold_unavailable` and
-/// `DecdnMetrics::streams_active` are both `Family<L, M>` (private fields; see
-/// [`crate::metrics::Metrics::probe_hold_unavailable`] for the accessor that
-/// uses one). Each layer here has an unrelated remedy (one abusive peer,
+/// per-field labels: `DecdnMetrics::streams_active` is a `Family<L, M>`
+/// (a private field). Each layer here has an unrelated remedy (one abusive peer,
 /// aggregate load), so no alert spans the family and a shared label would buy
 /// nothing.
 struct DhtRateLimitMetrics(Arc<Metrics>);
@@ -81,10 +79,8 @@ impl DhtRateLimiter {
     /// Prefer this over [`Self::new`] at wiring sites: `DhtRateLimitConfig` is
     /// an alias of the shared [`RateLimitConfig`], so `new` cannot tell a config
     /// mapped from `[dht.rate_limit]` from one mapped out of
-    /// `[probe.rate_limit]`. Taking `&ResolvedDht` makes the wrong pairing a
-    /// type error (#1457); see
-    /// [`crate::handlers::probe_rate_limit::ProbeRateLimiter::from_resolved`]
-    /// for the direction that actually loosens a cap.
+    /// `[serve.rate_limit]`. Taking `&ResolvedDht` makes the wrong pairing a
+    /// type error (#1457).
     #[must_use]
     pub fn from_resolved(
         resolved: &decdn_common::config::ResolvedDht,

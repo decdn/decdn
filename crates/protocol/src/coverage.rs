@@ -59,6 +59,19 @@ pub const MAX_COVERAGE_BYTES: usize = MAX_DISCOVERABLE_BLOB_BYTES
     .div_ceil(DISCOVERY_BLOCK_BYTES)
     .div_ceil(8) as usize;
 
+/// The most discovery blocks a [`Coverage`] names on the wire: the
+/// [`MAX_COVERAGE_BYTES`] bitmap at 8 blocks per byte, 1,600 blocks.
+///
+/// A blob with more blocks (past [`MAX_DISCOVERABLE_BLOB_BYTES`] at the fixed
+/// 64 MiB block) can still be served. Its coverage on the wire names only
+/// this prefix of its blocks ([`Coverage::for_wire`]), and a receiver reads
+/// a block at or past this index as unknown, never as absent.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_COVERAGE_BYTES is 200, so 1,600 blocks fit in u32"
+)]
+pub const MAX_COVERAGE_BLOCKS: u32 = (MAX_COVERAGE_BYTES * 8) as u32;
+
 /// The active discovery-block size in bytes.
 ///
 /// Production reads the fixed [`DISCOVERY_BLOCK_BYTES`] constant — this
@@ -114,6 +127,28 @@ pub fn num_blocks(total_bytes: u64) -> u32 {
     saturate_blocks(total_bytes.div_ceil(discovery_block_bytes()))
 }
 
+/// The discovery blocks that the byte range `[start, end)` touches, as a
+/// half-open range of block indices at [`discovery_block_bytes`]. Empty when
+/// `end <= start`.
+///
+/// The indices are `u64`, so a range near `u64::MAX` does not saturate: a
+/// caller that builds a [`Coverage`] from them converts each index itself.
+#[must_use]
+#[cfg_attr(
+    not(feature = "test-support"),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "`discovery_block_bytes` is not const under `test-support`"
+    )
+)]
+pub fn byte_range_blocks(start: u64, end: u64) -> std::ops::Range<u64> {
+    if end <= start {
+        return 0..0;
+    }
+    let block = discovery_block_bytes();
+    (start / block)..(end - 1) / block + 1
+}
+
 /// The overridable discovery-block size, compiled only under `test-support`.
 #[cfg(feature = "test-support")]
 mod test_block_size;
@@ -123,7 +158,7 @@ mod test_block_size;
 ///
 /// While the guard is held, [`discovery_block_bytes`] and [`num_blocks`] report
 /// `bytes` instead of [`DISCOVERY_BLOCK_BYTES`], so the block-spanning planner
-/// (`decdn_client::plan_covered_runs`) and the node's coverage-union probe
+/// (`decdn_client::plan_covered_runs`) and the node's coverage-union
 /// gather split a tiny blob into several blocks. Dropping the guard restores the
 /// production default.
 ///
@@ -235,6 +270,18 @@ impl Coverage {
         Self { blocks }
     }
 
+    /// The coverage a sender puts on the wire for a blob of `num_blocks`
+    /// blocks with the indices from `set` covered: [`Self::from_block_indices`]
+    /// cut at [`MAX_COVERAGE_BLOCKS`], so a receiver always decodes it.
+    ///
+    /// A blob past [`MAX_DISCOVERABLE_BLOB_BYTES`] loses its blocks past the
+    /// bound from the bitmap. The receiver reads those blocks as unknown
+    /// ([`MAX_COVERAGE_BLOCKS`]).
+    #[must_use]
+    pub fn for_wire(num_blocks: u32, set: impl Iterator<Item = u32>) -> Self {
+        Self::from_block_indices(num_blocks.min(MAX_COVERAGE_BLOCKS), set)
+    }
+
     /// Is `block` covered?
     #[must_use]
     pub fn covers(&self, block: u32) -> bool {
@@ -243,6 +290,23 @@ impl Coverage {
         self.blocks
             .get(byte_idx)
             .is_some_and(|b| (b >> bit) & 1 == 1)
+    }
+
+    /// Does this bitmap cover every discovery block that the byte range
+    /// `[start, end)` touches ([`byte_range_blocks`])?
+    ///
+    /// An empty range touches no block, so no bitmap covers it. A block past
+    /// the end of the bitmap is not covered. The walk checks that bound first,
+    /// so it reads at most the bitmap's own bits, whatever the range.
+    #[must_use]
+    pub fn covers_byte_range(&self, start: u64, end: u64) -> bool {
+        let mut blocks = byte_range_blocks(start, end);
+        let capacity = u64::try_from(self.blocks.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8);
+        !blocks.is_empty()
+            && blocks.end <= capacity
+            && blocks.all(|block| u32::try_from(block).is_ok_and(|block| self.covers(block)))
     }
 
     /// No block is covered — every byte of the bitmap is zero.

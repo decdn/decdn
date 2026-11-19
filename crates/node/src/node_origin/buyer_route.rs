@@ -36,8 +36,8 @@ impl BuyerPool {
         self.deployment
     }
 
-    /// Whether an upstream whose probe answer gave the `payment_pools` `hint`
-    /// is paid through the buyer pool.
+    /// Whether an upstream whose discovery answer gave the `payment_pools`
+    /// `hint` is paid through the buyer pool.
     #[must_use]
     pub fn pays(&self, hint: Option<&[PoolAccount]>) -> bool {
         self.route.choose(hint) == Some(self.deployment)

@@ -339,8 +339,8 @@ pub struct CacheMetrics {
     /// causes, both operator-actionable but with *different* remedies:
     ///
     /// - [`crate::CacheEngine::eviction_candidates`] returned empty. That set is
-    ///   filtered on pinned + probe-held, so the remedy is to raise
-    ///   `cache.cache_size_mb`, lower `max_probe_holds`, or trim the pinned set.
+    ///   filtered on pinned + in-use, so the remedy is to raise
+    ///   `cache.cache_size_mb` or trim the pinned set.
     ///   The set is also short when the open-time store walk failed
     ///   ([`Self::recency_seed_failures`]): blobs from before the restart are
     ///   not candidates until accessed. There the remedy is to restart once the

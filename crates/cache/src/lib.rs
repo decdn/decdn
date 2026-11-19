@@ -4,7 +4,7 @@
 //!
 //! [`CacheEngine`] owns the store. On a cache miss it pulls from a configured
 //! [`Origin`] and verifies the bytes against their BLAKE3 hash before it
-//! stores or returns them. Pinned blobs, probe holds, and the deny-sets are
+//! stores or returns them. Pinned blobs, in-use holds, and the deny-sets are
 //! enforced by the engine itself, whatever policy is plugged in.
 //!
 //! # Entry points
@@ -55,7 +55,6 @@ pub mod origin_probe;
 pub mod origin_range;
 mod outboard_cache;
 pub mod policy;
-pub mod probe_hold;
 pub mod range_pull;
 pub mod ranged_store;
 pub mod retry;
@@ -104,9 +103,6 @@ pub use policy::{
     AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionContext,
     EvictionPlan, EvictionPolicy, FrequencyEstimator, LruEviction, Segment,
 };
-pub use probe_hold::{
-    PROBE_HOLD_DURATION, PROBE_HOLD_MARGIN, PROBE_SLASH_WINDOW, ProbeHoldOutcome,
-};
 pub use ranged_store::NodeRangedStore;
 pub use serve_store::{EncodeStream, PresentRangeWatch, ServeStore};
 
@@ -122,9 +118,8 @@ pub use serve_store::{EncodeStream, PresentRangeWatch, ServeStore};
 /// the iroh-blobs store hash — see the `hash_bridge` conversions.
 pub use decdn_config_types::Hash as LeafHash;
 pub use decdn_config_types::{
-    Bytes, CircuitBreakerPolicy, DEFAULT_MAX_PROBE_HOLDS, DEFAULT_USER_AGENT, DecompressMode,
-    DeniedHashes, HashParseError, OriginKind, OriginUrl, PinDiff, PinnedHashes, RetryPolicy,
-    parse_origin_url, redact_for_log,
+    Bytes, CircuitBreakerPolicy, DEFAULT_USER_AGENT, DecompressMode, DeniedHashes, HashParseError,
+    OriginKind, OriginUrl, PinDiff, PinnedHashes, RetryPolicy, parse_origin_url, redact_for_log,
 };
 
 /// Convert a config-vocabulary [`decdn_config_types::Hash`] into the

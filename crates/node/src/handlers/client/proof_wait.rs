@@ -18,6 +18,14 @@
 //! reading while the connection carries other traffic can hold its wait until
 //! the ceiling.
 //!
+//! The first proof of a stream that has not passed funding admission does not
+//! wait that way ([`await_first_proof`]). Its wait is a fixed
+//! [`VOUCHER_READ_TIMEOUT`] from the answer, and no transport progress extends
+//! it. Before that proof the node has sent the stream nothing but its answer,
+//! so progress on the connection is traffic of other streams. Otherwise cheap
+//! opens on sibling streams could hold an unpaid stream, and the blob it pins,
+//! open until the ceiling.
+//!
 //! The ceiling is per owed chunk, not per proof. A chunk can take up to
 //! `MAX_PROOFS_PER_CHUNK` proofs, and [`ChunkProofs`] counts them and holds
 //! one deadline for all of them: [`PROOF_WAIT_CEILING`] after the chunk's
@@ -257,6 +265,42 @@ async fn wait_for_proof<T>(
         ),
     };
     Err(ProofWaitFault { kind, detail }.into_error())
+}
+
+/// Wait for `read`, the first proof of a stream that has not passed funding
+/// admission, on `conn`: at most [`VOUCHER_READ_TIMEOUT`] from now, whatever
+/// the connection sends meanwhile (see the module docs).
+///
+/// # Errors
+///
+/// The error of `read`, or a [`PeerFault`](super::wire::PeerFault) with a
+/// [`ProofWaitFault`] when the deadline passes.
+pub(super) async fn await_first_proof<T>(
+    read: impl Future<Output = anyhow::Result<T>>,
+    conn: &Connection,
+) -> anyhow::Result<T> {
+    wait_for_first_proof(read, || describe_path(conn)).await
+}
+
+/// The body of [`await_first_proof`], with the connection reduced to its path
+/// report (`path`).
+async fn wait_for_first_proof<T>(
+    read: impl Future<Output = anyhow::Result<T>>,
+    path: impl Fn() -> String,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(VOUCHER_READ_TIMEOUT, read)
+        .await
+        .unwrap_or_else(|_| {
+            Err(ProofWaitFault {
+                kind: ProofWaitKind::Stalled,
+                detail: format!(
+                    "no first proof within {VOUCHER_READ_TIMEOUT:.1?} of the answer; traffic on \
+                     other streams does not extend this wait ({})",
+                    path()
+                ),
+            }
+            .into_error())
+        })
 }
 
 /// The count of STREAM frames `conn` has sent, over all its paths.

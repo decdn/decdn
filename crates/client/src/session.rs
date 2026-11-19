@@ -20,11 +20,11 @@ pub struct GovernanceChain {
     /// The JSON-RPC endpoint of the governance chain: every registry read
     /// goes through it.
     pub rpc_url: String,
-    /// The governance chain id. The `SlashJudge` domain (probe answers and
-    /// stream responses) and the `CapacityBond` domain (the client identity
+    /// The governance chain id. The `SlashJudge` domain (discovery answers
+    /// and stream responses) and the `CapacityBond` domain (the client identity
     /// binding) are built for it.
     pub chain_id: u64,
-    /// The `SlashJudge` whose domain every probe answer and stream response
+    /// The `SlashJudge` whose domain every discovery answer and stream response
     /// verifies against.
     pub slash_judge: Address,
     /// The `CapacityBond` registry discovery reads, and the domain of the
@@ -129,7 +129,7 @@ pub struct PullSite {
     /// The client's region, for region-first discovery ordering. `None` skips
     /// the ordering.
     pub region: Option<String>,
-    /// The regions a fetch's discovery may probe. Empty allows every region.
+    /// The regions a fetch's discovery may open. Empty allows every region.
     /// It narrows the candidates and never ranks them, and widens back to
     /// every region when too few candidates remain. A bundle pull applies it
     /// to each entry's sample of the run's registry list, with the same
@@ -232,8 +232,8 @@ pub struct PinnedNode {
 pub struct DiscoveryOptions {
     /// The one node to fetch from. `None` discovers the holders.
     pub pinned: Option<PinnedNode>,
-    /// Read the registry and probe, even when the peer store holds a fresh
-    /// candidate set.
+    /// Read the registry and run a discovery round, even when the peer store
+    /// holds a fresh candidate set.
     pub rediscover: bool,
     /// How many holders one fetch stripes across at once.
     pub max_sources: usize,
@@ -264,11 +264,11 @@ impl Default for DiscoveryOptions {
 /// reached; the caller keeps the first.
 #[doc(hidden)]
 pub trait FetchMarks: Send + Sync {
-    /// Discovery starts a probe round.
-    fn probe_started(&self);
+    /// Discovery starts a round of opens.
+    fn discovery_started(&self);
     /// A lane's pool is open or reused, and its source is ready.
     fn lane_built(&self);
-    /// A holder joined the running fetch from a probe that answered late.
+    /// A holder joined the running fetch from an answer that arrived late.
     fn holder_joined(&self);
 }
 

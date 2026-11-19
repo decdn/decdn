@@ -91,7 +91,7 @@ fn a_refused_flooder_leaves_the_global_budget_to_other_peers() {
 fn rejection_increments_layer_metric_in_scrape() {
     // One unlabeled Counter per layer — the sibling-counter convention
     // settled in #1475, not a backend limitation (`iroh_metrics` does support
-    // labels via `Family<L, M>`; `probe_hold_unavailable` uses one).
+    // labels via `Family<L, M>`; `streams_active` uses one).
     // Operators recover the rolled-up rate with
     // `sum(rate({__name__=~"decdn_dht_rate_limit_rejected_(per_peer|global)_total"}[1m]))`.
     let metrics = metrics();

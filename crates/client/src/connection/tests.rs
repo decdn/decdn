@@ -342,7 +342,7 @@ async fn a_leg_that_times_out_unpins_its_connection() {
         Address::repeat_byte(0xB0),
         [0u8; 32],
         0,
-        0,
+        crate::RateCeiling::new(0),
         crate::PullDeadlines::new(Duration::from_millis(500), Duration::from_secs(5), 0)
             .expect("deadlines"),
         Some(connections.clone()),
@@ -562,7 +562,7 @@ fn pooled_source<'a>(
         Address::repeat_byte(0xB0),
         [0u8; 32],
         0,
-        0,
+        crate::RateCeiling::new(0),
         crate::PullDeadlines::new(Duration::from_millis(500), Duration::from_secs(5), 0)
             .expect("deadlines"),
         Some(connections.clone()),

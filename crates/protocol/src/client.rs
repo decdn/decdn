@@ -14,9 +14,8 @@
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
 //!     signed body fields `{hash, ok, rate_per_mb, timestamp_us}` (ADR 014
-//!     §1), produced by the stream-response slash signer in `decdn_incentive`
-//!     (analogous to its `ProbeSlashData`). The outcome (the size proof or
-//!     the refusal class) is unsigned.
+//!     §1), produced by the stream-response slash signer in `decdn_incentive`.
+//!     The outcome (the size proof or the refusal class) is unsigned.
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
 //!     carries `{signature, amount}` and the receiver reconstructs the full typed
 //!     data `{poolId, signer, provider, amount, bytesDelivered}` from stream
@@ -37,7 +36,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::message::{MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
+use crate::message::{EMPTY_ROOT, MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
 
 /// One megabyte in bytes (ADR 003: 1 MB = 1,048,576 bytes, exactly). The unit
 /// of `rate_per_mb` and, by the identity below, of [`CHUNK_BYTES`].
@@ -71,7 +70,7 @@ pub const MAX_CHAIN_LENGTH: u8 = 255;
 /// The node reads a [`StreamRequest`] and every later payment proof against it.
 /// The largest legitimate message is a [`StreamRequest`] with a
 /// [`crate::MAX_POOL_ACCOUNT_LEN`]-byte pool account, a client binding and a
-/// capability: 473 bytes, since every signature on the wire is a 65-byte EOA
+/// capability: 474 bytes, since every signature on the wire is a 65-byte EOA
 /// signature. The ceiling leaves headroom for Tier-1 extension fields and
 /// refuses a larger frame before the reader buffers it. It is also the wire
 /// bound on `owner_signature`, which decode checks only for being non-empty.
@@ -83,9 +82,9 @@ pub const MAX_CLIENT_CONTROL_FRAME: u32 = 4 * 1024;
 /// (ADR 013 § Wire Framing).
 ///
 /// The largest legitimate response carries a full [`crate::MAX_SIZE_PROOF_BYTES`]
-/// size proof and an origin attestation: 4,693 bytes. A `Declined` refusal
-/// that carries [`crate::MAX_PAYMENT_POOLS`] full-width payment pools is
-/// 1,493 bytes. The
+/// size proof, an origin attestation, a
+/// [`crate::coverage::MAX_COVERAGE_BYTES`] coverage bitmap and
+/// [`crate::MAX_PAYMENT_POOLS`] full-width payment pools: 6,272 bytes. The
 /// ceiling leaves headroom for Tier-1 extension fields and refuses a larger
 /// frame before the reader buffers it. The node reads no response, so this
 /// ceiling adds nothing to the node's reader buffers. The
@@ -149,9 +148,16 @@ pub enum ClientMessage {
     /// discriminant 5 — node → payer: the node delivered the whole requested
     /// range, holds payment for every byte of it, and ends the stream.
     StreamEnd,
-    /// discriminant 6 — node → payer, mid-stream failure (carries
-    /// [`StreamError::VoucherRejected`]); delivery-side errors instead ride in
-    /// [`StreamResponseExt::error`].
+    /// discriminant 6 — node → payer, a failure after the
+    /// [`Self::StreamResponse`]. It carries [`StreamError::VoucherRejected`]
+    /// when the node refuses a payment proof, or a refusal class
+    /// ([`StreamError::NotFound`], [`StreamError::Declined`],
+    /// [`StreamError::Unfunded`]) when the node stops serving. A refusal class
+    /// may arrive before the first [`Self::ChunkData`]: a node that answers
+    /// `ok: true` and then refuses admission at the first payment proof
+    /// writes it there. The payer treats it as the same refusal that a signed
+    /// `ok: false` answer states, without the signature. A refusal at open
+    /// rides in [`StreamResponseExt::error`] instead.
     StreamError(StreamError),
 }
 
@@ -213,9 +219,9 @@ impl ClientMessage {
 ///
 /// `timestamp_us` is a requester-generated microsecond timestamp echoed back in
 /// [`StreamResponseBody::timestamp_us`]; it both correlates the response and
-/// drives rate-manipulation slashing (ADR 005, ADR 014). `byte_offset` supports
-/// seek/resume on failover — the requester reconnects to another node and
-/// resumes from the last BLAKE3-verified byte.
+/// dates the signed evidence of blacklist-violation slashing (ADR 005,
+/// ADR 014). `byte_offset` supports seek/resume on failover — the requester
+/// reconnects to another node and resumes from the last BLAKE3-verified byte.
 ///
 /// This struct holds **only the frozen base fields** (ADR 013 §Tier 1). The
 /// optional [`StreamRequestExt`] is carried as **separate trailing bytes** after
@@ -271,6 +277,15 @@ pub struct StreamRequest {
     pub timestamp_us: u64,
 }
 
+/// The most streams on one `cdn/client/v1` connection that have not passed
+/// funding admission (ADR 005 § Open-stream pin). A node counts a stream from
+/// its accept until its admission: at its funding gates for a miss that pulls
+/// through, else at the payer's first voucher. It resets every stream past the
+/// cap with `RATE_LIMITED`. A requester holds at most this many streams on one
+/// node's connection until each has sent its first voucher, so its own opens
+/// never reach the reset.
+pub const MAX_UNADMITTED_STREAMS_PER_CONNECTION: usize = 10;
+
 /// The reserved "no namespace" [`StreamRequest::namespace_id`] value (all-zero
 /// big-endian `uint256`): content published without a namespace, served
 /// best-effort from cache / DHT with no authorized origins (ADR 002 §Namespace 0).
@@ -294,6 +309,11 @@ pub struct StreamRequestExt {
     /// signer registered (or the client is relying on a capability it sent on
     /// an earlier stream to a different node this session).
     pub capability: Option<WireCapability>,
+    /// When true, a node that does not hold the requested span may run its
+    /// miss path (discovery, upstream handshake, origin fill) before it
+    /// answers. When false, a miss answers at once with a signed refusal and
+    /// no upstream work.
+    pub pull_through: bool,
 }
 
 /// Off-chain ephemeral client identity binding (ADR 003 §Off-Chain Ephemeral
@@ -428,7 +448,7 @@ pub fn encode_stream_request(
 /// [`crate::decode_message`] after a `ClientMessage::StreamRequest`.
 ///
 /// An empty remainder ⇒ [`StreamRequestExt::default`] (no client binding, no
-/// capability). Trailing bytes beyond the known fields are tolerated for
+/// capability, no pull-through). Trailing bytes beyond the known fields are tolerated for
 /// forward compatibility (ADR 013 §Tier 1): a future optional field appended to
 /// [`StreamRequestExt`] is read by new receivers and skipped by old ones.
 ///
@@ -459,9 +479,8 @@ pub struct StreamResponse {
     /// Signed body. Its wire layout is frozen per ADR 013.
     pub body: StreamResponseBody,
     /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1;
-    /// produced by the `decdn_incentive` stream slash signer, analogous to its
-    /// `ProbeSlashData`). Always exactly [`SLASH_SIG_LEN`] bytes — *not* a
-    /// signature over postcard bytes.
+    /// produced by the `decdn_incentive` stream slash signer). Always exactly
+    /// [`SLASH_SIG_LEN`] bytes — *not* a signature over postcard bytes.
     pub slash_sig: Vec<u8>,
 }
 
@@ -484,13 +503,20 @@ pub struct StreamResponseExt {
     /// because its own `StreamResponse` is the attestation. A client ignores
     /// it; a relay verifies it before keeping it.
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
+    /// Which 64 MiB discovery blocks ([`crate::coverage`]) the node holds or
+    /// can serve. Unsigned: a hint, never a commitment, and nothing may let it
+    /// decide a payment or a slash. A receiver checks it against the signed
+    /// body and the requested span with [`StreamResponseExt::consistent_with`]
+    /// and drops a response where they disagree.
+    pub coverage: crate::Coverage,
     /// The `PaymentPool` contracts the node accepts (ADR 005 § Payment pool
-    /// routing). The node sets it only on the [`StreamError::Declined`]
-    /// refusal of a `payment_pool` it does not accept, and
-    /// [`StreamResponseExt::validate`] refuses it on any other response. A
-    /// receiver keeps at most the first [`crate::MAX_PAYMENT_POOLS`]
-    /// entries. It is a hint: a requester retries this node once on a
-    /// listed contract where it holds a funded pool.
+    /// routing). The node sets it on every answer, served or refused, so a
+    /// discovery open learns where the node is paid. A receiver keeps at most
+    /// the first [`crate::MAX_PAYMENT_POOLS`] entries. It is a hint: a
+    /// requester routes the node to a listed contract where it holds a funded
+    /// pool, and retries a node that refuses the request's `payment_pool` as
+    /// [`StreamError::Declined`] once on a listed contract. A wrong hint costs
+    /// one more refusal. `None` means the node named no contract.
     #[serde(deserialize_with = "crate::pool_account::deserialize_payment_pools")]
     pub payment_pools: Option<Vec<crate::PoolAccount>>,
 }
@@ -520,25 +546,31 @@ impl Default for StreamOutcome {
 }
 
 impl StreamResponseExt {
-    /// A served answer: the blob's size and its proof.
+    /// A served answer: the blob's size and its proof, with the blocks the
+    /// node serves. `coverage` covers every block of the requested span, or
+    /// the receiver drops the answer ([`Self::consistent_with`]).
     #[must_use]
     pub const fn served(
         size_proof: crate::SizeProof,
         origin_attestation: Option<crate::dht::OriginAttestation>,
+        coverage: crate::Coverage,
     ) -> Self {
         Self {
             outcome: StreamOutcome::Served(size_proof),
             origin_attestation,
+            coverage,
             payment_pools: None,
         }
     }
 
-    /// A refusal with `error`.
+    /// A refusal with `error`. `coverage` is empty, or a hint of blocks the
+    /// node holds that does not cover the requested span.
     #[must_use]
-    pub const fn refused(error: StreamError) -> Self {
+    pub const fn refused(error: StreamError, coverage: crate::Coverage) -> Self {
         Self {
             outcome: StreamOutcome::Refused(error),
             origin_attestation: None,
+            coverage,
             payment_pools: None,
         }
     }
@@ -547,13 +579,95 @@ impl StreamResponseExt {
     /// not accept, carrying the pools it does accept (ADR 005 § Payment pool
     /// routing). Keeps the first [`crate::MAX_PAYMENT_POOLS`] entries.
     #[must_use]
-    pub fn pool_declined(mut payment_pools: Vec<crate::PoolAccount>) -> Self {
+    pub fn pool_declined(payment_pools: Vec<crate::PoolAccount>) -> Self {
+        Self::refused(StreamError::Declined, crate::Coverage::empty())
+            .with_payment_pools(payment_pools)
+    }
+
+    /// This answer with `payment_pools` as the contracts the node accepts.
+    /// Keeps the first [`crate::MAX_PAYMENT_POOLS`] entries.
+    #[must_use]
+    pub fn with_payment_pools(mut self, mut payment_pools: Vec<crate::PoolAccount>) -> Self {
         payment_pools.truncate(crate::MAX_PAYMENT_POOLS);
-        Self {
-            outcome: StreamOutcome::Refused(StreamError::Declined),
-            origin_attestation: None,
-            payment_pools: Some(payment_pools),
+        self.payment_pools = Some(payment_pools);
+        self
+    }
+
+    /// Whether this answer refuses the request's `payment_pool` itself: a
+    /// [`StreamError::Declined`] whose `payment_pools` does not list
+    /// `requested`. A `Declined` that lists it, or one with no list, refuses
+    /// the blob or the span instead.
+    #[must_use]
+    pub fn declines_pool(&self, requested: &crate::PoolAccount) -> bool {
+        matches!(self.error(), Some(StreamError::Declined))
+            && self
+                .payment_pools
+                .as_ref()
+                .is_some_and(|pools| !pools.contains(requested))
+    }
+
+    /// Does this ext's `coverage` agree with the signed `body`, for a request
+    /// of the span `[byte_offset, byte_offset + byte_len)` (`byte_len == 0`
+    /// is to the end of the blob)?
+    ///
+    /// - `body.ok == true`: the coverage covers every discovery block the span
+    ///   touches. The served size proof bounds the span: a span to the end
+    ///   ends at the proven size, and a span past the end is cut at it. A span
+    ///   with no byte of the blob is covered by no coverage.
+    /// - `body.ok == false`: the coverage does not cover the span. An empty
+    ///   coverage always passes, and so does a hint of blocks outside the
+    ///   span. A refusal states no size, so a span to the end has no known
+    ///   end, and no coverage covers it.
+    ///
+    /// The coverage names at most [`crate::coverage::MAX_COVERAGE_BLOCKS`]
+    /// blocks ([`crate::Coverage::for_wire`]). The rule judges only the part
+    /// of the span inside that bound: a span wholly past it agrees with any
+    /// coverage, so a node serves a blob past
+    /// [`crate::coverage::MAX_DISCOVERABLE_BLOB_BYTES`] at any offset.
+    ///
+    /// The empty blob ([`EMPTY_ROOT`]) spans zero blocks, so its coverage is
+    /// empty on a holder and a non-holder alike. For that hash the coverage
+    /// must be empty, and `body.ok` alone says whether the node serves it. The
+    /// rule keys on `body.hash`, which the signature covers.
+    ///
+    /// The coverage is not in the signed set, so a mismatch has no
+    /// attributable author: a receiver finding `false` here treats the
+    /// response as a fault of the node, as it does a size proof that does not
+    /// verify. Call it after [`Self::validate`], which ties the outcome to
+    /// `body.ok`.
+    #[must_use]
+    pub fn consistent_with(
+        &self,
+        body: &StreamResponseBody,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> bool {
+        if body.hash == EMPTY_ROOT {
+            return self.coverage.is_empty();
         }
+        let proven_size = self.size_proof().map(crate::SizeProof::size);
+        let end = if byte_len == 0 {
+            proven_size
+        } else {
+            let end = byte_offset.saturating_add(byte_len);
+            Some(proven_size.map_or(end, |size| end.min(size)))
+        };
+        let Some(end) = end else {
+            return !body.ok;
+        };
+        // A wire coverage names only the blocks below `MAX_COVERAGE_BLOCKS`
+        // (`Coverage::for_wire`). The rule judges the part of the span inside
+        // that bound, and a span wholly past it is unknown, so any coverage
+        // agrees with it.
+        let wire_end = u64::from(crate::coverage::MAX_COVERAGE_BLOCKS)
+            .saturating_mul(crate::discovery_block_bytes());
+        if byte_offset < end && byte_offset >= wire_end {
+            return true;
+        }
+        let covered = self
+            .coverage
+            .covers_byte_range(byte_offset, end.min(wire_end));
+        body.ok == covered
     }
 
     /// The refusal class, when the node refused.
@@ -577,9 +691,7 @@ impl StreamResponseExt {
     /// Check the unsigned half against the signed `ok` flag (ADR 005
     /// §`cdn/client/v1`): `ok == true` ⇒ a served outcome with its size
     /// proof; `ok == false` ⇒ a delivery-side refusal, never the
-    /// mid-stream-only [`StreamError::VoucherRejected`]. `payment_pools`
-    /// rides only on a [`StreamError::Declined`] refusal (ADR 005 § Payment
-    /// pool routing).
+    /// mid-stream-only [`StreamError::VoucherRejected`].
     ///
     /// Separate from parsing so forward-compatible trailing bytes do not couple
     /// to value checks, and separate from [`StreamResponse::validate`] because
@@ -589,19 +701,14 @@ impl StreamResponseExt {
     /// # Errors
     ///
     /// [`MessageValidationError::StreamErrorWithOk`],
-    /// [`MessageValidationError::MissingStreamError`],
-    /// [`MessageValidationError::VoucherRejectedInResponse`], or
-    /// [`MessageValidationError::PaymentPoolsOutsideDeclined`].
+    /// [`MessageValidationError::MissingStreamError`], or
+    /// [`MessageValidationError::VoucherRejectedInResponse`].
     pub const fn validate(&self, ok: bool) -> Result<(), MessageValidationError> {
         match (ok, &self.outcome) {
             (true, StreamOutcome::Refused(_)) => Err(MessageValidationError::StreamErrorWithOk),
             (false, StreamOutcome::Served(_)) => Err(MessageValidationError::MissingStreamError),
             (false, StreamOutcome::Refused(code)) if !code.is_delivery_side() => {
                 Err(MessageValidationError::VoucherRejectedInResponse)
-            }
-            (_, StreamOutcome::Refused(StreamError::Declined)) => Ok(()),
-            _ if self.payment_pools.is_some() => {
-                Err(MessageValidationError::PaymentPoolsOutsideDeclined)
             }
             _ => Ok(()),
         }
@@ -656,8 +763,8 @@ pub fn parse_stream_response_ext(remainder: &[u8]) -> Result<StreamResponseExt, 
 pub struct StreamResponseBody {
     /// BLAKE3 hash this response answers for, echoed from the request.
     pub hash: [u8; 32],
-    /// Whether the node will serve the blob. A node MUST NOT sign `true` unless
-    /// it can deliver within the slashing window.
+    /// Whether the node will serve the blob. A signed `true` commits the node to
+    /// deliver; for a blacklisted hash it is slash evidence (ADR 014).
     pub ok: bool,
     /// Quoted rate in token base units per MB. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "crate::message::deserialize_rate_per_mb")]
@@ -687,8 +794,9 @@ impl StreamResponse {
                 rate: self.body.rate_per_mb,
             });
         }
-        // #252: requesters MUST reject a zero rate on receive — same rule as
-        // ProbeResponse. Shared `RateIsZero` so both paths fail identically.
+        // #252: requesters MUST reject a zero rate on receive. The decode hook
+        // only bounds the upper end; zero is a legitimate `u64` the wire
+        // accepts but a requester must not.
         if self.body.rate_per_mb == 0 {
             return Err(MessageValidationError::RateIsZero);
         }
@@ -1214,10 +1322,12 @@ impl WatermarkBundle {
 
 /// A stream failure code (ADR 005 §Open-time refusal classes).
 ///
-/// `NotFound`, `Declined`, and `Unfunded` are the open-time refusal classes and
-/// ride in [`StreamResponseExt::error`] alongside `ok: false`.
-/// `VoucherRejected` is the only variant delivered mid-stream, inside a
-/// [`ClientMessage::StreamError`]. All codes are unsigned and informational,
+/// `NotFound`, `Declined`, and `Unfunded` are the refusal classes. At open
+/// they ride in [`StreamResponseExt::error`] alongside `ok: false`. After an
+/// `ok: true` answer they ride in a [`ClientMessage::StreamError`], which may
+/// come before the first [`ClientMessage::ChunkData`] (see that variant).
+/// `VoucherRejected` rides only in a [`ClientMessage::StreamError`], never in
+/// the response. All codes are unsigned and informational,
 /// never on-chain evidence. A node keeps its finer refusal reason in its own
 /// per-reason metrics. The wire carries only the class, because a requester
 /// acts on the class alone.

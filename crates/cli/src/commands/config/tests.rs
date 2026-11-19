@@ -25,7 +25,6 @@ fn default_config_template_parses_with_every_section() {
         security,
         load_shed,
         dht,
-        probe,
         serve,
         receipts,
         content,
@@ -33,7 +32,7 @@ fn default_config_template_parses_with_every_section() {
         self_update,
     } = &parsed;
     // Every uncommented line is a section header with no field values —
-    // some nested (`[dht.rate_limit]`, `[probe.rate_limit]`) but each
+    // some nested (`[dht.rate_limit]`, `[serve.rate_limit]`) but each
     // mapping to a top-level section — so every section parses to `Some`
     // with its fields left at their built-in defaults.
     for (section, present) in [
@@ -46,7 +45,6 @@ fn default_config_template_parses_with_every_section() {
         ("security", security.is_some()),
         ("load_shed", load_shed.is_some()),
         ("dht", dht.is_some()),
-        ("probe", probe.is_some()),
         ("serve", serve.is_some()),
         ("receipts", receipts.is_some()),
         ("content", content.is_some()),
@@ -213,11 +211,9 @@ fn default_config_template_covers_every_wired_field() {
         eviction_target_pct,
         eviction_per_sweep_budget,
         eviction_tick_secs,
-        max_probe_holds,
-        stake_lane_reserved_holds,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
-        node_pull_probe_fanout,
+        node_pull_open_fanout,
         node_pull_timeout_sec,
         node_pull_stall_window_sec,
         node_pull_min_throughput_bps,
@@ -267,11 +263,6 @@ fn default_config_template_covers_every_wired_field() {
             eviction_per_sweep_budget.is_none(),
         ),
         ("eviction_tick_secs =", eviction_tick_secs.is_none()),
-        ("max_probe_holds =", max_probe_holds.is_none()),
-        (
-            "stake_lane_reserved_holds =",
-            stake_lane_reserved_holds.is_none(),
-        ),
         (
             "node_to_node_pull_through_enabled =",
             node_to_node_pull_through_enabled.is_none(),
@@ -280,7 +271,7 @@ fn default_config_template_covers_every_wired_field() {
             "relay_foreign_namespaces =",
             relay_foreign_namespaces.is_none(),
         ),
-        ("node_pull_probe_fanout =", node_pull_probe_fanout.is_none()),
+        ("node_pull_open_fanout =", node_pull_open_fanout.is_none()),
         ("node_pull_timeout_sec =", node_pull_timeout_sec.is_none()),
         (
             "node_pull_stall_window_sec =",

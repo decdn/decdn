@@ -226,20 +226,18 @@ fn aligned_wire_len_clamps_when_the_response_total_is_smaller_than_the_requested
     Ok(())
 }
 
-/// `client_binding_ext` maps an unbound context to `None` (so
-/// `encode_stream_request` appends no ext bytes — the base frame
-/// alone) and a bound one to `Some` carrying exactly the binding at the default
-/// voucher cadence. This is the mapping the single request site
-/// (`open_stream`) relies on, so it guards a refactor that would silently
-/// drop the ext (#1115).
+/// `request_ext` carries exactly the context's binding and capability, and
+/// the `pull_through` flag the open asks for. This is the mapping the single request site
+/// (`exchange`) relies on, so it guards a refactor that would silently
+/// drop the binding (#1115) or the `pull_through` flag.
 #[test]
-fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
+fn request_ext_reflects_the_context() -> anyhow::Result<()> {
     use std::sync::Arc;
 
     use alloy::primitives::{Address, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
 
-    use super::{PoolContext, client_binding_ext, sign_client_binding};
+    use super::{PoolContext, request_ext, sign_client_binding};
 
     let signer = PrivateKeySigner::random();
     let domain = decdn_incentive::bind_node_id_domain(1, Address::ZERO);
@@ -254,17 +252,22 @@ fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
         client_binding: None,
         capability: None,
     };
-    // Unbound ⇒ no ext.
+    // Unbound ⇒ no binding and no capability; the flag rides as asked.
+    let ext = request_ext(&ctx, true);
     anyhow::ensure!(
-        client_binding_ext(&ctx).is_none(),
-        "unbound ctx must yield no ext"
+        ext.binding.is_none() && ext.capability.is_none(),
+        "unbound ctx carries no binding"
+    );
+    anyhow::ensure!(ext.pull_through, "a pull asks for the miss path");
+    anyhow::ensure!(
+        !request_ext(&ctx, false).pull_through,
+        "a discovery open does not"
     );
 
     // Bound ⇒ ext carries exactly the binding.
     let binding = sign_client_binding(&signer, B256::repeat_byte(0xAB), &domain)?;
     let ctx = ctx.with_client_binding(binding.clone());
-    let ext =
-        client_binding_ext(&ctx).ok_or_else(|| anyhow::anyhow!("bound ctx must yield an ext"))?;
+    let ext = request_ext(&ctx, true);
     anyhow::ensure!(
         ext.binding == Some(binding),
         "ext must carry the exact binding"
@@ -285,8 +288,7 @@ fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
     }
     .sign(&owner, &domain)?;
     let ctx = ctx.with_capability(capability.clone());
-    let ext = client_binding_ext(&ctx)
-        .ok_or_else(|| anyhow::anyhow!("ctx with capability must yield an ext"))?;
+    let ext = request_ext(&ctx, true);
     let wire_cap = ext
         .capability
         .ok_or_else(|| anyhow::anyhow!("ext must carry the capability"))?;
@@ -307,7 +309,7 @@ fn client_binding_ext_reflects_binding_presence() -> anyhow::Result<()> {
 
 /// Build a test [`PoolContext`] signing with `signer` over the
 /// `(pool_id, provider)` lane, sharing the shape
-/// `client_binding_ext_reflects_binding_presence` already uses.
+/// `request_ext_reflects_the_context` already uses.
 fn resume_test_ctx(
     pool_id: alloy::primitives::B256,
     provider: alloy::primitives::Address,
@@ -1191,13 +1193,13 @@ async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
 ///
 /// This is the seam that makes real daemon output admissible on-chain. The
 /// `slash_sig` here is produced by the same `StreamSlashData` signer the node
-/// uses and covers the same EIP-712 digest `SlashJudge._verifyPair` checks, so
-/// what the assertion actually proves is that the operator's self-incriminating
-/// attestation survives the client's error path intact — byte-for-byte, still
-/// recovering to the signer. Before #1042 `refusal()` took only
-/// `response.error` and dropped the body and signature on the floor, leaving
-/// `SlashJudge`'s rate path reachable only from a test that holds the
-/// operator's key and synthesises its own evidence.
+/// uses and covers the same EIP-712 digest `SlashJudge.submitBlacklistChallenge`
+/// checks, so what the assertion actually proves is that the operator's
+/// self-incriminating attestation survives the client's error path intact —
+/// byte-for-byte, still recovering to the signer. A `refusal()` that kept only
+/// `response.error` would drop the body and signature on the floor, leaving
+/// `SlashJudge` reachable only from a test that holds the operator's key and
+/// synthesises its own evidence.
 ///
 /// Deliberately routed through the private [`UpstreamRefused::open`] — the one
 /// constructor the open stage uses — rather
@@ -1223,10 +1225,10 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::slash_judge_domain;
     use decdn_incentive::stream_sig::StreamSlashData;
-    use decdn_protocol::SizeProof;
     use decdn_protocol::client::{
         StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
     };
+    use decdn_protocol::{Coverage, SizeProof};
 
     let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
     let size = u64::try_from(blob.len())?;
@@ -1249,12 +1251,13 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
             body,
             slash_sig: sig.as_bytes().to_vec(),
         };
-        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts)
+        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts, 0, 0)
     };
 
     let proven = verify(StreamResponseExt::served(
         SizeProof::new(size, proof_bytes.clone())?,
         None,
+        Coverage::full(1),
     ))?;
     anyhow::ensure!(proven.map(super::ProvenSize::get) == Some(size));
     for (what, size_proof) in [
@@ -1264,9 +1267,13 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
         ),
         ("a huge size", SizeProof::new(1u64 << 60, vec![0xCD; 4000])?),
     ] {
-        let err = verify(StreamResponseExt::served(size_proof, None))
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
+        let err = verify(StreamResponseExt::served(
+            size_proof,
+            None,
+            Coverage::full(1),
+        ))
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
         anyhow::ensure!(
             err.downcast_ref::<super::UnprovenSize>().is_some(),
             "{what}: {err}"
@@ -1276,15 +1283,97 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
             "{what} is the source's fault"
         );
     }
-    let err = verify(StreamResponseExt::refused(StreamError::NotFound))
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("ok without a proof must not open"))?;
+    let err = verify(StreamResponseExt::refused(
+        StreamError::NotFound,
+        Coverage::empty(),
+    ))
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("ok without a proof must not open"))?;
     let expected = decdn_protocol::MessageValidationError::StreamErrorWithOk.to_string();
     anyhow::ensure!(err.to_string().contains(&expected), "no proof: {err}");
     anyhow::ensure!(
         matches!(crate::fault::classify(&err), crate::fault::Fault::Source),
         "no proof is the source's fault"
     );
+    Ok(())
+}
+
+/// The open stage drops an answer whose unsigned coverage disagrees with the
+/// signed `ok` for the requested span: a served answer that does not cover
+/// the span, and a refusal that does. Both are the source's fault.
+#[test]
+fn an_open_whose_coverage_disagrees_is_a_source_fault() -> anyhow::Result<()> {
+    use alloy::signers::local::PrivateKeySigner;
+    use decdn_incentive::slash_judge_domain;
+    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_protocol::client::{
+        StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
+    };
+    use decdn_protocol::{Coverage, SizeProof};
+
+    let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    let size = u64::try_from(blob.len())?;
+    let hash = *blake3::hash(&blob).as_bytes();
+    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
+        .size_proof
+        .to_vec();
+    let operator = PrivateKeySigner::random();
+    let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+    let ts = 1_700_000_000_000_000;
+    let verify = |ext: StreamResponseExt| -> anyhow::Result<Option<super::ProvenSize>> {
+        let body = StreamResponseBody {
+            hash,
+            ok: ext.size_proof().is_some(),
+            rate_per_mb: 10,
+            timestamp_us: ts,
+        };
+        let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+        let resp = StreamResponse {
+            body,
+            slash_sig: sig.as_bytes().to_vec(),
+        };
+        // A bounded span: a refusal states no size, so only a bounded span
+        // can be covered by it.
+        super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts, 0, size)
+    };
+    let served = |coverage| -> anyhow::Result<StreamResponseExt> {
+        Ok(StreamResponseExt::served(
+            SizeProof::new(size, proof_bytes.clone())?,
+            None,
+            coverage,
+        ))
+    };
+
+    // The consistent pairs open: a served answer that covers the blob, and a
+    // refusal with no coverage.
+    verify(served(Coverage::full(1))?)?;
+    verify(StreamResponseExt::refused(
+        StreamError::NotFound,
+        Coverage::empty(),
+    ))?;
+
+    for (what, ext) in [
+        (
+            "a served answer with no coverage",
+            served(Coverage::empty())?,
+        ),
+        (
+            "a refusal that covers the span",
+            StreamResponseExt::refused(StreamError::NotFound, Coverage::full(1)),
+        ),
+    ] {
+        let err = verify(ext)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("{what} must not open"))?;
+        anyhow::ensure!(
+            err.to_string().contains("coverage disagrees"),
+            "{what}: {err}"
+        );
+        anyhow::ensure!(
+            matches!(crate::fault::classify(&err), crate::fault::Fault::Source),
+            "{what} is the source's fault"
+        );
+    }
     Ok(())
 }
 
@@ -1306,10 +1395,12 @@ fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
         },
         slash_sig: vec![0; 65],
     };
+    let requested = PoolAccount::eip155(8_453, [0xa1; 20]);
     let accepted = vec![PoolAccount::eip155(8_453, [0xb1; 20])];
     let declined = UpstreamRefused::open(
         response.clone(),
         &StreamResponseExt::pool_declined(accepted.clone()),
+        &requested,
     );
     let refused = declined
         .downcast_ref::<UpstreamRefused>()
@@ -1317,11 +1408,18 @@ fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
     anyhow::ensure!(*refused.error() == StreamError::Declined);
     anyhow::ensure!(refused.accepted_pools() == Some(accepted.as_slice()));
 
-    let plain = UpstreamRefused::open(response, &StreamResponseExt::refused(StreamError::Declined));
-    let refused = plain
-        .downcast_ref::<UpstreamRefused>()
-        .ok_or_else(|| anyhow::anyhow!("a typed refusal: {plain:#}"))?;
-    anyhow::ensure!(refused.accepted_pools().is_none());
+    // A `Declined` whose list names the requested pool refuses the blob,
+    // not the pool, and so does one with no list.
+    for ext in [
+        StreamResponseExt::pool_declined(vec![requested]),
+        StreamResponseExt::refused(StreamError::Declined, decdn_protocol::Coverage::empty()),
+    ] {
+        let plain = UpstreamRefused::open(response.clone(), &ext, &requested);
+        let refused = plain
+            .downcast_ref::<UpstreamRefused>()
+            .ok_or_else(|| anyhow::anyhow!("a typed refusal: {plain:#}"))?;
+        anyhow::ensure!(refused.accepted_pools().is_none());
+    }
     anyhow::ensure!(
         UpstreamRefused::mid_stream(StreamError::Declined)
             .accepted_pools()
@@ -1354,12 +1452,19 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         body: body.clone(),
         slash_sig: sig.as_bytes().to_vec(),
     };
-    let response_ext = decdn_protocol::StreamResponseExt::refused(StreamError::Declined);
+    let response_ext = decdn_protocol::StreamResponseExt::refused(
+        StreamError::Declined,
+        decdn_protocol::Coverage::empty(),
+    );
     // Preconditions the real open stage enforces before ever calling `open`.
     response.validate()?;
     response_ext.validate(response.body.ok)?;
 
-    let err = UpstreamRefused::open(response, &response_ext);
+    let err = UpstreamRefused::open(
+        response,
+        &response_ext,
+        &decdn_protocol::PoolAccount::eip155(1, [0; 20]),
+    );
     let refused = err
         .downcast_ref::<UpstreamRefused>()
         .ok_or_else(|| anyhow::anyhow!("open() must stay a typed UpstreamRefused: {err:#}"))?;
@@ -1417,38 +1522,17 @@ fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
     let served = decdn_protocol::StreamResponseExt::served(
         decdn_protocol::SizeProof::new(0, Vec::new()).unwrap_or_default(),
         None,
+        decdn_protocol::Coverage::empty(),
     );
-    let err = UpstreamRefused::open(response, &served);
+    let err = UpstreamRefused::open(
+        response,
+        &served,
+        &decdn_protocol::PoolAccount::eip155(1, [0; 20]),
+    );
     assert!(
         err.downcast_ref::<UpstreamRefused>().is_none(),
         "a response with no error code must not become a typed refusal"
     );
-}
-
-/// #1375: the two buyer ceilings combine as a min with `0` meaning "unbounded"
-/// on each input, so a completed pull is always bounded by the LOWER of the
-/// probe-relative and absolute bounds — and unbounded only when both are.
-#[test]
-fn effective_rate_ceiling_is_min_with_zero_as_unbounded() {
-    use super::effective_rate_ceiling;
-    assert_eq!(
-        effective_rate_ceiling(0, 0),
-        0,
-        "both unbounded => unbounded"
-    );
-    assert_eq!(
-        effective_rate_ceiling(10, 0),
-        10,
-        "config unbounded => probe"
-    );
-    assert_eq!(
-        effective_rate_ceiling(0, 900),
-        900,
-        "probe unbounded => config"
-    );
-    assert_eq!(effective_rate_ceiling(10, 900), 10, "min: probe binds");
-    assert_eq!(effective_rate_ceiling(900, 10), 10, "min: config binds");
-    assert_eq!(effective_rate_ceiling(42, 42), 42, "equal bounds");
 }
 
 /// A **mid-stream** refusal carries no signature, so it must never carry a
@@ -1526,6 +1610,7 @@ async fn a_gate_stop_keeps_the_reveal_the_node_accepted() -> anyhow::Result<()> 
                 reason,
                 bundle: None,
             },
+            false,
         );
         assert!(
             err.downcast_ref::<UpstreamVoucherRejected>().is_some(),
@@ -1556,11 +1641,95 @@ async fn a_refused_proof_still_rewinds_its_reveal() -> anyhow::Result<()> {
             reason: VoucherRejectReason::CapabilityExpired,
             bundle: None,
         },
+        false,
     );
     assert_eq!(
         ledger.committed().amount,
         before.amount - U256::from(10u64),
         "a refused reveal gives back exactly one chunk"
     );
+    Ok(())
+}
+
+/// A refusal class in a `StreamError` frame, which a node may write before
+/// the first `ChunkData` when it refuses admission at the first payment
+/// proof, is the same typed refusal a signed `ok: false` answer gives. It
+/// carries no signed response, and `Unfunded` still drives funding recovery.
+#[tokio::test]
+async fn a_refusal_frame_before_any_chunk_is_a_typed_refusal() -> anyhow::Result<()> {
+    use decdn_protocol::client::StreamError;
+
+    use super::UpstreamRefused;
+    use crate::fault::{Fault, classify};
+
+    for (error, unfunded) in [
+        (StreamError::NotFound, false),
+        (StreamError::Declined, false),
+        (StreamError::Unfunded, true),
+    ] {
+        let (ledger, meter) = ledger_with_a_released_reveal().await?;
+        let err = super::voucher_rejection(&ledger, &meter, error.clone(), true);
+        let refused = err
+            .downcast_ref::<UpstreamRefused>()
+            .ok_or_else(|| anyhow::anyhow!("{error:?} must be a typed refusal: {err:#}"))?;
+        anyhow::ensure!(*refused.error() == error, "the class survives unchanged");
+        anyhow::ensure!(
+            refused.before_delivery(),
+            "a frame before any chunk is a refusal at admission"
+        );
+        let after = super::voucher_rejection(&ledger, &meter, error.clone(), false);
+        anyhow::ensure!(
+            after
+                .downcast_ref::<UpstreamRefused>()
+                .is_some_and(|r| !r.before_delivery()),
+            "a frame after delivered bytes is a mid-stream refusal"
+        );
+        anyhow::ensure!(
+            refused.evidence().is_none(),
+            "a bare frame carries no signed response"
+        );
+        let fault = classify(&err);
+        anyhow::ensure!(
+            if unfunded {
+                matches!(fault, Fault::Unaffordable)
+            } else {
+                matches!(fault, Fault::Source)
+            },
+            "{error:?} classifies as a funding wait only when unfunded"
+        );
+    }
+    Ok(())
+}
+
+/// A refusal at admission rewinds the stream's own proof. The node refuses
+/// before it reads that proof, so leaving it committed would fold it into the
+/// next cumulative voucher on the lane, and the node could redeem bytes it
+/// never delivered. A refusal after delivered bytes is no verdict on the
+/// proof and rewinds nothing.
+#[tokio::test]
+async fn a_refusal_at_admission_rewinds_the_streams_proof() -> anyhow::Result<()> {
+    use decdn_protocol::client::StreamError;
+
+    for error in [
+        StreamError::NotFound,
+        StreamError::Declined,
+        StreamError::Unfunded,
+    ] {
+        let (ledger, meter) = ledger_with_a_released_reveal().await?;
+        let before = ledger.committed();
+        let _ = super::voucher_rejection(&ledger, &meter, error.clone(), true);
+        anyhow::ensure!(
+            ledger.committed().amount == before.amount - U256::from(10u64),
+            "{error:?} at admission gives back the stream's reveal"
+        );
+
+        let (ledger, meter) = ledger_with_a_released_reveal().await?;
+        let before = ledger.committed();
+        let _ = super::voucher_rejection(&ledger, &meter, error.clone(), false);
+        anyhow::ensure!(
+            ledger.committed() == before,
+            "{error:?} mid-stream is no verdict on the proof"
+        );
+    }
     Ok(())
 }

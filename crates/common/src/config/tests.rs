@@ -1230,6 +1230,21 @@ fn resolve_cache_rejects_empty_fs_origin_path() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The node speaks no probe protocol, so a `[probe]` table is an unknown
+/// section and fails the parse rather than being silently ignored.
+#[test]
+fn a_probe_table_is_an_unknown_section() {
+    let toml = "\
+[probe.rate_limit]
+per_peer_rate_per_sec = 5.0
+";
+    let err = ::toml::from_str::<crate::config::FileConfig>(toml)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(err.contains("unknown field `probe`"), "{err}");
+}
+
 // -------------------------------------------------------------------
 // Governance / payment-chain split
 // -------------------------------------------------------------------
@@ -1350,6 +1365,44 @@ fn a_payment_chain_with_no_pool_is_refused() -> anyhow::Result<()> {
         msg.contains("blockchain.payment_chains[0].payment_pools"),
         "{msg}"
     );
+    Ok(())
+}
+
+/// A node lists every pool it accepts in each stream answer, and a receiver
+/// keeps only the first `MAX_PAYMENT_POOLS`. A config past that limit would
+/// hide a pool the node serves, so it does not resolve, across chains too.
+#[test]
+fn more_than_max_payment_pools_is_refused() -> anyhow::Result<()> {
+    let pool = |i: usize| -> anyhow::Result<String> {
+        Ok(Address::repeat_byte(u8::try_from(i)?.saturating_add(0x10)).to_checksum(None))
+    };
+    let list = |range: std::ops::Range<usize>| -> anyhow::Result<String> {
+        Ok(range
+            .map(|i| pool(i).map(|p| format!("\"{p}\"")))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .join(", "))
+    };
+    let max = decdn_protocol::MAX_PAYMENT_POOLS;
+    let chains = |split: usize, total: usize| -> anyhow::Result<String> {
+        Ok(format!(
+            "[[blockchain.payment_chains]]\n\
+             rpc_url = \"https://base.example/rpc\"\n\
+             chain_id = 84532\n\
+             payment_pools = [{}]\n\
+             [[blockchain.payment_chains]]\n\
+             rpc_url = \"https://arb.example/rpc\"\n\
+             chain_id = 421614\n\
+             payment_pools = [{}]\n",
+            list(0..split)?,
+            list(split..total)?
+        ))
+    };
+    resolve_blockchain_toml(&blockchain_toml(&chains(max / 2, max)?))?;
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(&chains(max / 2, max + 1)?)) else {
+        anyhow::bail!("{} pools must not resolve", max + 1);
+    };
+    let msg = format!("{err:#}");
+    anyhow::ensure!(msg.contains(&format!("at most {max}")), "{msg}");
     Ok(())
 }
 
@@ -2035,7 +2088,7 @@ fn resolve_payment_rejects_zero_commit_interval() -> anyhow::Result<()> {
 }
 
 // Issue #378: configuring a rate above the protocol-level wire ceiling
-// is a startup error — otherwise the node would publish ProbeResponses
+// is a startup error — otherwise the node would publish StreamResponses
 // that every honest client decoder rejects, silently dropping itself
 // out of the candidate pool.
 #[test]
@@ -2077,8 +2130,6 @@ fn cache_cli(
         cache_size_mb,
         max_blob_size_mb,
         max_rate_per_mb: None,
-        max_probe_holds: None,
-        stake_lane_reserved_holds: None,
     }
 }
 
@@ -2515,64 +2566,6 @@ fn resolve_cache_gc_interval_zero_disables() -> anyhow::Result<()> {
         resolved.gc_interval_sec == 0,
         "0 must round-trip as 0 (disabled); got: {}",
         resolved.gc_interval_sec
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_cache_stake_lane_reserved_holds_defaults_to_zero() -> anyhow::Result<()> {
-    // Absent everywhere => reservation off (#757). The default MUST be 0
-    // so a node that never opted in reserves no stake-lane holds.
-    let cli = cache_cli(None, None);
-    let resolved = resolve_cache(&cli, None, Path::new("/tmp"))?;
-    anyhow::ensure!(
-        resolved.stake_lane_reserved_holds == DEFAULT_STAKE_LANE_RESERVED_HOLDS,
-        "expected default {DEFAULT_STAKE_LANE_RESERVED_HOLDS}, got: {}",
-        resolved.stake_lane_reserved_holds
-    );
-    anyhow::ensure!(
-        resolved.stake_lane_reserved_holds == 0,
-        "the #757 default must be 0 (reservation off)"
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_cache_stake_lane_reserved_holds_from_file() -> anyhow::Result<()> {
-    let cli = cache_cli(None, None);
-    let file = types::CacheConfig {
-        stake_lane_reserved_holds: Some(8),
-        ..types::CacheConfig::default()
-    };
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    anyhow::ensure!(
-        resolved.stake_lane_reserved_holds == 8,
-        "expected 8 from file, got: {}",
-        resolved.stake_lane_reserved_holds
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_cache_stake_lane_reserved_holds_cli_overrides_file() -> anyhow::Result<()> {
-    // CLI wins over file, mirroring the `max_probe_holds` precedence.
-    let cli = crate::cli::run::CacheArgs {
-        cache_dir: None,
-        cache_size_mb: None,
-        max_blob_size_mb: None,
-        max_rate_per_mb: None,
-        max_probe_holds: None,
-        stake_lane_reserved_holds: Some(3),
-    };
-    let file = types::CacheConfig {
-        stake_lane_reserved_holds: Some(8),
-        ..types::CacheConfig::default()
-    };
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    anyhow::ensure!(
-        resolved.stake_lane_reserved_holds == 3,
-        "CLI flag must override the file value; expected 3, got: {}",
-        resolved.stake_lane_reserved_holds
     );
     Ok(())
 }
@@ -4269,11 +4262,6 @@ fn run_subcommand_args_are_wired_to_decdn_env_vars() {
         ("cache_size_mb", "DECDN_CACHE_SIZE_MB"),
         ("max_blob_size_mb", "DECDN_MAX_BLOB_SIZE_MB"),
         ("max_rate_per_mb", "DECDN_MAX_RATE_PER_MB"),
-        ("max_probe_holds", "DECDN_MAX_PROBE_HOLDS"),
-        (
-            "stake_lane_reserved_holds",
-            "DECDN_STAKE_LANE_RESERVED_HOLDS",
-        ),
         ("rate_per_mb", "DECDN_RATE_PER_MB"),
         ("log_level", "DECDN_LOG_LEVEL"),
         ("log_format", "DECDN_LOG_FORMAT"),
@@ -4669,8 +4657,6 @@ fn empty_cache_args() -> crate::cli::run::CacheArgs {
         cache_size_mb: None,
         max_blob_size_mb: None,
         max_rate_per_mb: None,
-        max_probe_holds: None,
-        stake_lane_reserved_holds: None,
     }
 }
 
@@ -7218,8 +7204,7 @@ fn dht_rl_with(mutate: impl FnOnce(&mut types::DhtRateLimitConfig)) -> types::Dh
 #[test]
 fn resolve_dht_absent_yields_adr022_defaults() {
     // No `[dht.rate_limit]` section at all => every ADR 022 default.
-    // Counterpart to `resolve_probe_absent_yields_adr005_defaults`: the
-    // rate/burst rows of `resolve_dht_into` are otherwise unpinned, so a
+    // The rate/burst rows of `resolve_dht_into` are otherwise unpinned, so a
     // wrong `DEFAULT_DHT_*` on the right-hand side of any `unwrap_or` ships
     // silently. Rates and bursts are spelled as literals on purpose —
     // asserting against the same constant the resolver reads would pin
@@ -7256,21 +7241,6 @@ fn resolved_dht_default_matches_resolver() {
     assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
 }
 
-/// Probe counterpart of `resolved_dht_default_matches_resolver`.
-/// `resolve_probe_absent_yields_adr005_defaults` pins `DEFAULT_PROBE_*`
-/// against the ADR but says nothing about `ResolvedProbe::default()`, which
-/// is the copy the fixtures use.
-#[test]
-fn resolved_probe_default_matches_resolver() {
-    let resolved = resolve_probe(None).expect("absent section is valid");
-    let hand = ResolvedProbe::default();
-    assert!((resolved.per_peer_rate_per_sec - hand.per_peer_rate_per_sec).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_peer_burst, hand.per_peer_burst);
-    assert!((resolved.global_rate_per_sec - hand.global_rate_per_sec).abs() < f64::EPSILON);
-    assert_eq!(resolved.global_burst, hand.global_burst);
-    assert_eq!(resolved.max_tracked_per_peer, hand.max_tracked_per_peer);
-}
-
 #[test]
 fn resolve_dht_max_tracked_per_peer_file_override() {
     let d = dht_rl_with(|r| r.max_tracked_per_peer = Some(8192));
@@ -7292,74 +7262,6 @@ fn resolve_dht_max_tracked_per_peer_default_when_field_absent() {
 fn resolve_dht_accepts_zero_max_tracked_per_peer_as_unbounded() {
     let d = dht_rl_with(|r| r.max_tracked_per_peer = Some(0));
     let resolved = resolve_dht(Some(&d)).expect("0 makes the map unbounded");
-    assert_eq!(resolved.max_tracked_per_peer, 0);
-}
-
-// ---- #982: `[probe.rate_limit]` resolver (ADR 005 §Probe rate limiting).
-// Mirrors the `[dht.rate_limit]` resolver tests above; the key regression
-// guards are the ADR-005 defaults (a tighter per-peer cap than the DHT
-// layer) and that the field keys in validation errors say `probe.*`. ----
-
-fn probe_rl_with(mutate: impl FnOnce(&mut types::ProbeRateLimitConfig)) -> types::ProbeConfig {
-    let mut r = types::ProbeRateLimitConfig::default();
-    mutate(&mut r);
-    types::ProbeConfig {
-        rate_limit: Some(r),
-    }
-}
-
-#[test]
-fn resolve_probe_absent_yields_adr005_defaults() {
-    // No `[probe.rate_limit]` section at all => every ADR 005 default.
-    let resolved = resolve_probe(None).expect("absent section is valid");
-    assert!((resolved.per_peer_rate_per_sec - 5.0).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_peer_burst, 5);
-    assert!((resolved.global_rate_per_sec - 1000.0).abs() < f64::EPSILON);
-    assert_eq!(resolved.global_burst, 2000);
-    assert_eq!(
-        resolved.max_tracked_per_peer,
-        DEFAULT_PROBE_MAX_TRACKED_PER_PEER
-    );
-}
-
-#[test]
-fn resolve_probe_file_override_applies() {
-    let p = probe_rl_with(|r| {
-        r.per_peer_rate_per_sec = Some(7.0);
-        r.per_peer_burst = Some(9);
-    });
-    let resolved = resolve_probe(Some(&p)).expect("valid override");
-    assert!((resolved.per_peer_rate_per_sec - 7.0).abs() < f64::EPSILON);
-    assert_eq!(resolved.per_peer_burst, 9);
-    // Untouched fields keep their ADR 005 defaults.
-    assert_eq!(resolved.global_burst, 2000);
-}
-
-#[test]
-fn resolve_probe_zero_rate_and_burst_disables_layer() {
-    let p = probe_rl_with(|r| {
-        r.per_peer_rate_per_sec = Some(0.0);
-        r.per_peer_burst = Some(0);
-    });
-    let resolved = resolve_probe(Some(&p)).expect("0/0 disables the per-peer layer");
-    assert!(resolved.per_peer_rate_per_sec.abs() < f64::EPSILON);
-    assert_eq!(resolved.per_peer_burst, 0);
-}
-
-#[test]
-fn resolve_probe_rate_positive_with_zero_burst_rejects() {
-    let p = probe_rl_with(|r| {
-        r.per_peer_rate_per_sec = Some(5.0);
-        r.per_peer_burst = Some(0);
-    });
-    let err = resolve_probe(Some(&p)).expect_err("rate>0+burst=0 must reject");
-    assert!(format!("{err:#}").contains("probe.rate_limit.per_peer_burst"));
-}
-
-#[test]
-fn resolve_probe_accepts_zero_max_tracked_as_unbounded() {
-    let p = probe_rl_with(|r| r.max_tracked_per_peer = Some(0));
-    let resolved = resolve_probe(Some(&p)).expect("0 makes the map unbounded");
     assert_eq!(resolved.max_tracked_per_peer, 0);
 }
 
@@ -7429,21 +7331,6 @@ fn dht_zero_max_tracked_warns_about_the_unbounded_map() {
 #[test]
 fn dht_at_defaults_records_no_notice() {
     assert!(notices_from(|bag| resolve_dht_into(None, bag)).is_empty());
-}
-
-/// Mirrors [`dht_at_defaults_records_no_notice`].
-#[test]
-fn probe_at_defaults_records_no_notice() {
-    assert!(notices_from(|bag| resolve_probe_into(None, bag)).is_empty());
-}
-
-#[test]
-fn probe_zero_max_tracked_warns_about_the_unbounded_map() {
-    let p = probe_rl_with(|r| r.max_tracked_per_peer = Some(0));
-    let notice = only_notice(notices_from(|bag| resolve_probe_into(Some(&p), bag)));
-    assert_eq!(notice.field, "probe.rate_limit.max_tracked_per_peer");
-    assert_eq!(notice.level, ConfigNoticeLevel::Warn);
-    assert!(notice.message.contains("unbounded"), "{notice:?}");
 }
 
 /// #843: a stale exported `DECDN_RELAY_URL` collapses a multi-entry
@@ -7558,7 +7445,7 @@ fn resolve_config_returns_the_notices_its_resolvers_recorded() -> anyhow::Result
 }
 
 // ---- `[serve.rate_limit]` resolver (ADR 005 §Request rate limiting).
-// Mirrors the `[probe.rate_limit]` resolver tests; the regression guards are
+// Mirrors the `[dht.rate_limit]` resolver tests; the regression guards are
 // the ADR 005 request defaults and the `serve.*` field keys. ----
 
 fn serve_rl_with(mutate: impl FnOnce(&mut types::ServeRateLimitConfig)) -> types::ServeConfig {

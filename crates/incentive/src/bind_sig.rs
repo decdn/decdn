@@ -29,7 +29,7 @@
 //! # Scope
 //!
 //! Only EOA (`ecrecover`) verification is implemented here, matching the
-//! EOA-only off-chain signing stance of [`crate::probe_sig`] and
+//! EOA-only off-chain signing stance of [`crate::stream_sig`] and
 //! [`crate::voucher`]. Off-chain verification is EOA recovery only (ADR 024
 //! §Off-Chain Signature Verification — EOA Recovery Only); a smart-account
 //! client binds through a capability-delegated EOA `signer` instead, so no

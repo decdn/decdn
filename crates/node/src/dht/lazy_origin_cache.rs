@@ -26,7 +26,7 @@
 //! stale on the parts of the answer that change without a new `getOrigins`
 //! call: operator staking status and operator→node bindings.
 //!
-//! Modeled directly on `super::probe_cache`: an `IndexMap` doubles as the
+//! Modeled directly on `super::candidate_cache`: an `IndexMap` doubles as the
 //! store and the LRU order (index 0 = most-recently-used), the TTL is
 //! anchored on `Instant` at insert and never refreshed on read, and the lock
 //! is poison-tolerant.
@@ -58,7 +58,7 @@ struct Entry {
 struct Inner {
     /// `namespaceId → entry`. `IndexMap` collapses the LRU ordering (index 0
     /// = most-recently-used) into the same store, mirroring
-    /// [`super::probe_cache`].
+    /// [`super::candidate_cache`].
     entries: IndexMap<U256, Entry>,
     /// Hard cap on live namespaces. Clamped to ≥ 1 in the constructor.
     cap: usize,
@@ -140,7 +140,7 @@ impl LazyOriginCache {
     }
 
     /// Poison-tolerant lock acquisition, mirroring
-    /// [`super::probe_cache::PositiveProbeCache::lock`].
+    /// [`super::candidate_cache::CandidateCache::lock`].
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         match self.inner.lock() {
             Ok(g) => g,

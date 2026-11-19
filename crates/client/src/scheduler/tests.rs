@@ -3943,11 +3943,11 @@ fn a_barred_lane_takes_only_what_it_covers() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #2281: narrowing a probed lane's coverage reaches its extra workers and
+/// #2281: narrowing a discovered lane's coverage reaches its extra workers and
 /// leaves a whole-blob lane alone, and widening it again when a block's
 /// drop ends hands the lane the block's range once more.
 #[test]
-fn set_coverage_narrows_and_restores_a_probed_lane_and_its_extras() -> anyhow::Result<()> {
+fn set_coverage_narrows_and_restores_a_discovered_lane_and_its_extras() -> anyhow::Result<()> {
     use std::collections::VecDeque;
 
     use decdn_bao_range::align_range;
@@ -4243,8 +4243,8 @@ async fn a_partial_holder_refusing_a_covered_block_loses_it_from_its_coverage() 
     Ok(())
 }
 
-/// A sole partial holder barred from the only block left gets one probe
-/// once its bar ends, and ends the item when the probe draws the bar
+/// A sole partial holder barred from the only block left gets one trial
+/// once its bar ends, and ends the item when the trial draws the bar
 /// again and a discovery finds no one else, as a unanimous `NotFound`
 /// does.
 #[tokio::test(start_paused = true)]
@@ -4293,7 +4293,7 @@ async fn a_sole_barred_partial_holder_ends_only_the_item() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A pull-through target (not a probed holder) that keeps saying
+/// A pull-through target (not a discovered holder) that keeps saying
 /// `NotFound` ends the item, and the stop carries the refusal.
 #[tokio::test(start_paused = true)]
 async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
@@ -4306,7 +4306,7 @@ async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
         });
     let (root, total) = (a.root(), a.total_bytes());
     let (store, _dir) = fresh_store(root, total);
-    let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?.not_probed();
+    let provider = StaticSources::new(vec![candidate(a, la, 0xA1, None)])?.undiscovered();
     let err = run_acquire(
         &store,
         &provider,
@@ -4326,10 +4326,10 @@ async fn unanimous_not_found_ends_only_the_item() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A sole probed holder that says `NotFound` twice (a load shed, say) and
+/// A sole discovered holder that says `NotFound` twice (a load shed, say) and
 /// then serves completes the fetch: its `NotFound` only cools it.
 #[tokio::test(start_paused = true)]
-async fn a_probed_holder_saying_not_found_twice_then_serving_completes() -> anyhow::Result<()> {
+async fn a_discovered_holder_saying_not_found_twice_then_serving_completes() -> anyhow::Result<()> {
     let data = blob(1024 * 1024);
     let la = Arc::new(PoolLedger::new(Cumulative::default()));
     let a = ScriptedSource::new(data.clone())?
@@ -6112,7 +6112,7 @@ impl crate::SourceProvider for SlowBuilds<'_> {
     }
 }
 
-/// A store-routed start: every holder holds the whole blob, no probe round
+/// A store-routed start: every holder holds the whole blob, no discovery round
 /// is pending, and every lane is still building on the first pass. The
 /// building lanes cover every missing range, so the fetch asks for no
 /// discovery (#2677).
@@ -7380,7 +7380,7 @@ impl SlotSources {
             provider: Address::repeat_byte(SLOT_PROVIDER),
             coverage: None,
             rtt_ms: 0.0,
-            probed_holder: true,
+            discovered_holder: true,
         }
     }
 
@@ -7934,10 +7934,10 @@ impl crate::SourceProvider for KeptLane<'_> {
 
 /// The lane that answered a size open, with a whole-blob pull primed on it,
 /// takes that pull as its first leg although another holder's lane builds at
-/// once. It starts before any build is polled, so the first plan is made for
-/// it alone and gives it the whole blob. Planned beside the other lane, its
-/// first leg is half the blob, the primed pull closes, and the holder serves
-/// the first half twice.
+/// once. The first plan stripes the blob across both lanes, so the kept
+/// lane's leg is its own stripe from the blob's start: the primed pull is
+/// narrowed to it and stops there, with no second open, and the other lane
+/// fetches the rest.
 #[tokio::test]
 async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_once()
 -> anyhow::Result<()> {
@@ -7962,7 +7962,7 @@ async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_o
         provider: a_provider,
         coverage: None,
         rtt_ms: 0.0,
-        probed_holder: true,
+        discovered_holder: true,
     }];
     holders.extend(inner.holders().into_iter().map(|holder| crate::Holder {
         rtt_ms: 1.0,
@@ -7978,23 +7978,29 @@ async fn a_size_opens_lane_adopts_its_primed_pull_beside_a_lane_that_builds_at_o
     store.finalize().await?;
 
     assert_eq!(std::fs::read(dir.path().join("b"))?, data);
+    let a_opens = a_probe.opened_ranges();
     assert_eq!(
-        a_probe.opened_ranges(),
-        vec![(0, total)],
-        "the kept lane's first leg adopts the primed pull and opens nothing itself"
+        a_opens.first(),
+        Some(&(0, total)),
+        "the kept lane's first leg adopts the primed pull: {a_opens:?}"
     );
     assert!(
-        b_probe
-            .opened_ranges()
-            .iter()
-            .all(|&(offset, _)| offset > 0),
-        "the other lane never opens the blob's start: {:?}",
-        b_probe.opened_ranges()
+        a_opens.iter().skip(1).all(|&(offset, _)| offset > 0),
+        "the kept lane never opens the blob's start a second time: {a_opens:?}"
+    );
+    assert!(
+        a_probe.stopped_pulls() >= 1,
+        "the narrowed pull stops at the end of its stripe"
+    );
+    let b_opens = b_probe.opened_ranges();
+    assert!(
+        !b_opens.is_empty() && b_opens.iter().all(|&(offset, _)| offset > 0),
+        "the other lane fetches its own stripe, past the blob's start: {b_opens:?}"
     );
     Ok(())
 }
 
-/// A lane without a probed bitmap covers the blocks up to the requested
+/// A lane without a answered bitmap covers the blocks up to the requested
 /// reach, not the whole proven size: a 1 MiB window of a 2^60-byte blob
 /// sizes a one-block bitmap.
 #[test]
@@ -8010,4 +8016,42 @@ fn whole_blob_coverage_stops_at_the_requested_reach() {
     // A tail runs to the end of the blob, so it covers every block.
     let tail = super::Want::new(&[(0, 0)], 3 * MIB);
     assert_eq!(tail.reach(), 3 * MIB);
+}
+
+/// A partial holder's coverage, as discovery reads it off a `NotFound`
+/// refusal, steers the plan: its lane takes the run it covers, and the full
+/// holder's lane takes the rest.
+#[test]
+fn a_partial_holders_coverage_steers_its_lanes_pick() -> anyhow::Result<()> {
+    let total = 4 * DISCOVERY_BLOCK_BYTES;
+    let partial = Coverage::from_block_indices(4, [0, 1].into_iter());
+    let full = Coverage::full(4);
+    let mut work = super::Work::new(std::collections::VecDeque::new(), [0; 32], false);
+    work.set_coverage_reach(total);
+    let all = decdn_bao_range::align_range(0, 0, total)?
+        .chunk_ranges()
+        .clone();
+    let slots = work.seed(&all, total, &[None, Some(partial.clone())])?;
+    let (Some(&full_slot), Some(&partial_slot)) = (slots.first(), slots.get(1)) else {
+        anyhow::bail!("two slots");
+    };
+    let missing = [(0, total)];
+    let picked = work
+        .pick(partial_slot, total, &partial, true, &missing)?
+        .ok_or_else(|| anyhow::anyhow!("the partial lane takes its run"))?;
+    assert!(!picked.uncovered, "the partial lane takes a run it covers");
+    assert!(
+        picked.range.fetch_end() <= 2 * DISCOVERY_BLOCK_BYTES,
+        "the partial lane's pick stays inside its blocks: {:?}",
+        (picked.range.fetch_start(), picked.range.fetch_len())
+    );
+    let rest = work
+        .pick(full_slot, total, &full, true, &missing)?
+        .ok_or_else(|| anyhow::anyhow!("the full lane takes the rest"))?;
+    assert!(
+        rest.range.fetch_start() >= picked.range.fetch_end()
+            || rest.range.fetch_end() <= picked.range.fetch_start(),
+        "the two picks do not overlap"
+    );
+    Ok(())
 }

@@ -540,6 +540,20 @@ impl Origin for FilesystemOrigin {
         })
     }
 
+    fn has_outboard(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, OriginPullError>> + Send + '_>> {
+        // A stat: the outboard is a regular file inside the base. The read
+        // ([`Self::fetch_outboard`]) checks its length.
+        Box::pin(async move {
+            Ok(self
+                .resolve_regular(&self.obao4_path_for(hash))
+                .await?
+                .is_some())
+        })
+    }
+
     fn fetch_size_proof(
         &self,
         hash: Hash,

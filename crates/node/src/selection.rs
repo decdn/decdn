@@ -17,37 +17,48 @@ use crate::dht::lookup::{DEFAULT_ROUND_TIMEOUT, MAX_LOOKUP_ROUNDS};
 /// caller (issue #322 — "max 3 provider attempts before returning error").
 pub const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
-/// Per-candidate probe timeout. Because candidates are probed concurrently, this also
-/// bounds the whole probe-collection phase. The budget covers connection setup plus one
-/// unpaid probe request/response. `probe_once` dials a fresh connection every call, and
-/// the protocol has no 0-RTT path, so even a resumable session pays a handshake round trip
-/// before the request goes out — every probe costs two RTTs, not one. At the 250-300 ms
-/// inter-continental RTTs this budget is sized against, two RTTs take 500-600 ms, so the
-/// ceiling sits above the far candidates' tail: a node whose only
-/// candidate is an inter-continental origin keeps it instead of dropping it as unreachable
-/// and signing a `NotFound` for content that origin serves (#2366). A sparse round still
-/// ends well inside the DHT round timeout that precedes it. A candidate past this ceiling
-/// is dropped, by design: it must not burn the caller's miss-latency budget. Both the
-/// figure and the trade are ADR 001 § Probe response collection.
-///
-/// What is left of the budget after the exchange goes to `probe_once`'s wait for hole
-/// punching to select a direct path. A candidate whose answer arrives in time is kept even
-/// when that wait runs out: it ranks on its exchange RTT, which can be the relay detour, and
-/// that RTT still feeds the ADR 030 region-latency penalty.
+/// The bound on each node-to-node discovery open's dial, and again on its
+/// exchange: the voucher-less `cdn/client/v1` request and its signed answer.
+/// Every open runs on the node's shared connection to the upstream, so an
+/// upstream this node already talks to costs no dial, and the exchange is one
+/// round trip. A cold upstream costs a handshake round trip first: at the
+/// 250-300 ms inter-continental RTTs this budget is sized against, the dial and
+/// the exchange each fit well inside it, so a node whose only candidate is an
+/// inter-continental origin keeps it instead of dropping it as unreachable and
+/// signing a `NotFound` for content that origin serves (#2366). ADR 001 § Open
+/// response collection.
 ///
 /// Lives here, beside the deadline arithmetic that has to budget for it, rather than in
 /// `node_origin` where it is used (#1145 review). Every term of [`outer_pull_deadline`] is
 /// then visible in one file, which is what stops the next one from being guessed.
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+pub const OPEN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// How many blob-holding candidates a SINGLE-SOURCE probe round collects before
-/// it stops waiting on the rest. [`PROBE_TIMEOUT`] stays the ceiling — a sparse
-/// round that never reaches this count still waits it out — but when this many
-/// good providers have already answered, the round selects among them instead of
-/// waiting the full window for a straggler or a dead peer that will only time
-/// out. The count leaves at least one alternate in hand for per-blob failover
-/// while keeping cold-miss discovery latency at the speed of the fastest good
-/// answers rather than the ceiling. ADR 001 § Probe response collection.
+/// How long a discovery open waits after its answer for hole punching to
+/// select a direct path, so it ranks the peer on that path's RTT. When none
+/// comes in time, it ranks on the selected path's estimate, which can be the
+/// relay detour; that RTT still feeds the ADR 030 region-latency penalty.
+/// Equal to the client's own grace, which the open applies.
+pub const OPEN_PATH_GRACE: Duration = Duration::from_millis(500);
+
+/// The ceiling on one discovery open, start to finish: its wait for a free
+/// discovery slot on the upstream's connection, the dial and the exchange
+/// ([`OPEN_TIMEOUT`] each), and the path-RTT wait ([`OPEN_PATH_GRACE`]).
+/// Because a round opens its candidates concurrently, this also bounds the
+/// whole collection phase. A candidate past it is dropped, by design: it must
+/// not burn the caller's miss-latency budget.
+pub const OPEN_CEILING: Duration = OPEN_TIMEOUT
+    .saturating_mul(2)
+    .saturating_add(OPEN_PATH_GRACE);
+
+/// How many blob-holding candidates a SINGLE-SOURCE discovery round collects
+/// before it stops waiting on the rest. [`OPEN_CEILING`] stays the ceiling — a
+/// sparse round that never reaches this count still waits it out — but when
+/// this many good providers have already answered, the round selects among
+/// them instead of waiting the full window for a straggler or a dead peer that
+/// will only time out. The count leaves at least one alternate in hand for
+/// per-blob failover while keeping cold-miss discovery latency at the speed of
+/// the fastest good answers rather than the ceiling. ADR 001 § Open response
+/// collection.
 ///
 /// Equal to [`MAX_PROVIDER_ATTEMPTS`] on purpose: the single-source pull loop
 /// tries at most that many providers, so collecting that many viable candidates
@@ -59,27 +70,27 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// needs a candidate set whose coverage UNION spans the requested range, not a
 /// fixed count: three responders that all hold discovery block 0 do not cover a
 /// three-block blob, yet stopping at this count would drop the block-1/block-2
-/// holders in the same fanout. That path gathers by coverage union instead (see
-/// `node_origin::probe_and_rank`'s `ProbeGather::CoverageUnion`), bounded only by
-/// the probe fanout.
-pub const PROBE_EARLY_EXIT_CANDIDATES: usize = MAX_PROVIDER_ATTEMPTS;
+/// holders in the same fan-out. That path gathers by coverage union instead (see
+/// `node_origin::open_and_rank`'s `OpenGather::CoverageUnion`), bounded only by
+/// the open fan-out.
+pub const OPEN_EARLY_EXIT_CANDIDATES: usize = MAX_PROVIDER_ATTEMPTS;
 
 /// One-time headroom added on top of the `MAX_PROVIDER_ATTEMPTS` sequential per-candidate
 /// costs when computing the outer pull-through deadline (#859). It covers the *one-time*
-/// `discover → probe → rank` overhead: work that runs under the outer deadline but does not
+/// `discover → open → rank` overhead: work that runs under the outer deadline but does not
 /// scale with the attempt count.
 ///
 /// **Derived, not chosen** (#1145 review). A flat constant would be smaller than the thing
 /// it is named for:
 ///
-/// - probing is concurrent, so it costs one [`PROBE_TIMEOUT`] — 1 s; but
+/// - the discovery opens are concurrent, so they cost one [`OPEN_CEILING`] — 2.5 s; but
 /// - discovery is `find_providers`, whose rounds are each bounded by
 ///   [`DEFAULT_ROUND_TIMEOUT`] (8 s) and whose round count is capped by
 ///   [`MAX_LOOKUP_ROUNDS`] (4).
 ///
-/// At those defaults, four discovery rounds plus the probe phase can cost 33 s. A flat
+/// At those defaults, four lookup rounds plus the open phase can cost 34.5 s. A flat
 /// budget short of that leaves the outer deadline short of what the fetch can actually spend,
-/// so the `tokio::time::timeout` around `discover → probe → rank → pull` can fire while
+/// so the `tokio::time::timeout` around `discover → open → rank → pull` can fire while
 /// candidate #3 is still in its stall window — the #859 fallback starvation this formula
 /// exists to prevent, reachable at the defaults.
 ///
@@ -87,7 +98,7 @@ pub const PROBE_EARLY_EXIT_CANDIDATES: usize = MAX_PROVIDER_ATTEMPTS;
 /// worst case finite, and this makes it a TERM. An unbounded cost cannot be budgeted for by
 /// any constant, however generous.
 pub const PULL_THROUGH_OUTER_SLACK: Duration =
-    PROBE_TIMEOUT.saturating_add(DEFAULT_ROUND_TIMEOUT.saturating_mul(MAX_LOOKUP_ROUNDS));
+    OPEN_CEILING.saturating_add(DEFAULT_ROUND_TIMEOUT.saturating_mul(MAX_LOOKUP_ROUNDS));
 
 /// How long a pull is willing to WAIT on a buyer-pool open before giving up on
 /// that candidate — not how long the open itself is allowed to take (#1143).
@@ -108,7 +119,7 @@ pub const POOL_OPEN_CALLER_BUDGET: Duration = Duration::from_secs(5);
 /// per-candidate budgets: the stream-open timeout (`cache.node_pull_timeout_sec`) and
 /// the streaming throughput-floor window (`cache.node_pull_stall_window_sec`).
 ///
-/// The delivery handler wraps the whole `discover → probe → rank → pull` fetch
+/// The delivery handler wraps the whole `discover → open → rank → pull` fetch
 /// in a single `tokio::time::timeout`. For the sequential `MAX_PROVIDER_ATTEMPTS`
 /// fallback loop to actually reach candidates #2..N when candidate #1 *stalls*,
 /// this outer deadline must strictly exceed the sum of all per-candidate costs —
@@ -181,10 +192,11 @@ const TIE_THRESHOLD: f64 = 0.01;
 pub struct Candidate {
     /// Iroh `NodeId` (Ed25519 public key) of the candidate.
     pub node_id: [u8; 32],
-    /// Quoted price in token base units per MB, from the most recent
-    /// `ProbeResponse` (`decdn_protocol::message::ProbeResponse::rate_per_mb`).
+    /// Quoted price in token base units per MB: the `rate_per_mb` the
+    /// candidate signed on its answer to a discovery open
+    /// (`decdn_protocol::client::StreamResponseBody::rate_per_mb`).
     pub rate_per_mb: u64,
-    /// Round-trip latency observed during probing.
+    /// The path round-trip time measured on that open.
     pub rtt_ms: u32,
     /// Local reputation in `[0.0, 1.0]` from the reputation engine.
     pub reputation: f32,
@@ -210,17 +222,17 @@ pub struct Candidate {
     /// integration is deferred; see ADR 019 for the capacity-bond interface
     /// that will.
     pub stake: u64,
-    /// Which discovery blocks (`decdn_protocol::coverage`) this candidate is
-    /// confirmed to hold, per its fresh `ProbeResponseExt.coverage` (#1506).
-    /// This is the PROBE-confirmed value, never the stale DHT-lookup hint —
-    /// discovery's ranking and selection consume only what a live probe just
-    /// verified. Ranking itself ignores this field; it rides alongside the
-    /// rank/RTT/rate fields for a range-aware caller to read after selection.
+    /// Which discovery blocks (`decdn_protocol::coverage`) this candidate
+    /// says it holds, per the fresh `StreamResponseExt.coverage` of its answer
+    /// to a discovery open (#1506). This is the OPEN-confirmed value, never the
+    /// stale DHT-lookup hint — discovery's ranking and selection consume only
+    /// what a live open just verified. Ranking itself ignores this field; it
+    /// rides alongside the rank/RTT/rate fields for a range-aware caller to
+    /// read after selection.
     pub coverage: Coverage,
-    /// The blob size the candidate reported on that probe
-    /// (`ProbeResponseExt.total_bytes`), when it knows it, proven against the
-    /// hash by the probe's size proof. The pull leg cuts its first upstream open
-    /// from it.
+    /// The blob size the candidate's answer proved, when the answer carried a
+    /// size proof: a served answer always does, a refusal never. The pull leg
+    /// cuts its first upstream open from it.
     pub total_bytes_hint: Option<u64>,
 }
 
@@ -237,7 +249,7 @@ pub struct RankedCandidate {
 ///
 /// `score = rate_per_mb × max(rtt_ms, 1) × (1 / clamp(reputation, 0.1, 1.0)²)`
 ///
-/// The RTT has a floor of 1 ms. A probe faster than 1 ms truncates to
+/// The RTT has a floor of 1 ms. An RTT under 1 ms truncates to
 /// `rtt_ms = 0`, and a zero factor would make the score 0 for any rate: two
 /// such peers would tie whatever they quote, and a dear one would outrank every
 /// cheaper peer at 1 ms or more. With the floor, sub-millisecond peers rank on

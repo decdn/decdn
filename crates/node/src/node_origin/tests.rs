@@ -375,19 +375,37 @@ fn each_refusal_class_has_its_verdict() {
     );
 }
 
-/// #2178: backpressure is a transport shed or an OPEN-stage refusal. A bare
-/// mid-stream `NotFound` is not: the per-signer cap refuses
-/// only at admission, and a source that serves some bytes and then refuses
-/// must not reset the wait budget on every round. The open-stage `NotFound`
+/// #2178: backpressure is a transport shed or a `NotFound` refusal to admit
+/// the stream: at the open, or as the first frame after a served answer, where
+/// an upstream admits a hit at its first proof and its load shed and
+/// per-signer cap refuse. A `NotFound` after delivered bytes is not: the
+/// per-signer cap refuses only at admission, and a source that serves some
+/// bytes and then refuses must not reset the wait budget on every round.
+/// `Unfunded` and `Declined` are never backpressure. The open-stage `NotFound`
 /// case needs a signed refusal, which only the client crate can build; the
 /// `a_sole_coverer_backpressure_refusal_is_retried_not_dropped` integration
 /// test drives it through a real signed `StreamResponse`.
 #[test]
-fn backpressure_is_a_transport_shed_or_an_open_stage_refusal() {
+fn backpressure_is_a_transport_shed_or_a_refusal_at_admission() {
     assert_eq!(
         backpressure_verdict(&anyhow::Error::new(UpstreamRateLimited { label: None })),
         Some(PullVerdict::RateLimited)
     );
+    assert_eq!(
+        backpressure_verdict(&anyhow::Error::new(UpstreamRefused::at_admission(
+            StreamError::NotFound
+        ))),
+        Some(PullVerdict::Refused(RefusalVerdict::Transient)),
+        "a NotFound before any delivered byte is backpressure"
+    );
+    for error in [StreamError::Unfunded, StreamError::Declined] {
+        let at_admission = anyhow::Error::new(UpstreamRefused::at_admission(error.clone()));
+        assert_eq!(
+            backpressure_verdict(&at_admission),
+            None,
+            "an admission {error:?} is not backpressure"
+        );
+    }
     for error in [
         StreamError::NotFound,
         StreamError::Unfunded,
@@ -817,7 +835,7 @@ fn our_deadline_and_their_silence_get_opposite_verdicts() {
 /// A transport-level `APP_ERR_RATE_LIMITED` shed (#1986) is the same event as
 /// a handler-level load-shed `NotFound`, and must get the same verdict: brief
 /// suppression, no reputation. Scoring it `Unreachable` would record a 0.0 EWMA
-/// sample for a peer that answered, and every prober in a `GlobalFull` window
+/// sample for a peer that answered, and every requester in a `GlobalFull` window
 /// would record one at once.
 #[test]
 fn a_rate_limit_shed_is_suppressed_not_scored() {
@@ -841,7 +859,7 @@ fn a_rate_limit_shed_is_suppressed_not_scored() {
 /// unreachable on the strength of a local fault.
 #[test]
 fn a_timestamp_refusal_is_not_scored_unreachable() {
-    for label in [Some("probe-error".to_owned()), None] {
+    for label in [Some("open-error".to_owned()), None] {
         let refused = anyhow::Error::new(UpstreamTimestampRejected { label })
             .context("read response")
             .context("pull from candidate");
@@ -865,7 +883,7 @@ fn a_timestamp_refusal_is_not_scored_unreachable() {
 #[test]
 fn a_timestamp_refusal_suppresses_the_pair_without_scoring() -> anyhow::Result<()> {
     let metrics = Metrics::new();
-    let negative_cache = NegativeProbeCache::new();
+    let negative_cache = NegativeCandidateCache::new();
     let peer = iroh::SecretKey::from_bytes(&[7; 32]).public();
     let hash_bytes = [9; 32];
     let node = DhtNodeId::from_bytes(*peer.as_bytes());
@@ -963,7 +981,7 @@ fn a_reputation_penalty_names_the_peer_and_its_new_score() -> anyhow::Result<()>
     Ok(())
 }
 
-/// A probed holder with `coverage` over a blob of `total_bytes_hint` bytes.
+/// A discovered holder with `coverage` over a blob of `total_bytes_hint` bytes.
 fn holder(coverage: Coverage, total_bytes_hint: Option<u64>) -> Candidate {
     Candidate {
         node_id: [0; 32],
@@ -1012,7 +1030,25 @@ fn coverage_spans_needs_every_block_from_a_sized_holder() {
     );
     assert!(
         !coverage_spans(hash, &[holder(blocks(&[0, 1]), None)]),
-        "a holder that reports no size spans nothing"
+        "a holder that proves no size spans nothing"
+    );
+    assert!(
+        coverage_spans(
+            hash,
+            &[
+                holder(blocks(&[0]), Some(size)),
+                holder(blocks(&[1, 2]), None),
+            ]
+        ),
+        "a partial holder's refusal proves no size, but its blocks join a union \
+         another holder sized"
+    );
+    assert!(
+        !coverage_spans(
+            hash,
+            &[holder(blocks(&[0]), Some(size)), holder(blocks(&[2]), None),]
+        ),
+        "an unsized partial holder that leaves a block uncovered does not close the union"
     );
     assert!(
         !coverage_spans(hash, &[]),
@@ -1027,6 +1063,43 @@ fn coverage_spans_needs_every_block_from_a_sized_holder() {
     assert!(
         !coverage_spans(hash, &[spurious, holder(blocks(&[0]), Some(size))]),
         "a coverage bit past the holder's own block count does not count"
+    );
+}
+
+/// A refusal of a span to the end states no size, so its receiver cannot judge
+/// its coverage. One that claims every block while it refuses the blob
+/// contradicts itself once another holder proves the size: it counts no
+/// block, and the union does not span, so the origin directory still joins.
+#[test]
+fn a_refusal_that_claims_every_block_does_not_close_the_union() {
+    let hash = [7u8; 32];
+    let size = 3 * decdn_protocol::DISCOVERY_BLOCK_BYTES;
+    let blocks = |set: &[u32]| Coverage::from_block_indices(3, set.iter().copied());
+    let liar = || {
+        holder(
+            Coverage::full(decdn_protocol::coverage::MAX_COVERAGE_BLOCKS),
+            None,
+        )
+    };
+
+    assert!(
+        !coverage_spans(hash, &[holder(blocks(&[0]), Some(size)), liar()]),
+        "a refusal that claims every block counts none of them"
+    );
+    assert!(
+        !coverage_spans(hash, &[liar(), holder(blocks(&[1]), Some(size))]),
+        "the order the answers land in does not matter"
+    );
+    assert!(
+        coverage_spans(
+            hash,
+            &[
+                holder(blocks(&[0]), Some(size)),
+                liar(),
+                holder(blocks(&[1, 2]), None),
+            ]
+        ),
+        "a consistent partial refusal still joins the union beside it"
     );
 }
 
@@ -1077,26 +1150,26 @@ fn coverage_spans_for_the_empty_root_needs_one_admitted_holder() {
     );
 }
 
-/// Each probe drop lands in one trail count: a failed probe is unreachable, a
-/// `has_blob: false` answer is absent, and every drop on this node's own
-/// policy is dropped. The fold copies the round's counts over the trail and
-/// leaves the walk's own fields alone (#2366).
+/// Each open drop lands in one trail count: a failed open is unreachable, a
+/// refusal from a peer that holds no block is absent, and every drop on this
+/// node's own policy is dropped. The fold copies the round's counts over the
+/// trail and leaves the walk's own fields alone (#2366).
 #[test]
-fn each_probe_drop_lands_in_one_trail_count() {
-    let mut tally = ProbeTally::default();
+fn each_open_drop_lands_in_one_trail_count() {
+    let mut tally = OpenTally::default();
     for drop in [
-        ProbeDrop::Unreachable,
-        ProbeDrop::Absent,
-        ProbeDrop::RateLimited,
-        ProbeDrop::TimestampRejected,
-        ProbeDrop::NoAddress,
-        ProbeDrop::Unverifiable,
-        ProbeDrop::Inconsistent,
+        OpenDrop::Unreachable,
+        OpenDrop::Absent,
+        OpenDrop::RateLimited,
+        OpenDrop::TimestampRejected,
+        OpenDrop::NoAddress,
+        OpenDrop::Unverifiable,
+        OpenDrop::OverCeiling,
     ] {
         tally.record(drop);
     }
     tally.skipped = 1;
-    tally.probed = 7;
+    tally.opened = 7;
     tally.holders = 2;
     tally.spans = true;
     let mut trail = PullLegTrail {
@@ -1113,7 +1186,7 @@ fn each_probe_drop_lands_in_one_trail_count() {
             source: CandidateSource::Dht,
             discovered: 7,
             skipped: 1,
-            probed: 7,
+            opened: 7,
             unreachable: 1,
             absent: 1,
             dropped: 5,
@@ -1129,52 +1202,76 @@ fn each_probe_drop_lands_in_one_trail_count() {
 #[test]
 fn trail_counts_saturate() {
     assert_eq!(count_u16(usize::MAX), u16::MAX);
-    let mut tally = ProbeTally {
+    let mut tally = OpenTally {
         dropped: u16::MAX,
-        ..ProbeTally::default()
+        ..OpenTally::default()
     };
-    tally.record(ProbeDrop::NoAddress);
+    tally.record(OpenDrop::NoAddress);
     assert_eq!(tally.dropped, u16::MAX);
 }
 
-/// The node takes an upstream's probe size only from a proof that verifies:
-/// a wrong size with real proof bytes of another size, a size with no proof
-/// bytes, and a 2^60 size with garbage proof bytes are all refused before the
-/// size sizes a coverage union or a pull leg. An answer with no size passes.
-#[test]
-fn an_upstream_probe_size_counts_only_with_its_proof() -> anyhow::Result<()> {
-    use decdn_protocol::{ProbeResponseExt, SizeProof};
-    let blob: Vec<u8> = (0..90_000u32).map(|i| (i % 251) as u8).collect();
-    let size = u64::try_from(blob.len())?;
-    let hash = *Hash::new(&blob).as_bytes();
-    let proof_bytes = decdn_bao_range::encode_outboard(blob.as_slice(), size)?
-        .size_proof
-        .to_vec();
-    let ext = |size_proof| ProbeResponseExt {
-        coverage: Coverage::full(1),
-        size_proof,
-        payment_pools: None,
-    };
-    assert!(
-        probe_size_proven(hash, &ext(Some(SizeProof::new(size, proof_bytes.clone())?))).is_ok()
-    );
-    assert!(probe_size_proven(hash, &ext(None)).is_ok());
-    for (what, size_proof) in [
-        (
-            "a wrong size",
-            SizeProof::new(size + 1, proof_bytes.clone())?,
-        ),
-        ("no proof bytes", SizeProof::new(size, Vec::new())?),
-        ("a huge size", SizeProof::new(1u64 << 60, vec![0xEE; 4000])?),
-        (
-            "a huge size with no proof bytes",
-            SizeProof::new(1u64 << 60, Vec::new())?,
-        ),
-    ] {
-        assert!(
-            probe_size_proven(hash, &ext(Some(size_proof))).is_err(),
-            "{what} is refused"
-        );
+/// Candidate `id` over a path of `rtt_ms`, whose answer proved
+/// `total_bytes_hint` (a served holder) or no size.
+fn candidate(id: u8, rtt_ms: u32, total_bytes_hint: Option<u64>) -> Candidate {
+    Candidate {
+        node_id: [id; 32],
+        rtt_ms,
+        total_bytes_hint,
+        ..holder(Coverage::empty(), None)
     }
-    Ok(())
+}
+
+/// The assigned origins are the attested ones, plus the providers only when
+/// they are the origin directory's fallback: a DHT answer's holders are not
+/// origins.
+#[test]
+fn assigned_origins_take_the_providers_only_from_the_directory() {
+    let node = |b: u8| DhtNodeId::from_bytes([b; 32]);
+    let attested = [node(1)];
+    let providers = [node(1), node(2)];
+    assert_eq!(
+        assigned_origins(&attested, CandidateSource::Dht, &providers),
+        vec![node(1)]
+    );
+    assert_eq!(
+        assigned_origins(&attested, CandidateSource::Directory, &providers),
+        vec![node(1), node(2)],
+        "a provider already attested is listed once"
+    );
+    assert_eq!(
+        assigned_origins(&[], CandidateSource::None, &[]),
+        Vec::<DhtNodeId>::new()
+    );
+}
+
+/// The cold tail joins only when no holder is usable, nearest first, and the
+/// ids it returns are the targets it appended.
+#[test]
+fn the_cold_tail_joins_only_without_a_usable_holder_nearest_first() {
+    let hash = [5u8; 32];
+    let cold = || vec![candidate(7, 300, None), candidate(8, 20, None)];
+
+    // A usable holder keeps the cold targets out.
+    let mut ranked = vec![candidate(1, 10, Some(4096))];
+    let ids = append_cold_tail(&mut ranked, cold(), |c| c.total_bytes_hint.is_some(), hash);
+    assert!(ids.is_empty());
+    assert_eq!(ranked.len(), 1);
+
+    // A holder the walk cannot use (here: above the buy cap) does not.
+    let mut ranked = vec![candidate(1, 10, Some(4096))];
+    let ids = append_cold_tail(&mut ranked, cold(), |_| false, hash);
+    assert_eq!(ids, vec![[8; 32], [7; 32]], "nearest first");
+    let order: Vec<[u8; 32]> = ranked.iter().map(|c| c.node_id).collect();
+    assert_eq!(order, vec![[1; 32], [8; 32], [7; 32]], "after the holders");
+
+    // A partial holder serves no span, so the cold targets join after it.
+    let mut ranked = vec![candidate(2, 10, None)];
+    let ids = append_cold_tail(&mut ranked, cold(), |c| c.total_bytes_hint.is_some(), hash);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ranked.len(), 3);
+
+    // No cold target: nothing joins.
+    let mut ranked = Vec::new();
+    assert!(append_cold_tail(&mut ranked, Vec::new(), |_| false, hash).is_empty());
+    assert!(ranked.is_empty());
 }

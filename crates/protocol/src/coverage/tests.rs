@@ -98,3 +98,68 @@ fn deserialize_rejects_oversized_bitmap() {
         "oversized coverage bitmap must be rejected"
     );
 }
+
+#[test]
+fn byte_range_blocks_spans_every_block_the_range_touches() {
+    let block = discovery_block_bytes();
+    assert_eq!(byte_range_blocks(0, 1), 0..1);
+    assert_eq!(byte_range_blocks(0, block), 0..1);
+    assert_eq!(byte_range_blocks(0, block + 1), 0..2);
+    assert_eq!(byte_range_blocks(block - 1, block + 1), 0..2);
+    assert_eq!(byte_range_blocks(2 * block, 3 * block), 2..3);
+    assert!(byte_range_blocks(5, 5).is_empty(), "an empty range");
+    assert!(byte_range_blocks(6, 5).is_empty(), "an inverted range");
+    assert_eq!(
+        byte_range_blocks(u64::MAX - 1, u64::MAX),
+        (u64::MAX - 1) / block..(u64::MAX - 1) / block + 1,
+        "no overflow at the top of the range"
+    );
+}
+
+#[test]
+fn covers_byte_range_needs_every_touched_block() {
+    let block = discovery_block_bytes();
+    let cov = Coverage::from_block_indices(4, [1, 2].into_iter());
+    assert!(cov.covers_byte_range(block, 3 * block));
+    assert!(cov.covers_byte_range(block + 7, block + 8));
+    assert!(
+        !cov.covers_byte_range(block - 1, 2 * block),
+        "block 0 is missing"
+    );
+    assert!(
+        !cov.covers_byte_range(2 * block, 3 * block + 1),
+        "block 3 is missing"
+    );
+    assert!(!cov.covers_byte_range(block, block), "an empty range");
+}
+
+#[test]
+fn covers_byte_range_is_false_past_the_bitmap() {
+    let block = discovery_block_bytes();
+    let cov = Coverage::full(8);
+    assert!(cov.covers_byte_range(0, 8 * block));
+    assert!(
+        !cov.covers_byte_range(0, 8 * block + 1),
+        "block 8 is past the bitmap"
+    );
+    assert!(
+        !cov.covers_byte_range(0, u64::MAX),
+        "a huge range ends at the bitmap bound"
+    );
+}
+
+#[test]
+fn for_wire_cuts_the_bitmap_at_the_wire_bound() -> Result<(), postcard::Error> {
+    let blocks = MAX_COVERAGE_BLOCKS * 2;
+    let cov = Coverage::for_wire(blocks, 0..blocks);
+    assert!(cov.covers(MAX_COVERAGE_BLOCKS - 1));
+    assert!(!cov.covers(MAX_COVERAGE_BLOCKS), "past the wire bound");
+    let decoded: Coverage = postcard::from_bytes(&postcard::to_allocvec(&cov)?)?;
+    assert_eq!(decoded, cov, "a receiver decodes it");
+    assert_eq!(
+        Coverage::for_wire(3, [0, 2].into_iter()),
+        Coverage::from_block_indices(3, [0, 2].into_iter()),
+        "a blob inside the bound is unchanged"
+    );
+    Ok(())
+}

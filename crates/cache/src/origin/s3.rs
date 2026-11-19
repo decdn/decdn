@@ -912,6 +912,34 @@ impl Origin for S3Origin {
         })
     }
 
+    fn has_outboard(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let key = format!("{}{OBAO4_SUFFIX}", key_for(&self.prefix, hash));
+            let log_target = format!("s3://{}/{key}", self.bucket);
+            // `HeadObject` reads the outboard's metadata and none of its body.
+            match self
+                .io
+                .run(
+                    self.client
+                        .head_object()
+                        .bucket(self.bucket.as_ref())
+                        .key(&key)
+                        .send(),
+                )
+                .await
+                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 HeadObject"))))?
+            {
+                Ok(_) => Ok(true),
+                // A missing outboard is `Ok(None)`; any other failure is a
+                // fault.
+                Err(e) => classify_head_object_error(e, &log_target).map(|size| size.is_some()),
+            }
+        })
+    }
+
     fn fetch_size_proof(
         &self,
         hash: Hash,

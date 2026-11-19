@@ -1416,13 +1416,12 @@ const MIB: u64 = 1 << 20;
 #[tokio::test]
 async fn a_rebase_never_moves_below_the_price_of_verified_bytes() -> anyhow::Result<()> {
     let ledger = PoolLedger::new(Cumulative::default());
-    ledger.note_rate(10);
     // 4 MiB paid at 10 base units per MiB.
     ledger
         .issue(4 * MIB, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
         .await?;
     ledger.note_wire(4 * MIB);
-    ledger.note_verified(4 * MIB);
+    ledger.note_verified(4 * MIB, 10);
     let paid = ledger.committed();
 
     let stale = Cumulative {
@@ -1437,11 +1436,44 @@ async fn a_rebase_never_moves_below_the_price_of_verified_bytes() -> anyhow::Res
     Ok(())
 }
 
+/// The floor prices each verified byte at the rate of the stream that
+/// verified it: a later stream at another rate never re-prices the bytes an
+/// earlier stream verified.
+#[tokio::test]
+async fn the_verified_floor_prices_each_stream_at_its_own_rate() -> anyhow::Result<()> {
+    let ledger = PoolLedger::new(Cumulative::default());
+    // 4 MiB at 10 per MiB, then 1 MiB at 30 per MiB: 70 in all.
+    ledger
+        .issue(4 * MIB, 10, EpochAction::Keep, |_n, _c| async { Ok(()) })
+        .await?;
+    ledger
+        .issue(MIB, 30, EpochAction::Keep, |_n, _c| async { Ok(()) })
+        .await?;
+    ledger.note_wire(5 * MIB);
+    ledger.note_verified(4 * MIB, 10);
+    ledger.note_verified(MIB, 30);
+    let paid = ledger.committed();
+    assert_eq!(paid.amount, U256::from(70u64));
+
+    let stale = Cumulative {
+        bytes: U256::from(MIB),
+        amount: U256::from(10u64),
+    };
+    assert_matches!(ledger.rebase(stale, Some(0)).await, Rebase::Rebased { .. });
+    let floor = ledger.committed();
+    assert_eq!(floor.bytes, U256::from(5 * MIB));
+    assert_eq!(
+        floor.amount,
+        U256::from(70u64),
+        "each stream's bytes at its own rate, not 5 MiB at the latest rate (150)"
+    );
+    Ok(())
+}
+
 /// A lane with a shared track record, as two signers at one node would hold.
 fn lane_at(trust: &Arc<crate::payer_window::NodeTrust>) -> PoolLedger {
     let ledger = PoolLedger::new(Cumulative::default());
     ledger.attach_trust(Arc::clone(trust));
-    ledger.note_rate(10);
     ledger
 }
 
@@ -1456,8 +1488,8 @@ fn node() -> Arc<crate::payer_window::NodeTrust> {
 fn verified_bytes_feed_the_operator_record() {
     let trust = node();
     let (a, b) = (lane_at(&trust), lane_at(&trust));
-    a.note_verified(2 * MIB);
-    b.note_verified(3 * MIB);
+    a.note_verified(2 * MIB, 10);
+    b.note_verified(3 * MIB, 10);
     assert_eq!(trust.verified(), 5 * MIB);
     assert_eq!(trust.lost(), 0);
 }

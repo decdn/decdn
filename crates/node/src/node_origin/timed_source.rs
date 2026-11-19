@@ -100,6 +100,10 @@ impl<S: BlobSource> BlobSource for TimedSource<S> {
     fn max_blob_size_bytes(&self) -> u64 {
         self.inner.max_blob_size_bytes()
     }
+
+    fn narrow(&self, reader: &mut Self::Reader, range: &AlignedRange) -> bool {
+        self.inner.narrow(&mut reader.inner, range)
+    }
 }
 
 /// A pull-leg reader that records the time from the start of its open to its

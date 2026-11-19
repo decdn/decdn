@@ -344,3 +344,32 @@ async fn stream_frames_count_stream_data_and_not_keep_alives() -> anyhow::Result
     server.close().await;
     Ok(())
 }
+
+/// The first-proof wait faults at its fixed deadline: no transport progress
+/// enters it, so sibling streams cannot extend it.
+#[tokio::test(start_paused = true)]
+async fn the_first_proof_wait_ends_at_its_fixed_deadline() -> anyhow::Result<()> {
+    let start = Instant::now();
+    let never = std::future::pending::<anyhow::Result<()>>();
+    let Err(err) = wait_for_first_proof(never, || "path".into()).await else {
+        anyhow::bail!("a first proof that never comes faults");
+    };
+    assert_eq!(start.elapsed(), VOUCHER_READ_TIMEOUT);
+    assert!(
+        err.downcast_ref::<super::super::wire::PeerFault>()
+            .is_some()
+    );
+    assert!(!ProofWaitFault::is_past_ceiling(&err));
+    Ok(())
+}
+
+/// A first proof that arrives before the deadline ends the wait.
+#[tokio::test(start_paused = true)]
+async fn a_first_proof_before_its_deadline_ends_the_wait() -> anyhow::Result<()> {
+    let read = async {
+        tokio::time::sleep(VOUCHER_READ_TIMEOUT.saturating_sub(SECOND)).await;
+        Ok::<_, anyhow::Error>(7)
+    };
+    assert_eq!(wait_for_first_proof(read, || "path".into()).await?, 7);
+    Ok(())
+}

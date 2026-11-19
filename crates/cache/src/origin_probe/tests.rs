@@ -166,7 +166,7 @@ fn presence_size_maps_to_probe_answer() {
     assert_eq!(
         Presence::Fault.size(),
         None,
-        "a fault also leaves has_blob false"
+        "a fault advertises nothing too"
     );
 }
 

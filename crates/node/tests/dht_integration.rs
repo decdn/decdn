@@ -69,8 +69,8 @@ use decdn_common::config::ResolvedSecurity;
 use decdn_node::dht::attestation::test_support;
 use decdn_node::dht::routing::K_BUCKET_SIZE;
 use decdn_node::dht::{
-    AttestedBy, ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig, NegativeProbeCache,
-    RecordStore, RecordStoreConfig, RoutingTable, StakerSet, client,
+    AttestedBy, ConfigStakerSet, DhtRateLimiter, InsertOutcome, LookupConfig,
+    NegativeCandidateCache, RecordStore, RecordStoreConfig, RoutingTable, StakerSet, client,
     rate_limit::DhtRateLimitConfig,
 };
 
@@ -81,7 +81,7 @@ async fn find_providers(
     conns: &decdn_client::Connections,
     routing: &Arc<Mutex<RoutingTable>>,
     staker_set: &Arc<dyn StakerSet>,
-    neg: &NegativeProbeCache,
+    neg: &NegativeCandidateCache,
     requester: NodeId,
     target: ContentHash,
     cfg: LookupConfig,
@@ -490,7 +490,7 @@ async fn find_providers_converges_after_peer_departs() -> anyhow::Result<()> {
     client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     client_staked.insert(departed_id);
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
 
     let providers = find_providers(
         &support::dht_conns(&client_ep),
@@ -578,7 +578,7 @@ async fn find_providers_tolerates_unreachable_peer() -> anyhow::Result<()> {
     client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     client_staked.insert(dead_id);
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
 
     // Guard against a hang regression. The routing table holds two peers and
     // `alpha` is 3, so round one queries both: the provider answers at once and
@@ -724,7 +724,7 @@ async fn find_providers_converges_via_closer_nodes_second_round() -> anyhow::Res
     client_staked.insert(seed_id);
     client_staked.insert(holder_id);
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
 
     let providers = find_providers(
         &support::dht_conns(&client_ep),
@@ -791,7 +791,7 @@ async fn find_providers_skips_a_dead_referral_on_the_next_lookup() -> anyhow::Re
     client_staked.insert(seed_id);
     client_staked.insert(holder_id);
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
     let metrics = Metrics::new();
 
     let providers = tokio::time::timeout(
@@ -900,10 +900,10 @@ async fn find_providers_stops_suppressing_once_the_negative_entry_expires() -> a
     client_staked.insert(NodeId::from_bytes(*provider.id.as_bytes()));
     let staker_set: Arc<dyn StakerSet> = Arc::new(ConfigStakerSet::new(client_staked));
 
-    // The production defaults: ADR 001 § Probe cache's 1024 entries and
+    // The production defaults: ADR 001 §Candidate cache's 1024 entries and
     // 5-minute TTL. Nothing this test does comes near that window, so the
     // suppression assertion below does not ride on how long a lookup takes.
-    let neg = NegativeProbeCache::new();
+    let neg = NegativeCandidateCache::new();
     let provider_node = NodeId::from_bytes(*provider.id.as_bytes());
     let target_hash = ContentHash::from_bytes(target);
     neg.record_failure(provider_node, target_hash);

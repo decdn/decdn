@@ -127,7 +127,7 @@ pub struct ResolvedBlockchain {
     /// used when `content_blacklist_address` is set.
     pub content_blacklist_poll_interval_sec: u64,
     /// Seconds the node may go without a successful chain read before the serve
-    /// and probe paths refuse (ADR 011 § Serving while chain-stale). Defaults to
+    /// path refuses (ADR 011 § Serving while chain-stale). Defaults to
     /// [`super::DEFAULT_CHAIN_STALENESS_GRACE_SEC`]. Always evaluated; a large
     /// value opts out. Only used when `content_blacklist_address` is set.
     pub chain_staleness_grace_sec: u64,
@@ -231,9 +231,9 @@ pub struct ResolvedCache {
     /// per-MB units as the wire `StreamResponse.rate_per_mb`; `0` = unlimited
     /// (the default). A buyer-side ceiling: it bounds what this node, acting as a
     /// BUYER on a cache-miss pull, will accept a provider to quote. The node also
-    /// always applies a probe-relative bound (a quote may not exceed the rate the
-    /// chosen candidate advertised at probe), so this is the additional absolute
-    /// backstop. The node never bounds its own sell rate.
+    /// always applies a discovery-relative bound (a quote may not exceed the rate
+    /// the chosen candidate quoted at discovery), so this is the additional
+    /// absolute backstop. The node never bounds its own sell rate.
     pub max_rate_per_mb: u64,
     /// Resolved ordered list of origin backends (#437, #284). Empty
     /// vec => no pull-through; cache misses return `NoOrigin`. A
@@ -291,7 +291,7 @@ pub struct ResolvedCache {
     pub fs_rescan_interval_sec: u64,
     /// TTL in seconds for a memoised positive live-origin probe answer (#1130
     /// pt3). Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
-    /// per-probe `HEAD`/`HeadObject` fallback that discovers non-pinned http/s3
+    /// per-request `HEAD`/`HeadObject` fallback that discovers non-pinned http/s3
     /// objects the enumeration index cannot see.
     pub origin_probe_ttl_sec: u64,
     /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC`]. The
@@ -303,13 +303,13 @@ pub struct ResolvedCache {
     /// hash that faulted is not re-probed, and is capped by
     /// `origin_probe_ttl_sec` so a recovered origin is noticed soon.
     pub origin_probe_fault_ttl_sec: u64,
-    /// Per-probe live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
+    /// Per-request live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
-    /// off the probe hot path.
+    /// off the serve hot path.
     pub origin_probe_timeout_ms: u64,
     /// Maximum distinct hashes in the live-origin probe memo (#1130 pt3).
     /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`]. Bounds
-    /// memo memory under a random-hash probe flood.
+    /// memo memory under a random-hash request flood.
     pub origin_probe_memo_capacity: u64,
     /// LRU eviction driver high-water percent of [`Self::cache_size_mb`]
     /// (#1173). Above this fraction the driver actively evicts. Validated to
@@ -327,17 +327,6 @@ pub struct ResolvedCache {
     /// LRU eviction driver wakeup cadence in seconds (#1173). Validated to
     /// `[1, 60]`. Default [`crate::config::DEFAULT_EVICTION_TICK_SECS`].
     pub eviction_tick_secs: u64,
-    /// Maximum number of concurrently held (eviction-exempt) blobs for the
-    /// probe-triggered hold (ADR 005 §Hold budget, #318). Default
-    /// [`crate::config::DEFAULT_MAX_PROBE_HOLDS`]; `0` disables
-    /// `has_blob: true`.
-    pub max_probe_holds: usize,
-    /// Probe-hold slots reserved for the stake lane (registered node-to-node
-    /// requesters) under hold-budget pressure (#757, ADR 003 §Admission and
-    /// Priority). Default `0` disables the reservation (single-lane node).
-    /// The runtime only builds a `StakeLanePolicy` when this is `> 0`, so the
-    /// probe handler's hot path is unchanged for the default.
-    pub stake_lane_reserved_holds: usize,
     /// Enable node-to-node paid cache-miss pull-through (#831). The default is
     /// role-derived: `true` when no origin backend is configured, `false` when
     /// one is. Explicit config overrides either default. When `true` and the
@@ -354,9 +343,10 @@ pub struct ResolvedCache {
     /// is relaying. Explicit config overrides either default. Node-local;
     /// `cache.*` is restart-required.
     pub relay_foreign_namespaces: bool,
-    /// Providers probed before ranking on a node-to-node pull (#831). Default
-    /// [`crate::config::DEFAULT_NODE_PULL_PROBE_FANOUT`].
-    pub node_pull_probe_fanout: usize,
+    /// Providers a node-to-node pull opens a discovery stream on before
+    /// ranking (#831). Default
+    /// [`crate::config::DEFAULT_NODE_PULL_OPEN_FANOUT`].
+    pub node_pull_open_fanout: usize,
     /// Per-pull wall-clock timeout in seconds for a node-to-node miss fill
     /// (#831). Default [`crate::config::DEFAULT_NODE_PULL_TIMEOUT_SEC`].
     ///
@@ -620,48 +610,10 @@ impl Default for ResolvedDht {
     }
 }
 
-/// Resolved `cdn/probe/v1` settings (ADR 005 §Probe rate limiting).
-///
-/// Mirrors [`ResolvedDht`] in shape; `Default` returns the ADR 005 defaults
-/// (a tighter per-peer cap than the DHT layer, since probes are
-/// unauthenticated and cheaper to flood) so hand-built `ResolvedConfig` test
-/// sites can write `ResolvedProbe::default()`. The production
-/// `resolve_probe_into` path threads the defaults through the resolver bag.
-#[derive(Debug, Clone)]
-pub struct ResolvedProbe {
-    /// Token refill rate for the per-peer (`NodeId`) limiter, in probes/second.
-    pub per_peer_rate_per_sec: f64,
-    /// Bucket capacity for the per-peer limiter: how many probes one
-    /// peer may send back to back before the refill rate binds. `0` alongside
-    /// a `0.0` rate disables the layer; `0` against a nonzero rate is rejected
-    /// as a deny-all. The same pairing rule holds for the global layer.
-    pub per_peer_burst: u32,
-    /// Token refill rate for the handler-wide limiter, in probes/second. Applies
-    /// across all peers together.
-    pub global_rate_per_sec: f64,
-    /// Bucket capacity for the handler-wide limiter.
-    pub global_burst: u32,
-    /// Hard cap on the per-peer (`NodeId`) keyed-limiter map (#645). `0`
-    /// => unbounded.
-    pub max_tracked_per_peer: usize,
-}
-
-impl Default for ResolvedProbe {
-    fn default() -> Self {
-        Self {
-            per_peer_rate_per_sec: 5.0,
-            per_peer_burst: 5,
-            global_rate_per_sec: 1000.0,
-            global_burst: 2000,
-            max_tracked_per_peer: 4096,
-        }
-    }
-}
-
 /// Resolved inbound `cdn/client/v1` settings (ADR 005 §Request rate
 /// limiting).
 ///
-/// Mirrors [`ResolvedProbe`] in shape; `Default` returns the ADR 005 request
+/// Mirrors [`ResolvedDht`] in shape; `Default` returns the ADR 005 request
 /// defaults so hand-built `ResolvedConfig` test sites can write
 /// `ResolvedServe::default()`. The production `resolve_serve_into` path
 /// threads the defaults through the resolver bag.
@@ -802,8 +754,6 @@ pub struct ResolvedConfig {
     pub load_shed: ResolvedLoadShed,
     /// `cdn/dht/v1` settings (ADR 022).
     pub dht: ResolvedDht,
-    /// `cdn/probe/v1` settings (ADR 005).
-    pub probe: ResolvedProbe,
     /// Inbound `cdn/client/v1` settings (ADR 005).
     pub serve: ResolvedServe,
     /// Download-receipt log settings.

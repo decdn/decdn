@@ -1,12 +1,12 @@
 //! Live-origin probe memo (#1130 pt3): a bounded, TTL'd cache of
-//! `HEAD`/`HeadObject` existence answers so a per-probe origin existence check
-//! does not hammer the backend.
+//! `HEAD`/`HeadObject` existence answers so a per-request origin existence
+//! check does not hammer the backend.
 //!
 //! `rescan_origins` (#1130) builds the zero-I/O `origin_held` index from
 //! `enumerate()` ∪ pins, which for http/s3 covers pinned hashes ONLY (neither
 //! backend lists). A non-pinned bucket object is therefore invisible to the
-//! probe. This memo backs the per-probe fallback that consults the origin
-//! directly (`CacheEngine::origin_probe_size`): it caches BOTH a positive answer
+//! index. This memo backs the per-request fallback that consults the origin
+//! directly (`CacheEngine::origin_probe_presence`): it caches BOTH a positive answer
 //! (`Present(size)`) under a long positive TTL and a negative one (`Absent`)
 //! under a short negative TTL, so a flood of random-hash probes turns into at
 //! most one `HeadObject` per hash per TTL window rather than one per probe,
@@ -72,8 +72,8 @@ pub enum Presence {
 }
 
 impl Presence {
-    /// The probe answer this presence yields: `Some(size)` advertises
-    /// `has_blob: true`, `None` leaves it `false`.
+    /// The size this presence advertises: `Some(size)` advertises the blob,
+    /// `None` does not.
     pub const fn size(self) -> Option<u64> {
         match self {
             Presence::Present(size) => Some(size),

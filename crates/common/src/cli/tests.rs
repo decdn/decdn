@@ -49,7 +49,17 @@ fn max_lane_streams_is_bounded_to_1_through_64() {
 fn json_requested_sees_the_flag_at_every_depth() {
     use clap::CommandFactory;
     for argv in [
-        &["decdn", "probe", "--json", "--node-id", "x", "--hash", "h"][..],
+        &[
+            "decdn",
+            "probe",
+            "--json",
+            "--node-id",
+            "x",
+            "--provider-address",
+            "0x1",
+            "--hash",
+            "h",
+        ][..],
         &["decdn", "node", "status", "--json"][..],
         &["decdn", "pool", "list", "--json"][..],
         &["decdn", "get", "decdn:abc", "--json"][..],
@@ -58,7 +68,16 @@ fn json_requested_sees_the_flag_at_every_depth() {
         assert!(json_requested(&matches), "{argv:?} asked for JSON");
     }
     for argv in [
-        &["decdn", "probe", "--node-id", "x", "--hash", "h"][..],
+        &[
+            "decdn",
+            "probe",
+            "--node-id",
+            "x",
+            "--provider-address",
+            "0x1",
+            "--hash",
+            "h",
+        ][..],
         &["decdn", "whoami"][..],
         &["decdn", "node", "status"][..],
     ] {

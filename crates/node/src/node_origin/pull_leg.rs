@@ -9,15 +9,15 @@
 //!
 //! # Two entry points
 //!
-//! - [`NodeOrigin::open_pull_leg`] — discovery + probe + rank + a header
-//!   handshake. Returns the ranked [`PullLegTarget`] (the upstream `total_bytes`
-//!   plus the ranked candidates, each with its probe-fresh range-keyed coverage),
-//!   so the orchestration can sign its `StreamResponse` before either leg streams a
-//!   byte. Discovery happens ONCE here; the pull leg does not re-discover. Any
-//!   holder — partial or whole — reports the same `total_bytes`, so the handshake
-//!   walks candidates until one answers. With a prime and a candidate that
-//!   reported its size on the probe, the handshake opens the pull leg's own first
-//!   leg and the target carries that pull for the first run to adopt (#2063).
+//! - [`NodeOrigin::open_pull_leg`] — discovery by voucher-less opens + rank + a
+//!   header handshake. Returns the ranked [`PullLegTarget`] (the upstream
+//!   `total_bytes` plus the ranked candidates, each with the range-keyed coverage
+//!   its open answered), so the orchestration can sign its `StreamResponse` before
+//!   either leg streams a byte. Discovery happens ONCE here; the pull leg does not
+//!   re-discover. Any holder — partial or whole — proves the same `total_bytes`,
+//!   so the handshake walks candidates until one answers. Each discovery open asks
+//!   for the pull leg's own first leg, so the first run's holder's open is that
+//!   leg, and the target carries it for the first run to adopt (#2063).
 //! - [`run_pull_leg`] — assembles the blob across the partial holders via the
 //!   ranged-drive loop (#1506): it plans the missing range into runs by coverage
 //!   ([`decdn_client::plan_covered_runs`]) and drives them in offset order,
@@ -66,11 +66,12 @@ use super::funder::{SETTLE_POLL_STEP, settle_window};
 use super::ranged_pull::{AssembleOutcome, RecoveryEnd, RunOutcome, RunSink, assemble};
 use super::timed_source::{TimedReader, TimedSource, timed_open};
 use super::{
-    EconGate, NodeOrigin, NodeOriginDeps, ProbeGather, ProbeTally, PullMiss, PullOutcome,
-    PullVerdict, SettleOnDrop, bind_upstream_ctx, cached_candidates, classify_pool_open_arm,
-    classify_pull_failure, count_u16, coverage_spans, discover, economic_ceiling, heat_of,
-    lane_ledger, mb_of, probe_and_rank, record_backpressure_exhausted, record_backpressure_refusal,
-    record_outcome, record_pool_open_failure,
+    Discovery, EconGate, HeldOpen, NodeOrigin, NodeOriginDeps, OpenGather, OpenSpec, OpenStreams,
+    OpenTally, PullMiss, PullOutcome, PullVerdict, SettleOnDrop, append_cold_tail,
+    assigned_origins, bind_upstream_ctx, cached_candidates, classify_pool_open_arm,
+    classify_pull_failure, count_u16, coverage_spans, discover, discovery_ctx, economic_ceiling,
+    heat_of, lane_ledger, mb_of, open_and_rank, record_backpressure_exhausted,
+    record_backpressure_refusal, record_outcome, record_pool_open_failure, usable_holder,
 };
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::dht::routing::NodeId as DhtNodeId;
@@ -93,8 +94,8 @@ type Handshake = (
 
 /// A discovered, ranked pull plan for one serve-miss: the `total_bytes` the caller
 /// needs to sign its `StreamResponse`, plus the RANKED candidate list (each
-/// carrying its probe-fresh range-keyed `coverage`, #1506) the ranged-drive loop
-/// assembles the blob from. Discovery + probe + rank happen ONCE, here, and the
+/// carrying the range-keyed `coverage` its open answered, #1506) the ranged-drive
+/// loop assembles the blob from. Discovery + rank happen ONCE, here, and the
 /// result is handed to [`run_pull_leg`], which opens a lane per planned run — a
 /// blob spread across partial holders is pulled from each in turn.
 pub(crate) struct PullLegTarget {
@@ -108,14 +109,14 @@ pub(crate) struct PullLegTarget {
     pub(crate) size_proof: Option<decdn_protocol::SizeProof>,
     /// The served client's namespace, threaded onto every lane (ADR 005), big-endian.
     namespace_id: [u8; 32],
-    /// The ranked candidates (best-first), each with its probe-confirmed
+    /// The ranked candidates (best-first), each with its open-confirmed
     /// `coverage`. The loop plans the missing range across these
     /// ([`decdn_client::plan_covered_runs`]) and opens one payment lane per
     /// run.
     candidates: Vec<Candidate>,
     /// The handshake's pull, opened at the first leg the pull leg is expected to
     /// open, for that leg to adopt (#2063). `None` when the handshake kept no
-    /// first-leg pull: no prime or probed size, or no predictable leg.
+    /// first-leg pull: no prime or proven size, or no predictable leg.
     primed: Option<PrimedHandshake>,
 }
 
@@ -235,6 +236,37 @@ impl PrimeLeg {
         align_range(start, draw, total_bytes).ok()
     }
 
+    /// The span every discovery open of this pull asks for, as
+    /// `(byte_offset, byte_len)`: the pull's own range, from the chunk group
+    /// its offset falls in, cut to the cap on held bytes `max_blob_size_bytes`
+    /// (`0` = none) so a holder's served stream fits under the cap. The open
+    /// needs no blob size: a holder clamps a range that runs past the blob's
+    /// end. A served stream of this span starts where
+    /// [`Self::predicted_leg`] starts and runs at least to its end, so the
+    /// first run adopts it, narrowed to its leg. The empty blob is asked for
+    /// whole, as a holder serves it only whole.
+    pub(crate) fn open_span(&self, hash: [u8; 32], max_blob_size_bytes: u64) -> (u64, u64) {
+        if hash == decdn_protocol::EMPTY_ROOT {
+            return (0, 0);
+        }
+        let start = self.offset - self.offset % CHUNK_GROUP_BYTES;
+        let len = if self.len == 0 {
+            0
+        } else {
+            self.offset
+                .saturating_add(self.len)
+                .div_ceil(CHUNK_GROUP_BYTES)
+                .saturating_mul(CHUNK_GROUP_BYTES)
+                - start
+        };
+        let len = match (len, max_blob_size_bytes) {
+            (len, 0) => len,
+            (0, cap) => cap,
+            (len, cap) => len.min(cap),
+        };
+        (start, len)
+    }
+
     /// The index into `coverages` of the source the pull leg's first run uses,
     /// planned as [`super::ranged_pull::assemble`] plans its first round over
     /// the ranked candidates' `coverages` of a `total_bytes` blob, or `None`
@@ -285,16 +317,22 @@ fn handshake_order(
 }
 
 /// The header handshake's range for a candidate advertising `coverage` of a
-/// `total_bytes` blob: the first chunk group of the first discovery block it
-/// covers, as `(offset, len)`, or `None` when it covers none of the blob.
+/// blob of `total_bytes`, when its size is proven: the first chunk group of the
+/// first discovery block it covers, as `(offset, len)`, or `None` when it covers
+/// none of the blob. A partial holder's refusal proves no size; its range is then
+/// the first chunk group of the first block it names, and the holder clamps a
+/// group that runs past the blob's end.
 fn covered_handshake_range(
     coverage: &decdn_protocol::Coverage,
-    total_bytes: u64,
+    total_bytes: Option<u64>,
 ) -> Option<(u64, u64)> {
-    let blocks = decdn_protocol::num_blocks(total_bytes);
+    let blocks = total_bytes.map_or(u32::MAX, decdn_protocol::num_blocks);
     let first = coverage.covered_blocks().find(|&block| block < blocks)?;
     let start = u64::from(first).checked_mul(decdn_protocol::discovery_block_bytes())?;
-    (start < total_bytes).then(|| (start, CHUNK_GROUP_BYTES.min(total_bytes - start)))
+    match total_bytes {
+        Some(total) => (start < total).then(|| (start, CHUNK_GROUP_BYTES.min(total - start))),
+        None => Some((start, CHUNK_GROUP_BYTES)),
+    }
 }
 
 /// Which run may adopt a primed pull, apart from the pull itself: the facts a
@@ -333,13 +371,18 @@ impl PrimeKey {
     }
 }
 
-/// The handshake's live pull, opened at the pull leg's predicted first leg and
-/// parked for the first run to adopt.
+/// The handshake's live pull of the pull leg's predicted first leg, parked for
+/// the first run to adopt: the candidate's discovery stream, adopted on its
+/// lane, or the handshake's own open.
 pub(crate) struct PrimedHandshake {
     /// What a run checks before it adopts the pull.
     key: PrimeKey,
     /// The pull leg the pull was cut for.
     prime: PrimeLeg,
+    /// The range the live pull serves: the first leg (`key.range`), or a
+    /// longer range from the same start, which the adopting open narrows to the
+    /// leg.
+    pull_range: AlignedRange,
     /// The pull's signed response header.
     header: UpstreamPullHeader,
     /// The live pull, timed from the start of the handshake open.
@@ -540,13 +583,14 @@ fn is_bao_corruption(err: &anyhow::Error) -> bool {
     })
 }
 
-/// The probe-cache candidates for `target`, when their coverage spans the blob.
+/// The candidate-cache candidates for `target`, when their coverage spans the
+/// blob.
 ///
 /// A cached list that cannot span the blob is no hit for the ranged assembly: a
 /// partial holder can win the handshake, and the blocks no cached holder covers
 /// would then stay unfilled (#2195). The caller's cold path re-runs discovery, and
-/// its probe round adds the directory's origins when the discovered holders do not
-/// span the blob. The entry is not invalidated here: that probe round overwrites
+/// its open round adds the directory's origins when the discovered holders do not
+/// span the blob. The entry is not invalidated here: that open round overwrites
 /// it.
 async fn spanning_cached_candidates(
     deps: &NodeOriginDeps,
@@ -562,7 +606,7 @@ async fn spanning_cached_candidates(
     debug!(
         %hash,
         cached = cached.len(),
-        "node-origin: probe-cache entry does not span the blob; running a fresh lookup"
+        "node-origin: candidate-cache entry does not span the blob; running a fresh lookup"
     );
     None
 }
@@ -573,7 +617,7 @@ pub(crate) enum CandidateSource {
     /// No list: pull-through is not provisioned, or discovery named nobody.
     #[default]
     None,
-    /// A probe-cache entry whose coverage spans the blob.
+    /// A candidate-cache entry whose coverage spans the blob.
     Cache,
     /// The DHT lookup's answer.
     Dht,
@@ -600,14 +644,14 @@ impl CandidateSource {
 /// the fleet's info-level log says which stage left the walk empty: nobody
 /// discovered, every candidate skipped or unreachable, holders that do not
 /// span the blob, or handshakes that all failed. Counts saturate at
-/// `u16::MAX`; the probe fanout and the attempt budget keep them far below it.
+/// `u16::MAX`; the open fan-out and the attempt budget keep them far below it.
 ///
 /// `source` and `discovered` describe the last candidate list the walk built.
-/// A probe-cache hit that fails its handshakes and falls through to a fresh
+/// A candidate-cache hit that fails its handshakes and falls through to a fresh
 /// lookup reports that lookup's source; `handshakes` counts both walks.
-/// `skipped` and `probed` also count the origin-directory supplement round,
-/// whose peers are not in `discovered`, so they can exceed it. A probe the
-/// round cancels at its early stop counts in `probed` only. `holders` and
+/// `skipped` and `opened` also count the origin-directory supplement round,
+/// whose peers are not in `discovered`, so they can exceed it. An open the
+/// round drops at its early stop counts in `opened` only. `holders` and
 /// `spans` describe the candidates the handshake walk has, after the
 /// requester drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -618,18 +662,19 @@ pub(crate) struct PullLegTrail {
     /// negative-cache filtered by the lookup; a directory list is not, so its
     /// suppressed peers count here and in `skipped`.
     pub(crate) discovered: u16,
-    /// Peers the probe rounds skipped before probing: suppressed for the hash
-    /// in the negative cache, or wedged as a provider.
+    /// Peers the discovery rounds skipped before opening: suppressed for the
+    /// hash in the negative cache, or wedged as a provider.
     pub(crate) skipped: u16,
-    /// Probes the rounds sent.
-    pub(crate) probed: u16,
-    /// Probes that failed: a timeout, a failed dial, a dropped connection.
+    /// Discovery opens the rounds sent.
+    pub(crate) opened: u16,
+    /// Opens that failed: a timeout, a failed dial, a dropped connection, or
+    /// the open's ceiling.
     pub(crate) unreachable: u16,
-    /// Probes answered `has_blob: false`.
+    /// Opens refused by a peer that holds no block of the blob.
     pub(crate) absent: u16,
-    /// Probes dropped on this node's own policy: shed by the peer's rate
-    /// limiter, an unverifiable signature, a `has_blob`/coverage mismatch, or
-    /// a peer with no operator address.
+    /// Opens dropped on this node's own policy: shed by the peer's rate
+    /// limiter, a refused timestamp, an answer that does not verify, a quote
+    /// above `max_rate_per_mb`, or a peer with no operator address.
     pub(crate) dropped: u16,
     /// Candidates the handshake walk has: admitted by the rounds, less the
     /// requester.
@@ -648,7 +693,7 @@ impl PullLegTrail {
         source: CandidateSource::None,
         discovered: 0,
         skipped: 0,
-        probed: 0,
+        opened: 0,
         unreachable: 0,
         absent: 0,
         dropped: 0,
@@ -670,18 +715,28 @@ pub(crate) struct PullLegMiss {
 }
 
 impl NodeOrigin {
-    /// Discover, probe, rank, and open a lane to the best available provider for
+    /// Discover, rank, and open a lane to the best available provider for
     /// `hash`, returning the bound [`PullLegTarget`] (with the upstream `total_bytes`)
     /// the orchestration hands to [`run_pull_leg`].
     ///
-    /// The handshake that reads `total_bytes` is a real open on the upstream: it
-    /// signs, claims a fill, and on a miss starts its own origin draw. With a
-    /// `prime` and a candidate that reported its size on the probe, the handshake
-    /// therefore opens the pull leg's own first leg and parks the pull in the
-    /// target for that leg to adopt (#2063). Otherwise it opens one chunk group
-    /// of a block the candidate advertised, reads the header, and drops the pull;
-    /// only without a probed size to cut a range from does it open the whole
-    /// blob.
+    /// Discovery opens a voucher-less `cdn/client/v1` stream on each candidate
+    /// that asks for the pull leg's own first span ([`PrimeLeg::open_span`]) and
+    /// no upstream work: a holder answers with its signed quote, its proven size
+    /// and its coverage, and holds the stream until a voucher or a cancel. The
+    /// first run's holder's stream is then that run's first leg, so the
+    /// handshake adopts it and parks it in the target for the run (#2063): no
+    /// second stream opens. A holder whose stream is not that leg answers the
+    /// handshake from its open's proven size, and its stream is cancelled. Every
+    /// other stream is cancelled when this returns.
+    ///
+    /// A candidate with no served stream (a partial holder that does not hold
+    /// the span, or a candidate-cache hit) runs the header handshake as a real
+    /// open on the upstream that asks it to fill what it lacks: it signs, claims
+    /// a fill, and on a miss starts its own origin draw. With a `prime` and a
+    /// proven size for the candidate, the handshake opens the pull leg's own
+    /// first leg and parks it. Otherwise it opens one chunk group of a block the
+    /// candidate advertised, reads the header, and drops the pull; only a
+    /// candidate that names no block is asked for the whole blob.
     ///
     /// `requester` is the node the serve answers. It is never a candidate: pulling
     /// from it would hand it back its own bytes, and two nodes that each lack part
@@ -689,9 +744,9 @@ impl NodeOrigin {
     /// serve path refuses a whole-blob request for `hash` from an active staker
     /// ([`NodeOrigin::refuses_whole_blob`]), which stops longer loops.
     ///
-    /// Shares the buffered [`decdn_cache::Origin::fetch`] path's cached-first discover → probe →
-    /// rank pipeline and its open-time candidate fallback, but stops at pool-open +
-    /// header instead of pulling any bytes.
+    /// Shares the buffered [`decdn_cache::Origin::fetch`] path's cached-first
+    /// discover → open → rank pipeline and its open-time candidate fallback, but
+    /// stops at the header instead of pulling any bytes.
     ///
     /// # Errors
     ///
@@ -721,9 +776,14 @@ impl NodeOrigin {
         let mut budget = MAX_PROVIDER_ATTEMPTS;
         let mut attempt_metered = false;
         let mut miss = PullMiss::Clean;
+        // Every discovery open asks for the pull leg's first span, so a holder's
+        // served stream can be that leg.
+        let open_span = prime.map_or((0, 0), |prime| {
+            prime.open_span(hash_bytes, deps.config.max_blob_size_bytes)
+        });
 
         if let Some(cached) = spanning_cached_candidates(deps, target, hash, requester).await {
-            deps.metrics.probe_cache_hit();
+            deps.metrics.candidate_cache_hit();
             deps.metrics.node_pull_attempt();
             attempt_metered = true;
             // A cached list is admitted as it stands, and it spans the blob by
@@ -732,8 +792,17 @@ impl NodeOrigin {
             trail.discovered = count_u16(cached.len());
             trail.holders = trail.discovered;
             trail.spans = true;
+            // A cache hit opened no stream: each handshake opens its own.
             let outcome = self
-                .handshake_from_candidates(deps, &cached, hash_bytes, namespace_id, budget, prime)
+                .handshake_from_candidates(
+                    deps,
+                    &cached,
+                    hash_bytes,
+                    namespace_id,
+                    budget,
+                    prime,
+                    (&mut OpenStreams::default(), open_span),
+                )
                 .await;
             trail.handshakes = count_u16(outcome.attempts);
             trail.last_fault = outcome.last_fault;
@@ -750,13 +819,13 @@ impl NodeOrigin {
                 Err(failed) => miss = miss.or(failed),
             }
             budget = budget.saturating_sub(outcome.attempts);
-            deps.probe_cache.invalidate(&target);
+            deps.candidate_cache.invalidate(&target);
             if budget == 0 {
-                debug!(%hash, "node-origin: probe-cache candidates exhausted the pull-leg budget");
+                debug!(%hash, "node-origin: candidate-cache candidates exhausted the pull-leg budget");
                 return Err(PullLegMiss { miss, trail });
             }
         } else {
-            deps.metrics.probe_cache_miss();
+            deps.metrics.candidate_cache_miss();
         }
 
         // `discover` drops the requester before it judges the directory fallback.
@@ -764,11 +833,12 @@ impl NodeOrigin {
         let discovered = discover(deps, hash_bytes, namespace_id, requester_id).await;
         let attested = discovered.attested;
         let providers = discovered.providers;
+        let assigned = assigned_origins(&attested, discovered.source, &providers);
         // The trail now describes this list; the cached walk keeps only its
         // handshake count and fault.
         trail.source = discovered.source;
         trail.discovered = count_u16(providers.len());
-        let mut tally = ProbeTally::default();
+        let mut tally = OpenTally::default();
         tally.fold_into(&mut trail);
         if providers.is_empty() {
             if !attempt_metered {
@@ -780,44 +850,84 @@ impl NodeOrigin {
         if !attempt_metered {
             deps.metrics.node_pull_attempt();
         }
+        let ctx = match discovery_ctx(deps).await {
+            Ok(ctx) => ctx,
+            Err((failed, why)) => {
+                trail.last_fault = Some(why);
+                return Err(PullLegMiss {
+                    miss: miss.or(failed),
+                    trail,
+                });
+            }
+        };
         // The ranged-drive assembly (#1506) plans over the coverage UNION of these
-        // candidates, so the probe round must gather holders until their union spans
+        // candidates, so the open round must gather holders until their union spans
         // the blob — not stop at a fixed count that could miss the holders of the
         // still-uncovered blocks — and adds the origin-directory candidates when the
         // discovered holders cannot span it (#2195).
-        // The origin-directory supplement inside the probe round can list the
+        // The origin-directory supplement inside the open round can list the
         // requester too.
-        let mut ranked = probe_and_rank(
+        let spec = OpenSpec::new(ctx, namespace_bytes, open_span);
+        let Discovery {
+            mut ranked,
+            mut streams,
+            cold,
+        } = open_and_rank(
             deps,
             providers,
-            &attested,
+            (&attested, &assigned),
             hash_bytes,
-            ProbeGather::CoverageUnion,
+            OpenGather::CoverageUnion,
             namespace_id,
+            &spec,
             &mut tally,
         )
         .await;
         tally.fold_into(&mut trail);
         ranked.retain(|candidate| candidate.node_id != requester);
-        // The requester can answer the directory supplement's probe as a
+        // The cold tail joins when no holder the walk can use served the span:
+        // decided after the requester is gone and under the buy cap.
+        let heat = heat_of(deps, hash_bytes);
+        let cold = append_cold_tail(
+            &mut ranked,
+            cold.into_iter()
+                .filter(|candidate| candidate.node_id != requester)
+                .collect(),
+            |candidate| usable_holder(deps, heat, candidate),
+            hash_bytes,
+        );
+        // The requester can answer the directory supplement's open as a
         // holder; the walk drops it, so the trail counts what the walk has.
         trail.holders = count_u16(ranked.len());
         trail.spans = coverage_spans(hash_bytes, &ranked);
         let outcome = self
-            .handshake_from_candidates(deps, &ranked, hash_bytes, namespace_id, budget, prime)
+            .handshake_from_candidates(
+                deps,
+                &ranked,
+                hash_bytes,
+                namespace_id,
+                budget,
+                prime,
+                (&mut streams, open_span),
+            )
             .await;
+        // Every stream the handshake did not adopt is cancelled here.
+        drop(streams);
         trail.handshakes = trail.handshakes.saturating_add(count_u16(outcome.attempts));
         if outcome.last_fault.is_some() {
             trail.last_fault = outcome.last_fault;
         }
         match outcome.payload {
-            Ok((total_bytes, size_proof, primed)) => Ok(PullLegTarget {
-                total_bytes,
-                size_proof,
-                namespace_id: namespace_bytes,
-                candidates: ranked,
-                primed,
-            }),
+            Ok((total_bytes, size_proof, primed)) => {
+                cover_cold(&mut ranked, &cold, total_bytes);
+                Ok(PullLegTarget {
+                    total_bytes,
+                    size_proof,
+                    namespace_id: namespace_bytes,
+                    candidates: ranked,
+                    primed,
+                })
+            }
             Err(failed) => Err(PullLegMiss {
                 miss: miss.or(failed),
                 trail,
@@ -831,11 +941,16 @@ impl NodeOrigin {
     /// the blob geometry the serve response commits to. The ranged pull opens its
     /// own per-run lanes later, and its first run may adopt the primed pull.
     ///
+    /// `streams` holds the discovery streams that served `open_span`, keyed by
+    /// node id; each visited candidate's handshake takes its own
+    /// ([`Self::handshake_total_bytes`]).
+    ///
     /// The walk visits first the candidate the pull's first run uses for
     /// `prime`, then the rest in rank order ([`handshake_order`]), so a
     /// top-ranked holder that lacks the request's first block does not take the
     /// handshake from the holder whose primed pull that run adopts. Each
     /// candidate keeps its index into `ranked` as its `candidate_ix`.
+    #[allow(clippy::too_many_arguments)]
     async fn handshake_from_candidates(
         &self,
         deps: &NodeOriginDeps,
@@ -844,14 +959,15 @@ impl NodeOrigin {
         namespace_id: U256,
         budget: usize,
         prime: Option<PrimeLeg>,
+        (streams, open_span): (&mut OpenStreams, (u64, u64)),
     ) -> PullOutcome<Handshake> {
         let mut attempts = 0;
         let mut miss = PullMiss::Clean;
         let mut last_fault = None;
         let coverages: Vec<decdn_protocol::Coverage> =
             ranked.iter().map(|c| c.coverage.clone()).collect();
-        // The size the order plans over is the first probed size; each
-        // candidate's own probed size cuts its primed leg in
+        // The size the order plans over is the first proven size; each
+        // candidate's own proven size cuts its primed leg in
         // `handshake_total_bytes`.
         let total_hint = ranked.iter().find_map(|c| c.total_bytes_hint);
         let visits = handshake_order(&coverages, total_hint, prime)
@@ -859,6 +975,7 @@ impl NodeOrigin {
             .filter_map(|ix| ranked.get(ix).map(|candidate| (ix, candidate)));
         for (candidate_ix, candidate) in visits.take(budget) {
             attempts += 1;
+            let discovered = (streams.take(&candidate.node_id), open_span);
             match self
                 .handshake_total_bytes(
                     deps,
@@ -867,6 +984,7 @@ impl NodeOrigin {
                     hash_bytes,
                     namespace_id,
                     prime,
+                    discovered,
                 )
                 .await
             {
@@ -896,20 +1014,29 @@ impl NodeOrigin {
 
     /// Resolve, open/reuse a lane, bind (#1117), and run the header handshake
     /// against one candidate, the `candidate_ix`-th ranked; return the committed
-    /// `total_bytes` and, when the handshake opened the pull leg's first leg, that
-    /// live pull. Any holder — partial or whole — signs the same whole-blob
-    /// geometry, so the caller can commit its `StreamResponse` from whichever
+    /// `total_bytes` and, when the handshake holds the pull leg's first leg, that
+    /// live pull. Any holder — partial or whole — proves the same whole-blob
+    /// size, so the caller can commit its `StreamResponse` from whichever
     /// candidate answers first. Classifies every failure into the [`PullMiss`] it
     /// is. The pool it opens is cached by `open_or_reuse_pool`, so the ranged
     /// pull's first lane to this provider reuses it.
     ///
-    /// With a `prime` and the candidate's probe-reported size, the handshake opens
-    /// [`PrimeLeg::predicted_leg`]. The probe's size passed its proof, so the
-    /// header proves the same size. A failure of that open is the candidate's
+    /// `discovered` is the candidate's discovery stream, when it served
+    /// `open_span`, the span every discovery open of this pull asked for. With
+    /// a `prime`, a stream whose span starts at
+    /// [`PrimeLeg::predicted_leg`] and runs at least to its end is that leg: it
+    /// is adopted on this lane and parked, and no second stream opens. A stream
+    /// that is not the leg answers the handshake from its proven size, and is
+    /// cancelled. Either way the handshake opens nothing.
+    ///
+    /// With no stream, the handshake opens one, asking the candidate to fill
+    /// what it lacks. With a `prime` and the candidate's proven size, it opens
+    /// [`PrimeLeg::predicted_leg`]; the size passed its proof, so the header
+    /// proves the same size. A failure of that open is the candidate's
     /// handshake outcome, classified as the whole-blob open's would be.
     // Straight-line resolve → gate → open → bind → handshake; the bounded first
     // attempt adds one branch to a flow that reads best in one piece.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn handshake_total_bytes(
         &self,
         deps: &NodeOriginDeps,
@@ -918,6 +1045,7 @@ impl NodeOrigin {
         hash_bytes: [u8; 32],
         namespace_id: U256,
         prime: Option<PrimeLeg>,
+        (mut discovered, open_span): (HeldOpen, (u64, u64)),
     ) -> Result<Handshake, HandshakeFault> {
         let Ok(pk) = PublicKey::from_bytes(&candidate.node_id) else {
             return Err(HandshakeFault::clean("no_address"));
@@ -933,9 +1061,12 @@ impl NodeOrigin {
         // ceiling BEFORE opening or reusing the pool. A skip folds into the walk as
         // `BelowMargin`.
         let heat = heat_of(deps, hash_bytes);
+        // The lane's ceiling: the candidate's discovery quote, under the buy cap.
         let rate_ceiling =
             match economic_ceiling(deps, candidate.node_id.into(), heat, candidate.rate_per_mb) {
-                EconGate::Allow { rate_ceiling, .. } => rate_ceiling,
+                EconGate::Allow { rate_ceiling, .. } => {
+                    decdn_client::RateCeiling::quoted(rate_ceiling, candidate.rate_per_mb)
+                }
                 EconGate::Skip => {
                     return Err(HandshakeFault {
                         miss: PullMiss::BelowMargin,
@@ -952,7 +1083,7 @@ impl NodeOrigin {
             Err(err) => {
                 let why = classify_pool_open_arm(&err).as_str();
                 return Err(HandshakeFault {
-                    miss: record_pool_open_failure(deps, provider_addr, &err),
+                    miss: record_pool_open_failure(deps, Some(provider_addr), &err),
                     why,
                 });
             }
@@ -977,13 +1108,109 @@ impl NodeOrigin {
         let ledger = lane_ledger(deps, provider_addr, &ctx);
         let namespace_bytes = namespace_id.to_be_bytes::<32>();
         let stream_guard = deps.metrics.outbound_stream_guard();
+        // Every handshake leg opens or adopts its stream on the node's shared
+        // connection to the upstream, whose driver runs on the main runtime and
+        // outlives the pull thread that adopts the pull.
+        let source = PeerSource::new(
+            &deps.endpoint,
+            EndpointAddr::new(pk),
+            Arc::new(std::sync::Mutex::new(ctx.clone())),
+            Arc::clone(&ledger),
+            &deps.slash_domain,
+            provider_addr,
+            namespace_bytes,
+            deps.config.max_blob_size_bytes,
+            rate_ceiling,
+            deadlines,
+            Some(deps.connections.clone()),
+        );
 
-        // The pull leg's own first leg, when the probe reported the size to cut it
-        // from. It opens a stream on the node's shared connection to the
-        // upstream, whose driver runs on the main runtime and outlives the pull
-        // thread that adopts the pull.
-        // The probe's size passed its proof, so it is the size the header
-        // proves too.
+        // The candidate's discovery stream served the span every open asked for.
+        if let Some(opened) = discovered.take() {
+            // A served answer proves its size; one that does not is no
+            // handshake, and the walk moves to the next candidate rather than
+            // commit a size nobody proved.
+            let Some(total_bytes) = opened.proven_size().map(decdn_client::ProvenSize::get) else {
+                drop(stream_guard);
+                opened.cancel();
+                debug!(%provider_addr, "node-origin: a served discovery answer proved no size");
+                return Err(HandshakeFault::clean("unproven_size"));
+            };
+            let leg = prime.and_then(|prime| {
+                prime
+                    .predicted_leg(
+                        total_bytes,
+                        &candidate.coverage,
+                        deps.config.max_blob_size_bytes,
+                    )
+                    .map(|leg| (prime, leg))
+            });
+            let pull_range = served_range(open_span, total_bytes);
+            let adoptable = match (leg, pull_range) {
+                (Some((prime, leg)), Some(pull_range))
+                    if pull_serves_leg(&pull_range, &leg) && source.can_adopt(&opened) =>
+                {
+                    Some((prime, leg, pull_range))
+                }
+                _ => None,
+            };
+            let Some((prime, leg, pull_range)) = adoptable else {
+                // Not the first leg: the answer's proven size is the handshake,
+                // and nothing opens. The stream is cancelled, so the upstream
+                // releases its pin at once.
+                drop(stream_guard);
+                let size_proof = opened.ext().size_proof().cloned();
+                let attestation = opened.ext().origin_attestation.clone().or_else(|| {
+                    decdn_protocol::OriginAttestation::from_response(opened.response())
+                });
+                deps.attestations
+                    .keep_offered(hash_bytes, attestation.as_ref());
+                opened.cancel();
+                return Ok((total_bytes, size_proof, None));
+            };
+            let answered_at = opened.answered_at();
+            let adopted = timed_open(
+                std::future::ready(source.adopt_reader(opened)),
+                Arc::clone(&deps.metrics),
+            )
+            .await;
+            drop(stream_guard);
+            return match adopted {
+                Ok((header, reader)) => {
+                    deps.attestations
+                        .keep_offered(hash_bytes, header.origin_attestation.as_ref());
+                    let size_proof = header.size_proof.clone();
+                    let primed = PrimedHandshake {
+                        key: PrimeKey {
+                            candidate_ix,
+                            pool_id: ctx.pool_id,
+                            ledger,
+                            range: leg,
+                            // The pull's age runs from its answer.
+                            opened_at: answered_at,
+                        },
+                        prime,
+                        pull_range,
+                        header,
+                        reader,
+                    };
+                    Ok((total_bytes, size_proof, Some(primed)))
+                }
+                // The lane refused the stream before paying (a quote above its
+                // ceiling, a stream past the cap): the handshake's own outcome.
+                Err(err) => Err(HandshakeFault::for_verdict(handshake_verdict(
+                    deps,
+                    pk,
+                    provider_addr,
+                    hash_bytes,
+                    ctx.pool_id,
+                    &err,
+                ))),
+            };
+        }
+
+        // The pull leg's own first leg, when the candidate's proven size cuts it.
+        // The size passed its proof, so it is the size the header proves too.
         let hint = candidate.total_bytes_hint;
         let predicted = prime.zip(hint).and_then(|(prime, total)| {
             prime
@@ -991,21 +1218,6 @@ impl NodeOrigin {
                 .map(|range| (prime, range))
         });
         if let Some((prime, range)) = predicted {
-            let source = PeerSource::new(
-                &deps.endpoint,
-                EndpointAddr::new(pk),
-                Arc::new(std::sync::Mutex::new(ctx.clone())),
-                Arc::clone(&ledger),
-                &deps.slash_domain,
-                provider_addr,
-                namespace_bytes,
-                deps.config.max_blob_size_bytes,
-                rate_ceiling,
-                deadlines,
-                // A stream on the node's shared connection to the upstream,
-                // whose driver runs on the main runtime.
-                Some(deps.connections.clone()),
-            );
             let handshake = timed_open(
                 source.open(hash_bytes, range.clone()),
                 Arc::clone(&deps.metrics),
@@ -1022,10 +1234,11 @@ impl NodeOrigin {
                             candidate_ix,
                             pool_id: ctx.pool_id,
                             ledger,
-                            range,
+                            range: range.clone(),
                             opened_at: tokio::time::Instant::now(),
                         },
                         prime,
+                        pull_range: range,
                         header,
                         reader,
                     };
@@ -1049,29 +1262,11 @@ impl NodeOrigin {
         // The range lies in a block the candidate advertised, so a partial holder
         // answers from what it holds; asked for bytes it lacks, a holder that pulls
         // through starts its own pull for them, and partial holders asking each
-        // other form a loop. Only without a size to cut that range from is the
-        // whole blob (`byte_offset == 0`, `byte_len == 0`) the range asked for.
-        let (byte_offset, byte_len) = hint
-            .and_then(|total| covered_handshake_range(&candidate.coverage, total))
-            .unwrap_or((0, 0));
-        let header_source = PeerSource::new(
-            &deps.endpoint,
-            EndpointAddr::new(pk),
-            Arc::new(std::sync::Mutex::new(ctx.clone())),
-            Arc::clone(&ledger),
-            &deps.slash_domain,
-            provider_addr,
-            namespace_bytes,
-            deps.config.max_blob_size_bytes,
-            rate_ceiling,
-            deadlines,
-            // A stream on the node's shared connection to the upstream, whose
-            // driver runs on the main runtime.
-            Some(deps.connections.clone()),
-        );
-        let (header, probe) = match header_source
-            .open_span(hash_bytes, byte_offset, byte_len)
-            .await
+        // other form a loop. Only a candidate that names no block is asked for the
+        // whole blob (`byte_offset == 0`, `byte_len == 0`).
+        let (byte_offset, byte_len) =
+            covered_handshake_range(&candidate.coverage, hint).unwrap_or((0, 0));
+        let (header, header_pull) = match source.open_span(hash_bytes, byte_offset, byte_len).await
         {
             Ok(pair) => pair,
             Err(err) => {
@@ -1085,10 +1280,41 @@ impl NodeOrigin {
         let size_proof = header.size_proof.clone();
         deps.attestations
             .keep_offered(hash_bytes, header.origin_attestation.as_ref());
-        let _ = probe.abort();
+        let _ = header_pull.abort();
         drop(stream_guard);
         Ok((total_bytes, size_proof, None))
     }
+}
+
+/// Give each `cold` target in `ranked` the coverage of every block of the
+/// `total_bytes` blob: it fills whatever it is asked for, so once the size is
+/// proven the ranged pull may plan any block on it.
+fn cover_cold(ranked: &mut [Candidate], cold: &[[u8; 32]], total_bytes: u64) {
+    if cold.is_empty() {
+        return;
+    }
+    let full = decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes));
+    for candidate in ranked.iter_mut().filter(|c| cold.contains(&c.node_id)) {
+        candidate.coverage = full.clone();
+    }
+}
+
+/// The range a holder serves for a request of `(byte_offset, byte_len)` on a
+/// blob of `total_bytes`: the span cut at the blob's end, as a holder clamps
+/// it. `None` for a span that starts at or past the end of a non-empty blob.
+fn served_range((byte_offset, byte_len): (u64, u64), total_bytes: u64) -> Option<AlignedRange> {
+    let len = match byte_len {
+        0 => 0,
+        len => len.min(total_bytes.checked_sub(byte_offset)?),
+    };
+    align_range(byte_offset, len, total_bytes).ok()
+}
+
+/// Whether a pull of `pull_range` is the first leg `leg`: it starts where the
+/// leg starts and runs at least to its end. A longer pull is narrowed to the
+/// leg when the leg's open adopts it, and pays only up to the leg's end.
+const fn pull_serves_leg(pull_range: &AlignedRange, leg: &AlignedRange) -> bool {
+    pull_range.fetch_start() == leg.fetch_start() && pull_range.fetch_end() >= leg.fetch_end()
 }
 
 /// Why one handshake failed: the miss it folds into the walk, and the
@@ -1151,7 +1377,7 @@ fn handshake_verdict(
 /// A blob can live spread across nodes — one holds discovery block 0, another
 /// block 1. The loop derives the still-missing gap from the shared
 /// [`CacheStore`], plans it into contiguous runs by each candidate's
-/// probe-fresh coverage ([`decdn_client::plan_covered_runs`], concentrate +
+/// open-fresh coverage ([`decdn_client::plan_covered_runs`], concentrate +
 /// sticky), and drives the runs in offset order. Each run opens ONE buyer lane to
 /// its source — one `(signer, provider)` payment lane — and runs are SEQUENTIAL,
 /// so two lanes never pay at once. The [`CacheStore`], [`CreditPacer`], the
@@ -1446,7 +1672,7 @@ impl PeerRunSink<'_> {
         {
             source.prime(
                 self.hash_bytes,
-                primed.key.range,
+                primed.pull_range,
                 primed.header,
                 primed.reader,
                 primed.key.opened_at,
@@ -1627,10 +1853,14 @@ impl PeerRunSink<'_> {
             heat,
             candidate.rate_per_mb,
         ) {
+            // The lane's ceiling: the source's discovery quote, under the buy cap.
             EconGate::Allow {
                 rate_ceiling,
                 speculative,
-            } => (rate_ceiling, speculative),
+            } => (
+                decdn_client::RateCeiling::quoted(rate_ceiling, candidate.rate_per_mb),
+                speculative,
+            ),
             EconGate::Skip => return RunOutcome::Reassign,
         };
         let ctx = match self
@@ -1645,7 +1875,7 @@ impl PeerRunSink<'_> {
             // unreadable store), no other lane can fix it — terminal. Otherwise it
             // is per-provider (a contract revert): drop this source and re-plan.
             Err(err) => {
-                return match record_pool_open_failure(self.deps, provider_addr, &err) {
+                return match record_pool_open_failure(self.deps, Some(provider_addr), &err) {
                     PullMiss::LocalFault | PullMiss::FundingNeeded => {
                         RunOutcome::Terminal(FillError::new(format!(
                             "node-origin ranged pull: local buyer fault opening a lane: {err:#}"

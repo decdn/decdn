@@ -3,7 +3,7 @@
 //!
 //! A thin serve-flavoured wrapper over the shared
 //! [`crate::rate_limit::LayeredRateLimiter`] engine, like
-//! [`super::probe_rate_limit`]: it pins the serve-specific operator-visible
+//! [`crate::dht::rate_limit`]: it pins the serve-specific operator-visible
 //! metric names (via a private metrics sink). The layering and narrowest-first
 //! ordering (per-peer → global) live in the shared engine.
 //!
@@ -18,7 +18,7 @@ use crate::metrics::Metrics;
 use crate::rate_limit::{LayeredRateLimiter, RateLimitConfig, RateLimitMetricsSink, RejectLayer};
 
 /// Routes shared-limiter metric events to the serve operator-visible counters
-/// (`decdn_serve_rate_limit_*`), like the probe and DHT sinks, with one
+/// (`decdn_serve_rate_limit_*`), like the DHT sink, with one
 /// difference: a refusal is not counted here. A refused stream is an inbound
 /// failure, and the client handler's dispatch sink counts every failed end on
 /// exactly one reason ([`crate::metrics::INBOUND_FAILURE_REASONS`]), so it

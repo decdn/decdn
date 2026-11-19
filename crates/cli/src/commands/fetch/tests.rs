@@ -818,7 +818,7 @@ fn size_hints_forget_the_oldest_past_the_bound() {
 }
 
 /// A blob an earlier fetch verified starts the next fetch at its size, so a
-/// pinned node is not probed for it.
+/// pinned node is not opened for it before its lane opens.
 #[test]
 fn a_verified_size_is_the_next_fetchs_known_size() {
     let sizes = Mutex::new(SizeHints::default());

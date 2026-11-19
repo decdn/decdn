@@ -128,8 +128,8 @@ boot chain reads retry. The RPC preflight's own retries show only in its
   `decdn_capacity_bond_registry_resync_failures_total` advancing) means the
   5-minute `getRegisteredNodes` refresh fails. One snapshot feeds both the
   active-staker set and the `NodeId → operator` bindings, so while it fails:
-  - The cached active-staker set drifts from chain state and mis-sheds
-    stake-lane probes / DHT `Store`s.
+  - The cached active-staker set drifts from chain state and mis-admits
+    DHT `Store`s.
   - New node registrations are missed, so those providers stay unpayable and
     are skipped — the pull path's reachable-provider set may be capped by
     stale bindings. (Only on nodes with
@@ -211,23 +211,19 @@ decrypt.
 
 ## Slashing risk
 
-**Triggers** — the two, and only two, offenses `SlashJudge` adjudicates,
-one per `submit*Challenge` entry point (per
+**Trigger** — the one offense `SlashJudge` adjudicates, through
+`submitBlacklistChallenge` (per
 [ADR 011](../adr/011-content-takedown.md),
 [ADR 014](../adr/014-on-chain-verification.md)):
 
-- **Rate manipulation** — charging a *higher* stream rate than this node
-  itself probe-quoted, inside the 30-second slashing window. The direction
-  matters: `SlashJudge` reverts `NotRateManipulation` unless the signed
-  `StreamResponse` rate strictly exceeds the signed `ProbeResponse` rate, so
-  quoting high and serving cheap is never an offense. Only a reprice
-  *upward* has to wait. The window is measured between the requester
-  timestamps the node signs, and each one may sit up to 30 seconds from the
-  node's clock, so an upward reprice waits 90 seconds of real time after the
-  last probe answered at the old rate.
 - **Blacklist violation** — serving content after the blacklist entry's
   `effectiveAt` (`addedAt` plus the compliance window), not after `addedAt`
-  — see [ContentBlacklist compliance](#contentblacklist-compliance).
+  — see [ContentBlacklist compliance](#contentblacklist-compliance). The
+  evidence is a signed `StreamResponse` with `ok: true`; the answer to a
+  discovery open is one too.
+
+There is no rate slash: a client sees the signed quote before it pays and
+signs that price into each voucher. A rate change needs no wait.
 
 There is no "missed response" offense: every slash is driven by the
 operator's own signed messages, so a node that stays silent cannot be
@@ -236,10 +232,6 @@ slashed by an external adversary.
 **Detect:**
 
 - Alerts in `prometheus-alerts.yml` (verbatim names):
-  - `DecdnProbeHoldViolations` (critical) — hold budget exhausted, so
-    present blobs are being advertised without an eviction hold and may be
-    evicted before the pull arrives. Budget pressure and lost deliveries,
-    not slash evidence; see step 4.
   - `DecdnBlacklistWatcherStalled` (critical) — the blacklist sync has
     not completed a ledger poll for several intervals, so the node may be
     serving content blacklisted since the last successful poll. It fires on
@@ -252,15 +244,13 @@ slashed by an external adversary.
 
 **Remediate:**
 
-1. **Fix the root cause before anything else.** Each offense has its own:
-   blacklist sync lag or a stale RPC endpoint (blacklist violation), an
-   upward rate reconfiguration applied less than 90 seconds after the last
-   probe answered at the old rate (rate manipulation).
+1. **Fix the root cause before anything else:** blacklist sync lag or a
+   stale RPC endpoint.
    A slash you appeal while the underlying problem persists will not stop
    the next strike.
 2. **There is no counter-evidence window.** If on-chain verification passes,
    the slash executes synchronously inside the challenger's
-   `submit*Challenge` reveal — see
+   `submitBlacklistChallenge` reveal — see
    [ADR 014 § Bond Handling](../adr/014-on-chain-verification.md#bond-handling).
    Nothing you send afterwards can undo it in-protocol; there is no
    counter-evidence deadline to race, only the appeal window in step 3.
@@ -289,29 +279,6 @@ slashed by an external adversary.
    (`APPEAL_FREQUENCY_WINDOW`), so lead with the most clear-cut case. Flow,
    windows, and what counts as evidence:
    [ADR 028](../adr/028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
-4. **For `DecdnProbeHoldViolations`:** this is lost deliveries, not slash
-   evidence. The alert watches
-   `decdn_probe_hold_unavailable_total{reason="exhausted"}` and fires when a
-   blob is present but *un-holdable*
-   because every hold slot is live. Holds are best-effort, so the node still
-   signs `has_blob: true` and forgoes only the hold — the blob stays visible to
-   the LRU driver and may be evicted before the requester's pull arrives, which
-   costs a wasted round trip. No offense pairs a probe with a later miss, so
-   this is never slash evidence. Raise the
-   budget with `[cache] max_probe_holds` (`--max-probe-holds` /
-   `DECDN_MAX_PROBE_HOLDS`, default 256); a busy node serving many peers
-   should scale it up proportionally, while a node with a *small* cache
-   should keep it under ~25% of cache capacity. **This field is
-   restart-required** — a config reload logs "requires restart" and keeps the
-   old value. Add host memory or shed load if the pressure is genuine. If the
-   series is flat but `reason="disabled"` or `reason="stake_lane_reserved"` is
-   climbing, the forgone holds are deliberate — a `max_probe_holds` of 0, or
-   end-client probes shed to keep stake-lane headroom — and neither calls for
-   this remedy. Note only `disabled` also suppresses the advertisement;
-   `stake_lane_reserved` still answers `has_blob: true`.
-   Background:
-   [ADR 005 § Hold budget](../adr/005-protocol.md#hold-budget) and
-   [Appendix: Observability](../adr/appendix-observability.md#slash-safety-metrics-all-mandatory).
 
 ## ContentBlacklist compliance
 
@@ -340,16 +307,16 @@ without a new ledger record.
 Enforcement is two writes per hash, in order — a governance-sourced *deny*, then
 the *eviction*. `CacheEngine::evict` durably records the takedown in `evicted.log`
 and cascades to every serving surface through `CacheEngine::refuses` — including
-the DHT republisher dropping the hash on its next tick, the probe handler no
-longer signing `has_blob: true`, and the client handler refusing to re-pull-fill
-it. `evict` is sticky and works on absent hashes, so a hash blacklisted while the
+the DHT republisher dropping the hash on its next tick, and the client handler
+refusing every stream for it, discovery opens included, and refusing to
+re-pull-fill it. `evict` is sticky and works on absent hashes, so a hash blacklisted while the
 node was offline is pre-blocked. The separate deny
 records *why*, which `evicted.log` cannot express. Every one of these refusals
 reaches the client as the one class `Declined`, so a client cannot tell which
 list a hash is on (ADR 011 § `StreamRequest` Response); the deny keeps the
 cause on the node's own per-reason counters
 (`decdn_serve_stream_rejected_chain_hash_denied_total`,
-`..._hash_denied_total`, `..._evicted_since_probe_total`). A
+`..._hash_denied_total`, `..._withdrawn_total`). A
 fail-closed readiness gate keeps every ALPN listener shut until the first
 enumeration + enforcement pass completes, so a node refuses to serve rather than
 serve un-enforced.
@@ -735,10 +702,9 @@ reason.
 
 ## Active-staker set repair not running
 
-**Symptoms:** none directly visible. The node keeps serving, probing and
+**Symptoms:** none directly visible. The node keeps serving, discovering and
 settling normally while the cached active-staker set drifts from chain state,
-mis-shedding stake-lane probes and gating DHT `Store` admission on stale
-membership.
+gating DHT `Store` admission on stale membership.
 
 **Detect:** `DecdnCapacityBondRegistryResyncFailing` on
 `rate(decdn_capacity_bond_registry_resync_failures_total[15m]) > 0`, or

@@ -278,8 +278,8 @@ pub fn write_validate_summary<W: std::io::Write>(
     if resolved.cache.node_to_node_pull_through_enabled {
         writeln!(
             w,
-            "  node_to_node_pull:        enabled (probe_fanout={}, pull_timeout_sec={}, stall_window_sec={}, min_throughput_bps={})",
-            resolved.cache.node_pull_probe_fanout,
+            "  node_to_node_pull:        enabled (open_fanout={}, pull_timeout_sec={}, stall_window_sec={}, min_throughput_bps={})",
+            resolved.cache.node_pull_open_fanout,
             resolved.cache.node_pull_timeout_sec,
             resolved.cache.node_pull_stall_window_sec,
             resolved.cache.node_pull_min_throughput_bps
@@ -344,16 +344,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         w,
         "  dht.global_rate_per_sec:  {}",
         resolved.dht.global_rate_per_sec
-    )?;
-    writeln!(
-        w,
-        "  probe.per_peer_rate_per_sec: {}",
-        resolved.probe.per_peer_rate_per_sec
-    )?;
-    writeln!(
-        w,
-        "  probe.global_rate_per_sec: {}",
-        resolved.probe.global_rate_per_sec
     )?;
     writeln!(
         w,
@@ -1051,7 +1041,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # cache_size_mb = 102400                  # UPPER bound on the cache; the eviction driver clamps it down to keep disk_headroom_mb free on the volume (#1930). Set it large to let free disk size the cache.
 # disk_headroom_mb = 8192                  # free disk (MiB) the eviction driver keeps unused on the cache_dir volume, defended against ANY process (#1930); default 8 GiB. 0 opts out (only cache_size_mb binds)
 # max_blob_size_mb = 51200             # cap on the bytes of one blob held (an own-origin blob over it is refused; a pull-through serves any offset while the bytes held fit); unset => 50 GB capped to cache_size_mb. Must be <= cache_size_mb; 0 = unlimited
-# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the candidate's probe rate, before paying. A buyer-side ceiling only; the node never bounds its own sell rate
+# max_rate_per_mb = 0                      # buyer-side per-MB rate ceiling for paid cache-miss pulls (USDC base units); 0 = unlimited (#1375). Refuses a provider quote above the lower of this and the rate the candidate quoted at discovery, before paying. A buyer-side ceiling only; the node never bounds its own sell rate
 # pinned_hashes = []                       # blob hashes (hex) exempted from LRU eviction (#276)
 # user_agent = "decdn-node/<version>"      # User-Agent on HTTP origin pull-through (#435); default embeds the crate version
 # Pull-through origin (singular). Mutually exclusive with the plural [[cache.origins]] form below.
@@ -1095,23 +1085,21 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # above — uncomment this header along with them or TOML will nest them wrongly.
 # [cache]
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518). NOTE: the eviction driver only drops GC protection, so with 0 it can never reclaim disk and cache_size_mb is unenforceable (#1173)
-# fs_rescan_interval_sec = 60              # re-walk the fs origin + re-check pins into the origin-held index, so a file dropped into the origin becomes probe-answerable and DHT-announced within one interval (#1130); 0 disables the timer (startup and `decdn node reload` still rescan)
+# fs_rescan_interval_sec = 60              # re-walk the fs origin + re-check pins into the origin-held index, so a file dropped into the origin becomes open-answerable and DHT-announced within one interval (#1130); 0 disables the timer (startup and `decdn node reload` still rescan)
 # origin_probe_ttl_sec = 15                # TTL for a memoised positive live-origin probe answer — a hash absent from the fs/pins index falls back to a HEAD/HeadObject against the http/s3 origin, a present answer cached this long (#1130 pt3)
 # origin_probe_negative_ttl_sec = 2        # TTL for a memoised negative (absent) live-origin probe answer; short on purpose so a stale absent cannot hide newly-available own content for long (#1130 pt3)
 # origin_probe_fault_ttl_sec = 5           # TTL for a memoised fault (backend outage) live-origin probe answer; the memo is per hash, so this collapses one hash's repeats rather than a namespace's load. Must satisfy origin_probe_negative_ttl_sec <= this <= origin_probe_ttl_sec: patient enough to beat the negative TTL on a retried hash, eager enough that a recovered origin stops refusing clients soon (#1130 pt3, #1789 item 6)
-# origin_probe_timeout_ms = 2000           # per-probe ceiling on the live-origin HEAD/HeadObject; on timeout the probe answers has_blob:false and the miss is memoised absent for one negative TTL (#1130 pt3)
-# origin_probe_memo_capacity = 4096        # max distinct hashes held in the live-origin probe memo; bounds memo memory under a random-hash probe flood (#1130 pt3)
+# origin_probe_timeout_ms = 2000           # per-request ceiling on the live-origin HEAD/HeadObject; on timeout the node does not advertise the blob and memoises the fault for one fault TTL (#1130 pt3)
+# origin_probe_memo_capacity = 4096        # max distinct hashes held in the live-origin probe memo; bounds memo memory under a random-hash request flood (#1130 pt3)
 # eviction_high_water_pct = 90             # LRU driver evicts above this % of cache_size_mb (#1173); bounds [60,95]
 # eviction_target_pct = 80                 # LRU driver evicts down to this % (#1173); bounds [40,90], must be <= high_water-5
 # eviction_per_sweep_budget = 16           # max LRU victims per tick before yielding (#1173); bounds [1,256]
 # eviction_tick_secs = 1                   # LRU driver wakeup cadence in seconds (#1173); bounds [1,60]
-# max_probe_holds = 256                    # probe eviction-hold budget (ADR 005 §Hold budget); 0 disables has_blob:true
-# stake_lane_reserved_holds = 0            # hold slots reserved for node-to-node probes (#757, ADR 003 §Admission); 0 = off
 # node_to_node_pull_through_enabled = true # paid cache-miss pull from upstream nodes (#831, ADR 001/022); default is role-derived — off when a [cache.origin]/[[cache.origins]] backend is configured, on when none is; set explicitly to override
 # relay_foreign_namespaces = true          # relay content this node's own backend does not hold (#1759); default is role-derived — origin-only (false) when a [cache.origin]/[[cache.origins]] backend is configured, relay (true) when none is; set explicitly to override
-# node_pull_probe_fanout = 5               # providers probed before ranking on a node-to-node pull (#831)
+# node_pull_open_fanout = 5                # providers a node-to-node pull opens a discovery stream on before ranking (#831)
 # node_pull_timeout_sec = 20               # per-upstream STREAM-OPEN timeout (connect/handshake/response) on a node-to-node miss; NOT the pool open, which has its own 5s budget. The overall pull-through deadline is derived from this, the pool-open budget, and the stall window, so every ranked upstream can be tried before falling back (#831, #859)
-# node_pull_stall_window_sec = 20          # per-upstream THROUGHPUT-FLOOR window while streaming (#1797); bytes are counted off the stream sub-frame, so it trips only when throughput falls below the floor — not on a large blob or a big frame. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (168s at defaults); also the head start of each own-origin range-pull read's time budget (ADR 037)
+# node_pull_stall_window_sec = 20          # per-upstream THROUGHPUT-FLOOR window while streaming (#1797); bytes are counted off the stream sub-frame, so it trips only when throughput falls below the floor — not on a large blob or a big frame. Budgeted per candidate, so raising it raises the worst-case client wait ~3x (169.5s at defaults); also the head start of each own-origin range-pull read's time budget (ADR 037)
 # node_pull_min_throughput_bps = 4096      # minimum sustained upstream throughput (bytes/sec) over node_pull_stall_window_sec (#1797); catches a slow-drip wedge. 0 = idle detection only (one byte per window). The abort is requester-local and does not score the upstream's reputation; also the average throughput each own-origin range-pull read ({H}.obao4 or one data window) must sustain after that head start, 0 = those reads unbounded
 # eviction_policy = "lru"                  # ADR 040: "lru" or "tinylfu"; restart-required
 # admission_policy = "always"              # ADR 040: "always" or "tinylfu"; restart-required
@@ -1157,13 +1145,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # global_burst = 2000                       # global inbound DHT burst capacity
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
 
-[probe.rate_limit]
-# per_peer_rate_per_sec = 5.0               # per-peer (NodeId) sustained rate (ADR 005); 0.0 disables the layer
-# per_peer_burst = 5                        # per-peer burst capacity; required > 0 when the rate is > 0
-# global_rate_per_sec = 1000.0              # global inbound probe sustained rate; 0.0 disables
-# global_burst = 2000                       # global inbound probe burst capacity
-# max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map (#645); 0 = unbounded
-
 [serve.rate_limit]
 # per_peer_rate_per_sec = 100.0             # inbound cdn/client/v1 requests per peer (NodeId), sustained (ADR 005); 0.0 disables
 # per_peer_burst = 400                      # per-peer burst capacity; required > 0 when the rate is > 0
@@ -1193,7 +1174,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [client]
 # `decdn get` discovery pre-filter (independent of the
 # node-scoped [network.discovery] address discovery above). Narrows which
-# registered nodes are probed/discovered; never ranks them. Absent/empty =>
+# registered nodes discovery opens; never ranks them. Absent/empty =>
 # no filter, every registered node is eligible.
 # region_allowlist = ["US", "DE"]
 

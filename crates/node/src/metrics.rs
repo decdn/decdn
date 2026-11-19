@@ -6,12 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::U256;
 use bytes::Bytes;
-use decdn_cache::{CacheEngine, CacheMetrics};
+use decdn_cache::CacheMetrics;
 use decdn_incentive::PoolOpenFailureReason;
 use decdn_protocol::Region;
 use http_body_util::Full;
@@ -30,10 +30,12 @@ use tokio::sync::{Semaphore, oneshot};
 
 use crate::load_shed::RequestClass;
 
-/// Bucket upper bounds of `decdn_probe_collection_latency_seconds`, per the
-/// registry row in `adr/appendix-observability.md`. The collection window has a
-/// 1 s ceiling, so the top finite bucket leaves room for a slow scheduler.
-const PROBE_COLLECTION_BUCKETS: [f64; 8] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+/// Bucket upper bounds of `decdn_open_collection_latency_seconds`, per the
+/// registry row in `adr/appendix-observability.md`. One open has a 2.5 s
+/// ceiling (`selection::OPEN_CEILING`), and a round that reaches it lands a
+/// little past it. So a 5 s bucket sits above the ceiling, and a round at
+/// the ceiling does not fall into `+Inf`.
+const OPEN_COLLECTION_BUCKETS: [f64; 9] = [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 
 /// Bucket upper bounds shared by the time-to-first-byte histograms. A cache hit
 /// resolves in the low buckets. A serve miss includes discovery and an upstream
@@ -80,7 +82,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_capability_expired_total",
     "decdn_serve_stream_rejected_chain_hash_denied_total",
     "decdn_serve_stream_rejected_chain_stale_total",
-    "decdn_serve_stream_rejected_evicted_since_probe_total",
+    "decdn_serve_stream_rejected_withdrawn_total",
     "decdn_serve_stream_rejected_foreign_declined_total",
     "decdn_serve_stream_rejected_hash_denied_total",
     "decdn_serve_stream_rejected_insufficient_deposit_total",
@@ -96,6 +98,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_signer_cap_exhausted_total",
     "decdn_serve_stream_rejected_stream_cap_full_total",
     "decdn_serve_stream_rejected_timestamp_skew_total",
+    "decdn_serve_stream_rejected_unadmitted_cap_full_total",
     "decdn_serve_stream_rejected_unaccepted_pool_total",
     "decdn_serve_stream_rejected_unknown_lane_total",
     "decdn_serve_stream_request_unreadable_total",
@@ -108,6 +111,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_proof_budget_exhausted_total",
     "decdn_serve_stream_client_declined_total",
     "decdn_serve_stream_client_abandoned_total",
+    "decdn_serve_stream_unclaimed_total",
     "decdn_serve_stream_node_fault_total",
     "decdn_serve_rate_limit_rejected_per_peer_total",
     "decdn_serve_rate_limit_rejected_global_total",
@@ -136,86 +140,6 @@ enum StreamDirection {
 )]
 struct StreamLabels {
     direction: StreamDirection,
-}
-
-/// Why a probe for a present blob got **no** eviction hold, as the `reason`
-/// label on `decdn_probe_hold_unavailable_total`.
-///
-/// Holds are best-effort, so this is not the same as "answered
-/// `has_blob: false`" — `exhausted` and `stake_lane_reserved` still advertise.
-///
-/// The three values are not interchangeable — each has a different operator
-/// remedy, which is why the reference `DecdnProbeHoldViolations` alert filters
-/// on `reason="exhausted"` alone. The derive renders variants in `snake_case`, so
-/// these encode as `reason="exhausted"` / `"disabled"` / `"stake_lane_reserved"`.
-///
-/// Not to be confused with [`decdn_cache::ProbeHoldOutcome::Unavailable`],
-/// which is the one probe-hold outcome that emits **no** metric at all — a
-/// blob genuinely absent is a true negative, not a refusal. The shared word is
-/// inverted between the two types: here it selects *for* the counter, there it
-/// selects *against* it.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Hash,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Serialize,
-    Deserialize,
-    EncodeLabelValue,
-)]
-pub enum ProbeHoldUnavailableReason {
-    /// Blob present, but **all** hold slots were live (`max_probe_holds`
-    /// reached) — genuine budget pressure. The node still advertises
-    /// `has_blob: true` and forgoes only the hold, so the blob may be
-    /// LRU-evicted before the pull lands. This is the "raise `max_probe_holds`"
-    /// signal and the only value the `DecdnProbeHoldViolations` alert fires on.
-    Exhausted,
-    /// Blob present, but the eviction-hold path is **disabled by config**
-    /// (`max_probe_holds == 0`) — an intentional operator choice, not budget
-    /// pressure (#739). The one reason that also suppresses the advertisement:
-    /// the node answers `has_blob: false` for store-backed content (origin-held
-    /// content takes no hold and is unaffected). Raising `max_probe_holds` is
-    /// the remedy only if the disable was unintended; alerting on it would be
-    /// nonsensical.
-    Disabled,
-    /// An end-client probe (a requester that is *not* a registered operator)
-    /// hit the stake-lane-reserved end-client ceiling
-    /// (`max_probe_holds - cache.stake_lane_reserved_holds`), keeping hold
-    /// headroom for node-to-node cache-miss probes per ADR 003 §Admission and
-    /// Priority (#757). The reservation is a content-independent *admission*
-    /// decision, so unlike the two above it is decided before any hold attempt
-    /// — but the handler still consults the cache afterwards to answer
-    /// honestly, and advertises the blob if it is present. Zero unless
-    /// `cache.stake_lane_reserved_holds > 0`.
-    StakeLaneReserved,
-}
-
-impl ProbeHoldUnavailableReason {
-    /// Every variant, in the order [`Metrics::new`] materializes them.
-    ///
-    /// This is what makes "every reason exports at zero" structural rather
-    /// than a convention. [`Metrics::new`] destructures `ALL.map(…)` into its
-    /// three cached handles, so adding a variant here changes the array length
-    /// and **fails to compile** at that pattern — you cannot add a reason
-    /// without materializing its child. The recorder's exhaustive `match` is
-    /// the second gate; without this array a fourth variant could satisfy the
-    /// compiler with a `_ =>` arm calling `get_or_create`, silently
-    /// reintroducing the lazily-created series this design exists to prevent.
-    ///
-    /// Order is load-bearing (it binds handles positionally); a reorder is
-    /// caught by `probe_hold_unavailable_increments_only_the_named_reason`.
-    const ALL: [Self; 3] = [Self::Exhausted, Self::Disabled, Self::StakeLaneReserved];
-}
-
-#[derive(
-    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, EncodeLabelSet,
-)]
-struct ProbeHoldUnavailableLabels {
-    reason: ProbeHoldUnavailableReason,
 }
 
 /// Why capability intake dropped an owner-signed capability, as the `reason`
@@ -453,12 +377,10 @@ pub enum ServeEconomicsRegime {
 /// deCDN-specific counters and gauges surfaced at `/metrics`.
 ///
 /// The group name becomes the metric-name prefix, so fields appear as
-/// e.g. `decdn_probe_requests_total`.
+/// e.g. `decdn_active_connections`.
 #[derive(Debug, Serialize, Deserialize, MetricsGroup)]
 #[metrics(default, name = "decdn")]
 pub struct DecdnMetrics {
-    /// Total probe requests served.
-    pub probe_requests: Counter,
     /// Currently open QUIC connections.
     pub active_connections: Gauge,
     /// Currently open paid delivery streams, split by node direction.
@@ -594,60 +516,6 @@ pub struct DecdnMetrics {
     /// § Node Discovery), `0` when the node is behind NAT. Sampled at
     /// bring-up. Operator-visible name: `decdn_node_public_address`.
     pub node_public_address: Gauge,
-    /// `decdn_probe_hold_unavailable_total{reason}` per the canonical metric
-    /// registry (`adr/appendix-observability.md` — the authoritative naming
-    /// source, superseding informal ADR-005 references): a probe for a present
-    /// blob that got no eviction hold, broken out by cause on the `reason`
-    /// label (#1443, collapsing the former `probe_hold_violations` /
-    /// `probe_holds_disabled` / `probe_stake_lane_reserved` counters).
-    ///
-    /// For `exhausted` / `stake_lane_reserved` the node still advertises
-    /// (`has_blob: true`) and simply forgoes the hold — the blob may be
-    /// LRU-evicted before the pull, costing one wasted round trip. That is not
-    /// a slash (ADR 014 pairs no offense with a miss) and not a reputation
-    /// penalty either: a `NotFound` is classified `Transient` and suppresses
-    /// the (peer, hash) pair without scoring the peer. `disabled` is the
-    /// operator opt-out (`max_probe_holds == 0`) that answers `has_blob: false`
-    /// for store-backed content. See
-    /// [`ProbeHoldUnavailableReason`] for what each value means and which one
-    /// the "raise `max_probe_holds`" alert fires on; all three children are
-    /// materialized at startup by [`Metrics::new`] so each series is exported
-    /// at zero rather than appearing only on first increment. Field has no
-    /// `_total` suffix because the `OpenMetrics` encoder appends it.
-    ///
-    /// **This is a documented exception, not the convention** (#1475) — a
-    /// labeled *reason split* (`capability_intake_dropped` is the other), not
-    /// the crate's only `Family`:
-    /// `streams_active` and `staker_set_active_by_region` label other axes.
-    /// Every other reason-style split in this crate — `dispatch_rejected_*`, `probe_rate_limit_rejected_*`,
-    /// and `pool_open_failures_*` — fans out to sibling unlabeled counters,
-    /// and that stays the default for a new split: sibling counters need no
-    /// `EncodeLabelSet` type, no pre-materialization to keep a series
-    /// exporting at zero, and no alert rewrite when a reason is added.
-    ///
-    /// The exception is earned because the three values share one *aggregate*
-    /// and one budget axis: an operator asks "are probe holds unavailable?"
-    /// first and drills into which value second — the shape a label serves and
-    /// sibling counters make awkward. They pointedly do NOT share an alert:
-    /// `DecdnProbeHoldViolations` filters to `reason="exhausted"` precisely
-    /// because [`ProbeHoldUnavailableReason::Disabled`] is an intentional
-    /// operator choice and alerting on it would be nonsensical, and
-    /// `StakeLaneReserved` has its own knob. Being able to express that filter
-    /// is itself part of what the label buys. A split whose values have
-    /// unrelated remedies *and* no meaningful aggregate gains nothing from a
-    /// label and should stay siblings.
-    probe_hold_unavailable: Family<ProbeHoldUnavailableLabels, Counter>,
-    /// `decdn_probe_hold_slots_used` (registry): current active
-    /// probe-triggered eviction holds (distinct held blobs), ADR 005
-    /// §Probe-triggered eviction hold. Sampled from the cache engine at
-    /// scrape time, so it tracks hold expiry with no probe traffic; pair
-    /// with `probe_hold_slots_max` for a saturation ratio.
-    pub probe_hold_slots_used: Gauge,
-    /// `decdn_probe_hold_slots_max` (registry, mandatory): the configured
-    /// `max_probe_holds` budget. Set once at startup. Pairs with
-    /// `probe_hold_slots_used` so dashboards can alert on a saturation
-    /// ratio rather than an absolute count.
-    pub probe_hold_slots_max: Gauge,
     /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 022 §DHT Rate Limiting). One Counter per layer to match
     /// the existing `dispatch_rejected_*` convention: a plain counter field
@@ -676,34 +544,9 @@ pub struct DecdnMetrics {
     /// startup. Operator-visible name:
     /// `decdn_dht_rate_limit_tracked_per_peer` (#645).
     pub dht_rate_limit_tracked_per_peer: Gauge,
-    /// `cdn/probe/v1` requests rejected by the per-peer (`NodeId`) token
-    /// bucket (ADR 005 §Probe rate limiting). One Counter per layer to match
-    /// the existing `dht_rate_limit_rejected_*` / `dispatch_rejected_*`
-    /// convention; a plain counter field carries no label dimension (a labeled
-    /// series would need a `Family`);
-    /// operators recover the rolled-up rate with
-    /// `sum(rate({__name__=~"decdn_probe_rate_limit_rejected_(per_peer|global)_total"}[1m]))`.
-    /// Operator-visible name: `decdn_probe_rate_limit_rejected_per_peer_total`.
-    pub probe_rate_limit_rejected_per_peer: Counter,
-    /// `cdn/probe/v1` requests rejected by the global token bucket. Sibling
-    /// to `probe_rate_limit_rejected_per_peer` — see its docs. Operator-
-    /// visible name: `decdn_probe_rate_limit_rejected_global_total`.
-    pub probe_rate_limit_rejected_global: Counter,
-    /// `retain_recent` sweeps of the per-peer (`NodeId`) probe keyed-limiter
-    /// map that actually ran (single-flight CAS won, layer enabled). Bumped
-    /// from both the lazy-prune path in the limiter's `check` and the periodic
-    /// `gc_per_peer` GC task. Operator-visible name:
-    /// `decdn_probe_rate_limit_prune_sweeps_per_peer_total` (#645).
-    pub probe_rate_limit_prune_sweeps_per_peer: Counter,
-    /// Current size of the per-peer probe keyed-limiter map after the most
-    /// recent prune (lazy or periodic). Pair with
-    /// `decdn_probe_rate_limit_prune_sweeps_per_peer_total` to detect cap
-    /// saturation. Operator-visible name:
-    /// `decdn_probe_rate_limit_tracked_per_peer` (#645).
-    pub probe_rate_limit_tracked_per_peer: Gauge,
     /// Inbound `cdn/client/v1` streams refused by the per-peer (`NodeId`) token
     /// bucket before the request was read (ADR 005 §Request rate limiting).
-    /// One Counter per layer, like `probe_rate_limit_rejected_*`. Each bump
+    /// One Counter per layer, like `dht_rate_limit_rejected_*`. Each bump
     /// ends exactly one inbound stream as failed. Operator-visible name:
     /// `decdn_serve_rate_limit_rejected_per_peer_total`.
     pub serve_rate_limit_rejected_per_peer: Counter,
@@ -1057,10 +900,9 @@ pub struct DecdnMetrics {
     /// `decdn_capacity_bond_registry_resync_failures_total`: registry re-reads
     /// of `getRegisteredNodes` that could not read chain state and kept the
     /// projections they already had. The staker set gates DHT `Store`
-    /// admission and the stake-lane probe reservation, so a persistently
-    /// failing re-read leaves it stale. Pairs with the liveness gauge below.
-    /// Field has no `_total` suffix because the `OpenMetrics` encoder appends
-    /// it.
+    /// admission, so a persistently failing re-read leaves it stale. Pairs
+    /// with the liveness gauge below. Field has no `_total` suffix because the
+    /// `OpenMetrics` encoder appends it.
     pub capacity_bond_registry_resync_failures: Counter,
     /// `decdn_staker_set_active_count` (#783): current cached active-staker
     /// set size, set on every registry read. A count holding flat while
@@ -1113,37 +955,39 @@ pub struct DecdnMetrics {
     /// (DHT plus the origin-directory fallback) surfaced no provider — the blob
     /// is unavailable on the network, not a pull failure.
     pub node_pull_no_providers: Counter,
-    /// `decdn_probe_cache_hits_total` (#1165): cache-miss pulls whose candidate
-    /// walk STARTED from a live ADR 001 §Probe cache entry with at least one
-    /// still-selectable provider. The DHT lookup and probe fanout are skipped —
-    /// unless every cached provider fails, in which case the same fetch either
-    /// falls through to a fresh lookup + probe (if attempt budget remains) or
-    /// returns a clean miss (if the cached providers exhausted the budget first,
-    /// the common case since an entry holds up to 10 providers but the budget is
-    /// 3) — either way it stays counted here (the hit is "the cache had
-    /// something worth trying", not "the cache delivered"). Field has no
-    /// `_total` suffix because the
-    /// `OpenMetrics` encoder appends it. With `probe_cache_misses` this is the
-    /// hit ratio the TTL exists to buy; a ratio near zero means the TTL is
-    /// shorter than the request inter-arrival time for hot blobs and the cache
-    /// is pure overhead.
-    pub probe_cache_hits: Counter,
-    /// `decdn_probe_cache_misses_total` (#1165): cache-miss pulls that had to run
-    /// a fresh DHT lookup + probe. Counts an entry that was absent, expired, OR
-    /// fully suppressed (every cached provider negative-cached, wedged, no longer
-    /// an active staker, or otherwise unselectable), and on the ranged pull leg an
-    /// entry whose providers do not cover every block of the blob (#2195) — all
-    /// cost the same network work, which is what this measures.
-    pub probe_cache_misses: Counter,
-    /// `decdn_probe_collection_latency_seconds` (ADR 001 §Probe response
-    /// collection): the time from the start of the concurrent probes, dials
-    /// included, to the end of collection — the early stop once enough holders
-    /// answer, or the drain of the probe set, which `PROBE_TIMEOUT` bounds per
-    /// probe. A round that sends no probe records nothing. Each probe round
-    /// records one sample, so a ranged miss whose holders do not span the blob,
-    /// and that then probes origin-directory candidates, records two (#2195).
-    #[default(Histogram::new(PROBE_COLLECTION_BUCKETS.to_vec()))]
-    pub probe_collection_latency_seconds: Histogram,
+    /// `decdn_candidate_cache_hits_total` (#1165): cache-miss pulls whose
+    /// candidate walk STARTED from a live ADR 001 §Candidate cache entry with
+    /// at least one still-selectable provider. The DHT lookup and the discovery
+    /// fan-out are skipped — unless every cached provider fails, in which case
+    /// the same fetch either falls through to a fresh lookup and discovery (if
+    /// attempt budget remains) or returns a clean miss (if the cached providers
+    /// exhausted the budget first, the common case since an entry holds up to
+    /// 10 providers but the budget is 3) — either way it stays counted here
+    /// (the hit is "the cache had something worth trying", not "the cache
+    /// delivered"). Field has no `_total` suffix because the `OpenMetrics`
+    /// encoder appends it. With `candidate_cache_misses` this is the hit ratio
+    /// the TTL exists to buy; a ratio near zero means the TTL is shorter than
+    /// the request inter-arrival time for hot blobs and the cache is pure
+    /// overhead.
+    pub candidate_cache_hits: Counter,
+    /// `decdn_candidate_cache_misses_total` (#1165): cache-miss pulls that had
+    /// to run a fresh DHT lookup and discovery. Counts an entry that was
+    /// absent, expired, OR fully suppressed (every cached provider
+    /// negative-cached, wedged, no longer an active staker, or otherwise
+    /// unselectable), and on the ranged pull leg an entry whose providers do
+    /// not cover every block of the blob (#2195) — all cost the same network
+    /// work, which is what this measures.
+    pub candidate_cache_misses: Counter,
+    /// `decdn_open_collection_latency_seconds` (ADR 001 §Open response
+    /// collection): the time from the start of the concurrent discovery opens,
+    /// dials included, to the end of collection — the early stop once enough
+    /// holders answer, or the drain of the open set, which `OPEN_CEILING`
+    /// bounds per open. A round that sends no open records nothing. Each open
+    /// round records one sample, so a ranged miss whose holders do not span the
+    /// blob, and that then opens origin-directory candidates, records two
+    /// (#2195).
+    #[default(Histogram::new(OPEN_COLLECTION_BUCKETS.to_vec()))]
+    pub open_collection_latency_seconds: Histogram,
     /// `decdn_dht_lookup_round_ceiling_total` (#1145 review): a `find_providers` lookup was
     /// TRUNCATED at `MAX_LOOKUP_ROUNDS` while still finding closer nodes.
     ///
@@ -1164,12 +1008,12 @@ pub struct DecdnMetrics {
     /// sustained nonzero rate means a peer is taking payment for wrong content;
     /// the cache engine rejects the bytes, but the USDC was still spent.
     pub node_pull_corruption: Counter,
-    /// `decdn_node_pull_unreachable_total` (#831): a probe or pull to a
+    /// `decdn_node_pull_unreachable_total` (#831): a discovery open or pull to a
     /// candidate failed at the transport (scored [`Outcome::Unreachable`]).
     ///
     /// [`Outcome::Unreachable`]: decdn_reputation::Outcome::Unreachable
     pub node_pull_unreachable: Counter,
-    /// `decdn_node_region_latency_penalty_total` (#1177): a probed peer
+    /// `decdn_node_region_latency_penalty_total` (#1177): a discovered peer
     /// self-attested this node's own region yet answered slower than the ADR 030
     /// latency ceiling, so it was penalized in local reputation
     /// ([`Outcome::RegionLatencyMismatch`]). A sustained rate points at
@@ -1237,16 +1081,14 @@ pub struct DecdnMetrics {
     /// provider's reputation. A sustained rate
     /// means this node's ceiling is below the content it is trying to warm.
     pub node_pull_too_large: Counter,
-    /// `decdn_node_pull_rate_above_ceiling_total` (#1375): a selected upstream
-    /// signed an open-stage `StreamResponse` quoting a per-MB rate above this
-    /// node's effective buyer ceiling (the lower of the candidate's probe rate and
-    /// the configured `cache.max_rate_per_mb`), so the buyer refused before paying
-    /// any voucher. Sibling of [`Self::node_pull_too_large`]: a buyer-side policy
-    /// decision that does NOT tar the provider (an over-*config* quote is our tight
-    /// policy; an over-*probe* quote is a possible bait-and-switch we do not
-    /// adjudicate here). A sustained rate is the operator's signal that nodes are
-    /// being probed for rate manipulation — the one refusal on this path that
-    /// guards a slashable offense, so it earns a counter of its own.
+    /// `decdn_node_pull_rate_above_ceiling_total` (#1375): an upstream signed a
+    /// `StreamResponse` quoting a per-MB rate above this node's effective buyer
+    /// ceiling (the configured `cache.max_rate_per_mb`, lowered by the
+    /// serve-economics buy cap when one applies), so the buyer refused before
+    /// paying any voucher. Sibling of [`Self::node_pull_too_large`]: a buyer-side
+    /// policy decision that does NOT tar the provider, because the ceiling is this
+    /// node's own policy. A sustained rate is the operator's signal that the
+    /// upstreams it finds quote above what it is configured to pay.
     pub node_pull_rate_above_ceiling: Counter,
     /// `decdn_serve_economics_refused_total` (ADR 041): candidates existed for a
     /// cache-miss buy but every one quoted above this node's serve-economics buy
@@ -1349,10 +1191,10 @@ pub struct DecdnMetrics {
     /// peer health first; a small fraction is the healthy "that peer did not
     /// have it".
     pub node_pull_refused_unattributable: Counter,
-    /// `decdn_node_upstream_rate_limited_total` (#1986): a probe or pull to a
-    /// candidate was shed at the transport with `APP_ERR_RATE_LIMITED` (`0x10`,
-    /// ADR 013 §Application Error Codes) — the upstream's connection limiter,
-    /// probe limiter, or per-connection stream cap refused the work before any
+    /// `decdn_node_upstream_rate_limited_total` (#1986): a discovery open or pull
+    /// to a candidate was shed at the transport with `APP_ERR_RATE_LIMITED`
+    /// (`0x10`, ADR 013 §Application Error Codes) — the upstream's connection
+    /// limiter, request limiter, or per-connection stream cap refused the work before any
     /// signed message existed. The transport-level twin of a load-shed `NotFound`
     /// refusal, treated the same way: NO reputation outcome is recorded, and the
     /// `(peer, hash)` pair is suppressed for the short refusal TTL except on a
@@ -1364,7 +1206,7 @@ pub struct DecdnMetrics {
     /// the upstream's close ack-wait and can still arrive as a bare drop, which
     /// lands in the unreachable counter instead of here.
     pub node_upstream_rate_limited: Counter,
-    /// `decdn_node_upstream_timestamp_rejected_total`: a probe or pull to a
+    /// `decdn_node_upstream_timestamp_rejected_total`: a discovery open or pull to a
     /// candidate was refused at the transport with `APP_ERR_TIMESTAMP_SKEW`
     /// (`0x04`, ADR 013 §Application Error Codes): the upstream found this
     /// node's request `timestamp_us` more than 30 seconds from its own clock.
@@ -1618,7 +1460,7 @@ pub struct DecdnMetrics {
     /// Sibling of `serve_cache_partial_hit` and `serve_cache_miss`. At most one
     /// of the three is bumped per request, and two requests that reach
     /// `serve_audit` bump none: a withdrawn hash (operator evict or corruption
-    /// quarantine) is refused for `evicted_since_probe`, and a `serve_audit` store
+    /// quarantine) is refused for `withdrawn`, and a `serve_audit` store
     /// fault is refused for `internal_error`. Neither is an availability class — one
     /// is a refusal, the other is the store failing to answer — so the ratio's
     /// denominator deliberately excludes both. Field has no `_total` suffix
@@ -1628,8 +1470,8 @@ pub struct DecdnMetrics {
     /// that is not `Complete` but whose held chunk groups already cover the
     /// requested span (#1506). Counted apart from `serve_cache_hit` because the
     /// two answer different questions — this one is the payoff of the
-    /// range-keyed partial-holder advertisement a node makes over
-    /// `cdn/probe/v1` and the DHT, and folding it into the plain hit would hide
+    /// range-keyed partial-holder advertisement a node makes in its open
+    /// answers and the DHT, and folding it into the plain hit would hide
     /// whether that mechanism carries any traffic. Both are hits for hit-rate
     /// purposes.
     pub serve_cache_partial_hit: Counter,
@@ -1651,28 +1493,37 @@ pub struct DecdnMetrics {
     pub serve_cache_miss: Counter,
     /// `decdn_serve_first_byte_hit_seconds`: time to first byte of a paid serve
     /// the availability gate classed as a hit (complete or partial), from the
-    /// decoded request to the first `ChunkData` frame written. The first frame
-    /// rides the opening credit window, so no client payment round trip is in
-    /// the window; one `getPool` chain read is, when the pool view has no entry
-    /// for the pool. A stream that ends before any frame records nothing.
-    /// Sibling of `serve_first_byte_miss_seconds` on the cache-class axis.
+    /// decoded request to the first `ChunkData` frame written. It measures this
+    /// node's latency only. A hit answers before funding admission and waits
+    /// for the payer's first proof; the clock leaves that wait out
+    /// (`FirstByteClock`). The admission after the proof stays in: the
+    /// load-shed admit and the `getPool` and `getAuthorization` chain reads on a
+    /// view miss. A stream that ends before any frame records nothing. Sibling
+    /// of `serve_first_byte_miss_seconds` on the cache-class axis.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_byte_hit_seconds: Histogram,
     /// `decdn_serve_first_byte_miss_seconds`: time to first byte of a paid serve
     /// the availability gate classed as a miss — the same window as
-    /// `serve_first_byte_hit_seconds`, which here also covers discovery and the
-    /// upstream or origin fill that produces the first frame. A window-paced
-    /// fill streams its first frame early; a buffered fill completes the whole
-    /// blob first, so on that tier the value grows with blob size.
+    /// `serve_first_byte_hit_seconds`, which here also covers the upstream or
+    /// origin fill that produces the first frame. A pull-through miss runs
+    /// funding admission and discovery before it answers. An own-origin serve
+    /// answers first and admits at the payer's first proof, as a hit does, and
+    /// the clock leaves its wait for that proof out. A
+    /// window-paced fill streams its first frame early; a buffered fill
+    /// completes the whole blob first, so on that tier the value grows with
+    /// blob size.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_byte_miss_seconds: Histogram,
-    /// `decdn_serve_admission_seconds`: the admission phase of a paid serve's
-    /// time to first byte, from the decoded request to the load-shed admit. It
-    /// covers the binding check, the deny gates, the `getPool` and
-    /// `getAuthorization` chain reads on a view miss, and the availability
-    /// audit. The class is unknown until the audit ends, so this phase has no
-    /// hit/miss siblings. Records only for a stream that writes its first frame,
-    /// so the three phase histograms and the total share one population.
+    /// `decdn_serve_admission_seconds`: the first phase of a paid serve's time
+    /// to first byte, from the decoded request to the tier pick that classes the
+    /// serve a hit or a miss. It covers the timestamp and binding checks, the
+    /// chain-staleness and deny gates, and the availability audit. It holds no
+    /// funding admission and no chain read: a pull-through miss admits in the
+    /// response phase, and every other serve admits at the payer's first proof,
+    /// in the first-frame phase. The class is unknown until the tier pick, so
+    /// this phase has no hit/miss siblings. Records only for a stream that
+    /// writes its first frame, so the three phase histograms and the total
+    /// share one population.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_admission_seconds: Histogram,
     /// `decdn_serve_signer_auth_cached_total`: admit-path signer confirms the
@@ -1690,25 +1541,35 @@ pub struct DecdnMetrics {
     /// `getAuthorization`, its own or one already in flight for the pair.
     pub serve_signer_auth_reread: Counter,
     /// `decdn_serve_response_hit_seconds`: the response phase of a paid hit,
-    /// from the load-shed admit to the signed `StreamResponse` written.
+    /// from the tier pick to the signed `StreamResponse` written. It covers the
+    /// size proof, the coverage and the signature. A hit admits at the payer's
+    /// first proof, so this phase holds no load-shed admit and no chain read.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_response_hit_seconds: Histogram,
     /// `decdn_serve_response_miss_seconds`: the response phase of a paid miss,
-    /// from the load-shed admit to the signed `StreamResponse` written. It
-    /// covers the pre-spend deposit gate, the origin size and range probes, and
-    /// on a node-to-node fill the upstream discovery, pool open and handshake.
-    /// A buffered fill imports the whole blob in this phase.
+    /// from the tier pick to the signed `StreamResponse` written. It covers the
+    /// own-origin size and range probes. On a pull-through miss it also covers
+    /// the load-shed admit, the funding gates with their chain reads, the
+    /// pre-spend deposit gate and, on a node-to-node fill, the upstream
+    /// discovery, pool open and handshake. A buffered fill imports the whole
+    /// blob in this phase.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_response_miss_seconds: Histogram,
     /// `decdn_serve_first_frame_hit_seconds`: the first-frame phase of a paid
     /// hit, from the `StreamResponse` written to the first `ChunkData` frame
-    /// written. It covers the read and encode of the whole first frame.
+    /// written, less the wait for the payer's first proof, which is the
+    /// payer's time. It covers funding admission at that proof (the load-shed
+    /// admit, and the chain reads on a view miss) and the read and encode of
+    /// the whole first frame.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_frame_hit_seconds: Histogram,
     /// `decdn_serve_first_frame_miss_seconds`: the first-frame phase of a paid
     /// miss, from the `StreamResponse` written to the first `ChunkData` frame
-    /// written. On a window-paced fill it covers the pull leg filling the whole
-    /// first frame from upstream or origin.
+    /// written. An own-origin serve runs funding admission at the payer's first
+    /// proof, and the phase leaves out its wait for that proof. A pull-through
+    /// miss is admitted before it answers. On a window-paced fill the phase
+    /// covers the pull leg filling the whole first frame from upstream or
+    /// origin.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_frame_miss_seconds: Histogram,
     /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
@@ -1721,14 +1582,15 @@ pub struct DecdnMetrics {
     /// the lazy origin directory cache (positive + negative entries).
     /// Bounded by the configured cache capacity (LRU eviction).
     pub origin_directory_cache_size: Gauge,
-    /// Paid-delivery (`serve_stream`) requests refused because the blob was
-    /// deliberately evicted between probe and stream (#279). One `Counter` per
+    /// Paid-delivery (`serve_stream`) requests refused because the node
+    /// withdrew the blob: an operator evict or a corruption quarantine with no
+    /// blacklist entry behind it (#279). One `Counter` per
     /// reason — like the `dispatch_rejected_*` convention — because a plain counter
     /// field carries no label dimension, and the wire `StreamError` deliberately
     /// conflates the three `NotFound` reasons (`cache_miss`, `unknown_lane`,
     /// `owner_mismatch`) (#876). Visible name:
-    /// `decdn_serve_stream_rejected_evicted_since_probe_total`.
-    pub serve_stream_rejected_evicted_since_probe: Counter,
+    /// `decdn_serve_stream_rejected_withdrawn_total`.
+    pub serve_stream_rejected_withdrawn: Counter,
     /// `serve_stream` requests refused because the blob is absent and
     /// pull-through was unavailable or failed to fill it. Visible name:
     /// `decdn_serve_stream_rejected_cache_miss_total`.
@@ -1766,18 +1628,6 @@ pub struct DecdnMetrics {
     /// No signed response is sent. Visible name:
     /// `decdn_serve_stream_rejected_timestamp_skew_total`.
     pub serve_stream_rejected_timestamp_skew: Counter,
-    /// Probe requests this node could not read: the read timed out, the frame
-    /// or the message failed to decode, or the peer sent a response on the
-    /// server stream. The connection closes with the matching ADR 013 code.
-    /// Visible name: `decdn_probe_read_faults_total`.
-    pub probe_read_faults: Counter,
-    /// Probe requests refused because the request's `timestamp_us` differs
-    /// from this node's clock by more than
-    /// [`crate::handlers::timestamp_skew::MAX_REQUEST_TIMESTAMP_SKEW_US`].
-    /// The connection closes with `TIMESTAMP_SKEW` (ADR 013 §Application Error Codes) and no
-    /// signed response is sent. Visible name:
-    /// `decdn_probe_timestamp_skew_refusals_total`.
-    pub probe_timestamp_skew_refusals: Counter,
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting pool's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
@@ -1839,7 +1689,10 @@ pub struct DecdnMetrics {
     /// See [`CapabilityIntakeDropReason`] for each value. Every child exports at
     /// zero from startup.
     ///
-    /// A labelled reason split, like `probe_hold_unavailable`, because the
+    /// A labelled reason split, a documented exception to the sibling-counter
+    /// convention (#1475): `dispatch_rejected_*`, `dht_rate_limit_rejected_*`
+    /// and `pool_open_failures_*` fan out to sibling unlabeled counters, and
+    /// that stays the default for a new split. The label is earned because the
     /// values share one aggregate: an operator asks "does intake drop
     /// capabilities?" first and "why?" second.
     capability_intake_dropped: Family<CapabilityIntakeDropLabels, Counter>,
@@ -1903,7 +1756,7 @@ pub struct DecdnMetrics {
     /// operator alone. Visible name:
     /// `decdn_serve_stream_rejected_chain_hash_denied_total`.
     ///
-    /// Not to be confused with `serve_stream_rejected_evicted_since_probe`,
+    /// Not to be confused with `serve_stream_rejected_withdrawn`,
     /// which sees only evictions with no blacklist entry behind them (corruption
     /// recovery, a manual `decdn node evict`).
     pub serve_stream_rejected_chain_hash_denied: Counter,
@@ -1991,6 +1844,13 @@ pub struct DecdnMetrics {
     /// sends no signed response. A client that opens more concurrent streams
     /// than the cap drives it.
     pub serve_stream_rejected_stream_cap_full: Counter,
+    /// `decdn_serve_stream_rejected_unadmitted_cap_full_total`:
+    /// `cdn/client/v1` streams reset with `RATE_LIMITED` because the connection
+    /// already held `MAX_UNADMITTED_STREAMS_PER_CONNECTION` streams that have
+    /// not passed admission. The node reads no request and sends no signed
+    /// response. A peer that opens streams and
+    /// does not pay on them drives it.
+    pub serve_stream_rejected_unadmitted_cap_full: Counter,
     /// `decdn_serve_stream_request_unreadable_total`: `cdn/client/v1` streams
     /// reset because the node could not read the first request: the read timed
     /// out, the peer reset the stream or dropped the connection, the length
@@ -2007,14 +1867,20 @@ pub struct DecdnMetrics {
     /// even when the peer leaves before it reads the reject frame.
     pub serve_stream_voucher_rejected: Counter,
     /// `decdn_serve_stream_client_declined_total`: `cdn/client/v1` streams the
-    /// requester left before any voucher credited a byte. The routine shapes are a
-    /// requester that reads the signed `StreamResponse` and does not take the
-    /// quote, and the header handshake a downstream node's miss pull opens and
-    /// closes without adopting. A peer that sends a malformed proof before paying
-    /// counts here too. The reference requester closes every stream with code `0`,
-    /// and the node does not read the code, so it sees only that the peer left,
-    /// not why. Peer-side, logged at `debug!`.
+    /// requester left after it sent a frame past its request and before any
+    /// voucher credited a byte: a malformed proof, or proofs that credited
+    /// nothing. The reference requester closes every stream with code `0`, and
+    /// the node does not read the code, so it sees only that the peer left, not
+    /// why. Peer-side, logged at `debug!`.
     pub serve_stream_client_declined: Counter,
+    /// `decdn_serve_stream_unclaimed_total`: `cdn/client/v1` streams the
+    /// requester left before it sent anything after its request. The routine
+    /// shapes are an open whose answer the requester reads and does not take
+    /// (a discovery open, a quote it declines, a header handshake a downstream
+    /// node's miss pull does not adopt), and an open it cancels or lets time
+    /// out while the node waits for its first proof. Peer-side, logged at
+    /// `debug!`.
+    pub serve_stream_unclaimed: Counter,
     /// `decdn_serve_stream_client_abandoned_total`: paying `cdn/client/v1`
     /// streams the requester left or broke the protocol on after at least one
     /// voucher credited bytes: it stopped reading, reset the stream, dropped the
@@ -2296,26 +2162,11 @@ pub struct Metrics {
     inbound_failed: Arc<Counter>,
     outbound_completed: Arc<Counter>,
     outbound_failed: Arc<Counter>,
-    /// Materialized `probe_hold_unavailable` children, one per
-    /// [`ProbeHoldUnavailableReason`]. Held here for the same reason as the
-    /// stream gauges: `Family` creates a child series lazily on first
-    /// `get_or_create`, so without this each `reason` would be absent from
-    /// `/metrics` until it first fired — an operator's dashboard and alert
-    /// would show a gap rather than a zero. Creating them at startup keeps
-    /// the property that all three series are exported at zero.
-    probe_hold_exhausted: Arc<Counter>,
-    probe_hold_disabled: Arc<Counter>,
-    probe_hold_stake_lane_reserved: Arc<Counter>,
     /// Regions that currently have a `staker_set_active_by_region` child.
     /// `Family` cannot enumerate its children, so this is what tells
     /// [`Self::staker_set_active_by_region`] which ones to remove.
     published_regions: Mutex<BTreeSet<Region>>,
     started_at: Instant,
-    /// Cache engine whose live probe-hold count backs the
-    /// `probe_hold_slots_used` gauge, sampled once per scrape in
-    /// [`Self::encode`]. Unset until runtime bring-up attaches the cache
-    /// through [`Self::attach_probe_holds`]; the gauge then reads `0`.
-    probe_holds: OnceLock<CacheEngine>,
 }
 
 impl Default for Metrics {
@@ -2378,19 +2229,6 @@ impl Metrics {
         let inbound_failed = decdn.streams_failed.get_or_create(&inbound);
         let outbound_completed = decdn.streams_completed.get_or_create(&outbound);
         let outbound_failed = decdn.streams_failed.get_or_create(&outbound);
-        // Materialize every `reason` child up front so all three series export
-        // at zero from a fresh registry (see the field docs on `Metrics`).
-        // Driven off `ALL` and destructured positionally so a new variant
-        // cannot compile without being materialized here — see `ALL`'s docs.
-        let [
-            probe_hold_exhausted,
-            probe_hold_disabled,
-            probe_hold_stake_lane_reserved,
-        ] = ProbeHoldUnavailableReason::ALL.map(|reason| {
-            decdn
-                .probe_hold_unavailable
-                .get_or_create(&ProbeHoldUnavailableLabels { reason })
-        });
         for reason in CapabilityIntakeDropReason::ALL {
             decdn
                 .capability_intake_dropped
@@ -2427,24 +2265,9 @@ impl Metrics {
             inbound_failed,
             outbound_completed,
             outbound_failed,
-            probe_hold_exhausted,
-            probe_hold_disabled,
-            probe_hold_stake_lane_reserved,
             published_regions: Mutex::new(BTreeSet::new()),
             started_at: Instant::now(),
-            probe_holds: OnceLock::new(),
         }
-    }
-
-    /// Attach the cache engine whose probe holds back
-    /// `decdn_probe_hold_slots_used`. Each scrape samples
-    /// [`CacheEngine::probe_hold_slots_used`], which sweeps expired holds, so
-    /// the gauge falls back to `0` once holds lapse even with no probe
-    /// traffic. Only the first attach takes effect.
-    pub(crate) fn attach_probe_holds(&self, cache: CacheEngine) {
-        // A second attach is a no-op: the runtime builds one cache per
-        // process, so the first engine is the live one.
-        let _ = self.probe_holds.set(cache);
     }
 
     /// Shared `Arc<CacheMetrics>` for wiring into [`decdn_cache::CacheEngine`].
@@ -2590,24 +2413,6 @@ impl Metrics {
             ShedReason::NodeAtCapacity => self.decdn.load_shed_refused_node_at_capacity.inc(),
             ShedReason::EgressSaturated => self.decdn.load_shed_refused_egress_saturated.inc(),
             ShedReason::ClientAtCapacity => self.decdn.load_shed_refused_client_at_capacity.inc(),
-        };
-    }
-
-    /// Record a probe that could not be answered from a guaranteed eviction
-    /// hold, broken out by cause on the `reason` label of
-    /// `decdn_probe_hold_unavailable_total` (#1443). Hand-written rather than
-    /// a `recorders!` entry because the pre-materialized child handles live on
-    /// `Metrics`, whereas `recorders!` only reaches `self.decdn.$field`. Same
-    /// enum-dispatch shape as [`Self::pool_open_failure_by_reason`], though
-    /// that one's counters *are* siblings on `self.decdn`. Pairs with the
-    /// structured `debug!` at each call site in [`crate::handlers::probe`].
-    pub fn probe_hold_unavailable(&self, reason: ProbeHoldUnavailableReason) {
-        match reason {
-            ProbeHoldUnavailableReason::Exhausted => self.probe_hold_exhausted.inc(),
-            ProbeHoldUnavailableReason::Disabled => self.probe_hold_disabled.inc(),
-            ProbeHoldUnavailableReason::StakeLaneReserved => {
-                self.probe_hold_stake_lane_reserved.inc()
-            }
         };
     }
 
@@ -2771,12 +2576,6 @@ impl Metrics {
         let uptime = i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX);
         self.decdn.node_uptime_seconds.set(uptime);
 
-        if let Some(cache) = self.probe_holds.get() {
-            self.decdn
-                .probe_hold_slots_used
-                .set(sat(cache.probe_hold_slots_used()));
-        }
-
         let reg = self
             .registry
             .read()
@@ -2790,7 +2589,8 @@ impl Metrics {
 ///
 /// Each entry spells out both names — `method => field.op(value)` — because the
 /// two diverge for many of them: the method reads as a singular event while the
-/// field is plural (`probe_request` vs `probe_requests`), or the field is a
+/// field is plural (`dht_rate_limit_prune_sweep_per_peer` vs
+/// `dht_rate_limit_prune_sweeps_per_peer`), or the field is a
 /// semantic rename of the action (`connection_opened` bumps
 /// `active_connections`). Deriving one name from the
 /// other would bind the wrong series, so neither is ever synthesized. (Field
@@ -2834,13 +2634,6 @@ macro_rules! recorders {
 }
 
 recorders! {
-    /// A `cdn/probe/v1` request was served.
-    probe_request => probe_requests.inc();
-
-    /// Publish the configured `max_probe_holds` budget (registry-mandatory
-    /// `decdn_probe_hold_slots_max`). Called once at runtime bring-up.
-    probe_hold_slots_max(max: usize) => probe_hold_slots_max.set(sat(max));
-
     /// A redeem hint was dropped because the bounded advisory channel was full
     /// (`try_send` → `Full`, #751). Advisory, so a few drops are benign; a
     /// sustained rate means the redeemer is not keeping up with fan-out.
@@ -2986,19 +2779,19 @@ recorders! {
     /// A cache miss surfaced no provider from discovery (#831).
     node_pull_no_providers => node_pull_no_providers.inc();
 
-    /// A cache-miss pull was served from the ADR 001 probe cache: no DHT lookup,
-    /// no probe fanout (#1165).
-    probe_cache_hit => probe_cache_hits.inc();
+    /// A cache-miss pull was served from the ADR 001 candidate cache: no DHT
+    /// lookup, no discovery fan-out (#1165).
+    candidate_cache_hit => candidate_cache_hits.inc();
 
-    /// A cache-miss pull found no usable probe-cache entry and ran a fresh
-    /// lookup + probe (#1165).
-    probe_cache_miss => probe_cache_misses.inc();
+    /// A cache-miss pull found no usable candidate-cache entry and ran a fresh
+    /// lookup and discovery (#1165).
+    candidate_cache_miss => candidate_cache_misses.inc();
 
-    /// One probe round's collection window ended (ADR 001 §Probe response
-    /// collection): `elapsed` runs from the start of the concurrent probes to
+    /// One discovery round's collection window ended (ADR 001 §Open response
+    /// collection): `elapsed` runs from the start of the concurrent opens to
     /// the end of collection.
-    probe_collection_latency(elapsed: Duration) =>
-        probe_collection_latency_seconds.observe(elapsed.as_secs_f64());
+    open_collection_latency(elapsed: Duration) =>
+        open_collection_latency_seconds.observe(elapsed.as_secs_f64());
 
     /// One node-to-node pull leg read its first bao bytes `elapsed` after its
     /// open started.
@@ -3012,10 +2805,10 @@ recorders! {
     /// An upstream served hash-mismatched bytes for a paid pull (#831).
     node_pull_corruption => node_pull_corruption.inc();
 
-    /// A probe or pull to a candidate failed at the transport (#831).
+    /// A discovery open or pull to a candidate failed at the transport (#831).
     node_pull_unreachable => node_pull_unreachable.inc();
 
-    /// A probed peer claimed this node's own region but exceeded the ADR 030
+    /// A discovered peer claimed this node's own region but exceeded the ADR 030
     /// latency ceiling, so it took the local reputation penalty (#1177).
     node_region_latency_penalty => node_region_latency_penalty.inc();
 
@@ -3033,8 +2826,8 @@ recorders! {
     node_pull_rate_above_ceiling => node_pull_rate_above_ceiling.inc();
 
     /// Record a paid-delivery (`serve_stream`) request refused because the
-    /// blob was evicted between probe and stream (#876).
-    serve_stream_rejected_evicted_since_probe => serve_stream_rejected_evicted_since_probe.inc();
+    /// node withdrew the blob (#876).
+    serve_stream_rejected_withdrawn => serve_stream_rejected_withdrawn.inc();
 
     /// Record a `serve_stream` request refused on a cache miss that
     /// pull-through could not fill (#876).
@@ -3059,10 +2852,6 @@ recorders! {
     /// A `serve_stream` request's timestamp exceeded the clock-skew bound and
     /// the stream was reset.
     serve_stream_rejected_timestamp_skew => serve_stream_rejected_timestamp_skew.inc();
-    /// A probe request could not be read.
-    probe_read_fault => probe_read_faults.inc();
-    /// A probe request's timestamp exceeded the clock-skew bound.
-    probe_timestamp_skew_refusal => probe_timestamp_skew_refusals.inc();
 
     /// Record a `serve_stream` cache-miss refused by the pre-flight deposit guard
     /// (#856): the requesting pool could not cover the worst-case blob cost,
@@ -3172,6 +2961,10 @@ recorders! {
     /// was full.
     serve_stream_rejected_stream_cap_full => serve_stream_rejected_stream_cap_full.inc();
 
+    /// Record a `cdn/client/v1` stream reset because the connection held its cap
+    /// of streams that have not passed admission.
+    serve_stream_rejected_unadmitted_cap_full => serve_stream_rejected_unadmitted_cap_full.inc();
+
     /// Record a `cdn/client/v1` stream reset because its first request could not
     /// be read. Peer-side.
     serve_stream_request_unreadable => serve_stream_request_unreadable.inc();
@@ -3179,9 +2972,13 @@ recorders! {
     /// Record a paying `cdn/client/v1` stream stopped on a rejected voucher.
     serve_stream_voucher_rejected => serve_stream_voucher_rejected.inc();
 
-    /// Record a `cdn/client/v1` stream the requester left before any voucher
-    /// credited a byte. Peer-side.
+    /// Record a `cdn/client/v1` stream the requester left after a frame followed
+    /// its request and before any voucher credited a byte. Peer-side.
     serve_stream_client_declined => serve_stream_client_declined.inc();
+
+    /// Record a `cdn/client/v1` stream the requester left before it sent
+    /// anything after its request. Peer-side.
+    serve_stream_unclaimed => serve_stream_unclaimed.inc();
 
     /// Record a paying `cdn/client/v1` stream the requester left after a voucher
     /// credited bytes. Peer-side.
@@ -3264,11 +3061,12 @@ recorders! {
     /// serve us, which is usually our own deposit or binding, not their fault.
     node_pull_refused_unattributable => node_pull_refused_unattributable.inc();
 
-    /// An upstream shed a probe or pull at the transport with `APP_ERR_RATE_LIMITED`
+    /// An upstream shed a discovery open or pull at the transport with
+    /// `APP_ERR_RATE_LIMITED`
     /// (#1986). Suppressed briefly, never scored — see the counter's docs.
     node_upstream_rate_limited => node_upstream_rate_limited.inc();
 
-    /// An upstream refused a probe or pull's request timestamp with
+    /// An upstream refused a discovery open or pull's request timestamp with
     /// `APP_ERR_TIMESTAMP_SKEW`. Never scored — see the counter's docs.
     node_upstream_timestamp_rejected => node_upstream_timestamp_rejected.inc();
 
@@ -3384,20 +3182,6 @@ recorders! {
 
     /// Set the per-peer DHT keyed-limiter tracked-size gauge (#645).
     dht_rate_limit_tracked_per_peer_set(n: usize) => dht_rate_limit_tracked_per_peer.set(sat(n));
-
-    /// Record a `cdn/probe/v1` request rejected at the per-peer layer.
-    probe_rate_limit_rejected_per_peer => probe_rate_limit_rejected_per_peer.inc();
-
-    /// Record a `cdn/probe/v1` request rejected at the global layer.
-    probe_rate_limit_rejected_global => probe_rate_limit_rejected_global.inc();
-
-    /// Record a `retain_recent` sweep of the per-peer probe keyed-limiter
-    /// map (#645).
-    probe_rate_limit_prune_sweep_per_peer => probe_rate_limit_prune_sweeps_per_peer.inc();
-
-    /// Set the per-peer probe keyed-limiter tracked-size gauge (#645).
-    probe_rate_limit_tracked_per_peer_set(n: usize)
-        => probe_rate_limit_tracked_per_peer.set(sat(n));
 
     /// Record an inbound `cdn/client/v1` stream refused at the per-peer layer.
     serve_rate_limit_rejected_per_peer => serve_rate_limit_rejected_per_peer.inc();
@@ -3734,47 +3518,89 @@ impl Drop for ConnectionGuard<'_> {
 /// clock and records nothing.
 ///
 /// The clock also splits the total into three phases: admission (decoded to
-/// load-shed admit), response (admit to the signed `StreamResponse` written)
-/// and first frame (response written to the first frame written). Each phase
-/// records into its own histogram, and a `debug` event carries all three.
+/// the tier pick that sets the class), response (tier pick to the signed
+/// `StreamResponse` written) and first frame (response written to the first
+/// frame written). Funding admission falls in the response phase on a
+/// pull-through miss and in the first-frame phase on every other serve, at the
+/// payer's first proof. Each phase records into its own histogram, and a
+/// `debug` event carries all three.
+///
+/// The clock measures this node's latency only. An open that answers before
+/// admission waits for the payer's first proof, and that wait is the payer's:
+/// a round trip at least, and for a discovery open the requester's choice
+/// among its candidates. [`Self::mark_first_proof_at`] takes the span from the
+/// response written to the proof out of the first-frame phase and the total.
 #[derive(Debug)]
 pub(crate) struct FirstByteClock {
     started: Instant,
     admitted: Instant,
     responded: Option<Instant>,
+    /// The payer's wait for an open that answers before admission: from the
+    /// response written to the payer's first proof. Zero for any other serve.
+    payer_wait: Duration,
     class: RequestClass,
 }
 
 impl FirstByteClock {
-    /// A clock that started at `started` and passed the load-shed gate at
+    /// A clock that started at `started` and picked its serve tier at
     /// `admitted`, for a serve of class `class`.
     pub(crate) const fn new(started: Instant, admitted: Instant, class: RequestClass) -> Self {
         Self {
             started,
             admitted,
             responded: None,
+            payer_wait: Duration::ZERO,
             class,
         }
     }
 
     /// Mark the signed `StreamResponse` written.
     pub(crate) fn mark_responded(&mut self) {
-        self.responded = Some(Instant::now());
+        self.mark_responded_at(Instant::now());
+    }
+
+    /// Mark the signed `StreamResponse` written at `at`.
+    pub(crate) const fn mark_responded_at(&mut self, at: Instant) {
+        self.responded = Some(at);
+    }
+
+    /// Mark the payer's first proof arrived, for an open that answered before
+    /// admission. See [`Self::mark_first_proof_at`].
+    pub(crate) fn mark_first_proof(&mut self) {
+        self.mark_first_proof_at(Instant::now());
+    }
+
+    /// Mark the payer's first proof arrived at `at`, for an open that answered
+    /// before admission. The span from the response written to `at` is the
+    /// payer's, so the clock leaves it out of the first-frame phase and the
+    /// total. The deferred admission that runs after the proof stays in. Without
+    /// a response mark, there is no wait to leave out.
+    pub(crate) fn mark_first_proof_at(&mut self, at: Instant) {
+        if let Some(responded) = self.responded {
+            self.payer_wait = at.saturating_duration_since(responded);
+        }
     }
 
     /// Record the time since the clock started and each phase: the first frame
     /// is written. Without a response mark, only the admission phase and the
     /// total record.
     pub(crate) fn record(self, metrics: &Metrics) {
-        let now = Instant::now();
-        let total = now.saturating_duration_since(self.started);
+        self.record_at(metrics, Instant::now());
+    }
+
+    /// [`Self::record`] with the first frame written at `now`.
+    fn record_at(self, metrics: &Metrics, now: Instant) {
+        let total = now
+            .saturating_duration_since(self.started)
+            .saturating_sub(self.payer_wait);
         let admission = self.admitted.saturating_duration_since(self.started);
         let m = &metrics.decdn;
         m.serve_admission_seconds.observe(admission.as_secs_f64());
         let phases = self.responded.map(|responded| {
             (
                 responded.saturating_duration_since(self.admitted),
-                now.saturating_duration_since(responded),
+                now.saturating_duration_since(responded)
+                    .saturating_sub(self.payer_wait),
             )
         });
         let (first_byte, response, first_frame) = match self.class {

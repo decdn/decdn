@@ -1,5 +1,4 @@
 use super::*;
-use crate::slash_judge_domain;
 use alloy::primitives::address;
 use alloy::signers::local::PrivateKeySigner;
 
@@ -220,4 +219,36 @@ fn from_response_body_maps_fields() {
         timestamp_us: 1_700_000_000_000_000,
     };
     assert_eq!(StreamSlashData::from_response_body(&body), sample_data());
+}
+
+/// Lock the `SlashJudge` domain separator to the canonical EIP-712 form.
+#[test]
+fn domain_separator_matches_eip712_canonical() -> anyhow::Result<()> {
+    use alloy::primitives::{U256, keccak256};
+    use alloy::sol_types::SolValue;
+
+    let domain_typehash = keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let chain_id: u64 = 421_614;
+    let verifying = address!("0000000000000000000000000000000000001234");
+
+    let domain = slash_judge_domain(chain_id, verifying);
+    let actual = domain.separator();
+
+    let expected = keccak256(
+        (
+            domain_typehash,
+            keccak256(SLASH_JUDGE_DOMAIN_NAME.as_bytes()),
+            keccak256(SLASH_JUDGE_DOMAIN_VERSION.as_bytes()),
+            U256::from(chain_id),
+            verifying,
+        )
+            .abi_encode(),
+    );
+    anyhow::ensure!(
+        actual == expected,
+        "domain separator drift: actual={actual} expected={expected}"
+    );
+    Ok(())
 }

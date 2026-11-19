@@ -644,7 +644,7 @@ enum Selection {
 /// candidate list is every active registered node: the peer store's
 /// identity-fresh records when enough of them qualify, else one
 /// `CapacityBond` registry read bounded by
-/// [`DiscoveryOptions::registry_timeout`]. Each entry then probes its own
+/// [`DiscoveryOptions::registry_timeout`]. Each entry then opens its own
 /// sample of the list. Resolve the selection before you unlock a key, so a
 /// failed discovery costs no password prompt.
 ///
@@ -758,7 +758,7 @@ pub trait FileObserver: Send + Sync {
         let _ = (received, expected);
     }
 
-    /// The blob probes its holders before any byte arrives.
+    /// The blob discovers its holders before any byte arrives.
     fn discovering(&self) {}
 
     /// The blob's own bytes are in, and it waits for a sibling to land the
@@ -1095,8 +1095,8 @@ impl BundlePuller {
         &self.ctx.escrows
     }
 
-    /// The rates the run's nodes signed, nearest first: from the probes this
-    /// puller's fetches ran, else from the peer store. A node with neither is
+    /// The rates the run's nodes signed, nearest first: from the discovery
+    /// opens this puller's fetches ran, else from the peer store. A node with neither is
     /// left out. `decdn get` prints its estimate from these before the pull
     /// starts (#2600).
     #[doc(hidden)]
@@ -1140,10 +1140,8 @@ impl BundlePullerBuilder {
         self
     }
 
-    /// The absolute per-MB rate cap, folded per lane with the rate the
-    /// candidate's own probe signed ([`crate::effective_rate_ceiling`]);
-    /// `0`, the default, sets no absolute cap, and a probed lane is still
-    /// capped at its probe rate.
+    /// The most a lane pays per MiB: a lane refuses a stream whose signed
+    /// quote is above it. `0`, the default, sets no ceiling.
     pub const fn max_rate_per_mb(mut self, rate: u64) -> Self {
         self.max_rate_per_mb = rate;
         self

@@ -30,15 +30,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
-use anyhow::Context as _;
 use decdn_bao_range::AlignedRange;
 use decdn_incentive::PoolId;
 use iroh::{Endpoint, EndpointAddr};
 
 use crate::sink::PullReader;
 use crate::{
-    Connections, PoolContext, PoolLedger, PullDeadlines, UpstreamPull, UpstreamPullHeader,
-    VoucherProgress,
+    Connections, OpenedStream, PoolContext, PoolLedger, PullDeadlines, RateCeiling, UpstreamPull,
+    UpstreamPullHeader, VoucherProgress,
 };
 
 /// A boxed, `Send` future returned by the async trait methods in this module,
@@ -124,6 +123,17 @@ pub trait BlobSource: Send + Sync {
     /// bytes.
     fn max_blob_size_bytes(&self) -> u64 {
         0
+    }
+
+    /// Let `reader`, opened for a range that starts where `range` starts and
+    /// runs past it, serve `range` alone. `range`'s encoding is a prefix of the
+    /// longer range's, so the decoder reads it from the same stream. The pull
+    /// pays ahead only up to `range`'s end, so the source sends nothing past
+    /// it, and once the decoder has read `range`, [`Self::finish`] stops the
+    /// pull as [`Self::stop`] does instead of draining it to its own end.
+    /// `false` when the reader cannot, and the caller closes it.
+    fn narrow(&self, _reader: &mut Self::Reader, _range: &AlignedRange) -> bool {
+        false
     }
 }
 
@@ -270,7 +280,9 @@ pub struct PeerSource<'a> {
     expected_signer: Address,
     namespace_id: [u8; 32],
     max_blob_size_bytes: u64,
-    max_rate_per_mb: u64,
+    /// The most each stream to the target may quote: the node's first quote
+    /// in the fetch, under the payer's absolute ceiling.
+    rate_ceiling: RateCeiling,
     deadlines: PullDeadlines,
     /// The command's shared connection per node, or `None` to dial per open.
     connections: Option<Connections>,
@@ -285,7 +297,7 @@ impl std::fmt::Debug for PeerSource<'_> {
             .field("expected_signer", &self.expected_signer)
             .field("namespace_id", &self.namespace_id)
             .field("max_blob_size_bytes", &self.max_blob_size_bytes)
-            .field("max_rate_per_mb", &self.max_rate_per_mb)
+            .field("rate_ceiling", &self.rate_ceiling)
             .field("deadlines", &self.deadlines)
             .finish_non_exhaustive()
     }
@@ -293,9 +305,11 @@ impl std::fmt::Debug for PeerSource<'_> {
 
 impl<'a> PeerSource<'a> {
     /// Build a source for one gap-driven fetch against `target`, paid out of
-    /// `ledger` over `ctx`'s lane. `namespace_id`, `max_rate_per_mb`, and
-    /// `deadlines` are the same buyer-side policy knobs
-    /// [`crate::open_progressive_pull`] takes directly — see its docs.
+    /// `ledger` over `ctx`'s lane. `namespace_id` and `deadlines` are the same
+    /// buyer-side policy knobs [`crate::open_progressive_pull`] takes directly
+    /// — see its docs. `rate_ceiling` is the target's ceiling in this fetch:
+    /// every stream that quotes above it is refused unpaid, and a clone of it
+    /// held by another source of the same node shares its first quote.
     /// `max_blob_size_bytes` is the cap on bytes held for one blob (#1895): each
     /// stream carries at most that much content, and the driver reads it back via
     /// [`BlobSource::max_blob_size_bytes`] to end a fill that would hold more;
@@ -318,7 +332,7 @@ impl<'a> PeerSource<'a> {
         expected_signer: Address,
         namespace_id: [u8; 32],
         max_blob_size_bytes: u64,
-        max_rate_per_mb: u64,
+        rate_ceiling: RateCeiling,
         deadlines: PullDeadlines,
         connections: Option<Connections>,
     ) -> Self {
@@ -331,17 +345,16 @@ impl<'a> PeerSource<'a> {
             expected_signer,
             namespace_id,
             max_blob_size_bytes,
-            max_rate_per_mb,
+            rate_ceiling,
             deadlines,
             connections,
         }
     }
 
-    /// The stream-rate ceiling this source refuses a quote above (`0` = no
-    /// ceiling): what the lane build passed as `max_rate_per_mb`.
+    /// The stream-rate ceiling this source refuses a quote above.
     #[cfg(test)]
-    pub(crate) const fn rate_ceiling(&self) -> u64 {
-        self.max_rate_per_mb
+    pub(crate) const fn rate_ceiling(&self) -> &RateCeiling {
+        &self.rate_ceiling
     }
 
     /// Open `[byte_offset, +byte_len)` of `hash` (`byte_len == 0` = to end)
@@ -401,7 +414,7 @@ impl<'a> PeerSource<'a> {
             self.open_shared(connections, &ctx, hash, byte_offset, byte_len)
                 .await
         } else {
-            crate::open_progressive_pull(
+            crate::open_dialled_pull(
                 self.endpoint,
                 self.target.clone(),
                 &ctx,
@@ -413,7 +426,7 @@ impl<'a> PeerSource<'a> {
                 byte_offset,
                 micros_now(),
                 self.max_blob_size_bytes,
-                self.max_rate_per_mb,
+                &self.rate_ceiling,
                 self.deadlines,
                 byte_len,
             )
@@ -422,21 +435,24 @@ impl<'a> PeerSource<'a> {
     }
 
     /// Open the pull on the target's connection in `connections`, dialling
-    /// one when the target has none. `deadlines.open` bounds the dial, and
-    /// again the stream open that follows it.
-    ///
-    /// The pull holds the connection while it runs. A transport fault on the
-    /// open or on a later read (a connection reset, a closed connection, an
-    /// idle timeout, an open or read that falls under its deadline) unpins
-    /// this connection from the map, so the next open dials again. Any other
-    /// failure (a refusal, a bad response, a hash mismatch) leaves the
-    /// connection pinned for the next open.
-    ///
-    /// A connection that was pinned before this open and is closed under it
-    /// is a stale pin: the target reaped it idle between legs, or its budget
-    /// ran out. The open then redials once and opens again. No byte is paid
-    /// before the header, so the retry costs nothing. A connection this open
-    /// dialled itself that fails is the target's failure, and is not retried.
+    /// one when the target has none ([`crate::opened::open_shared`]), and adopt
+    /// it ([`Self::adopt`]). `deadlines.open` bounds the dial, and again the
+    /// stream open that follows it. A pinned connection closed under the open
+    /// is redialled once; a transport fault unpins the connection.
+    #[tracing::instrument(
+        name = "open_progressive_pull",
+        skip_all,
+        fields(
+            error = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            otel.kind = "client",
+            peer = %self.target.id,
+            hash = %decdn_protocol::ContentHash::from_bytes(hash),
+            pool_id = %ctx.pool_id,
+            byte_offset = byte_offset,
+            byte_len = byte_len,
+        )
+    )]
     async fn open_shared(
         &self,
         connections: &Connections,
@@ -445,77 +461,115 @@ impl<'a> PeerSource<'a> {
         byte_offset: u64,
         byte_len: u64,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        debug_assert_eq!(
-            connections.alpn(),
-            decdn_protocol::ALPN_CLIENT,
-            "a pull opens on a cdn/client/v1 map"
-        );
-        let lease = self.lease(connections).await?;
-        let pinned = lease.is_pinned();
-        let warm = lease.into_warm();
-        let err = match self
-            .open_on(connections, warm.clone(), ctx, hash, byte_offset, byte_len)
-            .await
-        {
-            Ok(opened) => return Ok(opened),
-            Err(err) => err,
-        };
-        if !(pinned && warm.is_closed()) {
-            return Err(err);
-        }
-        tracing::debug!(
-            peer = %self.target.id,
-            close = ?warm.connection().close_reason(),
-            error = %err,
-            "pooled connection closed under the open; redialling once"
-        );
-        let fresh = self.lease(connections).await?.into_warm();
-        self.open_on(connections, fresh, ctx, hash, byte_offset, byte_len)
-            .await
-            .with_context(|| format!("after a redial; the pinned connection failed: {err:#}"))
+        let result = self
+            .open_shared_inner(connections, ctx, hash, byte_offset, byte_len)
+            .await;
+        crate::record_open_result(&tracing::Span::current(), &result);
+        result
     }
 
-    /// The target's connection in `connections`, dialled when it has none,
-    /// under `deadlines.open`.
-    async fn lease(&self, connections: &Connections) -> anyhow::Result<crate::connection::Lease> {
-        let open = self.deadlines.open;
-        tokio::time::timeout(open, connections.get_or_dial(&self.target))
-            .await
-            .map_err(|_| anyhow::Error::new(crate::PullTimeout { after: open }))?
-    }
-
-    /// Open the pull as a stream on `warm`, which the pull holds and unpins
-    /// from `connections` on a transport fault.
-    async fn open_on(
+    /// The body of [`Self::open_shared`].
+    async fn open_shared_inner(
         &self,
         connections: &Connections,
-        warm: Arc<crate::WarmConnection>,
         ctx: &PoolContext,
         hash: [u8; 32],
         byte_offset: u64,
         byte_len: u64,
     ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
-        let conn = warm.connection().clone();
-        crate::open_progressive_pull_on(
-            &conn,
-            crate::connection::ConnOwner::Shared {
-                warm,
-                map: connections.clone(),
-            },
+        // A place on the node's connection, held until the pull's first
+        // voucher, so this command's opens never pass the node's bound on
+        // streams with no voucher. Taken before the timestamp is stamped: a
+        // wait for a place must not age the request. The wait runs under the
+        // open's budget, so a node whose places are all held times out.
+        let permit = crate::opened::permit_within(
+            self.deadlines.open,
+            connections.open_permit(self.target.id),
+        )
+        .await?;
+        let args = crate::opened::OpenArgs {
+            ctx,
+            slash_domain: self.slash_domain,
+            expected_signer: self.expected_signer,
+            hash,
+            namespace_id: self.namespace_id,
+            byte_offset,
+            byte_len,
+            timestamp_us: micros_now(),
+            open: self.deadlines.open,
+            // Every lane, gap and retry open asks the node to fill what it
+            // misses.
+            pull_through: true,
+        };
+        let mut opened =
+            crate::opened::open_shared(connections, &self.target, args, false, false).await?;
+        opened.permit = Some(permit);
+        self.adopt_with(ctx, opened)
+    }
+
+    /// Adopt `opened`, a stream a discovery opened on this source's node, as
+    /// a pull on this source's lane: its context, ledger, cap, rate ceiling and
+    /// deadlines ([`OpenedStream::into_pull`]).
+    ///
+    /// # Errors
+    ///
+    /// The stream's node is not this source's target, the lane cannot pay the
+    /// stream ([`OpenedStream::paid_by`]), or any error
+    /// [`OpenedStream::into_pull`] returns.
+    pub(crate) fn adopt(
+        &self,
+        opened: OpenedStream,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        let ctx = {
+            self.ctx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pool context lock poisoned"))?
+                .clone()
+        };
+        anyhow::ensure!(
+            opened.peer() == self.target.id,
+            "a stream opened on {} cannot be adopted by the lane to {}",
+            opened.peer(),
+            self.target.id
+        );
+        self.adopt_with(&ctx, opened)
+    }
+
+    /// [`Self::adopt`] under the context snapshot `ctx`.
+    fn adopt_with(
+        &self,
+        ctx: &PoolContext,
+        opened: OpenedStream,
+    ) -> anyhow::Result<(UpstreamPullHeader, UpstreamPull)> {
+        opened.into_pull_under(
             ctx,
             Arc::clone(&self.ledger),
-            self.slash_domain,
-            self.expected_signer,
-            hash,
-            self.namespace_id,
-            byte_offset,
-            micros_now(),
             self.max_blob_size_bytes,
-            self.max_rate_per_mb,
+            &self.rate_ceiling,
             self.deadlines,
-            byte_len,
         )
-        .await
+    }
+
+    /// [`Self::adopt`], with the pull wrapped as the reader a drive reads: for
+    /// a caller outside this crate that parks the pull for its drive
+    /// ([`PrimedSource::prime`]).
+    ///
+    /// # Errors
+    ///
+    /// Any error [`Self::adopt`] returns.
+    #[doc(hidden)]
+    pub fn adopt_reader(
+        &self,
+        opened: OpenedStream,
+    ) -> anyhow::Result<(UpstreamPullHeader, PullReader)> {
+        let (header, pull) = self.adopt(opened)?;
+        Ok((header, PullReader::new(pull)))
+    }
+
+    /// Whether this source's lane can pay `opened` ([`OpenedStream::paid_by`]).
+    #[doc(hidden)]
+    pub fn can_adopt(&self, opened: &OpenedStream) -> bool {
+        opened.peer() == self.target.id && self.ctx.lock().is_ok_and(|ctx| opened.paid_by(&ctx))
     }
 }
 
@@ -555,6 +609,11 @@ impl BlobSource for PeerSource<'_> {
     fn max_blob_size_bytes(&self) -> u64 {
         self.max_blob_size_bytes
     }
+
+    fn narrow(&self, reader: &mut Self::Reader, range: &AlignedRange) -> bool {
+        reader.narrow(range.wire_len());
+        true
+    }
 }
 
 /// How long a primed pull may wait for its adopting open. A pull opened ahead of
@@ -589,14 +648,15 @@ struct Primed<R> {
 /// it. Any other open, and an open that finds the primed pull opened longer than
 /// [`PRIMED_MAX_IDLE`] ago, goes to the wrapped source.
 ///
-/// Adoption is by exact [`AlignedRange`] equality, never by containment: a
-/// pull's [`finish`](BlobSource::finish) drains and pays to its stream end, so a
-/// longer pull in place of a shorter leg would pay for bytes the leg never asked
-/// for. Call [`clear`](Self::clear) once the drive returns, so a pull no open
-/// took is closed at once rather than left idle. A pull parked with
-/// [`prime_next`](Self::prime_next) is the next open's alone: an open of another
-/// range closes it before the wrapped source opens, so the peer never holds it
-/// beside the leg that replaces it.
+/// Adoption is by exact [`AlignedRange`] equality, or by a pull of a longer
+/// range from the same start that the wrapped source narrows to the open's
+/// range ([`BlobSource::narrow`]): a narrowed pull pays only up to the open's
+/// end and stops there instead of draining to its own. A source that cannot
+/// narrow adopts by equality alone. Call [`clear`](Self::clear) once the drive
+/// returns, so a pull no open took is closed at once rather than left idle. A
+/// pull parked with [`prime_next`](Self::prime_next) is the next open's alone:
+/// an open of another range closes it before the wrapped source opens, so the
+/// peer never holds it beside the leg that replaces it.
 #[doc(hidden)]
 pub struct PrimedSource<S: BlobSource> {
     inner: S,
@@ -714,6 +774,25 @@ impl<S: BlobSource> PrimedSource<S> {
         if parked.hash == hash && parked.range == *range {
             return Some((parked.header, parked.reader));
         }
+        // A pull of a longer range from the same start serves the open's
+        // range as its prefix, narrowed to end there.
+        if parked.hash == hash
+            && parked.range.fetch_start() == range.fetch_start()
+            && parked.range.fetch_end() >= range.fetch_end()
+        {
+            let Primed {
+                header, mut reader, ..
+            } = parked;
+            if self.inner.narrow(&mut reader, range) {
+                tracing::debug!(
+                    byte_offset = range.fetch_start(),
+                    byte_len = range.fetch_len(),
+                    "a primed pull of a longer range is narrowed to the open's range"
+                );
+                return Some((header, reader));
+            }
+            return None;
+        }
         if parked.next_only {
             tracing::debug!("a primed pull the next open did not take is closed");
             return None;
@@ -747,6 +826,10 @@ impl<S: BlobSource> BlobSource for PrimedSource<S> {
 
     fn max_blob_size_bytes(&self) -> u64 {
         self.inner.max_blob_size_bytes()
+    }
+
+    fn narrow(&self, reader: &mut Self::Reader, range: &AlignedRange) -> bool {
+        self.inner.narrow(reader, range)
     }
 }
 
@@ -1332,12 +1415,17 @@ mod doubles {
                         stall_after: self.stall_after,
                         read_so_far: 0,
                         read_delay: self.read_delay,
+                        narrowed: false,
                     },
                 ))
             })
         }
 
         fn finish(&self, reader: Self::Reader) -> SourceFuture<'_, VoucherProgress> {
+            // A narrowed reader served a prefix of its range: it stops there.
+            if reader.narrowed {
+                return self.stop(reader);
+            }
             Box::pin(async move {
                 // Hold the completed-but-unpaid range open (delivered, `fill_gap`
                 // not yet returned) so a peer can steal it while it is present.
@@ -1360,6 +1448,11 @@ mod doubles {
 
         fn max_blob_size_bytes(&self) -> u64 {
             self.max_blob_size
+        }
+
+        fn narrow(&self, reader: &mut Self::Reader, _range: &AlignedRange) -> bool {
+            reader.narrowed = true;
+            true
         }
     }
 
@@ -1398,6 +1491,9 @@ mod doubles {
         read_so_far: u64,
         /// See `ScriptedSource::throttled`.
         read_delay: Option<Duration>,
+        /// The reader serves a prefix of its range alone
+        /// ([`BlobSource::narrow`](crate::BlobSource::narrow)): `finish` stops it.
+        narrowed: bool,
     }
 
     impl ScriptedReader {

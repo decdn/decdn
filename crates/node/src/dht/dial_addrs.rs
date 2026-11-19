@@ -4,7 +4,7 @@
 //!
 //! The `CapacityBond` registry refresh keeps this directory in step with each
 //! node's on-chain `multiaddrs`. With its lookup on the endpoint, every
-//! `EndpointAddr::new(node_id)` dial (DHT RPCs, upstream probes and pulls,
+//! `EndpointAddr::new(node_id)` dial (DHT RPCs, upstream discovery opens and pulls,
 //! waiver requests) resolves the registry addresses at once, alongside the
 //! pkarr lookup that supplies the peer's home relay URL and the public IPs it
 //! publishes (`node_publish_filter`). iroh sends the handshake to every known

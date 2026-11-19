@@ -12,9 +12,10 @@
 //!
 //! Two shapes of origin:
 //! 1. The origin publishes the sibling `{H}.obao4` outboard → the handler
-//!    streams (HEAD for the size, outboard GETs, `206` ranged data GETs per
-//!    draw), serves the span, and a partial request leaves the blob **partial**
-//!    (never a whole-blob GET).
+//!    answers from `HEAD`s of the data and the outboard, then streams after
+//!    admission (outboard GETs, `206` ranged data GETs per draw), serves the
+//!    span, and a partial request leaves the blob **partial** (never a
+//!    whole-blob GET).
 //! 2. The origin does NOT publish the outboard → the spine declines and the
 //!    handler falls back to the buffered whole-blob pull, still serving the
 //!    correct range bytes ("fallback is always correct", ADR 037).
@@ -190,6 +191,7 @@ async fn ranged_paid_pull(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -338,10 +340,9 @@ fn decode_bao_range(
     Ok(slice.to_vec())
 }
 
-/// The CLI's header-only open ahead of a multi-source fetch
-/// (`probe_admitted_total`): a bound `(0, 0)` request,
-/// read the signed `StreamResponse` for `total_bytes`, then close the connection
-/// without paying or reading a byte. Returns the advertised total.
+/// The CLI's header-only open ahead of a multi-source fetch: a bound `(0, 0)`
+/// request, read the signed `StreamResponse` for `total_bytes`, then close the
+/// connection without paying or reading a byte. Returns the advertised total.
 async fn throwaway_open(
     client_ep: &iroh::Endpoint,
     target: EndpointAddr,
@@ -392,6 +393,7 @@ async fn idle_open(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -437,6 +439,16 @@ async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
         .respond_with(
             ResponseTemplate::new(206).set_body_bytes(blob.get(..end).unwrap_or_default().to_vec()),
         )
+        .mount(server)
+        .await;
+}
+
+/// Answer a `HEAD` of the sibling `{hex}.obao4` with `status`: the outboard
+/// presence probe an open reads before it answers.
+async fn mount_outboard_head(server: &MockServer, hex: &str, status: u16) {
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(status))
         .mount(server)
         .await;
 }
@@ -505,6 +517,7 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
         .mount(&server)
         .await;
     // (2) sibling outboard GET.
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -636,6 +649,7 @@ async fn truncated_outboard_declines_before_signing_and_falls_back() -> anyhow::
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(truncated))
@@ -719,6 +733,7 @@ async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Re
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 404).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(404))
@@ -831,6 +846,7 @@ async fn range_request_with_outboard_outage_falls_back_to_whole_blob() -> anyhow
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 503).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(503))
@@ -934,6 +950,7 @@ async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> a
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 503).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(503))
@@ -983,6 +1000,7 @@ async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> a
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -1016,9 +1034,10 @@ async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> a
 #[tokio::test(flavor = "multi_thread")]
 async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result<()> {
     // A ranged cache-miss request WITHOUT an ownership binding must not make the
-    // node front any origin egress: `pull_authorized` fails, so the range pull
-    // (and the whole-blob fallback) is never initiated. This closes the
-    // griefing vector where an unpaid client induces origin HEAD/range traffic.
+    // node front any origin egress: with a pool view wired, the node refuses an
+    // unbound request before its origin probe, so neither the range pull nor
+    // the whole-blob fallback is initiated. This closes the griefing vector
+    // where an unpaid client induces origin HEAD/range traffic.
     let (blob, outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
@@ -1033,6 +1052,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
@@ -1044,16 +1064,33 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let _provider = server_eth.address();
-    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    let metrics = Arc::new(Metrics::new());
+    let mut status = std::collections::HashMap::new();
+    status.insert(
         pool_id,
-        client_eth.address(),
-        &server_eth,
+        decdn_node::pool_view::PoolStatus {
+            owner: client_eth.address(),
+            remaining: U256::from(10_000_000u64),
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+    );
+    let pool_view =
+        Arc::new(StatusMapPoolView { status }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let handler = build_handler_full_configured(
         server_id,
-        None,
-    )
-    .await?;
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache.clone(),
+        Arc::new(MemoryPoolStateStore::new()),
+        RATE_PER_MB,
+        &domains(),
+        16,
+        |deps| support::set_pool_view(deps, pool_view),
+    )?;
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -1074,6 +1111,7 @@ async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result
     let ext = StreamRequestExt {
         binding: None,
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -1142,6 +1180,7 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
@@ -1247,6 +1286,7 @@ async fn end_past_the_blob_own_origin_cold_miss_serves_clamped_tail() -> anyhow:
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
@@ -1521,6 +1561,7 @@ fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
 /// upstream, pool, or payment on the ingest side; the client still pays the
 /// downstream vouchers exactly as any paid delivery.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Result<()> {
     let (blob, outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
@@ -1548,6 +1589,7 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
         .await;
     // (2) sibling outboard GET: the dispatch serviceability outboard probe. The
     //     pull leg's draws reuse the copy that probe cached (#2061).
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -1680,6 +1722,7 @@ async fn bounded_whole_blob_own_origin_miss_streams_via_backend_origin() -> anyh
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -1788,6 +1831,7 @@ async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> a
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -1886,6 +1930,7 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2051,6 +2096,7 @@ async fn tail_open_ahead_of_a_stalled_owner_does_not_starve() -> anyhow::Result<
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2179,6 +2225,7 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2301,12 +2348,12 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
 }
 
 /// An origin that publishes a valid `{H}.obao4` but ignores `Range` (a data GET
-/// answers `200` with the whole body). The serviceability probe reads the first
-/// chunk group, sees the decline, and degrades BEFORE any signature: the
-/// buffered whole-blob fallback serves, and the two-leg tier is never entered,
-/// so no signed stream fails on its first draw.
+/// answers `200` with the whole body). The open answers from the outboard's
+/// `HEAD`. Admission at the first proof reads the first chunk group, sees the
+/// decline, and refuses the stream before any chunk. The next request for the
+/// hash degrades before it signs: the buffered whole-blob fallback serves.
 #[tokio::test(flavor = "multi_thread")]
-async fn no_range_origin_degrades_to_buffered_before_signing() -> anyhow::Result<()> {
+async fn no_range_origin_is_refused_after_admission_then_degrades() -> anyhow::Result<()> {
     let (blob, outboard, hash) = blob_with_outboard();
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
@@ -2320,6 +2367,7 @@ async fn no_range_origin_degrades_to_buffered_before_signing() -> anyhow::Result
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2357,35 +2405,52 @@ async fn no_range_origin_degrades_to_buffered_before_signing() -> anyhow::Result
     let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
-    let got = tokio::time::timeout(
-        Duration::from_secs(20),
-        ranged_paid_pull(
-            &client_ep,
-            target,
-            client_node_id,
-            &client_eth,
-            pool_id,
-            provider,
-            hash,
-            0,
-            0,
-            RATE_PER_MB,
-        ),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("a no-Range origin must degrade, not hang"))??;
+    let pull = || {
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            ranged_paid_pull(
+                &client_ep,
+                target.clone(),
+                client_node_id,
+                &client_eth,
+                pool_id,
+                provider,
+                hash,
+                0,
+                0,
+                RATE_PER_MB,
+            ),
+        )
+    };
+    let refused = pull()
+        .await
+        .map_err(|_| anyhow::anyhow!("a no-Range origin must refuse, not hang"))?;
+    anyhow::ensure!(
+        refused.is_err(),
+        "the first stream is refused after admission"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 1,
+        "an unusable range refuses as a miss"
+    );
+    let got = pull()
+        .await
+        .map_err(|_| anyhow::anyhow!("a no-Range origin must degrade, not hang"))??;
     anyhow::ensure!(
         got.as_slice() == blob.as_slice(),
         "the buffered fallback must deliver the whole blob byte-exact"
     );
     anyhow::ensure!(cache.has(hash).await?, "the fallback caches the blob");
     anyhow::ensure!(
-        counter_value(&metrics, "local_outboard_serves_total")? == 0,
-        "the range probe must decline before the two-leg tier signs"
+        counter_value(&metrics, "local_outboard_serves_total")? == 1,
+        "only the first request enters the two-leg tier"
     );
     // The degrade comes from the range half: the outboard was read once, and the
     // probe's ranged read of the first chunk group reached the origin once.
-    let obao_gets = count_requests(&server, |r| r.url.path() == format!("/{hex}.obao4")).await?;
+    let obao_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
+    })
+    .await?;
     anyhow::ensure!(obao_gets == 1, "one outboard read, got {obao_gets}");
     let probe = probe_range_val(blob.len());
     let probe_gets = count_requests(&server, |r| {
@@ -2465,6 +2530,7 @@ async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> 
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -2496,10 +2562,12 @@ async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> 
 }
 
 /// #1129 through the range half of the serviceability probe: the size and the
-/// outboard answer, but the ranged read of the first chunk group times out. With no
-/// other fill tier configured, the miss must refuse as `InternalError` (a
-/// degraded node), never `NotFound` (an empty one), and nothing is signed.
+/// outboard answer, so the open answers `ok: true`. At admission the ranged read
+/// of the first chunk group times out. The stream must refuse as
+/// `InternalError` (a degraded node, wire `Declined`) before any chunk, never
+/// `NotFound` (an empty one).
 #[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
 async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() -> anyhow::Result<()>
 {
     let (blob, outboard, hash) = blob_with_outboard();
@@ -2519,6 +2587,7 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
@@ -2576,6 +2645,7 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -2590,7 +2660,27 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
         encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
     write_frame_to(&mut send, &payload).await?;
     let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(!resp.body.ok, "a faulted node must refuse");
+    anyhow::ensure!(resp.body.ok, "the open answers from the outboard's HEAD");
+    let first_proof = Voucher {
+        pool_id,
+        signer: client_eth.address(),
+        provider: server_eth.address(),
+        amount: U256::from(1u64),
+        bytes_delivered: U256::from(64 * 1024u64),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
+    }
+    .sign(client_eth.as_ref(), &voucher_dom())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client_msg(
+        &mut send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&first_proof)?),
+    )
+    .await?;
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::Declined) => {}
+        other => anyhow::bail!("expected Declined before any ChunkData, got {other:?}"),
+    }
     conn.close(0u32.into(), b"done");
 
     anyhow::ensure!(
@@ -2598,8 +2688,8 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
         "a range-probe transport fault must refuse as InternalError (degraded node)"
     );
     anyhow::ensure!(
-        counter_value(&metrics, "local_outboard_serves_total")? == 0,
-        "the two-leg tier must not be entered after a faulted probe"
+        cache.in_flight_total(hash).is_none(),
+        "the refused stream starts no fill"
     );
     anyhow::ensure!(
         counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
@@ -2638,6 +2728,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2697,6 +2788,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -2752,8 +2844,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
 
 /// The span-capped floor guard, ACCEPT direction: a pool that covers one small
 /// aligned span but not a full credit window must be SERVED for a bounded
-/// request (the guard prices the span), and refused for a whole-blob request
-/// (the guard prices the window). Guards the `.min(credit_floor)` cap — a
+/// request (the guard prices the span). Guards the `.min(credit_floor)` cap — a
 /// regression to the uncapped floor silently refuses every small ranged
 /// request from modest pools.
 #[tokio::test(flavor = "multi_thread")]
@@ -2782,6 +2873,7 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2881,47 +2973,6 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
         "the span-capped floor must not refuse a coverable range"
     );
 
-    // REFUSE: the whole-blob request prices a full window the pool cannot cover.
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
-    let binding_signature = client_eth
-        .sign_hash_sync(&binding_hash)?
-        .as_bytes()
-        .to_vec();
-    let ext = StreamRequestExt {
-        binding: Some(ClientBinding {
-            ethereum_address: client_eth.address().into(),
-            binding_signature,
-        }),
-        capability: None,
-    };
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id.into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    let payload =
-        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
-    write_frame_to(&mut send, &payload).await?;
-    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(
-        !resp.body.ok,
-        "a whole-blob request against a window-poor pool must be refused"
-    );
-    conn.close(0u32.into(), b"done");
-
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
@@ -2994,6 +3045,7 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
         .await;
     // (2) sibling outboard GET: the dispatch serviceability probe AND the pull
     //     leg's range-encode outboard fetch.
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -3184,6 +3236,7 @@ async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -3316,9 +3369,9 @@ async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result
 }
 
 /// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
-/// must FAIL the serve, not hang it. Dispatch confirms serviceability (origin size,
-/// published outboard and the ranged first-group probe succeed) and signs `ok:true`,
-/// but the ranged data GET the
+/// must FAIL the serve, not hang it. Dispatch signs `ok:true` from the origin size
+/// and the outboard's `HEAD`, admission's ranged first-group probe succeeds, but
+/// the ranged data GET the
 /// local pull leg draws returns `500` — so `origin_range_wire` errors, the pull
 /// leg records a terminal `pull_result`/`pull_ended`, and the serve leg races that
 /// terminal against its present-range watch and FAILS the gap it is waiting on. The
@@ -3345,9 +3398,10 @@ async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Res
         )
         .mount(&server)
         .await;
-    // (2) outboard GET SUCCEEDS: the outboard half of serviceability. With the
-    //     range probe below, dispatch signs `ok:true` and commits to the two-leg
+    // (2) outboard HEAD and GET SUCCEED: dispatch signs `ok:true` from the
+    //     HEAD, and with the range probe below admission commits to the two-leg
     //     serve.
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
@@ -3553,6 +3607,7 @@ async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Res
         )
         .mount(&server)
         .await;
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -3766,6 +3821,7 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
         .await;
     // sibling outboard GET (serviceability probe + the pull leg's range-encode
     // outboard fetch).
+    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -3955,6 +4011,7 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
             )
             .mount(&server)
             .await;
+        mount_outboard_head(&server, &hex, 200).await;
         Mock::given(method("GET"))
             .and(path(format!("/{hex}.obao4")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -4093,5 +4150,244 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
     );
 
     shutdown([server_task], [&server_ep]).await?;
+    Ok(())
+}
+
+/// A bound ext for `client_eth` on the connection of `client_node_id`, with
+/// `pull_through` as given.
+fn bound_ext(
+    client_eth: &PrivateKeySigner,
+    client_node_id: B256,
+    pull_through: bool,
+) -> anyhow::Result<StreamRequestExt> {
+    let binding_hash =
+        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    Ok(StreamRequestExt {
+        binding: Some(ClientBinding {
+            ethereum_address: client_eth.address().into(),
+            binding_signature: client_eth
+                .sign_hash_sync(&binding_hash)?
+                .as_bytes()
+                .to_vec(),
+        }),
+        capability: None,
+        pull_through,
+    })
+}
+
+/// The own-origin probe that runs before admission goes through the probe
+/// memo: two opens for the same hash the origin lacks reach the origin with one
+/// `HEAD`, and both answer `NotFound`.
+#[tokio::test(flavor = "multi_thread")]
+async fn repeat_opens_for_an_absent_hash_probe_the_origin_once() -> anyhow::Result<()> {
+    let hash = Hash::new(b"a blob no origin holds");
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x7A);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, _cache, _metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        None,
+    )
+    .await?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            ALPN_CLIENT,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let ext = bound_ext(&client_eth, client_node_id, false)?;
+
+    for _ in 0..2 {
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+        let req = StreamRequest {
+            hash: *hash.as_bytes(),
+            namespace_id: decdn_protocol::client::NO_NAMESPACE,
+            payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
+            pool_id: pool_id.into(),
+            byte_offset: 0,
+            byte_len: 0,
+            timestamp_us: now_us(),
+        };
+        write_frame_to(&mut send, &encode_stream_request(&req, Some(&ext))?).await?;
+        let (resp, resp_ext) = read_stream_response(&mut recv).await?;
+        anyhow::ensure!(
+            !resp.body.ok
+                && resp_ext.error() == Some(&decdn_protocol::client::StreamError::NotFound),
+            "an absent hash answers NotFound"
+        );
+    }
+    let heads = count_requests(&server, |r| r.method.as_str() == "HEAD").await?;
+    anyhow::ensure!(
+        heads == 1,
+        "two opens must cost one origin HEAD, saw {heads}"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// An own-origin open on a pool that cannot cover the span answers before
+/// admission, and its admission refuses `Unfunded` at the first proof, before
+/// any `ChunkData`. The fill never starts, and the origin sees no outboard
+/// read and no range read: the open reads only memoised `HEAD`s.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn an_underfunded_own_origin_open_is_refused_at_admission_and_reads_no_range()
+-> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    let hex = hash.to_hex();
+    let server = MockServer::start().await;
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}")))
+        .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
+        )
+        .mount(&server)
+        .await;
+    mount_outboard_head(&server, &hex, 200).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+        .mount(&server)
+        .await;
+    mount_range_probe(&server, &hex, &blob).await;
+
+    let pool_id = B256::repeat_byte(0x7B);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let provider = server_eth.address();
+    let store = Arc::new(MemoryPoolStateStore::new());
+    store.record(&LaneState::hydrate(
+        pool_id,
+        client_eth.address(),
+        provider,
+        U256::from(10_000_000u64),
+        u64::MAX,
+        U256::ZERO,
+        U256::ZERO,
+        None,
+        decdn_incentive::LaneChain::NONE,
+    ))?;
+    let cache_dir = tempfile::tempdir()?;
+    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
+    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    let metrics = Arc::new(Metrics::new());
+    // The whole 200 KiB blob costs 2 at the harness rate; the pool holds 1.
+    let mut status = std::collections::HashMap::new();
+    status.insert(
+        pool_id,
+        decdn_node::pool_view::PoolStatus {
+            owner: client_eth.address(),
+            remaining: U256::from(1u64),
+            lifecycle: decdn_node::pool_view::Lifecycle::Open,
+        },
+    );
+    let pool_view =
+        Arc::new(StatusMapPoolView { status }) as Arc<dyn decdn_node::pool_view::PoolView>;
+    let store_dyn: Arc<dyn PoolStateStore> = store;
+    let handler = build_handler_full_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache.clone(),
+        store_dyn,
+        RATE_PER_MB,
+        &domains(),
+        16,
+        |deps| support::set_pool_view(deps, pool_view),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let conn = client_ep
+        .connect(
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            ALPN_CLIENT,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
+    let req = StreamRequest {
+        hash: *hash.as_bytes(),
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: now_us(),
+    };
+    let ext = bound_ext(&client_eth, client_node_id, true)?;
+    write_frame_to(&mut send, &encode_stream_request(&req, Some(&ext))?).await?;
+    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
+    anyhow::ensure!(resp.body.ok, "the own-origin open answers before admission");
+    let gets =
+        |r: &Request| r.method.as_str() == "GET" && r.url.path() != format!("/{hex}.sizeproof");
+
+    let first_proof = Voucher {
+        pool_id,
+        signer: client_eth.address(),
+        provider,
+        amount: U256::from(1u64),
+        bytes_delivered: U256::from(64 * 1024u64),
+        chain_root: B256::ZERO,
+        chunk_price: U256::ZERO,
+    }
+    .sign(client_eth.as_ref(), &voucher_dom())
+    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
+    write_client_msg(
+        &mut send,
+        &ClientMessage::Voucher(signed_to_wire_voucher(&first_proof)?),
+    )
+    .await?;
+    match read_client_msg(&mut recv).await? {
+        ClientMessage::StreamError(decdn_protocol::client::StreamError::Unfunded) => {}
+        other => anyhow::bail!("expected Unfunded before any ChunkData, got {other:?}"),
+    }
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_insufficient_deposit_total")? == 1,
+        "the refusal counts as insufficient deposit"
+    );
+    anyhow::ensure!(
+        count_requests(&server, gets).await? == 0,
+        "neither the open nor the refused admission reads the outboard or a range"
+    );
+    anyhow::ensure!(
+        cache.in_flight_total(hash).is_none() && !cache.has(hash).await?,
+        "the refused open starts no fill"
+    );
+
+    conn.close(0u32.into(), b"done");
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }

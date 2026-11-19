@@ -7,7 +7,7 @@
 //! and per-lane pacing work against `ScriptedSource` — a source built to
 //! deterministically prove the payee binding BY CONSTRUCTION. What they cannot
 //! reach is the part that only exists on the real wire: that the CLI's
-//! auto-discovered candidate set, probed and admitted via `admit_sources`,
+//! auto-discovered candidate set, opened and admitted via `admit_sources`,
 //! actually opens one `(signer, provider)` payment lane PER holder against the
 //! real `PaymentPool` contract, and that BOTH lanes settle a non-zero claim —
 //! i.e. the work was genuinely split across two independent daemons, not
@@ -16,10 +16,10 @@
 //! Two independently-bonded nodes ("holder A" and "holder B") are launched,
 //! each pre-warmed with the SAME blob (so they share a hash and are both
 //! admissible sources). The client never pins `--node-id`, so `decdn get`
-//! auto-discovers both via the on-chain `CapacityBond` registry, probes them,
-//! and runs the acquire loop (`decdn_client::acquire`, through the
-//! `Downloader` face in `crates/cli/src/commands/fetch.rs`) with one lane per
-//! holder.
+//! auto-discovers both via the on-chain `CapacityBond` registry, opens the
+//! blob on each with no voucher, and runs the acquire loop
+//! (`decdn_client::acquire`, through the `Downloader` face in
+//! `crates/cli/src/commands/fetch.rs`) with one lane per holder.
 //!
 //! What this test asserts:
 //!   1. The fetched output is byte-identical to the source blob.

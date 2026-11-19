@@ -480,6 +480,35 @@ impl Origin for HttpOrigin {
         })
     }
 
+    fn has_outboard(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, OriginPullError>> + Send + '_>> {
+        Box::pin(async move {
+            let hex = hash.to_hex();
+            let url = self
+                .base_url
+                .as_url()
+                .join(&format!("{hex}{OBAO4_SUFFIX}"))
+                .with_context(|| format!("failed to build outboard URL for {hash}"))
+                .map_err(OriginPullError::Permanent)?;
+            let url_log = redact_for_log(&url);
+            let resp = self
+                .send(self.client.head(url.clone()), &format!("HEAD {url_log}"))
+                .await?;
+            let status = resp.status();
+            // The statuses classify as in `get_outboard_bounded`: a retriable
+            // status is a fault, and any other non-success (a 404, a
+            // redirect, a permission decline) is no outboard.
+            if !status.is_success() && is_transient_status(status) {
+                return Err(OriginPullError::Transient(anyhow::anyhow!(
+                    "origin outboard HEAD {url_log} answered {status}"
+                )));
+            }
+            Ok(status.is_success())
+        })
+    }
+
     fn fetch_size_proof(
         &self,
         hash: Hash,

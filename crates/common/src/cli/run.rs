@@ -116,7 +116,7 @@ pub struct BlockchainArgs {
     pub publisher_registry_address: Option<String>,
 
     /// `SlashJudge` contract address (0x-prefixed hex) — EIP-712
-    /// `verifyingContract` for probe `slash_sig` (ADR 014).
+    /// `verifyingContract` for stream `slash_sig` (ADR 014).
     #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_JUDGE_ADDRESS")]
     pub slash_judge_address: Option<String>,
 
@@ -160,23 +160,10 @@ pub struct CacheArgs {
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid cache-miss pulls, in USDC
     /// base units (same units as `--rate-per-mb`) [default: 0 = unlimited]. This
     /// node refuses a provider quote above the lower of this and the rate the
-    /// chosen candidate advertised at probe, before paying (#1375). Distinct from
+    /// chosen candidate quoted at discovery, before paying (#1375). Distinct from
     /// the seller-side `--delivery-ceiling` clamp.
     #[arg(long, value_name = "UNITS", env = "DECDN_MAX_RATE_PER_MB")]
     pub max_rate_per_mb: Option<u64>,
-
-    /// Max concurrently held (eviction-exempt) blobs for the probe hold
-    /// (ADR 005 §Hold budget) [default: 256]. `0` disables `has_blob: true`.
-    #[arg(long, value_name = "N", env = "DECDN_MAX_PROBE_HOLDS")]
-    pub max_probe_holds: Option<u64>,
-
-    /// Probe-hold slots reserved for the stake lane — registered
-    /// node-to-node cache-miss probes (#757, ADR 003 §Admission and
-    /// Priority) [default: 0 = off]. Under hold-budget pressure end-client
-    /// probes are shed once usage reaches `max_probe_holds - N`, reserving
-    /// the last `N` slots for node-to-node probes.
-    #[arg(long, value_name = "N", env = "DECDN_STAKE_LANE_RESERVED_HOLDS")]
-    pub stake_lane_reserved_holds: Option<u64>,
 }
 
 /// Payment rate configuration.

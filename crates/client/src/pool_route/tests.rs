@@ -83,6 +83,18 @@ fn retry_skips_the_refused_pool() {
     assert_eq!(route.retry(a(), &hint(&[a()])), None);
 }
 
+/// A discovery open names the route's most preferred contract: a held one
+/// ahead of the configured order.
+#[test]
+fn the_route_names_its_most_preferred_contract_first() {
+    let plain = PoolRoute::new(&[a(), b()], |_| false).unwrap_or_else(|| PoolRoute::single(c()));
+    assert_eq!(plain.first(), a());
+    let held_b =
+        PoolRoute::new(&[a(), b()], |d| d == b()).unwrap_or_else(|| PoolRoute::single(c()));
+    assert_eq!(held_b.first(), b());
+    assert_eq!(PoolRoute::single(c()).first(), c());
+}
+
 fn passes(configured: &[Deployment]) -> PoolPasses {
     PoolPasses::new(PoolRoute::new(configured, |_| false).unwrap_or_else(|| PoolRoute::single(a())))
 }

@@ -915,3 +915,19 @@ async fn a_dangling_outboard_symlink_is_permanent() -> anyhow::Result<()> {
     let err = origin.fetch_outboard(hash, 1 << 20).await.err();
     ensure_permanent("fetch_outboard", err, "symlink whose target does not exist")
 }
+
+/// The outboard-presence probe stats the sibling `{hex}.obao4`: true when it
+/// exists, false when it does not.
+#[tokio::test]
+async fn has_outboard_stats_the_sibling() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+    let hash = seed_blob_with_outboard(&canonical, &vec![9u8; 64 * 1024]).await?;
+    anyhow::ensure!(origin.has_outboard(hash).await?, "a published outboard");
+    anyhow::ensure!(
+        !origin.has_outboard(Hash::new(b"no-such-blob")).await?,
+        "no outboard for an unknown hash"
+    );
+    Ok(())
+}

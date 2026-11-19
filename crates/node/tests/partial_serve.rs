@@ -2,7 +2,7 @@
 //! *part* of a blob must serve a `cdn/client/v1` request that falls entirely
 //! within its cached ranges directly from cache, without attempting any
 //! fill/pull-through — the counterpart to the will-serve coverage a partial
-//! holder now advertises (probe/DHT, #1506 tasks 2-3). Before this gate,
+//! holder now advertises (discovery opens and the DHT, #1506 tasks 2-3). Before this gate,
 //! `serve_audit` is `Complete`-only, so a partial holder always fell into the
 //! miss path and terminated `NotFound` even for bytes it already has.
 //!
@@ -138,6 +138,7 @@ async fn ranged_paid_pull(
             binding_signature,
         }),
         capability: None,
+        pull_through: true,
     };
     let req = StreamRequest {
         hash: *hash.as_bytes(),
@@ -154,6 +155,13 @@ async fn ranged_paid_pull(
 
     let (resp, resp_ext) = read_stream_response(&mut recv).await?;
     anyhow::ensure!(resp.body.ok, "delivery refused: {:?}", resp_ext.error());
+    // A partial holder's answer covers the span it serves, even where the
+    // span holds only part of a discovery block.
+    anyhow::ensure!(
+        resp_ext.consistent_with(&resp.body, byte_offset, byte_len),
+        "the served coverage {:?} does not cover [{byte_offset}, +{byte_len})",
+        resp_ext.coverage
+    );
     let total_bytes = resp_ext
         .size_proof()
         .map(decdn_protocol::SizeProof::size)
@@ -438,7 +446,12 @@ async fn partial_serve_mixed_range_pulls_only_the_missing_group() -> anyhow::Res
         .respond_with(ResponseTemplate::new(200).insert_header("Content-Length", total.to_string()))
         .mount(&server)
         .await;
-    // sibling outboard GET.
+    // sibling outboard: a HEAD before the answer, a GET after admission.
+    Mock::given(method("HEAD"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.to_vec()))

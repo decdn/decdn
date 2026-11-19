@@ -6,7 +6,7 @@ use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use tracing_subscriber::prelude::*;
 
 use super::super::dispatch::{record_request, serve_stream_span};
-use super::super::wire::{ClientPaymentFault, PeerFault, tag_paid_progress};
+use super::super::wire::{ClientPaymentFault, FrameSeen, PeerFault, tag_paid_progress};
 use super::{ErrEnd, ResetCause, ServeEnd, ServeStop};
 use crate::handlers::client::{ServeRejectReason, StreamRequest};
 use crate::metrics::{INBOUND_FAILURE_REASONS, Metrics};
@@ -159,7 +159,7 @@ fn only_reason(meter: impl FnOnce(&Metrics)) -> &'static str {
 /// until the test below covers it.
 const fn refusal_is_listed(reason: ServeRejectReason) {
     match reason {
-        ServeRejectReason::EvictedSinceProbe
+        ServeRejectReason::Withdrawn
         | ServeRejectReason::CacheMiss
         | ServeRejectReason::UnacceptedPool
         | ServeRejectReason::InternalError
@@ -188,9 +188,13 @@ const fn refusal_is_listed(reason: ServeRejectReason) {
 /// together they reach every name in `INBOUND_FAILURE_REASONS`. A completed
 /// end counts on none.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one table of every failed end and its reason"
+)]
 fn every_failed_end_counts_on_exactly_one_listed_reason() {
     let refusals = [
-        ServeRejectReason::EvictedSinceProbe,
+        ServeRejectReason::Withdrawn,
         ServeRejectReason::CacheMiss,
         ServeRejectReason::UnacceptedPool,
         ServeRejectReason::InternalError,
@@ -223,6 +227,7 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
     ];
     let resets = [
         ResetCause::StreamCapFull,
+        ResetCause::UnadmittedCapFull,
         ResetCause::BadBinding,
         ResetCause::TimestampSkew,
         ResetCause::RequestUnreadable,
@@ -259,7 +264,11 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
             ErrEnd::VoucherRejected,
         ),
         (tag_paid_progress(peer_gone(), 1), ErrEnd::ClientAbandoned),
-        (tag_paid_progress(peer_gone(), 0), ErrEnd::ClientDeclined),
+        (
+            tag_paid_progress(peer_gone().context(FrameSeen), 0),
+            ErrEnd::ClientDeclined,
+        ),
+        (tag_paid_progress(peer_gone(), 0), ErrEnd::Unclaimed),
     ];
     for (err, want) in errors {
         assert_eq!(ErrEnd::of(&err), want, "classify {err:#}");
@@ -271,6 +280,7 @@ fn every_failed_end_counts_on_exactly_one_listed_reason() {
             ErrEnd::VoucherRejected => "decdn_serve_stream_voucher_rejected_total",
             ErrEnd::ClientAbandoned => "decdn_serve_stream_client_abandoned_total",
             ErrEnd::ClientDeclined => "decdn_serve_stream_client_declined_total",
+            ErrEnd::Unclaimed => "decdn_serve_stream_unclaimed_total",
         };
         assert_eq!(only_reason(|m| want.meter(m)), expected, "{want:?}");
         let shared = reached.get(expected);

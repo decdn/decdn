@@ -8,7 +8,7 @@
 //!    proposal snapshot — A's own weight is zeroed by the slash, so a second
 //!    operator must carry the grant vote. A serves bytes too: B's vote cap is
 //!    sized from the other operators' bytes, so B needs A's in the window.
-//! 2. Slash A through a **real** `SlashJudge` rate-manipulation commit-reveal
+//! 2. Slash A through a **real** `SlashJudge` blacklist-violation commit-reveal
 //!    challenge.
 //! 3. Restart A's daemon and assert it surfaces the slash over
 //!    `admin_v1_slashes`.
@@ -145,12 +145,16 @@ async fn run() -> anyhow::Result<()> {
         .fetch(&chain, &node_b, hash_b, alloy::primitives::U256::ZERO)
         .await?;
     assert_eq!(outcome.bytes, payload, "B must deliver the blob");
+    // A node redeems a stream's vouchers in more than one batch, so wait for
+    // the whole blob: a sweep of a partial redemption leaves the rest to a
+    // later batch, which skews the two operators' credit.
+    let whole = U256::from(payload.len());
     let served = poll(Duration::from_secs(120), || async {
         let b = chain.served_bytes(node_b.operator_addr()).await?;
-        Ok((b > U256::ZERO).then_some(b))
+        Ok((b >= whole).then_some(b))
     })
     .await?
-    .context("B's on-chain served-bytes never advanced")?;
+    .context("B's on-chain served-bytes never reached the whole blob")?;
     // Vote weight reads `FeeRouter`'s epoch counter, which only a received
     // sweep credits, so B's pending share is swept now, at what it holds.
     chain.sweep(&[node_b.operator_addr()]).await?;
@@ -203,7 +207,7 @@ async fn run() -> anyhow::Result<()> {
     // inside the trailing window at the proposal snapshot.
     time::increase_time(chain.admin(), 8 * DAY).await?;
 
-    // ---- Slash A via a real SlashJudge rate-manipulation challenge. A fresh EOA
+    // ---- Slash A via a real SlashJudge blacklist-violation challenge. A fresh EOA
     // is the challenger; A's own eth key signs the self-incriminating evidence.
     let challenger = PrivateKeySigner::random();
     let a_node_id = B256::from_slice(node_a.node_id().as_bytes());

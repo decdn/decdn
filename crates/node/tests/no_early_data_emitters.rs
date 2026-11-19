@@ -1,7 +1,7 @@
 //! Source guard: no crate opens a QUIC connection that carries early data.
 //!
-//! Every ALPN this workspace speaks — `cdn/probe/v1` included — completes a
-//! full handshake before any application byte is written. That property cannot
+//! Every ALPN this workspace speaks — `cdn/client/v1` and `cdn/dht/v1` —
+//! completes a full handshake before any application byte is written. That property cannot
 //! be asserted at the wire, and the gap is a property of the transport, not of
 //! this repo: iroh sets `max_early_data_size = u32::MAX` on every server TLS
 //! config, so a peer's early data is accepted regardless of what the handler

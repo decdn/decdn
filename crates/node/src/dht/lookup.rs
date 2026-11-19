@@ -10,7 +10,7 @@
 //! ## Termination
 //!
 //! Stops as soon as **either**:
-//! - `providers.len() >= k` (saturation — caller has enough to probe), OR
+//! - `providers.len() >= k` (saturation — caller has enough to open), OR
 //! - a full round completes without surfacing any candidate strictly
 //!   closer to `target` than the current best queried node
 //!   (convergence — no further progress possible).
@@ -28,9 +28,9 @@
 //! 2. **Active-staker** — drop non-staked `NodeId`s from both
 //!    `closer_nodes` and `providers`. The DHT routing pool is
 //!    restricted to staked nodes by spec.
-//! 3. **Negative probe cache** — drop `(provider, target)` pairs the
-//!    requester has already observed returning `has_blob: false`
-//!    within the cache TTL. Only applies to `providers`, never to
+//! 3. **Negative cache** — drop `(provider, target)` pairs the
+//!    requester has already observed answering a discovery open with
+//!    `NotFound` within the cache TTL. Only applies to `providers`, never to
 //!    `closer_nodes`.
 //! 4. **Origin attestation** — drop a provider whose attestation does
 //!    not recover to a seated origin (ADR 022 § Origin Attestation). This
@@ -63,7 +63,7 @@ use tracing::{Instrument as _, debug, warn};
 
 use crate::dht::attestation::AttestationVerifier;
 use crate::dht::client;
-use crate::dht::negative_cache::{Hash, NegativeProbeCache};
+use crate::dht::negative_cache::{Hash, NegativeCandidateCache};
 use crate::dht::routing::{K_BUCKET_SIZE, NODE_ID_LEN, NodeId, RoutingTable, xor_distance_bytes};
 use crate::dht::staker_set::StakerSet;
 
@@ -74,7 +74,7 @@ pub struct Lookup {
     /// coverage hint.
     pub providers: Vec<(NodeId, Coverage)>,
     /// The seated origins the valid attestations in the answers name, in the
-    /// order the lookup first saw them. The requester's fallback probes these
+    /// order the lookup first saw them. The requester's fallback opens these
     /// before it reads a namespace's origin directory (ADR 022 § `FIND_VALUE`
     /// Flow).
     pub origins: Vec<Address>,
@@ -194,7 +194,7 @@ pub async fn find_providers(
     routing_table: &Arc<Mutex<RoutingTable>>,
     staker_set: &Arc<dyn StakerSet>,
     verifier: &AttestationVerifier,
-    negative_cache: &NegativeProbeCache,
+    negative_cache: &NegativeCandidateCache,
     requester_id: NodeId,
     target: Hash,
     cfg: LookupConfig,
@@ -296,7 +296,7 @@ struct LookupCtx<'a> {
     routing_table: &'a Arc<Mutex<RoutingTable>>,
     staker_set: &'a dyn StakerSet,
     verifier: &'a AttestationVerifier,
-    negative_cache: &'a NegativeProbeCache,
+    negative_cache: &'a NegativeCandidateCache,
     requester_id: NodeId,
     target: Hash,
     cfg: LookupConfig,
@@ -464,7 +464,7 @@ fn fold_response(
     target: &Hash,
     staker_set: &dyn StakerSet,
     verifier: &AttestationVerifier,
-    negative_cache: &NegativeProbeCache,
+    negative_cache: &NegativeCandidateCache,
     resp: decdn_protocol::dht::FindValueResponse,
     responder: NodeId,
     state: &mut LookupState,
@@ -482,7 +482,7 @@ fn fold_response(
     let bonded: HashSet<NodeId> = filter_active_stakers(provider_ids, staker_set)
         .into_iter()
         .collect();
-    let probeable: HashSet<NodeId> =
+    let openable: HashSet<NodeId> =
         filter_negative_cache(bonded.iter().copied().collect(), target, negative_cache)
             .into_iter()
             .collect();
@@ -498,7 +498,7 @@ fn fold_response(
         match state.attesting_origin(verifier, target, &p.attestation) {
             Some(origin) => {
                 state.origins.insert(origin);
-                if probeable.contains(&p.node) {
+                if openable.contains(&p.node) {
                     state.record_provider(p.node, p.coverage);
                 }
             }
@@ -550,14 +550,14 @@ fn filter_active_stakers(nodes: Vec<NodeId>, staker_set: &dyn StakerSet) -> Vec<
 }
 
 /// Filter 3: drop `(provider, target)` pairs already present in the
-/// negative probe cache. Only applies to `providers` — a peer that
+/// negative cache. Only applies to `providers` — a peer that
 /// previously denied holding `target` may still legitimately route
 /// `closer_nodes` for it.
 #[must_use]
 fn filter_negative_cache(
     providers: Vec<NodeId>,
     target: &Hash,
-    cache: &NegativeProbeCache,
+    cache: &NegativeCandidateCache,
 ) -> Vec<NodeId> {
     providers
         .into_iter()

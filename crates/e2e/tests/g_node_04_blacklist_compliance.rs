@@ -7,10 +7,11 @@
 //!   serves blob `H`; governance adds `H` to `ContentBlacklist`; the node's
 //!   blacklist watcher evicts `H` (asserted via admin `evict` dry-run flipping
 //!   `was_present` true→false), then refuses paid delivery `Declined` *for the
-//!   blacklist reason* (its `chain_hash_denied` counter), and its probe handler
-//!   reports `has_blob: false`. Eviction is durable across a daemon restart.
-//!   Finally, a signed post-entry `ProbeResponse` for `H` is driven through the
-//!   `SlashJudge` commit-reveal to prove serving-after-blacklist is slashable.
+//!   blacklist reason* (its `chain_hash_denied` counter), and refuses a
+//!   voucher-less discovery open. Eviction is durable across a daemon restart.
+//!   Finally, a signed post-entry `StreamResponse { ok: true }` for `H` is
+//!   driven through the `SlashJudge` commit-reveal to prove
+//!   serving-after-blacklist is slashable.
 //! - **Regional scope (`regional_blacklist_scope`, ties GOV-05):** a US and a DE
 //!   node both hold `H2`; a US-regional entry is evicted by the US node and
 //!   ignored by the DE node. A global sentinel blob (held only by DE, blacklisted
@@ -26,19 +27,19 @@
 //!   `removeHashGlobal` slow path (an appeal / wrongful-entry reversal) lifts the
 //!   node's governance deny, so the refusal *reason* moves from `chain_hash_denied`
 //!   to the sticky eviction — but the wire code stays `Declined`, the blob stays
-//!   evicted, and the probe still reports `has_blob: false`. Content un-eviction is not a
+//!   evicted, and a discovery open is still refused. Content un-eviction is not a
 //!   watcher action (eviction is durable and one-way, `evicted.log`); appeal
 //!   restitution is financial, through `SlashAppeal` (ADR 028).
-//! - **Probe-hold interplay (`takedown_evicts_a_probe_held_blob`):** a probe
-//!   places an eviction-hold on `H` (the node signs `has_blob: true`), then
-//!   governance blacklists `H`; the watcher evicts it anyway. A probe-hold is
-//!   LRU-exemption only — a governance takedown always wins (ADR 040 §Pinning),
-//!   which is the cross-layer half of the engine's `try_probe_hold` TOCTOU test.
+//! - **Open-stream interplay (`takedown_evicts_a_blob_pinned_by_an_open_stream`):**
+//!   a discovery open pins `H` for the life of its stream (the node answers
+//!   `ok`), then governance blacklists `H`; the watcher evicts it anyway. The
+//!   pin is LRU-exemption only — a governance takedown always wins (ADR 040
+//!   §Pinning).
 //!
 //! **Coverage.** The journey exercises all three serving seams end-to-end
 //! against the daemon — delivery refusal (`Declined`, pinned to the governance
 //! deny by the node's per-reason counter), the
-//! probe handler (`has_blob: false`), and on-chain slashability. DHT
+//! discovery open (a signed refusal), and on-chain slashability. DHT
 //! announce-suppression stays delegated to `crates/node/src/dht/publish.rs`
 //! unit tests (its `refuses` gate). `SlashJudge` enforces slashability from
 //! an entry's `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance
@@ -59,19 +60,16 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256, keccak256};
+use alloy::primitives::{B256, U256};
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::SolValue;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, EvictRequest};
-use decdn_e2e::bindings::{Erc20, SlashJudge, SlashJudgeBlacklist};
 use decdn_e2e::chain::{ChainFixture, region_key};
 use decdn_e2e::client::{ClientFixture, PoolSession};
 use decdn_e2e::node::NodeFixture;
 use decdn_e2e::poll;
 use decdn_e2e::time;
-use decdn_incentive::{PROBE_RESPONSE_TYPEHASH, ProbeSlashData, slash_judge_domain};
 use jsonrpsee::http_client::HttpClient;
 
 const MIB: usize = 1024 * 1024;
@@ -90,13 +88,8 @@ const REMOVAL_OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
 /// The node's refusal counter for a governance hash deny.
 const CHAIN_HASH_DENIED: &str = "decdn_serve_stream_rejected_chain_hash_denied_total";
-/// The node's refusal counter for a blob it no longer holds after a probe.
-const EVICTED_SINCE_PROBE: &str = "decdn_serve_stream_rejected_evicted_since_probe_total";
-
-/// `OffenseType.Blacklist` discriminant (`ISlashJudge` enum: Rate, Blacklist).
-const OFFENSE_BLACKLIST: u8 = 1;
-/// The daemon config's quoted rate; echoed into the probe evidence.
-const RATE_PER_MB: u64 = 10;
+/// The node's refusal counter for a blob it no longer holds after an open.
+const WITHDRAWN: &str = "decdn_serve_stream_rejected_withdrawn_total";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn global_blacklist_compliance() -> anyhow::Result<()> {
@@ -131,10 +124,10 @@ async fn removal_lifts_the_deny_but_eviction_is_sticky() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn takedown_evicts_a_probe_held_blob() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_probe_hold_interplay()))
+async fn takedown_evicts_a_blob_pinned_by_an_open_stream() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_open_stream_interplay()))
         .await
-        .context("probe-hold interplay e2e exceeded the overall timeout")??;
+        .context("open-stream interplay e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -179,13 +172,10 @@ async fn run_global() -> anyhow::Result<()> {
     // specifically (not some unrelated pool/connect/payment failure).
     assert_refused_as_blacklisted(&chain, &node, hash).await?;
 
-    // ...and the probe handler stops signing `has_blob: true` (the
-    // blacklist-violation compliance seam — distinct from the delivery path above).
-    let probe = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
-    assert!(
-        !probe.body.has_blob,
-        "daemon must report has_blob:false for an evicted blacklisted blob"
-    );
+    // ...and a discovery open is refused too (the blacklist-violation
+    // compliance seam — an open that sends no voucher, distinct from the
+    // delivery path above).
+    assert_open_refused(&chain, &node, hash, "an evicted blacklisted blob").await?;
 
     // Eviction is durable across a daemon restart — and so is its *cause*. The
     // refusal assertion below is the cross-layer proof of the governance deny
@@ -297,7 +287,7 @@ async fn declined_counters(node: &NodeFixture) -> anyhow::Result<String> {
     for reason in [
         "chain_hash_denied",
         "hash_denied",
-        "evicted_since_probe",
+        "withdrawn",
         "foreign_declined",
         "internal_error",
         "range_not_satisfiable",
@@ -313,7 +303,7 @@ async fn declined_counters(node: &NodeFixture) -> anyhow::Result<String> {
 /// The `removeHashGlobal` reversal (an appeal / wrongful-entry override) lifts the
 /// governance deny but not the eviction: the refusal stays `Declined` but its
 /// reason moves to the sticky eviction, the blob stays evicted, and the
-/// probe still reports `has_blob: false`. Content un-eviction is never a watcher
+/// node still refuses a discovery open. Content un-eviction is never a watcher
 /// action — `evicted.log` is durable and one-way, and appeal restitution is
 /// financial (`SlashAppeal`, ADR 028), not a re-serve.
 async fn run_removal_reversal() -> anyhow::Result<()> {
@@ -323,7 +313,7 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
 
     let chain = ChainFixture::launch().await?;
     let payload = vec![0x8Bu8; 2 * MIB]; // H — blacklisted, then removed.
-    // W — never blacklisted; keeps the pool session live so every H probe below is
+    // W — never blacklisted; keeps the pool session live so every H fetch below is
     // a cheap `fetch_once` reusing one pool rather than opening a fresh one.
     let warmup = vec![0x8Cu8; MIB];
     let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&payload, &warmup]).await?;
@@ -339,7 +329,7 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     );
 
     // One session, proven live by the warm-up fetch of the never-blacklisted W,
-    // reused for every H probe below.
+    // reused for every H fetch below.
     let client = ClientFixture::new(&chain).await?;
     let (mut session, _warm) = client.open_session(&chain, &node, warmup_hash).await?;
 
@@ -383,7 +373,7 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
         &mut session,
         &node,
         hash,
-        EVICTED_SINCE_PROBE,
+        WITHDRAWN,
         Duration::from_secs(180),
         || time::mine(chain.admin()),
     )
@@ -395,27 +385,30 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
         );
     }
 
-    // The eviction itself is sticky and one-way: the blob is still gone and the
-    // probe still declines it, even though the hash is no longer blacklisted.
+    // The eviction itself is sticky and one-way: the blob is still gone and a
+    // discovery open still declines it, even though the hash is no longer
+    // blacklisted.
     assert!(
         !evict_was_present(&admin, hash).await?,
         "removal must NOT un-evict the blob (eviction is durable, one-way)"
     );
-    let probe = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
-    assert!(
-        !probe.body.has_blob,
-        "an evicted blob stays unadvertised after the blacklist entry is removed"
-    );
+    assert_open_refused(
+        &chain,
+        &node,
+        hash,
+        "an evicted blob after the blacklist entry is removed",
+    )
+    .await?;
 
     Ok(())
 }
 
-/// A probe-hold does not shield a blob from a governance takedown. A probe makes
-/// the node sign `has_blob: true` and place an eviction hold on H; governance then
-/// blacklists H, and the watcher evicts it anyway — a probe-hold is LRU-exemption
-/// only, and a takedown always wins (ADR 040 §Pinning). This is the cross-layer
-/// half of the engine's `try_probe_hold` TOCTOU unit test.
-async fn run_probe_hold_interplay() -> anyhow::Result<()> {
+/// An open stream's pin does not shield a blob from a governance takedown. A
+/// discovery open makes the node answer `ok` and pin H for the life of the
+/// stream; governance then blacklists H while the stream is still open, and the
+/// watcher evicts it anyway — the pin is LRU-exemption only, and a takedown
+/// always wins (ADR 040 §Pinning).
+async fn run_open_stream_interplay() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init();
@@ -426,18 +419,18 @@ async fn run_probe_hold_interplay() -> anyhow::Result<()> {
     let admin = node.admin_client()?;
     let hash_key = to_b256(hash);
 
-    // The node holds H and advertises it: this probe signs `has_blob: true` and
-    // places a fresh eviction hold on H (eviction-exempt from LRU for the hold
-    // window).
-    let held = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
+    // The node holds H and answers it: this open signs `ok: true` and pins H
+    // (eviction-exempt from LRU) until the stream ends.
+    let client = ClientFixture::new(&chain).await?;
+    let held = client.discovery_open(&chain, &node, hash).await?;
     assert!(
-        held.body.has_blob,
-        "node must advertise H (and so place a probe-hold) before the takedown"
+        held.served(),
+        "node must answer H (and so pin it for the open stream) before the takedown"
     );
 
-    // Blacklist H while the hold is live. The watcher evicts within a couple of
-    // its 2s poll cycles — inside the hold window — so the eviction is observed
-    // against a hold the takedown had to override, not one that lapsed first.
+    // Blacklist H while the stream is open. The watcher evicts within a couple
+    // of its 2s poll cycles, so the eviction is observed against a pin the
+    // takedown had to override.
     chain.add_hash_global(hash_key).await?;
     time::increase_time(chain.admin(), 3600).await?;
     let evicted = poll(Duration::from_secs(60), || async {
@@ -446,16 +439,20 @@ async fn run_probe_hold_interplay() -> anyhow::Result<()> {
     .await?;
     assert!(
         evicted.is_some(),
-        "a governance takedown must evict a probe-held blob (the hold does not shield it)"
+        "a governance takedown must evict a blob an open stream pins (the pin does not \
+         shield it)"
     );
+    held.cancel();
 
-    // The probe seam agrees: the evicted blob is no longer advertised, so the
-    // hold can never be refreshed back into existence.
-    let after = ClientFixture::new(&chain).await?.probe(&node, hash).await?;
-    assert!(
-        !after.body.has_blob,
-        "a taken-down blob must not be advertised, even one that was just probe-held"
-    );
+    // The open seam agrees: a fresh open of the evicted blob is refused, so no
+    // new stream can pin it back into service.
+    assert_open_refused(
+        &chain,
+        &node,
+        hash,
+        "a taken-down blob an open stream pinned",
+    )
+    .await?;
     assert_refused_as_blacklisted(&chain, &node, hash).await?;
 
     Ok(())
@@ -590,6 +587,25 @@ async fn run_scope_transition() -> anyhow::Result<()> {
 
 /// Dry-run `admin_v1_evict` — `was_present` is true iff the node currently holds
 /// (and has not evicted) the blob. Dry-run never mutates cache state.
+/// A voucher-less discovery open of `hash` on `node` answers a signed refusal:
+/// the node verifies, signs `ok: false`, and pins nothing. `what` names the blob
+/// for the failure message.
+async fn assert_open_refused(
+    chain: &ChainFixture,
+    node: &NodeFixture,
+    hash: Hash,
+    what: &str,
+) -> anyhow::Result<()> {
+    let opened = ClientFixture::new(chain)
+        .await?
+        .discovery_open(chain, node, hash)
+        .await?;
+    let served = opened.served();
+    opened.cancel();
+    anyhow::ensure!(!served, "the daemon must refuse an open of {what}");
+    Ok(())
+}
+
 async fn evict_was_present(admin: &HttpClient, hash: Hash) -> anyhow::Result<bool> {
     let resp = admin
         .evict(EvictRequest {
@@ -601,129 +617,32 @@ async fn evict_was_present(admin: &HttpClient, hash: Hash) -> anyhow::Result<boo
     Ok(resp.was_present)
 }
 
-/// Construct a signed post-entry `ProbeResponse` for `hash` and drive it through
+/// Drive a signed post-entry `StreamResponse { ok: true }` for `hash` through
 /// `SlashJudge.submitBlacklistChallenge` (commit-reveal + challenge bond),
 /// asserting the slash lands. Proves serving a blacklisted hash is slashable.
+///
+/// ADR 011 § Compliance Window: the entry is not slashable until
+/// `effectiveAt = addedAt + complianceWindow`, so the fixture steps chain time
+/// past it before stamping evidence. Without that the challenge reverts with
+/// `BlacklistAfterResponse` — the correct behaviour (#1169), so the drive
+/// respects it rather than routing around it.
 async fn drive_blacklist_slash(
     chain: &ChainFixture,
     node: &NodeFixture,
     hash: Hash,
 ) -> anyhow::Result<()> {
-    let hash_key = to_b256(hash);
-    // ADR 011 § Compliance Window: the entry is not slashable until
-    // `effectiveAt = addedAt + complianceWindow`, so step past it before
-    // stamping evidence. Without this the challenge reverts with
-    // `BlacklistAfterResponse` — which is the correct behaviour and exactly what
-    // #1169 added, so the drive has to respect it rather than route around it.
-    // The window is read from the contract, not hardcoded, so a governance
-    // change to the default can't turn this into a no-op.
-    let window = chain.compliance_window().await?;
-    chain.advance_time(window + 60).await?;
-
-    // Evidence timestamp: current chain time (µs), now strictly after the
-    // entry's `effectiveAt` and fresh enough to pass the staleness check.
-    let response_ts_us = chain.head_timestamp().await? * 1_000_000;
-
-    // The signed `slash_sig` — the production probe signer produces exactly the
-    // EIP-712 digest `SlashJudge` verifies.
-    let probe = ProbeSlashData {
-        hash: hash_key,
-        has_blob: true,
-        rate_per_mb: RATE_PER_MB,
-        timestamp_us: response_ts_us,
-    };
-    let domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
-    let slash_sig = probe.sign(node.operator(), &domain)?.as_bytes().to_vec();
-
-    // evidenceHash = keccak(abi.encode(uint8(Blacklist), challengedNode, structHash, isStream)),
-    // structHash = keccak(abi.encode(PROBE_TYPEHASH, fields)) — mirrors SlashJudge.
-    let struct_hash = keccak256(
-        (
-            PROBE_RESPONSE_TYPEHASH,
-            hash_key,
-            true,
-            RATE_PER_MB,
-            response_ts_us,
-        )
-            .abi_encode(),
-    );
-    // `uint8(Blacklist)` and `uint256(2)` abi-encode to the same 32-byte word.
-    let evidence_hash = keccak256(
-        (
-            U256::from(OFFENSE_BLACKLIST),
-            node.operator().address(),
-            struct_hash,
-            false,
-        )
-            .abi_encode(),
-    );
-
-    // A funded challenger holding the challenge bond (refunded on success).
     let challenger = PrivateKeySigner::random();
-    let challenger_addr = challenger.address();
-    chain.fund_eth(challenger_addr, 100).await?;
-    let judge = SlashJudge::new(chain.addrs().slash_judge, chain.admin());
-    let bond = judge
-        .challengeBond()
-        .call()
-        .await
-        .context("read challengeBond")?;
-    chain.transfer_token(challenger_addr, bond).await?;
-
-    let cp = chain.provider_for(&challenger);
-    let approve = Erc20::new(chain.addrs().token, &cp)
-        .approve(chain.addrs().slash_judge, bond)
-        .send()
-        .await
-        .context("challenger approve TOKEN")?
-        .get_receipt()
-        .await
-        .context("approve receipt")?;
-    assert!(approve.status(), "challenger TOKEN approve reverted");
-
-    // Commit, mature past MIN_REVEAL_DELAY (1 min), then reveal.
-    let salt = B256::ZERO;
-    let commitment = keccak256((evidence_hash, salt, challenger_addr).abi_encode());
-    let judge_c = SlashJudge::new(chain.addrs().slash_judge, &cp);
-    let commit = judge_c
-        .commitChallenge(commitment)
-        .send()
-        .await
-        .context("commitChallenge send")?
-        .get_receipt()
-        .await
-        .context("commitChallenge receipt")?;
-    assert!(commit.status(), "commitChallenge reverted");
-    time::increase_time(chain.admin(), 61).await?;
-
-    let response_data = SlashJudge::ProbeMsg {
-        hash: hash_key,
-        hasBlob: true,
-        ratePerMb: RATE_PER_MB,
-        timestampUs: response_ts_us,
-    }
-    .abi_encode();
     let node_id = B256::from_slice(node.node_id().as_bytes());
-    let receipt = SlashJudgeBlacklist::new(chain.addrs().slash_judge, &cp)
-        .submitBlacklistChallenge(
-            node.operator_addr(),
-            node_id,
-            hash_key,
-            response_data.into(),
-            slash_sig.into(),
-            false,
-            salt,
-        )
-        .send()
+    let slash_id = chain
+        .slash_operator_via_judge(&challenger, node.operator(), node_id, to_b256(hash))
         .await
-        .context("submitBlacklistChallenge send")?
-        .get_receipt()
-        .await
-        .context("submitBlacklistChallenge receipt")?;
-    assert!(
-        receipt.status(),
-        "submitBlacklistChallenge reverted — serving a blacklisted hash was not slashable"
+        .context("serving a blacklisted hash must be slashable")?;
+    let (operator, _slashed_at, amount) = chain.slash_record(slash_id).await?;
+    anyhow::ensure!(
+        operator == node.operator_addr(),
+        "the slash record must name the serving operator, got {operator}"
     );
+    anyhow::ensure!(amount > U256::ZERO, "the slash must take a non-zero amount");
     Ok(())
 }
 

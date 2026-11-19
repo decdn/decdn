@@ -1660,16 +1660,19 @@ contract CapacityBondTest is Test {
     /// the record cannot replace the `Slashed` log: `CapacityBond.Slashed` carries
     /// the offense but no `slashId`, and `SlashRecorded` carries the `slashId` but
     /// no offense, so attributing one to the other off-chain otherwise means
-    /// joining two events by transaction ordering.
+    /// joining two events by transaction ordering. `slash` stores the taxonomy
+    /// byte it is given; a non-zero byte keeps the assertion from passing on
+    /// the zero default.
     function test_slashRecord_persistsOffenseTypeAndEvidenceHash() public {
         bytes32 evidence = keccak256("evidence-digest");
+        uint8 offense = 0xA5;
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1, evidence);
+        (uint256 slashId,) = bond.slash(operator, challenger, offense, evidence);
 
         SlashRecord memory r = bond.getSlashRecord(slashId);
-        assertEq(r.offenseType, 1);
+        assertEq(r.offenseType, offense);
         assertEq(r.evidenceHash, evidence);
     }
 

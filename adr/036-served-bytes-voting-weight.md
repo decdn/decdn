@@ -163,7 +163,7 @@ Cost scales linearly with network revenue and with the cap. Defenses:
 2. **`age_ramp` floor.** A brand-new bonded operator who wash-trades heavily still votes at a fraction of their bytes-weighted share for the first `age_ramp_months` months. Combined with the cap, this limits the speed-to-influence of a fresh attacker.
 3. **Rolling-window decay.** Sustained wash trading is required across the full window to maintain the cap; a stopping attacker decays out over N epochs.
 
-The attack is bounded but not eliminated. Future tightening options (deferred to a follow-up ADR if observed): raise `buybackBps` or `deliveryFloor`, gate vote weight on a probe-verified delivery threshold, introduce a non-linear wash-trade-detection penalty. The current parameters are calibrated for the testnet-and-early-mainnet regime where attacker cost-of-capital is high relative to expected governance return.
+The attack is bounded but not eliminated. Future tightening options (deferred to a follow-up ADR if observed): raise `buybackBps` or `deliveryFloor`, gate vote weight on a verified-delivery threshold, introduce a non-linear wash-trade-detection penalty. The current parameters are calibrated for the testnet-and-early-mainnet regime where attacker cost-of-capital is high relative to expected governance return.
 
 ### Instant-governance via bond-then-serve-burst
 

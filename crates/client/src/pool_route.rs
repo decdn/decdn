@@ -3,9 +3,10 @@
 //!
 //! A client can pay through several contracts, on one or more payment chains.
 //! A node accepts its own list of contracts and names them in the
-//! `payment_pools` hint of its probe answer. [`PoolRoute`] picks one contract
-//! for each node: the first contract in the client's preference order that the
-//! node's hint lists. A node with no hint gets the first configured contract,
+//! `payment_pools` hint of every answer to a `cdn/client/v1` open. A discovery
+//! open names the route's first contract ([`PoolRoute::first`]). [`PoolRoute`]
+//! picks one contract for each node: the first contract in the client's
+//! preference order that the node's hint lists. A node with no hint gets the first configured contract,
 //! the one the node knows from the client's pinned configuration.
 //!
 //! A fetch pays through one contract at a time, because its acquire loop gates
@@ -90,6 +91,14 @@ impl PoolRoute {
     #[must_use]
     pub fn order(&self) -> &[Deployment] {
         &self.order
+    }
+
+    /// The contract the route prefers most: the first of [`Self::order`]. A
+    /// discovery open names it, before any node's `payment_pools` hint is
+    /// known.
+    #[must_use]
+    pub fn first(&self) -> Deployment {
+        self.order.first().copied().unwrap_or(self.configured_first)
     }
 
     /// The contract a node with the `payment_pools` `hint` is paid through:
@@ -198,8 +207,8 @@ impl PoolPasses {
         self.lock().started.insert(deployment);
     }
 
-    /// Whether the pass on `pass` pays the node at `provider`, whose probe
-    /// answer gave `hint`. It does when the node is routed to `pass`, or when
+    /// Whether the pass on `pass` pays the node at `provider`, whose
+    /// discovery answer gave `hint`. It does when the node is routed to `pass`, or when
     /// the node refused another contract and `pass` is its retry. A node
     /// routed to another contract is kept for that contract's pass. A node
     /// routed to no contract of the route, or that refused `pass`, is never

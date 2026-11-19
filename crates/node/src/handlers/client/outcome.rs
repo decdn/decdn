@@ -14,7 +14,7 @@
 //! [`INBOUND_FAILURE_REASONS`]: crate::metrics::INBOUND_FAILURE_REASONS
 
 use super::ServeRejectReason;
-use super::wire::{ClientPaymentFault, PaidProgress, is_peer_attributable};
+use super::wire::{ClientPaymentFault, FrameSeen, PaidProgress, is_peer_attributable};
 use crate::metrics::Metrics;
 use crate::rate_limit::RejectLayer;
 use tracing::Span;
@@ -47,6 +47,10 @@ pub(super) enum ServeEnd {
 pub(super) enum ResetCause {
     /// The per-connection stream cap was full (`RATE_LIMITED`).
     StreamCapFull,
+    /// The connection held its cap of streams that have not passed admission
+    /// (`RATE_LIMITED`,
+    /// [`MAX_UNADMITTED_STREAMS_PER_CONNECTION`](decdn_protocol::client::MAX_UNADMITTED_STREAMS_PER_CONNECTION)).
+    UnadmittedCapFull,
     /// The `[serve.rate_limit]` limiter refused the stream at this layer
     /// (`RATE_LIMITED`, ADR 005 §Request rate limiting).
     RateLimited(RejectLayer),
@@ -68,6 +72,7 @@ impl ResetCause {
     const fn as_str(self) -> &'static str {
         match self {
             Self::StreamCapFull => "stream_cap_full",
+            Self::UnadmittedCapFull => "unadmitted_cap_full",
             Self::RateLimited(_) => "rate_limited",
             Self::BadBinding => "bad_binding",
             Self::TimestampSkew => "timestamp_skew",
@@ -81,7 +86,7 @@ impl ResetCause {
 /// serve-miss refusal's log line records the same value.
 pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
     match reason {
-        ServeRejectReason::EvictedSinceProbe => "evicted_since_probe",
+        ServeRejectReason::Withdrawn => "withdrawn",
         ServeRejectReason::CacheMiss => "cache_miss",
         ServeRejectReason::UnacceptedPool => "unaccepted_pool",
         ServeRejectReason::InternalError => "internal_error",
@@ -175,6 +180,9 @@ impl ServeEnd {
             },
             Self::Reset(cause) => match cause {
                 ResetCause::StreamCapFull => metrics.serve_stream_rejected_stream_cap_full(),
+                ResetCause::UnadmittedCapFull => {
+                    metrics.serve_stream_rejected_unadmitted_cap_full();
+                }
                 ResetCause::RateLimited(RejectLayer::PerPeer) => {
                     metrics.serve_rate_limit_rejected_per_peer();
                 }
@@ -214,8 +222,8 @@ impl ServeEnd {
 /// per [`ServeRejectReason`].
 fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
     match reason {
-        ServeRejectReason::EvictedSinceProbe => {
-            metrics.serve_stream_rejected_evicted_since_probe();
+        ServeRejectReason::Withdrawn => {
+            metrics.serve_stream_rejected_withdrawn();
         }
         ServeRejectReason::CacheMiss => metrics.serve_stream_rejected_cache_miss(),
         ServeRejectReason::UnacceptedPool => metrics.serve_stream_rejected_unaccepted_pool(),
@@ -269,9 +277,12 @@ pub(super) enum ErrEnd {
     /// A peer that left or broke the protocol after a voucher credited bytes
     /// ([`PaidProgress`]).
     ClientAbandoned,
-    /// A peer that left or broke the protocol before any voucher credited a
-    /// byte.
+    /// A peer that left or broke the protocol after a frame followed its
+    /// request ([`FrameSeen`]) and before any voucher credited a byte.
     ClientDeclined,
+    /// A peer that left before it sent anything after its request: it did
+    /// not take the open.
+    Unclaimed,
 }
 
 impl ErrEnd {
@@ -279,9 +290,14 @@ impl ErrEnd {
     /// loop tagged [`PaidProgress`] stays a node fault; a rate-check bail comes
     /// before the payment split, so it stays a rejected voucher after payment.
     ///
+    /// A peer-attributable end splits three ways: abandoned after a voucher
+    /// credited bytes, declined after a frame followed the request, and
+    /// unclaimed when nothing did — an open the payer did not take, including
+    /// one it cancelled while the node waited for its first proof.
+    ///
     /// Both proof-wait faults, the stall and the chunk's ceiling, carry
-    /// [`PeerFault`](super::wire::PeerFault) and take the declined or abandoned
-    /// split like any other peer that stops paying. The ceiling is not a node bug, so it does not
+    /// [`PeerFault`](super::wire::PeerFault) and take that split like any other
+    /// peer that stops paying. The ceiling is not a node bug, so it does not
     /// belong on the node-fault counter, and every end must count on exactly one
     /// reason. Only the pull-through abandon counter, which is not a reason
     /// counter, leaves the ceiling out (`serve_leg`).
@@ -292,8 +308,10 @@ impl ErrEnd {
             Self::VoucherRejected
         } else if e.is::<PaidProgress>() {
             Self::ClientAbandoned
-        } else {
+        } else if e.is::<FrameSeen>() {
             Self::ClientDeclined
+        } else {
+            Self::Unclaimed
         }
     }
 
@@ -304,6 +322,7 @@ impl ErrEnd {
             Self::VoucherRejected => metrics.serve_stream_voucher_rejected(),
             Self::ClientAbandoned => metrics.serve_stream_client_abandoned(),
             Self::ClientDeclined => metrics.serve_stream_client_declined(),
+            Self::Unclaimed => metrics.serve_stream_unclaimed(),
         }
     }
 }

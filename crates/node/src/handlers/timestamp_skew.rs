@@ -1,13 +1,12 @@
 //! Bound on the requester-generated `timestamp_us` a handler accepts.
 //!
-//! Every signed response body ([`decdn_protocol::ProbeResponseBody`],
-//! [`decdn_protocol::client::StreamResponseBody`]) echoes the request's
-//! `timestamp_us` into the EIP-712 slash-evidence set (ADR 014 §1), and
-//! `SlashJudge` reads that field as the serve time: it pairs evidence inside a
-//! window keyed on it, applies blacklist effective-time comparisons to it, and
-//! rejects evidence stamped more than 60 seconds ahead of block time. A node
+//! The signed response body ([`decdn_protocol::client::StreamResponseBody`])
+//! echoes the request's `timestamp_us` into the EIP-712 slash-evidence set
+//! (ADR 014 §1), and `SlashJudge` reads that field as the serve time: it
+//! pairs evidence inside a window keyed on it, applies blacklist
+//! effective-time comparisons to it, and rejects evidence stamped more than 60 seconds ahead of block time. A node
 //! that signs whatever timestamp a requester chose therefore attests to a
-//! serve time of the requester's choosing. Both handlers refuse a skewed
+//! serve time of the requester's choosing. The client handler refuses a skewed
 //! request before anything is signed, so every `slash_sig` this node emits
 //! carries a timestamp consistent with its clock at admission. A long serve
 //! only ages the admitted timestamp: the window tiers and the closing response
@@ -33,12 +32,6 @@ use crate::warn_throttle::WarnThrottle;
 /// admits stays inside that bound, so its signed evidence never reverts
 /// `EvidenceInFuture`. Wide enough that NTP-disciplined clocks never come
 /// close.
-///
-/// It also sets how long an upward reprice waits. A probe signed at the old
-/// rate can carry a timestamp up to this bound behind real time, and a stream
-/// signed at the new rate one up to this bound ahead. So a node is slashable
-/// for the 30-second pairing window plus twice this bound, 90 seconds of real
-/// time after its last probe at the old rate.
 pub const MAX_REQUEST_TIMESTAMP_SKEW_US: u64 = 30_000_000;
 
 /// `SlashJudge`'s `MAX_FUTURE_SKEW_US`: the furthest ahead of block time a
@@ -71,7 +64,7 @@ pub fn now_us() -> u64 {
                     error = %err,
                     suppressed,
                     "wall-clock before UNIX_EPOCH; request timestamps read against 0, so \
-                     every inbound probe/stream request will be refused for clock skew. Set \
+                     every inbound stream request will be refused for clock skew. Set \
                      the host clock."
                 );
             }

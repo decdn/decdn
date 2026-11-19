@@ -1,20 +1,21 @@
-//! Requester-side negative probe cache (ADR 001 §Probe cache).
+//! Requester-side negative cache (ADR 001 §Candidate cache).
 //!
-//! Suppresses repeated `cdn/probe/v1` requests to a `(NodeId, hash)`
-//! pair that already returned `has_blob: false` within the TTL window.
-//! Per ADR 001 § Probe cache the cache:
+//! Suppresses repeated discovery opens to a `(NodeId, hash)` pair that
+//! already answered a voucher-less `cdn/client/v1` open with a signed
+//! `NotFound` and no held block within the TTL window. Per ADR 001
+//! §Candidate cache the cache:
 //!
 //! - is keyed `(NodeId, hash)`;
 //! - holds at most 1024 entries with LRU eviction;
 //! - retains entries for 5 minutes (TTL anchored at insertion);
-//! - does NOT retain the probe response signature — purely a request-
+//! - does NOT retain the answer's signature — purely a request-
 //!   suppression structure, not slashing evidence.
 //!
 //! The DHT iterative lookup ([`super::lookup`]) consumes
-//! [`NegativeProbeCache::contains_active`] as the third ADR 022
+//! [`NegativeCandidateCache::contains_active`] as the third ADR 022
 //! §Lookup-integrity filter on `FindValueResponse.providers`.
-//! [`NegativeProbeCache::record_failure`] is the producer-side hook
-//! for the outbound `cdn/probe/v1` client.
+//! [`NegativeCandidateCache::record_failure`] is the producer-side hook
+//! for the node's outbound discovery opens.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -26,14 +27,14 @@ use crate::dht::routing::NodeId;
 
 pub use crate::dht::records::Hash;
 
-/// ADR 001 § Probe cache: negative cache TTL is 5 minutes — longer than the
-/// positive probe cache (15s) because false-STORE results are less
+/// ADR 001 §Candidate cache: negative cache TTL is 5 minutes — longer than
+/// the candidate cache (30 s) because false-STORE results are less
 /// time-sensitive, and shorter than the DHT record TTL (1h) so a
 /// publisher that genuinely acquires the blob during the negative
 /// window can re-establish reachability after one cache lifetime.
 const DEFAULT_TTL: Duration = Duration::from_mins(5);
 
-/// ADR 001 § Probe cache: max 1024 entries.
+/// ADR 001 §Candidate cache: max 1024 entries.
 const DEFAULT_CAPACITY: usize = 1024;
 
 type Key = (NodeId, Hash);
@@ -50,26 +51,26 @@ struct Inner {
     /// Hard cap on live entries. Clamped to ≥ 1 in the constructor.
     cap: usize,
     /// TTL applied to each entry on insert. Anchored at insertion
-    /// (NOT refreshed on read) — see [`NegativeProbeCache::contains_active`].
+    /// (NOT refreshed on read) — see [`NegativeCandidateCache::contains_active`].
     ttl: Duration,
 }
 
-/// Bounded LRU cache of `(NodeId, hash)` pairs returned
-/// `has_blob: false` within the TTL window.
+/// Bounded LRU cache of `(NodeId, hash)` pairs that answered `NotFound`
+/// within the TTL window.
 #[derive(Debug)]
-pub struct NegativeProbeCache {
+pub struct NegativeCandidateCache {
     inner: Mutex<Inner>,
 }
 
-impl Default for NegativeProbeCache {
+impl Default for NegativeCandidateCache {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl NegativeProbeCache {
-    /// Build a cache with the ADR 001 § Probe cache defaults (1024 entries, 5-
-    /// minute TTL).
+impl NegativeCandidateCache {
+    /// Build a cache with the ADR 001 §Candidate cache defaults (1024
+    /// entries, 5-minute TTL).
     #[must_use]
     pub fn new() -> Self {
         Self::with_capacity_and_ttl(DEFAULT_CAPACITY, DEFAULT_TTL)
@@ -83,7 +84,7 @@ impl NegativeProbeCache {
 
     /// Build a cache with an explicit capacity and TTL.
     ///
-    /// Production code uses [`Self::new`] (the ADR 001 § Probe cache
+    /// Production code uses [`Self::new`] (the ADR 001 §Candidate cache
     /// 1024-entry, 5-minute defaults); this constructor is the test /
     /// tuning seam. The TTL is anchored on [`std::time::Instant`], so
     /// `tokio::time` pause / advance has no effect on it, and a short
@@ -125,7 +126,7 @@ impl NegativeProbeCache {
     /// `(node_id, hash)` is in the cache and its TTL hasn't elapsed.
     /// A live hit bumps the entry to the front of the LRU ordering
     /// (index 0) **without refreshing the entry's expiry** — TTL is
-    /// anchored at insertion per ADR 001 § Probe cache, not at read. An
+    /// anchored at insertion per ADR 001 §Candidate cache, not at read. An
     /// expired entry is evicted before returning `false`.
     #[must_use]
     pub fn contains_active(&self, node_id: &NodeId, hash: &Hash) -> bool {
@@ -149,12 +150,12 @@ impl NegativeProbeCache {
     /// Insert / refresh `(node_id, hash)` with `now + TTL` expiry,
     /// moving the entry to the front of the LRU ordering. Evicts the
     /// least-recently-used entry on cap overflow. Producer-side hook
-    /// for the outbound probe client; the lookup module never calls
+    /// for the outbound discovery opens; the lookup module never calls
     /// this directly.
     ///
     /// Uses the cache-wide TTL, which suits an AUTHORITATIVE negative:
-    /// a probe's `has_blob: false` is the peer having just looked. For
-    /// a weaker signal, pass its own TTL — see
+    /// a discovery open's `NotFound` with no held block is the peer
+    /// having just looked. For a weaker signal, pass its own TTL — see
     /// [`Self::record_failure_with_ttl`].
     pub fn record_failure(&self, node_id: NodeId, hash: Hash) {
         let ttl = self.lock().ttl;
@@ -162,15 +163,15 @@ impl NegativeProbeCache {
     }
 
     /// [`Self::record_failure`] with an explicit TTL, for a negative
-    /// that is weaker than a probe's.
+    /// that is weaker than a discovery open's `NotFound`.
     ///
     /// Entries store an absolute expiry, so mixing TTLs is free: a
     /// short-lived entry simply falls out sooner, and
     /// [`Self::contains_active`] cannot tell the two apart (nor does it
     /// need to). The caller owns the judgement of how much its evidence
     /// is worth — see `node_origin::REFUSAL_SUPPRESSION_TTL`, which is
-    /// far shorter because a delivery refusal, unlike a probe answer,
-    /// may not be about the peer at all.
+    /// far shorter because a refusal of a paid pull, unlike a
+    /// discovery open's answer, may not be about the peer at all.
     pub fn record_failure_with_ttl(&self, node_id: NodeId, hash: Hash, ttl: Duration) {
         let key = (node_id, hash);
         let mut guard = self.lock();
@@ -209,7 +210,7 @@ impl NegativeProbeCache {
         match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => {
-                warn!("NegativeProbeCache mutex poisoned; recovering inner state");
+                warn!("NegativeCandidateCache mutex poisoned; recovering inner state");
                 poisoned.into_inner()
             }
         }

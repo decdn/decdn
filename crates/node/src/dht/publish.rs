@@ -1140,10 +1140,10 @@ fn plan_cycle(
 /// operator-evict already removed.
 ///
 /// Origin-held counts, not just the local store. `CacheEngine::coverage`
-/// derives its bitmap from cached blocks only, but the probe path
-/// advertises origin-held content through `origin_held_size` — so a
+/// derives its bitmap from cached blocks only, but a discovery open answers
+/// origin-held content as held (the serve path's own-origin tier) — so a
 /// filesystem or pinned-origin hash that was never imported would be
-/// advertised at probe time and yet dropped here at its first due time,
+/// answered as held at open time and yet dropped here at its first due time,
 /// publishing no `Store` at all. Both bulk seeds feed exactly that content
 /// in, so a cache-only check silently discards what they schedule.
 ///
@@ -1194,7 +1194,8 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 /// nothing: the record would advertise no block a requester can fetch. That
 /// covers a cache event for a hash the store no longer holds, a partial with no
 /// whole block, a coverage query that faulted, and the empty blob, which spans
-/// no block and is discoverable by probe alone (ADR 022 § Consistency rule).
+/// no block and is discoverable by a stream open alone (ADR 022 § Consistency
+/// rule).
 ///
 /// A hash with no valid origin attestation sends nothing either (ADR 022
 /// § Origin Attestation): it stays scheduled, and publishes once the node
@@ -1294,11 +1295,15 @@ async fn publish_hash(
 /// blocking on it; the hash stays scheduled and retries next cycle via the
 /// `cache_still_holds` due-time gate. Coverage the node cannot size under a
 /// size proof is no coverage: the node serves no blob it cannot prove the
-/// size of (ADR 005 § Bounded byte ranges), so it advertises none.
+/// size of (ADR 005 § Bounded byte ranges), so it advertises none. The
+/// coverage is cut for the wire ([`Coverage::for_wire`]), so the record of a
+/// blob past `MAX_DISCOVERABLE_BLOB_BYTES` still decodes.
 async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> Coverage {
     let h = iroh_blobs::Hash::from_bytes(*hash.as_bytes());
     match cache.coverage_sized(h).await {
-        Ok((coverage, Some(size))) if cache.size_proof(h, size).await.is_some() => coverage,
+        Ok((coverage, Some(size))) if cache.size_proof(h, size).await.is_some() => {
+            Coverage::for_wire(decdn_protocol::num_blocks(size), coverage.covered_blocks())
+        }
         Ok(_) => Coverage::empty(),
         Err(err) => {
             tracing::debug!(

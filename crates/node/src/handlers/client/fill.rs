@@ -1,7 +1,10 @@
 //! Cache-fill tiers for the serve-miss path.
 
+use decdn_protocol::{Coverage, byte_range_blocks, num_blocks};
+
 use super::{
     Arc, CacheError, ClientHandler, Duration, FillOutcome, Hash, LaneDeliveryState, LaneId, Mutex,
+    StreamRequest,
 };
 use tracing::Instrument as _;
 
@@ -35,10 +38,11 @@ impl ClientHandler {
     /// funded the delivery (`getPool.owner`), not whichever throwaway key happened
     /// to sign the vouchers. So a blacklisted delegate signer over a clean funder
     /// is not refused, and a clean delegate signer never launders a blacklisted
-    /// funder. That gate runs at the serve gate's open-time funder check in
-    /// `dispatch.rs`, which precedes every fill tier — a blacklisted funder is
-    /// refused there before this authority is consulted, so no fill fronts USDC
-    /// or origin egress on a blacklisted funder's behalf.
+    /// funder. That gate is the funder check of the funding gates
+    /// (`ClientHandler::funding_gates`), which run before every fill tier — a
+    /// blacklisted funder is refused there before this authority is consulted,
+    /// so no fill fronts USDC or origin egress on a blacklisted funder's
+    /// behalf.
     pub(super) fn pull_authorized(
         lane_key: Option<LaneId>,
         known_lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
@@ -48,7 +52,7 @@ impl ClientHandler {
 
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The
     /// cache engine's `NodeOrigin` (last in the origin chain) does the discovery
-    /// → probe → ranked paid pull → populate; here we trigger it via
+    /// → discovery opens → ranked paid pull → populate; here we trigger it via
     /// `cache.populate` (which fills the store WITHOUT returning the blob or
     /// bumping `bytes_returned` — this is an internal fill, not client egress),
     /// bounded by `timeout` so a slow upstream can't pin the delivery path. The
@@ -197,8 +201,8 @@ impl ClientHandler {
     /// The partial-serve gate (#1506): whether `[byte_offset, byte_offset +
     /// byte_len)` is already fully present in the LOCAL cache of a blob
     /// `serve_audit` reports unserveable (not `Complete`) — the counterpart
-    /// to the will-serve coverage a partial holder now advertises (probe/DHT
-    /// tasks 2-3). Returns the blob's total size when so, letting the caller
+    /// to the will-serve coverage a partial holder advertises in its discovery
+    /// answers and DHT records. Returns the blob's total size when so, letting the caller
     /// skip straight to the size gate + delivery instead of running the
     /// miss-path fill legs; `None` otherwise.
     ///
@@ -245,6 +249,79 @@ impl ClientHandler {
             .await
             .ok()?;
         missing.is_empty().then_some(size)
+    }
+
+    /// The coverage a miss of `req` that asks for no pull-through refuses
+    /// with: the discovery blocks the store holds whole, so a partial holder
+    /// still reads as a holder of those blocks. The span the request asked
+    /// for is a miss, so the held blocks do not cover it; a coverage that
+    /// would ([`decdn_protocol::client::StreamResponseExt::consistent_with`])
+    /// is left out, and so is one a store read fails to give.
+    pub(super) async fn miss_coverage(&self, hash: Hash, req: &StreamRequest) -> Coverage {
+        let (held, size) = match self.cache.coverage_sized(hash).await {
+            Ok(sized) => sized,
+            Err(e) => {
+                tracing::debug!(
+                    %hash,
+                    error = %decdn_cache::ErrorChain::new(&e),
+                    "miss: the store coverage read failed; refusing with no coverage"
+                );
+                return Coverage::empty();
+            }
+        };
+        let Some(size) = size else {
+            return Coverage::empty();
+        };
+        let coverage = Coverage::for_wire(num_blocks(size), held.covered_blocks());
+        let refusal = decdn_protocol::client::StreamResponseExt::refused(
+            decdn_protocol::client::StreamError::NotFound,
+            coverage.clone(),
+        );
+        let body = decdn_protocol::client::StreamResponseBody {
+            hash: req.hash,
+            ok: false,
+            rate_per_mb: 0,
+            timestamp_us: req.timestamp_us,
+        };
+        if refusal.consistent_with(&body, req.byte_offset, req.byte_len) {
+            coverage
+        } else {
+            Coverage::empty()
+        }
+    }
+
+    /// The coverage a covering partial hit of `req` answers with: the
+    /// discovery blocks the store holds whole, plus every block the requested
+    /// span touches.
+    ///
+    /// The node holds every byte of the span ([`Self::partial_hit_size`]), but
+    /// the span can hold only part of a block, and the store counts a block
+    /// only when it holds all of it. The span's blocks keep the answer
+    /// covering what it serves. A store read that fails leaves the span's
+    /// blocks alone.
+    pub(super) async fn partial_hit_coverage(
+        &self,
+        hash: Hash,
+        req: &StreamRequest,
+        total_bytes: u64,
+    ) -> Coverage {
+        let held = self.cache.coverage(hash).await.unwrap_or_else(|e| {
+            tracing::warn!(
+                %hash,
+                error = %decdn_cache::ErrorChain::new(&e),
+                "partial hit: the store coverage read failed; advertising the served span only"
+            );
+            Coverage::empty()
+        });
+        let end = if req.byte_len == 0 {
+            total_bytes
+        } else {
+            req.byte_offset
+                .saturating_add(req.byte_len)
+                .min(total_bytes)
+        };
+        let span = byte_range_blocks(req.byte_offset, end).filter_map(|i| u32::try_from(i).ok());
+        Coverage::for_wire(num_blocks(total_bytes), held.covered_blocks().chain(span))
     }
 
     /// Handle a foreground pull-through deadline expiry (#859). Serves the blob if
@@ -309,4 +386,13 @@ fn fill_span(tier: &'static str, hash: Hash) -> tracing::Span {
         %hash,
         outcome = tracing::field::Empty,
     )
+}
+
+/// The coverage a node answers with when it serves every block of a
+/// `total_bytes`-byte blob: a complete hit, an own-origin fill or a
+/// pull-through. Cut at the wire bound ([`Coverage::for_wire`]), so a blob
+/// past `MAX_DISCOVERABLE_BLOB_BYTES` still gets an answer the payer decodes.
+pub(super) fn full_coverage(total_bytes: u64) -> Coverage {
+    let blocks = num_blocks(total_bytes);
+    Coverage::for_wire(blocks, 0..blocks)
 }

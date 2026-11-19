@@ -2182,7 +2182,7 @@ fn download_bytes_counts_shared_chunks_once() {
     );
 }
 
-/// A run's rate hints take this run's probe sample over the peer store,
+/// A run's rate hints take this run's discovery sample over the peer store,
 /// fall back to the store, sort nearest first with an unknown RTT last, and
 /// leave out a node with no known rate.
 #[test]

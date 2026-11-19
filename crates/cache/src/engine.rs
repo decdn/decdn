@@ -6,7 +6,7 @@ use std::io::Write;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -41,7 +41,6 @@ use crate::origin_range::{
     RANGE_PULL_PERMIT_WARN_AFTER, within_origin_timeout,
 };
 use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
-use crate::probe_hold::ProbeHoldOutcome;
 use crate::range_pull::{AlignedRange, align_range, align_range_clamped};
 use crate::retry::{
     TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
@@ -156,9 +155,8 @@ pub struct OriginHeldReport {
 
 /// A live origin-existence answer (#1766), distinguishing a genuine negative
 /// from a backend fault. It is the target of the two-way collapse in
-/// `crate::origin_probe::Presence`: `Present`/`Absent` map straight across,
-/// and `Fault` is folded into "don't advertise" — see
-/// [`CacheEngine::origin_probe_size`].
+/// `crate::origin_probe::Presence`: `Present`/`Absent` map straight across
+/// ([`CacheEngine::origin_probe_presence`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginPresence {
     /// A configured origin holds the blob; carries the total byte size.
@@ -293,7 +291,7 @@ struct Inner {
     /// configured origin *before* any pull-through, each mapped to its total
     /// byte size. Rebuilt wholesale by [`CacheEngine::rescan_origins`] (fs
     /// directory enumeration ∪ present operator pins) and swapped atomically,
-    /// mirroring `pinned`. Probe and DHT-announce read it so cold origin
+    /// mirroring `pinned`. The serve path and DHT-announce read it so cold origin
     /// content is discoverable on the first request rather than only after a
     /// warm pulls it into the store. Never includes refused/denied hashes.
     origin_held: ArcSwap<OriginHeldIndex>,
@@ -315,13 +313,18 @@ struct Inner {
     rescan_slot: AtomicU8,
     /// Live-origin probe memo (#1130 pt3). The `origin_held` index only covers
     /// fs enumeration ∪ pins — http/s3 do not list, so a non-pinned bucket
-    /// object is absent from it. [`CacheEngine::origin_probe_size`] falls back to
+    /// object is absent from it. [`CacheEngine::origin_probe_presence`] falls back to
     /// a live `HEAD`/`HeadObject` for such hashes and memoises the answer here
     /// (positive AND negative) under `cache.origin_probe_ttl_sec`, so a probe
     /// flood costs at most one origin round-trip per hash per TTL window rather
-    /// than one per probe. Restart-configured like `max_probe_holds`; swapped in
-    /// wholesale by [`CacheEngine::set_origin_probe_config`] at bring-up.
+    /// than one per probe. Restart-configured; swapped in wholesale by
+    /// [`CacheEngine::set_origin_probe_config`] at bring-up.
     origin_probe_memo: Mutex<OriginProbeMemo>,
+    /// Memo of [`CacheEngine::origin_outboard_published`]: whether an origin
+    /// publishes a hash's `{H}.obao4` outboard, under the same TTLs as
+    /// `origin_probe_memo`. An origin whose ranges a serve finds unusable is
+    /// memoised as publishing none ([`CacheEngine::origin_range_serviceable`]).
+    outboard_probe_memo: Mutex<OriginProbeMemo>,
     /// Hashes this node refuses to serve, announce, or acquire because the
     /// operator's own `[content] denied_hashes` names them, and which a later
     /// config reload can UN-refuse (ADR 011 § Local Denylist). The governance
@@ -335,11 +338,10 @@ struct Inner {
     /// mechanism on a statutory clock in both directions.
     ///
     /// It lives HERE rather than beside the origin deny-set in `decdn-node`
-    /// because "will this node serve/announce/acquire `hash`" has five
-    /// consumers — the serve path, `try_probe_hold`, the DHT republisher,
-    /// `populate`, and the per-MB in-flight re-check that terminates a stream
-    /// already running when a takedown lands — and the ADR requires one answer
-    /// for all of them. Keeping it next to `evicted` is what lets
+    /// because "will this node serve/announce/acquire `hash`" has four
+    /// consumers — the serve path, the DHT republisher, `populate`, and the
+    /// per-MB in-flight re-check that terminates a stream already running when
+    /// a takedown lands — and the ADR requires one answer for all of them. Keeping it next to `evicted` is what lets
     /// [`CacheEngine::refuses`] be the single predicate they all call, so the
     /// next consumer inherits the check instead of forgetting it. The in-flight
     /// one is exactly that: it was added later and needed no wiring of its own.
@@ -354,7 +356,7 @@ struct Inner {
     /// Membership is not what stops the serving — the watcher also
     /// [`CacheEngine::evict`]s, which is sticky and durable. What this set adds
     /// is the *reason*, and the reason picks the refusal reason the node
-    /// meters: a denied hash rather than `EvictedSinceProbe`, the reason the
+    /// meters: a denied hash rather than `Withdrawn`, the reason the
     /// eviction arm reports without this slot. On the wire every one of these
     /// refusals is `Declined`, so a governance takedown and this operator's own
     /// denylist stay indistinguishable (ADR 011 §`StreamRequest` Response).
@@ -408,37 +410,11 @@ struct Inner {
     /// every serve at the first mismatching chunk group, so no buyer pays for
     /// a corrupt group in the window.
     quarantined: DashMap<Hash, ()>,
-    /// Probe-triggered eviction holds (#318, ADR 005 §Probe-triggered
-    /// eviction hold). Maps a held hash to its hold *expiry* instant; a
-    /// held hash is invisible to [`CacheEngine::eviction_candidates`] until
-    /// expiry, composing *above* the LRU layer. Holds are per-blob, not
-    /// per-probe: many peers probing the same hash share (and refresh) one
-    /// entry, so the slot count is bounded by distinct held blobs, not
-    /// probe volume. Expired entries are swept lazily on every hold
-    /// admission, every `eviction_candidates` call, and every
-    /// [`CacheEngine::probe_hold_slots_used`] read (no background task).
-    /// Expiries run on the tokio clock so a paused test clock drives them.
-    ///
-    /// Like [`Self::pinned`] this only blocks *LRU* eviction — an explicit
-    /// operator [`CacheEngine::evict`] still wins (ADR 040 §Pinning, durable
-    /// operator-evict, and the probe-hold stay engine-enforced: DMCA always
-    /// wins), enforced
-    /// because [`CacheEngine::try_probe_hold`] gates on [`CacheEngine::has`]
-    /// which already
-    /// honors the evicted set.
-    probe_holds: Mutex<HashMap<Hash, tokio::time::Instant>>,
     /// Hashes a reader or a fill is using, with how many [`InUse`] guards
     /// hold each. Eviction skips them: a release under a live reader or fill
     /// lets GC sweep the entry it is using, and a write into a swept entry
     /// is lost.
     in_use: Mutex<HashMap<Hash, usize>>,
-    /// Hold-budget cap (ADR 005 §Hold budget). `0` disables `has_blob: true`
-    /// entirely. Set once from `cache.max_probe_holds` via
-    /// [`CacheEngine::set_max_probe_holds`] at runtime bring-up — `cache.*`
-    /// is restart-required (not hot-reloaded), so an atomic written once is
-    /// sufficient and avoids threading the value through every `open_*`
-    /// constructor and its many test call sites.
-    max_probe_holds: AtomicUsize,
     /// Optional shared frequency signal (ADR 040). `None` for the `lru`/`always`
     /// default — the observe call is skipped, so recency-only pays nothing.
     frequency: ArcSwap<Option<Arc<dyn crate::policy::FrequencyEstimator>>>,
@@ -776,7 +752,7 @@ pub struct EvictionPreview {
     /// blob reports `BlobStatus::Partial { size }` as is: the whole blob's
     /// size once its last chunk validates, `None` before. That is the blob's
     /// total, not the bytes it holds on disk — the delivery path signs it as
-    /// the blob's total and the probe path advertises it, and
+    /// the blob's total and the open answer advertises it, and
     /// [`CacheEngine::size_snapshot`] is the on-disk measure.
     pub size_bytes: Option<u64>,
     /// Microseconds elapsed since the last recorded access to the blob: a
@@ -1339,9 +1315,9 @@ async fn gc_protect_inner(
         // - `inflight` recovers, clears the poison, `error!`s once and
         //   counts it at all six sites, because losing its invariant costs
         //   origin egress and USDC. See [`Inner::lock_inflight`].
-        // - `evicted` and `probe_holds` recover silently everywhere; for
-        //   `evicted` that is load-bearing (skipping would resume serving
-        //   a DMCA-takedown hash) and written up at `evict`/`is_evicted`.
+        // - `evicted` recovers silently everywhere. That is load-bearing
+        //   (skipping would resume serving a DMCA-takedown hash) and written up
+        //   at `evict`/`is_evicted`.
         // - `access_times` has no entry here: it is a `DashMap`, so no
         //   poisoning decision exists to make. A panic while one of its shards
         //   is locked leaves that shard usable, and every reader and writer
@@ -1720,13 +1696,12 @@ impl CacheEngine {
                 origin_held: ArcSwap::from(Arc::new(OriginHeldIndex::default())),
                 rescan_slot: AtomicU8::new(RESCAN_IDLE),
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
+                outboard_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: MonotoneHashSet::new(evicted),
                 quarantined: DashMap::new(),
-                probe_holds: Mutex::new(HashMap::new()),
                 in_use: Mutex::new(HashMap::new()),
-                max_probe_holds: AtomicUsize::new(crate::probe_hold::DEFAULT_MAX_PROBE_HOLDS),
                 frequency: ArcSwap::from_pointee(None),
                 admission: ArcSwap::from_pointee(
                     Arc::new(crate::policy::AlwaysAdmit) as Arc<dyn crate::policy::AdmissionPolicy>
@@ -1776,7 +1751,7 @@ impl CacheEngine {
     /// first; `or_insert` is defensive. The walk is [`Self::iter_hashes`], which
     /// skips refused hashes. At open only the durable evicted set is populated,
     /// so operator-evicted hashes stay out and every other stored blob enters
-    /// the map. [`Self::eviction_candidates`] then filters pinned and probe-held
+    /// the map. [`Self::eviction_candidates`] then filters pinned and in-use
     /// hashes as for any other entry.
     ///
     /// A failed walk logs a WARN, increments `recency_seed_failures`, and leaves
@@ -1923,8 +1898,8 @@ impl CacheEngine {
     }
 
     /// Rebuild the origin-held discovery index (#1130): the hashes this node
-    /// can serve from a configured origin *before* any pull-through, so probe
-    /// and DHT-announce can advertise them. The set is the union of
+    /// can serve from a configured origin *before* any pull-through, so the
+    /// serve path and DHT-announce can advertise them. The set is the union of
     ///
     /// - every enumerable origin's [`Origin::enumerate`] listing (the local
     ///   filesystem walks its sharded tree; HTTP/S3 enumerate to nothing), and
@@ -2226,42 +2201,20 @@ impl CacheEngine {
     }
 
     /// Total byte size of `hash` if this node can serve it from a configured
-    /// origin (#1130), else `None`. Backs the probe `has_blob` / `total_bytes`
-    /// answer for origin-held content — `Some` means "advertise and serve" —
-    /// resolved from the last [`Self::rescan_origins`] with no per-probe I/O.
+    /// origin (#1130), else `None`. Backs the advertised answer for
+    /// origin-held content — `Some` means "advertise and serve" — resolved
+    /// from the last [`Self::rescan_origins`] with no per-request I/O.
     ///
     /// Returns `None` for a [`Self::refuses`]-listed hash even if the snapshot
     /// still holds it: the index is rebuilt only on rescan, so a hash
     /// blacklisted / evicted / denied since the last rescan would otherwise be
-    /// advertised (probe `has_blob: true`) for content the serve path would
+    /// advertised (DHT-announced) for content the serve path would
     /// refuse. The live refusal check is the authority.
     pub fn origin_held_size(&self, hash: Hash) -> Option<u64> {
         if self.refuses(hash) {
             return None;
         }
         self.inner.origin_held.load().held.get(&hash).copied()
-    }
-
-    /// Total byte size of `hash` if a configured origin can serve it, resolved
-    /// by a **live** `HEAD`/`HeadObject`/stat and memoised (#1130 pt3). This is
-    /// the per-probe fallback for the http/s3 discovery gap: [`Self::rescan_origins`]
-    /// can only index what an origin `enumerate`s, and http/s3 enumerate to
-    /// nothing, so a non-pinned bucket object is absent from
-    /// [`Self::origin_held_size`]. Callers should consult the in-memory index
-    /// first (zero I/O) and only fall back here on its miss.
-    ///
-    /// A thin wrapper over [`Self::origin_probe_presence`]: `Present(size)`
-    /// advertises `Some(size)`, and both `Absent` and `Fault` advertise `None`
-    /// — a probing caller (the `probe` handler's `has_blob`, DHT announce)
-    /// never distinguishes "genuinely missing" from "backend unreachable
-    /// right now"; either way it must not advertise the blob.
-    ///
-    /// **Never fetches the body** — existence and size only.
-    pub async fn origin_probe_size(&self, hash: Hash) -> Option<u64> {
-        match self.origin_probe_presence(hash).await {
-            OriginPresence::Present(size) => Some(size),
-            OriginPresence::Absent | OriginPresence::Fault => None,
-        }
     }
 
     /// Walk the origin chain for `hash`, distinguishing a genuine negative from
@@ -2356,10 +2309,13 @@ impl CacheEngine {
     }
 
     /// Live existence probe against the configured origins, distinguishing a
-    /// genuine negative from a backend fault (#1766). This is the primitive
-    /// behind [`Self::origin_probe_size`]; callers that must NOT treat a fault
-    /// as an authoritative absence (the origin-only serve gate) use this
-    /// directly instead of the size-only wrapper.
+    /// genuine negative from a backend fault (#1766). Callers must NOT treat a
+    /// fault as an authoritative absence (the origin-only serve gate).
+    ///
+    /// The `origin_held` index covers fs enumeration ∪ pins only — http/s3 do
+    /// not list — so this is the fallback for a non-pinned bucket object.
+    /// Callers consult [`Self::origin_held_size`] first (zero I/O) and fall
+    /// back here on its miss.
     ///
     /// A memo hit returns with no I/O. On a miss the origin chain is walked
     /// under a `cache.origin_probe_timeout_ms` ceiling — deliberately not via
@@ -2378,7 +2334,7 @@ impl CacheEngine {
     ///   a retried hash is not re-probed as often as an absence, eager enough
     ///   that a recovered origin is noticed soon — a memoised fault costs
     ///   client-visible availability, since the origin-only serve gate answers
-    ///   `InternalError` and the probe/DHT paths report this node holds nothing
+    ///   `InternalError` and the open/DHT paths report this node holds nothing
     ///   for as long as it stands.
     /// - `Absent` — every configured origin answered `Ok(None)`, or none is
     ///   configured at all (a node with nothing configured genuinely holds
@@ -2412,7 +2368,7 @@ impl CacheEngine {
         if matches!(presence, OriginPresence::Fault) {
             // Warn rather than debug: the memo answers the repeats, so this
             // fires at most once per hash per fault TTL — and it is the only
-            // record that this node is about to refuse serves and answer probes
+            // record that this node is about to refuse serves and answer opens
             // with "not held" for content it may well hold. It names the walk's
             // last per-origin error, so a permanent fault (a symlink escape, a
             // permission denied) shows at the default level; each per-origin
@@ -2423,7 +2379,7 @@ impl CacheEngine {
                 transient = probe.transient,
                 cause = probe.cause.as_deref().unwrap_or("unknown"),
                 "origin probe faulted; memoising the fault — serves for this hash \
-                 answer InternalError and probes answer not-held until it expires"
+                 answer InternalError and opens answer not-held until it expires"
             );
         }
         self.probe_memo_lock().insert(hash, memo_presence, now);
@@ -2443,11 +2399,103 @@ impl CacheEngine {
 
     /// Install the live-origin-probe configuration at runtime bring-up (#1130
     /// pt3). `cache.*` is restart-required, so this is called once from the
-    /// runtime wiring and swaps the memo wholesale (dropping any warm entries) —
-    /// the same "set once, no threading through every test constructor" pattern
-    /// as [`Self::set_max_probe_holds`].
+    /// runtime wiring and swaps the memo wholesale (dropping any warm entries),
+    /// so the value need not thread through every test constructor.
     pub fn set_origin_probe_config(&self, policy: OriginProbePolicy) {
         *self.probe_memo_lock() = OriginProbeMemo::new(policy);
+        *self.outboard_memo_lock() = OriginProbeMemo::new(policy);
+    }
+
+    /// Lock the outboard-presence memo, recovering a poisoned mutex as
+    /// [`Self::probe_memo_lock`] does.
+    fn outboard_memo_lock(&self) -> std::sync::MutexGuard<'_, OriginProbeMemo> {
+        self.inner
+            .outboard_probe_memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether an origin publishes the `{H}.obao4` outboard of `hash`, a
+    /// `total_bytes`-byte blob, learnt without reading it: a memoised answer,
+    /// a cached copy, or an [`Origin::has_outboard`] probe of each origin in
+    /// turn. The serve-miss path asks before it answers an open from its own
+    /// origin, so an open the payer has not taken reads no outboard and no
+    /// data. The outboard read and the range window run after admission
+    /// ([`Self::origin_range_serviceable`]).
+    ///
+    /// Answers memoise per hash under the origin-probe TTLs
+    /// ([`Self::set_origin_probe_config`]), so repeats of a hash reach the
+    /// origin once per TTL. A size claim past the blob cap answers `false`
+    /// with no read, as the outboard read does.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::OriginError`] when no origin publishes the outboard and at
+    /// least one probe faulted or the walk overran the probe timeout, or such
+    /// a fault is memoised.
+    pub async fn origin_outboard_published(
+        &self,
+        hash: Hash,
+        total_bytes: u64,
+    ) -> CacheResult<bool> {
+        if total_bytes > self.inner.max_blob_bytes {
+            return Ok(false);
+        }
+        let fault = |cause: String| CacheError::OriginError {
+            hash,
+            source: anyhow::anyhow!(cause),
+        };
+        let now = Instant::now();
+        let timeout = {
+            let mut memo = self.outboard_memo_lock();
+            match memo.get(hash, now) {
+                Some(Presence::Present(_)) => return Ok(true),
+                Some(Presence::Absent) => return Ok(false),
+                Some(Presence::Fault) => {
+                    return Err(fault("an origin outboard probe faulted (memoised)".into()));
+                }
+                None => memo.timeout(),
+            }
+        };
+        // A cached copy answers with no origin read. The memo goes first: it
+        // holds a hash whose ranges a serve found unusable.
+        if self
+            .inner
+            .outboards
+            .get(hash, expected_outboard_len(total_bytes))
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let walk = async {
+            let mut last_fault = None;
+            for origin in &self.inner.origins {
+                match origin.has_outboard(hash).await {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            %hash,
+                            kind = ?origin.kind(),
+                            error = %format_args!("{e:#}"),
+                            "origin outboard probe faulted; checking remaining origins",
+                        );
+                        last_fault = Some(format!("{:?} origin: {e:#}", origin.kind()));
+                    }
+                }
+            }
+            last_fault.map_or(Ok(false), Err)
+        };
+        let answer = tokio::time::timeout(timeout, walk)
+            .await
+            .unwrap_or_else(|_| Err(format!("the outboard probe walk overran {timeout:?}")));
+        let presence = match &answer {
+            Ok(true) => Presence::Present(total_bytes),
+            Ok(false) => Presence::Absent,
+            Err(_) => Presence::Fault,
+        };
+        self.outboard_memo_lock().insert(hash, presence, now);
+        answer.map_err(fault)
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -2531,10 +2579,7 @@ impl CacheEngine {
     /// The single predicate every "should I expose this blob" decision must
     /// call. `is_evicted` alone is NOT sufficient and using it directly is the
     /// bug this exists to prevent: a denied-but-still-held hash would keep
-    /// being probe-answered `has_blob: true` and DHT-republished while the
-    /// serve path refused it — which under ADR 005 § Probe response is exactly
-    /// the signed evidence pair that makes the operator slashable for a
-    /// takedown they were discharging.
+    /// being DHT-republished while the serve path refused it.
     ///
     /// A [quarantined](Self::is_quarantined) hash is refused too. Its stored
     /// bytes failed validation, so a serve or an announce only fails every
@@ -2696,7 +2741,7 @@ impl CacheEngine {
     ///
     /// Cached blocks only — an origin-backed node that could re-pull the
     /// whole blob on demand does NOT get all-ones here; that capability-aware
-    /// widening is the probe handler's job (it alone knows whether `hash` has
+    /// widening is the serve handler's job (it alone knows whether `hash` has
     /// a configured origin), not this cache-only derivation's. Absent,
     /// evicted, or otherwise refused hashes report [`decdn_protocol::Coverage::empty`],
     /// mirroring [`Self::present_ranges`]'s guards.
@@ -3343,15 +3388,6 @@ impl CacheEngine {
         }
     }
 
-    /// Set the probe-hold budget cap from `cache.max_probe_holds` (ADR 005
-    /// §Hold budget, #318). Called once by the runtime at bring-up. `0`
-    /// disables the hold path so [`Self::try_probe_hold`] returns
-    /// [`ProbeHoldOutcome::HoldsDisabled`] for any present blob (the node then
-    /// answers `has_blob: false` to every probe).
-    pub fn set_max_probe_holds(&self, max: usize) {
-        self.inner.max_probe_holds.store(max, Ordering::Relaxed);
-    }
-
     /// Set the time budget for each origin read of the range-pull path — one
     /// `{H}.obao4` fetch or one data window (ADR 037). Called once by the
     /// runtime at bring-up, from `cache.node_pull_stall_window_sec` and
@@ -3636,121 +3672,6 @@ impl CacheEngine {
             .clone()
     }
 
-    /// Attempt to take (or refresh) a probe-triggered eviction hold on
-    /// `hash` for [`crate::probe_hold::PROBE_HOLD_DURATION`] (ADR 005
-    /// §Probe-triggered eviction hold).
-    ///
-    /// Returns [`ProbeHoldOutcome::Held`] when the blob is present, not
-    /// operator-evicted, and a hold was placed for the full window. The other
-    /// three variants classify why no hold happened, so the caller need not
-    /// re-inspect the cache:
-    /// - [`ProbeHoldOutcome::Unavailable`] — blob absent or operator-evicted.
-    /// - [`ProbeHoldOutcome::HoldsDisabled`] — holds disabled by config
-    ///   (`max_probe_holds == 0`); an intentional operator decision.
-    /// - [`ProbeHoldOutcome::BudgetExhausted`] — present but every hold slot
-    ///   is live (`max_probe_holds > 0`); genuine budget pressure.
-    ///
-    /// Placing a hold and advertising the blob are **not** the same decision:
-    /// `BudgetExhausted` is advertised despite holding no slot. Callers should
-    /// read [`ProbeHoldOutcome::advertises`] / [`ProbeHoldOutcome::hold_placed`]
-    /// rather than comparing against `Held`.
-    ///
-    /// Per-blob semantics: a hash already held has its expiry refreshed and
-    /// consumes no additional slot, so many peers probing one popular blob
-    /// share a single hold (ADR 005 §Hold budget). The common
-    /// already-held case is an O(1) lookup that skips the O(N) expiry
-    /// sweep; the sweep runs only when no live hold exists, bounding map
-    /// growth without a background task.
-    ///
-    /// The operator-evicted set is re-checked **while holding the
-    /// `probe_holds` lock**, closing the TOCTOU window where a concurrent
-    /// [`Self::evict`] (DMCA takedown) could land between the initial
-    /// [`Self::has`] check and granting the hold — a takedown always wins
-    /// (ADR 040 §Pinning, durable operator-evict, and the probe-hold stay
-    /// engine-enforced).
-    pub async fn try_probe_hold(&self, hash: Hash) -> CacheResult<ProbeHoldOutcome> {
-        // `has` returns false for operator-evicted hashes too. This stays
-        // *before* the `max == 0` check below so an absent/evicted blob is a
-        // true negative (`Unavailable`), not a config-disable event.
-        if !self.has(hash).await? {
-            return Ok(ProbeHoldOutcome::Unavailable);
-        }
-        let max = self.inner.max_probe_holds.load(Ordering::Relaxed);
-        // Holds disabled by config (#739): answer `HoldsDisabled` before
-        // touching the lock. This is the "never advertise store-backed content"
-        // path — it must override an existing live hold so that
-        // if the budget is ever lowered to 0 while a hold is live, the disable
-        // wins instead of the fast path below refreshing and re-signing the
-        // hold. (Today only the tests lower it post-startup;
-        // `cache.max_probe_holds` is restart-required, not hot-reloaded.) Also
-        // skips the O(N) expiry sweep entirely while holds are off. Returning
-        // before the under-lock `is_evicted` re-check is harmless: a blob
-        // evicted concurrently here is still answered `has_blob: false` (the
-        // misclassification is `Unavailable`→`HoldsDisabled`, a metric-only
-        // miscount between two counters — never a false `has_blob: true`).
-        if max == 0 {
-            return Ok(ProbeHoldOutcome::HoldsDisabled);
-        }
-        let now = tokio::time::Instant::now();
-        // `Instant + Duration` panics on overflow; saturate instead to keep
-        // the workspace anti-panic policy (clippy `unwrap_used`/`panic`).
-        let expiry = now
-            .checked_add(crate::probe_hold::PROBE_HOLD_DURATION)
-            .unwrap_or(now);
-        let mut guard = self
-            .inner
-            .probe_holds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-
-        // Fast path for popular re-probed blobs: a live hold already exists.
-        // O(1), no sweep. Still re-check the takedown set under the lock so a
-        // refresh can't resurrect just-refused content.
-        if guard.get(&hash).is_some_and(|exp| *exp > now) {
-            if self.refuses(hash) {
-                return Ok(ProbeHoldOutcome::Unavailable);
-            }
-            guard.insert(hash, expiry);
-            return Ok(ProbeHoldOutcome::Held);
-        }
-
-        // No live hold — sweep expired entries before consulting the budget.
-        guard.retain(|_, exp| *exp > now);
-        // TOCTOU re-check: a concurrent `evict()` or denylist reload may have
-        // completed after the `has()` above. Under the lock, a refused hash is
-        // never held — a hold is what authorises signing `has_blob: true`, and
-        // signing that for a *blacklisted* hash is the ADR 014
-        // blacklist-violation evidence (and for a locally-evicted one, an
-        // advertisement the serve path would only refuse).
-        if self.refuses(hash) {
-            return Ok(ProbeHoldOutcome::Unavailable);
-        }
-        if guard.len() >= max {
-            // `max == 0` was already handled above, so reaching the budget
-            // ceiling here is always genuine pressure: every slot is live
-            // (#739). This is the "increase max_probe_holds" signal (ADR 005
-            // §Hold budget) — never a config disable.
-            return Ok(ProbeHoldOutcome::BudgetExhausted);
-        }
-        guard.insert(hash, expiry);
-        Ok(ProbeHoldOutcome::Held)
-    }
-
-    /// Number of currently-active (non-expired) probe holds, for the
-    /// `probe_hold_slots_used` metric (ADR 005). Sweeps expired entries as
-    /// a side effect, so a caller that samples it on its own schedule (the
-    /// node's `/metrics` scrape) reads live holds even with no probe traffic.
-    pub fn probe_hold_slots_used(&self) -> usize {
-        let now = tokio::time::Instant::now();
-        let mut guard = self
-            .inner
-            .probe_holds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        guard.retain(|_, exp| *exp > now);
-        guard.len()
-    }
-
     /// Fetch the blob by hash. Hits the local store on a cache hit; on a miss
     /// pulls from the configured origin, BLAKE3-verifies, and inserts before
     /// returning.
@@ -4008,9 +3929,9 @@ impl CacheEngine {
     ///
     /// This is the outboard half of the own-origin serviceability probe
     /// ([`Self::origin_range_serviceable`]), which the serve-miss path runs
-    /// before it signs a `StreamResponse`, so a blob no origin can prove is
-    /// never advertised as serviceable. A cached copy answers without an origin
-    /// read.
+    /// after admission. Before it signs a `StreamResponse`, that path learns
+    /// only whether the outboard exists ([`Self::origin_outboard_published`]).
+    /// A cached copy answers without an origin read.
     /// The returned outboard is UNTRUSTED until it verifies against the root `H`
     /// (the range encode in [`Self::origin_range_wire`] is where that happens).
     ///
@@ -4136,15 +4057,16 @@ impl CacheEngine {
         OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone()).map(Some)
     }
 
-    /// The own-origin serviceability probe the serve-miss path runs before it
-    /// signs a `StreamResponse`: whether an origin furnishes both the `{H}.obao4`
-    /// outboard for `hash` (a `total_bytes`-byte blob) and ranged reads of its
-    /// data. `false` sends the caller to the buffered whole-blob degrade
-    /// (ADR 037 §"Fallback is always correct"), so an origin that publishes an
-    /// outboard but declines `Range` does not have a signed stream fail on its
-    /// first draw. The exception is an origin that served ranges earlier and
-    /// has stopped since: it fails its draw like any other mid-life origin
-    /// fault.
+    /// The own-origin serviceability probe the serve-miss path runs once the
+    /// payer's first proof admits a stream it answered from its own origin:
+    /// whether an origin furnishes both the `{H}.obao4` outboard for `hash` (a
+    /// `total_bytes`-byte blob) and ranged reads of its data. `false` refuses
+    /// that stream before any chunk, and memoises the hash as publishing no
+    /// outboard ([`Self::origin_outboard_published`]), so the next open of the
+    /// hash takes the buffered whole-blob degrade before it answers
+    /// (ADR 037 §"Fallback is always correct"). An origin that served ranges
+    /// earlier and has stopped since fails its draw like any other mid-life
+    /// origin fault.
     ///
     /// The range half reads the first chunk group through the same origin
     /// chain a draw walks, starting at the origin that served the outboard. It
@@ -4163,6 +4085,17 @@ impl CacheEngine {
         hash: Hash,
         total_bytes: u64,
     ) -> CacheResult<bool> {
+        let serviceable = self.range_serviceable(hash, total_bytes).await?;
+        if !serviceable {
+            // The next open of the hash takes the degrade before it answers.
+            self.outboard_memo_lock()
+                .insert(hash, Presence::Absent, Instant::now());
+        }
+        Ok(serviceable)
+    }
+
+    /// The body of [`Self::origin_range_serviceable`].
+    async fn range_serviceable(&self, hash: Hash, total_bytes: u64) -> CacheResult<bool> {
         let Some((outboard, ix)) = self.outboard_with_origin(hash, total_bytes).await? else {
             return Ok(false);
         };
@@ -4398,7 +4331,7 @@ impl CacheEngine {
     /// Read the `{H}.sizeproof` object of each origin until one proves
     /// `size`. One read runs per hash at a time: a concurrent lookup waits
     /// and takes its proof from the memo. A lookup that finds none is
-    /// remembered for [`SIZE_PROOF_MISS_TTL`], so a probe flood for a blob no
+    /// remembered for [`SIZE_PROOF_MISS_TTL`], so an open flood for a blob no
     /// origin proves reads no origin again within that time.
     async fn origin_size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
         if self.inner.origins.is_empty() || self.size_proof_missed(hash, size) {
@@ -5156,13 +5089,9 @@ impl CacheEngine {
     /// *some* pinned generation, just not necessarily the very latest.
     ///
     /// A third filter layer (after pinned, before the LRU sort) drops any
-    /// hash under an active probe-triggered eviction hold, even a deny-listed
-    /// one (#318, ADR 005
-    /// §Probe-triggered eviction hold; ADR 040 §Pinning, durable operator-evict,
-    /// and the probe-hold stay engine-enforced:
-    /// "a held hash is invisible to the LRU driver until the hold
-    /// expires"). The held set is swept of expired entries here too, so a
-    /// node with no probe traffic still releases stale holds.
+    /// hash a reader, a fill or an open stream holds an [`InUse`] guard on,
+    /// even a deny-listed one: a release under a live reader lets GC sweep
+    /// the entry it is using.
     pub fn eviction_candidates(&self) -> EvictionCandidates {
         let pinned = self.inner.pinned.load();
         // Hoisted once, like `pinned`: a deny-listed hash stays an eviction
@@ -5177,37 +5106,27 @@ impl CacheEngine {
         // open-time seed skips evicted hashes via `iter_hashes`.
         let denied = self.inner.denied.load();
         let chain_denied = self.inner.chain_denied.load();
-        let now = tokio::time::Instant::now();
-        let held: HashSet<Hash> = {
-            let mut g = self
-                .inner
-                .probe_holds
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            g.retain(|_, exp| *exp > now);
-            let mut held: HashSet<Hash> = g.keys().copied().collect();
-            held.extend(
-                self.inner
-                    .in_use
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .keys()
-                    .copied(),
-            );
-            held
-        };
+        let held: HashSet<Hash> = self
+            .inner
+            .in_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect();
         let map = self
             .inner
             .access_times
             .iter()
             .filter_map(|entry| {
                 let (h, t) = (entry.key(), entry.value());
-                // `held` short-circuits BEFORE the deny carve-out, so a probe-held
-                // hash stays excluded even when denied: a probe-hold is transient
-                // (seconds, self-expiring) and the takedown `evict()` is the
-                // reclaim actuator for a denied hash regardless, so the space path
-                // need not race the hold. The carve-out targets the *pin* (the
-                // hold-forever case), which is the actual "worst combination".
+                // `held` short-circuits BEFORE the deny carve-out, so an in-use
+                // hash stays excluded even when denied: the use is transient (the
+                // in-flight re-check ends a stream when a takedown lands) and the
+                // takedown `evict()` is the reclaim actuator for a denied hash
+                // regardless, so the space path need not race the use. The
+                // carve-out targets the *pin* (the hold-forever case), which is
+                // the actual "worst combination".
                 let deny_listed = denied.contains(h) || chain_denied.contains(h);
                 if held.contains(h) || (pinned.contains(h) && !deny_listed) {
                     None
@@ -5266,7 +5185,7 @@ impl CacheEngine {
     /// bytes), the public form of the internal
     /// `snapshot_blob_sizes` helper. This is the authoritative disk-usage
     /// input for the capacity-eviction driver (#1173): unlike
-    /// [`Self::eviction_candidates`] — which drops pinned and probe-held hashes
+    /// [`Self::eviction_candidates`] — which drops pinned and in-use hashes
     /// and carries no sizes — this walks the store, so it counts every on-disk
     /// byte, including bytes released but not yet reclaimed by GC.
     ///
@@ -6670,7 +6589,7 @@ fn record_origin_pull<T>(span: &tracing::Span, result: &CacheResult<T>) {
 const SIZE_PROOF_TAG_PREFIX: &str = "decdn-sizeproof-";
 
 /// How long a lookup that found no origin `{H}.sizeproof` is remembered, so a
-/// probe flood for an unprovable blob reads no origin again in that time.
+/// open flood for an unprovable blob reads no origin again in that time.
 const SIZE_PROOF_MISS_TTL: Duration = Duration::from_secs(5);
 
 /// Most `(hash, size)` misses the engine remembers.

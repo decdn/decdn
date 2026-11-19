@@ -105,13 +105,12 @@ it reads, so a settlement that the chain does not show stays out.
 
 ## Slashing
 
-A receipt adds no offense and no evidence path. The two on-chain offenses
-stay the same: rate manipulation and blacklist violation
+A receipt adds no offense and no evidence path. The one on-chain offense
+stays the same: blacklist violation
 ([ADR 014](014-on-chain-verification.md#evidence-verification-per-offense-type)).
 A blacklist challenge accepts one `StreamResponse`, within the evidence age.
-A rate challenge also needs a `ProbeResponse`, and a receipt holds no
-`ProbeResponse`. A person who holds a receipt has no power that the holder of
-the responses did not already have. Vouchers are not slashing evidence.
+A person who holds a receipt has no power that the holder of the response did
+not already have. Vouchers are not slashing evidence.
 
 ## Privacy
 

@@ -119,7 +119,7 @@ pub(crate) fn size_proof_for(hash: [u8; 32], total_bytes: u64) -> decdn_protocol
 
 /// The extension a scripted upstream sends on its `ok: true` response for
 /// `resp`'s hash at `total_bytes`: a served outcome with
-/// [`size_proof_for`]'s proof.
+/// [`size_proof_for`]'s proof, covering every block of the blob.
 pub(crate) fn proven_ext(
     resp: &decdn_protocol::client::StreamResponse,
     total_bytes: u64,
@@ -127,6 +127,7 @@ pub(crate) fn proven_ext(
     decdn_protocol::client::StreamResponseExt::served(
         size_proof_for(resp.body.hash, total_bytes),
         None,
+        decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes)),
     )
 }
 
