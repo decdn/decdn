@@ -1,69 +1,53 @@
-//! Integration tests for [`decdn_cache::CacheEngine`] end-to-end with a
-//! mocked HTTP origin.
+//! Integration tests for [`decdn_cache::CacheEngine`]: the `populate` chain
+//! walk (retry, coalescing, fallback), GC reclaim of evicted blobs, and the
+//! bao export of a held blob.
+//!
+//! Only the node-to-node origin pulls a whole blob: it admits the verified
+//! stream into the store itself and answers `OriginFetch::AlreadyAdmitted`.
+//! The test origins here do the same, through `CacheEngine::insert_blob`.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use decdn_cache::{
-    CacheEngine, CacheError, CacheMetrics, DecompressMode, FilesystemOrigin, Hash, HttpOrigin,
-    Origin, OriginError, OriginFetch, OriginKind, OriginPullError, PinnedHashes, RetryPolicy,
-    SupportedEncoding,
+    CacheEngine, CacheError, CacheMetrics, FilesystemOrigin, Hash, Origin, OriginFetch, OriginKind,
+    OriginPullError, OriginRangeRequest, PinnedHashes, RetryPolicy,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// Spin up a wiremock server that serves a single blob at
-/// `/{blake3_hex}`. Returns the `(server, hash)` pair.
-async fn serve_blob(payload: &'static [u8]) -> (MockServer, Hash) {
-    let server = MockServer::start().await;
-    let hash = Hash::new(payload);
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&server)
-        .await;
-    (server, hash)
-}
-
-async fn build_engine(origin_url: &str) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(origin_url)?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-    Ok((engine, tmp))
-}
-
-/// Same as [`build_engine`] but with `RetryPolicy::disabled()`. Used by
-/// status-mapping tests where the unit under test is the *first*-attempt
-/// classification — without disabling retry, those tests would burn ~6
-/// seconds of wall time exercising the default retry chain on every
-/// transient-classified status (5xx/408/429), and a flake on the third
-/// retry would surface as a status-mapping failure rather than a
-/// retry-loop failure.
-async fn build_engine_no_retry(
-    origin_url: &str,
-) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(origin_url)?);
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin>],
-        16,
-        decdn_cache::PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        None,
-        Duration::ZERO,
-    )
-    .await?;
-    Ok((engine, tmp))
-}
 
 fn err_of<T: std::fmt::Debug, E>(r: Result<T, E>) -> anyhow::Result<E> {
     r.err()
         .ok_or_else(|| anyhow::anyhow!("expected error, got Ok"))
+}
+
+/// The engine a test origin admits into, set right after the engine opens.
+type EngineSlot = Arc<OnceLock<CacheEngine>>;
+
+/// Admit `payload` into the engine in `slot`, as the node-to-node origin
+/// admits a verified stream, and answer `AlreadyAdmitted`.
+async fn admit(slot: &EngineSlot, payload: bytes::Bytes) -> Result<OriginFetch, OriginPullError> {
+    let engine = slot
+        .get()
+        .ok_or_else(|| OriginPullError::Permanent(anyhow::anyhow!("engine not set")))?;
+    engine
+        .insert_blob(payload)
+        .await
+        .map_err(|e| OriginPullError::Permanent(e.into()))?;
+    Ok(OriginFetch::AlreadyAdmitted)
+}
+
+/// Deterministic pseudo-random blob.
+fn make_blob(len: usize, seed: u32) -> Vec<u8> {
+    let mut payload = vec![0u8; len];
+    let mut x = seed;
+    for b in &mut payload {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x.to_le_bytes().first().copied().unwrap_or(0);
+    }
+    payload
 }
 
 /// Bound on a GC wait. It only catches a hung GC task: the waits count
@@ -99,126 +83,16 @@ async fn wait_for_gc_reclaim(metrics: &CacheMetrics) -> anyhow::Result<()> {
     wait_for_gc_runs(metrics, start + 3).await
 }
 
-#[tokio::test]
-async fn cache_miss_pulls_from_origin_and_caches() -> anyhow::Result<()> {
-    let payload: &[u8] = b"hello, decdn";
-    let (server, hash) = serve_blob(payload).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    anyhow::ensure!(!engine.has(hash).await?, "blob should be absent initially");
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "first get should return origin bytes");
-    anyhow::ensure!(engine.has(hash).await?, "blob should be cached after miss");
-
-    // Second get is served locally — drop the mock server to prove it.
-    drop(server);
-    let got2 = engine.get(hash).await?;
-    anyhow::ensure!(&got2[..] == payload, "second get should be served locally");
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn hash_mismatch_is_rejected_and_not_cached() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let expected = Hash::new(b"expected");
-    let mismatched_payload: &[u8] = b"something else entirely";
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", expected.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let err = err_of(engine.get(expected).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch, got: {err:?}"
-    );
-    anyhow::ensure!(
-        !engine.has(expected).await?,
-        "expected hash must not be cached"
-    );
-    // The wrong-hash bytes are made GC-eligible but their hash is NOT
-    // logically evicted: under BLAKE3 content-addressing those bytes *are*
-    // the authorized content for their own hash, so evicting it would durably
-    // censor a legitimate hash (#853). The non-censorship guarantee and the
-    // drain-path GC reclaim are covered by
-    // `streaming_mismatch_does_not_censor_actual_hash` and
-    // `drain_mismatch_tag_deleted_lets_gc_reclaim`.
-    Ok(())
-}
-
-/// #853 regression: a malicious upstream answers a pull for `expected`
-/// with the bytes of a *legitimate* blob `actual` it also holds. The
-/// mismatch must be rejected WITHOUT logically evicting `actual` — pre-fix
-/// the streaming path called `self.evict(actual)`, durably blacklisting a
-/// hash whose BLAKE3-addressed content is genuinely valid. Uses
-/// `build_engine_no_retry` (`buffered_max_bytes = 0`) to force the
-/// streaming path.
-#[tokio::test]
-async fn streaming_mismatch_does_not_censor_actual_hash() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let victim: &[u8] = b"a legitimate blob the attacker also holds";
-    let actual = Hash::new(victim);
-    let expected = Hash::new(b"what the client actually asked for");
-    // A pull for `expected` is answered with the victim's bytes (mismatch).
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", expected.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(victim))
-        .mount(&server)
-        .await;
-    // A correct content-addressed mount so `actual` is fetchable on its own.
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", actual.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(victim))
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine_no_retry(&server.uri()).await?;
-
-    let err = err_of(engine.get(expected).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch, got: {err:?}"
-    );
-    anyhow::ensure!(
-        !engine.inspect(actual).await?.already_evicted,
-        "actual must NOT be logically evicted on hash mismatch (#853 censorship vector)"
-    );
-    // The legitimate blob is still fully serveable — pre-fix this returned
-    // NotFound because `actual` was blacklisted in evicted.log.
-    let got = engine.get(actual).await?;
-    anyhow::ensure!(&got[..] == victim, "actual must serve its real bytes");
-    Ok(())
-}
-
-/// #837 regression (also covers the drain-path side of #853). The drain
-/// path commits via `add_bytes`, which creates a *named* tag that protects
-/// the wrong-hash bytes from GC forever. On mismatch the engine must delete
-/// that tag (not logically evict the hash) so the next sweep reclaims the
-/// disk. Uses `RetryPolicy::default()` (`buffered_max_bytes > 0`) so the
-/// small, Content-Length-bearing body takes the drain path.
-#[tokio::test]
-async fn drain_mismatch_tag_deleted_lets_gc_reclaim() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let expected = Hash::new(b"expected-drain");
-    let mismatched: &[u8] = b"a small body that fits the drain buffer but hashes wrong";
-    let actual = Hash::new(mismatched);
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", expected.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched))
-        .mount(&server)
-        .await;
-
+/// An engine with no origins, a metrics handle and a GC sweep every
+/// `gc_interval` (`ZERO` disables GC).
+async fn gc_engine(
+    gc_interval: Duration,
+) -> anyhow::Result<(CacheEngine, Arc<CacheMetrics>, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
     let metrics = Arc::new(CacheMetrics::default());
-    let gc_interval = Duration::from_millis(200);
     let engine = CacheEngine::open_full(
         tmp.path(),
-        vec![origin as Arc<dyn Origin>],
+        Vec::new(),
         16,
         PinnedHashes::empty(),
         RetryPolicy::default(),
@@ -227,35 +101,7 @@ async fn drain_mismatch_tag_deleted_lets_gc_reclaim() -> anyhow::Result<()> {
         gc_interval,
     )
     .await?;
-
-    let err = err_of(engine.get(expected).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch, got: {err:?}"
-    );
-
-    let pre = engine.inspect(actual).await?;
-    anyhow::ensure!(
-        pre.size_bytes.is_some(),
-        "drain-committed bytes must be on disk before GC runs"
-    );
-    anyhow::ensure!(
-        !pre.already_evicted,
-        "wrong-hash bytes must NOT be logically evicted (#853)"
-    );
-
-    wait_for_gc_reclaim(&metrics).await?;
-
-    anyhow::ensure!(
-        engine.inspect(actual).await?.size_bytes.is_none(),
-        "drain-path wrong-hash bytes must be GC-reclaimed once the named tag is deleted (#837)"
-    );
-    anyhow::ensure!(
-        metrics.gc_bytes_reclaimed.get() > 0,
-        "gc_bytes_reclaimed must be nonzero after reclaim; got {}",
-        metrics.gc_bytes_reclaimed.get()
-    );
-    Ok(())
+    Ok((engine, metrics, tmp))
 }
 
 /// #860 regression: a logically-evicted blob keeps its protecting named
@@ -265,27 +111,10 @@ async fn drain_mismatch_tag_deleted_lets_gc_reclaim() -> anyhow::Result<()> {
 #[tokio::test]
 async fn evict_makes_blob_gc_eligible() -> anyhow::Result<()> {
     let payload: &[u8] = b"content to evict and reclaim";
-    let (server, hash) = serve_blob(payload).await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let metrics = Arc::new(CacheMetrics::default());
-    let gc_interval = Duration::from_millis(200);
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::default(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&metrics)),
-        gc_interval,
-    )
-    .await?;
+    let (engine, metrics, _tmp) = gc_engine(Duration::from_millis(200)).await?;
 
     // Cache the blob (creates the protecting named tag), then evict it.
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "blob should be served from origin");
+    let hash = engine.insert_blob(payload.to_vec()).await?;
     anyhow::ensure!(
         engine.inspect(hash).await?.size_bytes.is_some(),
         "blob must be on disk after caching"
@@ -310,141 +139,6 @@ async fn evict_makes_blob_gc_eligible() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Companion to `evict_makes_blob_gc_eligible` that forces the *streaming*
-/// success path (`RetryPolicy::disabled()` ⇒ `buffered_max_bytes = 0`), so the
-/// blob is protected by a `tags().create()` tag rather than the drain path's
-/// `add_bytes` tag. Guards that `evict`'s `drop_named_tags_for` matches the
-/// streaming-promoted tag too — without this, a regression that only handled
-/// drain-path tags would still pass `evict_makes_blob_gc_eligible` (#860).
-#[tokio::test]
-async fn evict_makes_streaming_cached_blob_gc_eligible() -> anyhow::Result<()> {
-    let payload: &[u8] = b"streaming-cached content to evict and reclaim";
-    let (server, hash) = serve_blob(payload).await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let metrics = Arc::new(CacheMetrics::default());
-    let gc_interval = Duration::from_millis(200);
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&metrics)),
-        gc_interval,
-    )
-    .await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "blob should be served from origin");
-    anyhow::ensure!(
-        engine.inspect(hash).await?.size_bytes.is_some(),
-        "blob must be on disk after caching via the streaming path"
-    );
-    engine.evict(hash).await?;
-
-    wait_for_gc_reclaim(&metrics).await?;
-
-    anyhow::ensure!(
-        engine.inspect(hash).await?.size_bytes.is_none(),
-        "streaming-cached evicted blob must be GC-reclaimed once its tag is deleted (#860)"
-    );
-    anyhow::ensure!(
-        metrics.gc_bytes_reclaimed.get() > 0,
-        "gc_bytes_reclaimed must be nonzero after reclaim; got {}",
-        metrics.gc_bytes_reclaimed.get()
-    );
-    Ok(())
-}
-
-/// Periodic iroh-blobs GC must reclaim the partial-import bytes left
-/// behind by a hash-mismatch pull-through (#518). Threat model: a
-/// hostile origin streams garbage that hashes wrong; the streaming path
-/// drops the unpromoted temp tag so the bytes are tag-less and
-/// GC-eligible, but they stay on disk until the GC sweep fires. The
-/// wrong-hash blob is deliberately NOT logically evicted (#853): under
-/// content-addressing its bytes are valid content for their own hash, so
-/// the persisted evicted set is reserved for operator takedowns. This
-/// test wires a 200ms GC interval and asserts that within a small handful
-/// of cycles the bytes really do leave disk and the `gc_*` metrics record
-/// the reclaim.
-#[tokio::test]
-async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let expected = Hash::new(b"expected");
-    let mismatched_payload: &[u8] = b"a body the origin pretends matches the requested hash";
-    let actual = Hash::new(mismatched_payload);
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", expected.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let metrics = Arc::new(CacheMetrics::default());
-    // A short interval keeps the sweeps that `wait_for_gc_reclaim` counts
-    // fast.
-    let gc_interval = Duration::from_millis(200);
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&metrics)),
-        gc_interval,
-    )
-    .await?;
-
-    let err = err_of(engine.get(expected).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch, got: {err:?}"
-    );
-
-    // Pre-GC: iroh-blobs still holds the mismatched bytes under
-    // `actual`. `inspect` reads `BlobStatus` directly, so a `Some(_)` size
-    // here proves the disk-leak existed before GC ran.
-    let pre = engine.inspect(actual).await?;
-    anyhow::ensure!(
-        pre.size_bytes.is_some(),
-        "actual-hash bytes must be on disk before GC runs (got size_bytes = None)"
-    );
-    anyhow::ensure!(
-        !pre.already_evicted,
-        "wrong-hash bytes must NOT be logically evicted on mismatch (#853 censorship vector)"
-    );
-
-    // Wait for the sweep that deletes the bytes and for the next sweep,
-    // whose pre-sweep snapshot no longer holds them and counts them.
-    wait_for_gc_reclaim(&metrics).await?;
-
-    let post = engine.inspect(actual).await?;
-    anyhow::ensure!(
-        post.size_bytes.is_none(),
-        "actual-hash bytes must be reclaimed by iroh-blobs GC; got size_bytes = {:?}",
-        post.size_bytes
-    );
-    anyhow::ensure!(
-        metrics.gc_runs.get() >= 1,
-        "gc_runs_total should be >=1 after the periodic loop has fired; got {}",
-        metrics.gc_runs.get()
-    );
-    anyhow::ensure!(
-        metrics.gc_bytes_reclaimed.get() >= mismatched_payload.len() as u64,
-        "gc_bytes_reclaimed_total should cover at least the mismatched payload \
-         ({} bytes); got {}",
-        mismatched_payload.len(),
-        metrics.gc_bytes_reclaimed.get()
-    );
-
-    Ok(())
-}
-
 /// Locks in the **lagged-by-one-cycle attribution** documented in the
 /// `gc_bytes_reclaimed_total` metric: the first sweep records a baseline
 /// and reports zero reclaim, and each later sweep counts the bytes the
@@ -453,172 +147,49 @@ async fn gc_reclaims_partial_import_bytes() -> anyhow::Result<()> {
 /// payload twice, which inflates `gc_bytes_reclaimed_total` by the entire
 /// blob set on every restart — the exact alert signal
 /// `gc_bytes_reclaimed_total` exists for. A post-sweep snapshot never sees
-/// the deleted blob and counts zero. The broader-shaped
-/// `gc_reclaims_partial_import_bytes` test only asserts
-/// `>= mismatched_payload.len()`, so it passes in the first case.
+/// the deleted blob and counts zero.
 #[tokio::test]
 async fn gc_attribution_lags_one_cycle() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let expected = Hash::new(b"expected-lag");
-    let mismatched_payload: &[u8] = b"a body whose blake3 disagrees with the requested hash";
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", expected.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
-        .mount(&server)
-        .await;
+    let payload: &[u8] = b"a body evicted to become GC-eligible";
+    let (engine, metrics, _tmp) = gc_engine(Duration::from_millis(200)).await?;
+    let hash = engine.insert_blob(payload.to_vec()).await?;
+    engine.evict(hash).await?;
 
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let metrics = Arc::new(CacheMetrics::default());
-    let gc_interval = Duration::from_millis(200);
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&metrics)),
-        gc_interval,
-    )
-    .await?;
-
-    let err = err_of(engine.get(expected).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch, got: {err:?}"
-    );
-
-    // The store holds only the mismatched blob. One sweep deletes it and
-    // the next one counts it; every later snapshot lacks it, so later
-    // sweeps add nothing.
+    // The store holds only the evicted blob. One sweep deletes it and the
+    // next one counts it; every later snapshot lacks it, so later sweeps add
+    // nothing.
     wait_for_gc_reclaim(&metrics).await?;
     anyhow::ensure!(
-        metrics.gc_bytes_reclaimed.get() == mismatched_payload.len() as u64,
+        metrics.gc_bytes_reclaimed.get() == payload.len() as u64,
         "gc_bytes_reclaimed_total must count the deleted blob exactly once \
          ({} bytes): the first sweep has no baseline and counts nothing; got {}",
-        mismatched_payload.len(),
+        payload.len(),
         metrics.gc_bytes_reclaimed.get()
     );
-
     Ok(())
 }
 
-/// The other limb of #518's threat model: the engine must reclaim
-/// partial-import bytes from a *cap-breach* (mid-stream `BlobTooLarge`),
-/// not just hash mismatch. The cap-breach path drops the (possibly
-/// successful) temp tag in `engine.rs::pull_through` after the
-/// `count_and_cap_stream` adapter writes a `BlobTooLargeMarker` into
-/// the captured-error side-channel. Without GC, those bytes leak.
-/// This locks in the metric path that an operator alert ("hostile
-/// origin amplifying disk via repeated mid-stream errors", per the
-/// `gc_bytes_reclaimed_total` docstring) actually depends on.
-#[tokio::test]
-async fn gc_reclaims_cap_breach_partial_bytes() -> anyhow::Result<()> {
-    // 2 MiB chunked body, 1 MiB cap, no Content-Length → only the
-    // streaming running-total check catches it. Same setup as
-    // `mid_stream_overrun_is_rejected_by_http_origin` plus GC.
-    let payload_bytes = 2 * 1024 * 1024;
-    let addr = spawn_chunked_oversize_server(payload_bytes).await?;
-    let origin_url = format!("http://{addr}/");
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&origin_url)?);
-    let metrics = Arc::new(CacheMetrics::default());
-    let gc_interval = Duration::from_millis(200);
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin>],
-        1, // max_blob_size_mb = 1 MiB; payload is 2 MiB
-        PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&metrics)),
-        gc_interval,
-    )
-    .await?;
-
-    let err = err_of(engine.get(Hash::new(b"doesn't matter")).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::BlobTooLarge { .. }),
-        "expected BlobTooLarge from mid-stream cap, got: {err:?}"
-    );
-
-    // Wait the same way `gc_reclaims_partial_import_bytes` does: one
-    // sweep deletes the bytes, the next one counts them.
-    wait_for_gc_reclaim(&metrics).await?;
-
-    anyhow::ensure!(
-        metrics.gc_runs.get() >= 1,
-        "gc_runs_total should be >=1 after the periodic loop has fired; got {}",
-        metrics.gc_runs.get()
-    );
-    // We don't assert an exact byte count — `count_and_cap_stream`
-    // can terminate the upstream slightly past `max_blob_bytes`
-    // depending on chunk boundaries, and add_stream may have
-    // committed a different fraction. The load-bearing claim is
-    // that the metric is *nonzero*: GC is reclaiming partial-import
-    // bytes from this code path.
-    anyhow::ensure!(
-        metrics.gc_bytes_reclaimed.get() > 0,
-        "gc_bytes_reclaimed_total should be nonzero after cap-breach + GC; got {}",
-        metrics.gc_bytes_reclaimed.get()
-    );
-
-    Ok(())
-}
-
-/// Sister to `gc_reclaims_partial_import_bytes` for the disabled
-/// branch: when `gc_interval = Duration::ZERO`, iroh-blobs must NOT
-/// spawn a GC loop, the partial-import bytes must stay on disk, and
-/// the GC metrics must stay at zero indefinitely. Locks in the
-/// `if gc_interval.is_zero() { None } else { Some(...) }` polarity at
-/// `engine.rs::open_full` — a regression that swapped the polarity of
-/// that condition would silently re-enable GC for every operator who
-/// set `gc_interval_sec = 0` (or vice versa, silently disabling for
-/// everyone else).
+/// With `gc_interval = Duration::ZERO`, iroh-blobs must NOT spawn a GC loop:
+/// an evicted blob's untagged bytes stay on disk, and the GC metrics stay at
+/// zero. Locks in the `if gc_interval.is_zero() { None } else { Some(...) }`
+/// polarity at `engine.rs::open_full` — a regression that swapped it would
+/// silently re-enable GC for every operator who set `gc_interval_sec = 0` (or
+/// silently disable it for everyone else).
 #[tokio::test]
 async fn gc_disabled_does_not_reclaim_or_emit_metrics() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let expected = Hash::new(b"expected-disabled");
-    let mismatched_payload: &[u8] = b"a body with a different blake3 than the requested hash";
-    let actual = Hash::new(mismatched_payload);
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", expected.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(mismatched_payload))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let metrics = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin as Arc<dyn Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&metrics)),
-        Duration::ZERO, // GC disabled
-    )
-    .await?;
-
-    let err = err_of(engine.get(expected).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch, got: {err:?}"
-    );
+    let payload: &[u8] = b"a body that stays on disk with GC disabled";
+    let (engine, metrics, _tmp) = gc_engine(Duration::ZERO).await?;
+    let hash = engine.insert_blob(payload.to_vec()).await?;
+    engine.evict(hash).await?;
 
     // Sleep long enough that a 200ms-interval GC loop would have fired
     // multiple times if it had been spawned. With GC disabled, nothing
     // should change.
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    let post = engine.inspect(actual).await?;
     anyhow::ensure!(
-        post.size_bytes.is_some(),
-        "actual-hash bytes must remain on disk when GC is disabled; got size_bytes = None"
+        engine.inspect(hash).await?.size_bytes.is_some(),
+        "evicted bytes must remain on disk when GC is disabled; got size_bytes = None"
     );
     anyhow::ensure!(
         metrics.gc_runs.get() == 0,
@@ -629,214 +200,6 @@ async fn gc_disabled_does_not_reclaim_or_emit_metrics() -> anyhow::Result<()> {
         metrics.gc_bytes_reclaimed.get() == 0,
         "gc_bytes_reclaimed_total must stay at 0 when GC is disabled; got {}",
         metrics.gc_bytes_reclaimed.get()
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn origin_not_found_surfaces_not_found() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let hash = Hash::new(b"absent");
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::NotFound { .. }),
-        "expected NotFound, got: {err:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn blob_too_large_is_rejected_via_http_origin() -> anyhow::Result<()> {
-    // Payload of 2 MB, cap at 1 MB. Wiremock sets an honest `Content-Length`,
-    // so this trips the HTTP origin's fast-path rejection before any bytes
-    // are buffered — which surfaces as `OriginError`.
-    let payload = vec![0xABu8; 2 * 1024 * 1024];
-    let hash = Hash::new(&payload);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError (fast-path content-length rejection), got: {err:?}"
-    );
-    Ok(())
-}
-
-/// Origin that returns bytes exceeding `max_bytes` regardless of its
-/// argument — a stand-in for a misbehaving backend that bypasses the HTTP
-/// origin's streaming cap (e.g. a future S3 / filesystem impl that forgets
-/// to honor the size argument).
-#[derive(Debug)]
-struct OversizedOrigin {
-    payload: bytes::Bytes,
-}
-
-impl Origin for OversizedOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, decdn_cache::OriginPullError>> + Send + '_>>
-    {
-        let payload = self.payload.clone();
-        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
-    }
-}
-
-#[tokio::test]
-async fn engine_rejects_oversize_bytes_from_misbehaving_origin() -> anyhow::Result<()> {
-    // Origin ignores the max_bytes advisory and returns 2 MiB. Cap at 1 MiB.
-    // This proves the engine's post-receive size check is load-bearing
-    // defense in depth — a regression dropping that check would be caught
-    // by this test even if the HTTP origin's streaming cap is fine.
-    let payload = bytes::Bytes::from(vec![0xCDu8; 2 * 1024 * 1024]);
-    let hash = Hash::new(&payload);
-    let origin = Arc::new(OversizedOrigin { payload });
-
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::BlobTooLarge { .. }),
-        "expected BlobTooLarge from engine-level check, got: {err:?}"
-    );
-    anyhow::ensure!(
-        !engine.has(hash).await?,
-        "oversize bytes must not be cached"
-    );
-    Ok(())
-}
-
-/// A `Peer`-kind origin (the node→node analogue) that records whether it was
-/// consulted. `populate_local` (#1116) MUST skip it so an operator's reactive
-/// local-origin fill fronts no paid node→node pull; the full `populate` (`get`)
-/// path still walks it.
-#[derive(Debug)]
-struct PeerOrigin {
-    payload: bytes::Bytes,
-    fetches: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl Origin for PeerOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Peer
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        self.fetches
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let payload = self.payload.clone();
-        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
-    }
-}
-
-#[tokio::test]
-async fn populate_local_skips_peer_origin_and_fills_from_local() -> anyhow::Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    // Chain = [Peer(could serve), Filesystem(has the blob)]. `populate_local`
-    // must skip the paid `Peer` origin (fronting no USDC) and fill from the
-    // local fs origin — the engine-level guarantee behind #1116's local-first
-    // serve path.
-    let payload: &[u8] = b"served from the operator's own origin";
-    let hash = Hash::new(payload);
-    let peer_fetches = Arc::new(AtomicUsize::new(0));
-
-    let origin_dir = tempfile::tempdir()?;
-    seed_fs_blob(origin_dir.path(), hash, payload)?;
-    let cache_dir = tempfile::tempdir()?;
-
-    let peer = Arc::new(PeerOrigin {
-        payload: bytes::Bytes::from(payload.to_vec()),
-        fetches: Arc::clone(&peer_fetches),
-    });
-    let fs = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(
-        cache_dir.path(),
-        vec![peer as Arc<dyn Origin>, fs as Arc<dyn Origin>],
-        16,
-    )
-    .await?;
-
-    engine.populate_local(hash).await?;
-    anyhow::ensure!(
-        engine.has(hash).await?,
-        "local populate must fill the store"
-    );
-    anyhow::ensure!(
-        peer_fetches.load(Ordering::SeqCst) == 0,
-        "populate_local must NOT consult the Peer origin, got {} fetches",
-        peer_fetches.load(Ordering::SeqCst)
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn populate_local_with_only_peer_origin_is_no_origin() -> anyhow::Result<()> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    // A chain of nothing but a `Peer` origin has no eligible local origin, so
-    // `populate_local` is a fast `NoOrigin` miss that never consults the peer —
-    // whereas the full `populate` DOES pull from it. This is the engine contract
-    // that keeps a cache-only operator's reactive path from silently becoming a
-    // paid node→node pull (#1116).
-    let payload: &[u8] = b"only reachable via a paid peer";
-    let hash = Hash::new(payload);
-    let peer_fetches = Arc::new(AtomicUsize::new(0));
-
-    let cache_dir = tempfile::tempdir()?;
-    let peer = Arc::new(PeerOrigin {
-        payload: bytes::Bytes::from(payload.to_vec()),
-        fetches: Arc::clone(&peer_fetches),
-    });
-    let engine = CacheEngine::open(cache_dir.path(), vec![peer as Arc<dyn Origin>], 16).await?;
-
-    let err = err_of(engine.populate_local(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::NoOrigin { .. }),
-        "populate_local over a peer-only chain must be NoOrigin, got: {err:?}"
-    );
-    anyhow::ensure!(
-        peer_fetches.load(Ordering::SeqCst) == 0,
-        "peer-only populate_local must not consult the peer"
-    );
-
-    // Contrast: the full populate path DOES fall back to the peer and fills.
-    engine.populate(hash).await?;
-    anyhow::ensure!(
-        engine.has(hash).await?,
-        "full populate should fill via the peer"
-    );
-    anyhow::ensure!(
-        peer_fetches.load(Ordering::SeqCst) == 1,
-        "full populate should consult the peer exactly once"
     );
     Ok(())
 }
@@ -849,253 +212,26 @@ async fn shutdown_flushes_without_drop() -> anyhow::Result<()> {
     // `std::mem::forget` to skip `Drop` isolates the flush-on-shutdown
     // contract.
     let payload: &[u8] = b"persisted via shutdown, not drop";
-    let (server, hash) = serve_blob(payload).await;
 
     let tmp = tempfile::tempdir()?;
-    {
-        let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-        let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-        let _ = engine.get(hash).await?;
+    let hash = {
+        let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+        let hash = engine.insert_blob(payload.to_vec()).await?;
         engine.shutdown().await?;
         // Skip Drop so this test fails if shutdown() stopped flushing.
         std::mem::forget(engine);
-    }
-    drop(server);
+        hash
+    };
 
     let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
     anyhow::ensure!(
         engine.has(hash).await?,
         "reopened engine should see the blob flushed by shutdown()"
     );
-    let got = engine.get(hash).await?;
+    let got = engine.read_blob(hash).await?;
     anyhow::ensure!(
         &got[..] == payload,
-        "reopened engine should serve the cached payload without an origin"
-    );
-    Ok(())
-}
-
-/// Bind an ephemeral TCP port and serve exactly one request with a
-/// chunked-encoded body whose total size is `payload_bytes`. No
-/// `Content-Length` is sent, so reqwest can't trip the HTTP origin's
-/// fast-path rejection — the mid-stream running-total check is the only
-/// line of defense.
-async fn spawn_chunked_oversize_server(
-    payload_bytes: usize,
-) -> anyhow::Result<std::net::SocketAddr> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        let Ok((mut sock, _)) = listener.accept().await else {
-            return;
-        };
-        // Drain request headers — we only need to know when the client is
-        // done speaking before we start responding.
-        let mut buf = [0u8; 4096];
-        loop {
-            match sock.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => {
-                    let seen = buf.get(..n).unwrap_or(&[]);
-                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-            }
-        }
-        let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\n\r\n";
-        if sock.write_all(header).await.is_err() {
-            return;
-        }
-        let chunk_size = 64 * 1024;
-        let pad = vec![0xEEu8; chunk_size];
-        let mut remaining = payload_bytes;
-        while remaining > 0 {
-            let send = remaining.min(chunk_size);
-            let hdr = format!("{send:x}\r\n");
-            if sock.write_all(hdr.as_bytes()).await.is_err() {
-                return;
-            }
-            let chunk = pad.get(..send).unwrap_or(&[]);
-            if sock.write_all(chunk).await.is_err() {
-                return;
-            }
-            if sock.write_all(b"\r\n").await.is_err() {
-                return;
-            }
-            remaining -= send;
-        }
-        let _ = sock.write_all(b"0\r\n\r\n").await;
-    });
-    Ok(addr)
-}
-
-/// Bind an ephemeral TCP port, accept one connection, then hold the socket
-/// open without ever writing response bytes. Exercises the response-headers
-/// timeout: the TCP handshake completes (so `connect_timeout` doesn't fire)
-/// but the server never writes a status line.
-async fn spawn_silent_server() -> anyhow::Result<std::net::SocketAddr> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        if let Ok((sock, _)) = listener.accept().await {
-            let _sock = sock;
-            std::future::pending::<()>().await;
-        }
-    });
-    Ok(addr)
-}
-
-/// Bind an ephemeral TCP port, serve headers + a single short chunk, then
-/// hang. Exercises the per-chunk idle timeout: the first chunk arrives
-/// quickly, subsequent `.chunk()` calls block forever.
-async fn spawn_stall_after_partial_body_server() -> anyhow::Result<std::net::SocketAddr> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        let Ok((mut sock, _)) = listener.accept().await else {
-            return;
-        };
-        let mut buf = [0u8; 4096];
-        loop {
-            match sock.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => {
-                    let seen = buf.get(..n).unwrap_or(&[]);
-                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-            }
-        }
-        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n";
-        let _ = sock.write_all(resp).await;
-        // Hang — subsequent chunk reads must hit the idle timeout.
-        let _sock = sock;
-        std::future::pending::<()>().await;
-    });
-    Ok(addr)
-}
-
-#[tokio::test]
-async fn response_headers_timeout_fires_on_silent_server() -> anyhow::Result<()> {
-    // Use the disabled retry policy: the silent server only accepts one
-    // TCP connection, so retrying would queue connect attempts that
-    // wait out the 200ms headers timeout each time — irrelevant noise
-    // for a test that only cares about the *first* timeout firing.
-    let addr = spawn_silent_server().await?;
-    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
-        .with_timeouts(Duration::from_millis(200), Duration::from_secs(30));
-
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        None,
-        Duration::ZERO,
-    )
-    .await?;
-
-    let err = err_of(engine.get(Hash::new(b"anything")).await)?;
-    let msg = err.display_chain().to_string();
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from headers timeout, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.contains("headers timed out"),
-        "error message missing headers-timeout marker: {msg}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn chunk_idle_timeout_fires_when_origin_stalls_mid_body() -> anyhow::Result<()> {
-    // Disabled retry policy for the same reason as the headers-timeout
-    // test: the stall server only accepts one connection. A retry
-    // would block on a 30-second headers timeout per attempt, turning
-    // a sub-second test into a multi-minute one.
-    let addr = spawn_stall_after_partial_body_server().await?;
-    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
-        .with_timeouts(Duration::from_secs(30), Duration::from_millis(200));
-
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::disabled(),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        None,
-        Duration::ZERO,
-    )
-    .await?;
-
-    let err = err_of(engine.get(Hash::new(b"anything")).await)?;
-    let msg = err.display_chain().to_string();
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from idle timeout, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.contains("body read stalled"),
-        "error message missing stalled marker: {msg}"
-    );
-    // Sanity: 4 bytes of "ABCD" should be reported as buffered.
-    anyhow::ensure!(
-        msg.contains("4 bytes buffered"),
-        "error message missing progress info: {msg}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn pull_through_succeeds_above_one_mib_payload() -> anyhow::Result<()> {
-    // 2 MiB payload exercises the streaming pull-through across multiple
-    // origin chunks — `tokio_util::io::ReaderStream` emits 4 KiB-sized
-    // chunks by default, so 2 MiB → ~512 chunks through `add_stream`'s
-    // bidi protocol. This is a regression check that multi-chunk
-    // streaming completes through the engine — iroh-blobs' `add_stream`
-    // handles the BLAKE3 hashing internally (#271).
-    let payload = vec![0x7Fu8; 2 * 1024 * 1024];
-    let hash = Hash::new(&payload);
-
-    let origin_dir = tempfile::tempdir()?;
-    seed_fs_blob(origin_dir.path(), hash, &payload)?;
-
-    let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(got.len() == payload.len(), "size mismatch: {}", got.len());
-    anyhow::ensure!(got[..] == payload[..], "content mismatch");
-    anyhow::ensure!(engine.has(hash).await?, "blob should be cached");
-    Ok(())
-}
-
-#[tokio::test]
-async fn mid_stream_overrun_is_rejected_by_http_origin() -> anyhow::Result<()> {
-    // 2 MiB chunked body, 1 MiB cap, no Content-Length → only the
-    // streaming running-total check can catch this.
-    let payload_bytes = 2 * 1024 * 1024;
-    let addr = spawn_chunked_oversize_server(payload_bytes).await?;
-    let origin_url = format!("http://{addr}/");
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&origin_url)?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-
-    // Any hash works — the raw TCP server doesn't match paths.
-    let err = err_of(engine.get(Hash::new(b"doesn't matter")).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::BlobTooLarge { .. }),
-        "expected BlobTooLarge from mid-stream cap, got: {err:?}"
+        "reopened engine should hold the cached payload"
     );
     Ok(())
 }
@@ -1117,76 +253,31 @@ async fn open_on_file_path_yields_store_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write `payload` into the sharded filesystem layout rooted at `base`
-/// so `FilesystemOrigin` can serve it.
-fn seed_fs_blob(base: &std::path::Path, hash: Hash, payload: &[u8]) -> anyhow::Result<()> {
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let dir = base.join(shard);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hex.as_str()), payload)?;
-    Ok(())
-}
-
+/// A filesystem origin serves its blobs by range only: `populate` pulls no
+/// whole blob from it, even when the origin holds the data object.
 #[tokio::test]
-async fn fs_origin_pulls_and_caches() -> anyhow::Result<()> {
-    let payload: &[u8] = b"content-addressed from local disk";
+async fn populate_pulls_no_whole_blob_from_an_fs_origin() -> anyhow::Result<()> {
+    let payload: &[u8] = b"content-addressed on local disk";
     let hash = Hash::new(payload);
-
     let origin_dir = tempfile::tempdir()?;
-    seed_fs_blob(origin_dir.path(), hash, payload)?;
+    let hex = hash.to_hex();
+    let shard = origin_dir.path().join(
+        hex.get(..2)
+            .ok_or_else(|| anyhow::anyhow!("hex too short"))?,
+    );
+    std::fs::create_dir_all(&shard)?;
+    std::fs::write(shard.join(hex.as_str()), payload)?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
     let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
 
-    anyhow::ensure!(!engine.has(hash).await?, "blob should be absent initially");
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "first get should return fs bytes");
-    anyhow::ensure!(engine.has(hash).await?, "blob should be cached after miss");
-
-    // Wipe the origin dir to prove the second read is purely local.
-    drop(origin_dir);
-    let got2 = engine.get(hash).await?;
-    anyhow::ensure!(&got2[..] == payload, "second get should be served locally");
-    Ok(())
-}
-
-#[tokio::test]
-async fn fs_origin_reports_not_found() -> anyhow::Result<()> {
-    let origin_dir = tempfile::tempdir()?;
-    let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-
-    let err = err_of(engine.get(Hash::new(b"absent")).await)?;
+    let err = err_of(engine.populate(hash).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::NotFound { .. }),
         "expected NotFound, got: {err:?}"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn fs_origin_rejects_oversize() -> anyhow::Result<()> {
-    // 2 MiB payload seeded on disk; 1 MiB cap.
-    let payload = vec![0x42u8; 2 * 1024 * 1024];
-    let hash = Hash::new(&payload);
-
-    let origin_dir = tempfile::tempdir()?;
-    seed_fs_blob(origin_dir.path(), hash, &payload)?;
-
-    let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let engine = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from fs metadata-length fast-path, got: {err:?}"
-    );
+    anyhow::ensure!(!engine.has(hash).await?, "nothing lands in the store");
     Ok(())
 }
 
@@ -1194,7 +285,7 @@ async fn fs_origin_rejects_oversize() -> anyhow::Result<()> {
 async fn miss_without_origin_returns_no_origin() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
-    let err = err_of(engine.get(Hash::new(b"whatever")).await)?;
+    let err = err_of(engine.populate(Hash::new(b"whatever")).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::NoOrigin { .. }),
         "expected NoOrigin, got: {err:?}"
@@ -1202,1164 +293,49 @@ async fn miss_without_origin_returns_no_origin() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ----- Decompression (#312) -----
-//
-// `HttpOrigin` must transparently decompress `Content-Encoding: gzip` and
-// `Content-Encoding: zstd` responses before the engine's BLAKE3 verify
-// runs. The content-address is computed over the canonical (decompressed)
-// form, so a raw-bytes pass-through would fail every verify.
-
-use std::io::Write;
-
-fn gzip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    e.write_all(payload)?;
-    Ok(e.finish()?)
-}
-
-fn zstd_compress(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    Ok(zstd::stream::encode_all(payload, 1)?)
-}
-
-#[tokio::test]
-async fn http_origin_decompresses_gzip_response() -> anyhow::Result<()> {
-    let payload: &[u8] = b"hello, gzipped world! repeat repeat repeat repeat";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    let compressed = gzip(payload)?;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "gzip")
-                .set_body_bytes(compressed),
-        )
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        &got[..] == payload,
-        "decompressed bytes should match canonical payload"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_decompresses_zstd_response() -> anyhow::Result<()> {
-    let payload: &[u8] = b"hello, zstd! and a longer body to compress meaningfully xxxxx";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    let compressed = zstd_compress(payload)?;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "zstd")
-                .set_body_bytes(compressed),
-        )
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "decompressed bytes should match");
-    Ok(())
-}
-
-/// HTTP twin of `cache_engine_s3_compressed_above_buffer_threshold_succeeds`
-/// (#804). A gzip body whose *encoded* `Content-Length` fits under
-/// `buffered_max_bytes` but whose *decoded* length exceeds it — while still
-/// under `max_blob_bytes` — must succeed. Before the fix the HTTP adapter
-/// reported the encoded length as `size_hint`, routing the body into the
-/// buffer/drain path whose cap (`buffered_max_bytes`) is applied to the
-/// *decoded* stream — falsely rejecting an in-bounds blob as `BlobTooLarge`.
-/// The fix hands `None` for compressed bodies so they take the streaming path
-/// capped at `max_blob_bytes`. The advertised `Content-Length` (set by
-/// wiremock from the body) is load-bearing: without it `size_hint` is already
-/// `None` and the bug would not reproduce.
-#[tokio::test]
-async fn http_origin_compressed_above_buffer_threshold_succeeds() -> anyhow::Result<()> {
-    // Decodes to 8 MiB: above the 4 MiB default `buffered_max_bytes`,
-    // below the 16 MiB `max_blob_size` from `build_engine`.
-    let payload = vec![0u8; 8 * 1024 * 1024];
-    let hash = Hash::new(&payload);
-    let compressed = gzip(&payload)?;
-    anyhow::ensure!(
-        compressed.len() < 4 * 1024 * 1024,
-        "test setup: encoded length must be under buffered_max_bytes (4 MiB) \
-         to route into the drain path pre-fix, was {} bytes",
-        compressed.len()
-    );
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "gzip")
-                .set_body_bytes(compressed),
-        )
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        got.len() == payload.len() && got[..] == payload[..],
-        "in-bounds compressed blob must decode and cache, got {} bytes",
-        got.len()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_passes_through_identity_encoding() -> anyhow::Result<()> {
-    let payload: &[u8] = b"plain identity payload";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "identity")
-                .set_body_bytes(payload),
-        )
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload);
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_rejects_unknown_encoding() -> anyhow::Result<()> {
-    let payload: &[u8] = b"who knows what encoding";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "br") // Brotli — not supported.
-                .set_body_bytes(payload),
-        )
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let err = err_of(engine.get(hash).await)?;
-    // Surfaced as an OriginError wrapping the UnsupportedEncoding source.
-    let formatted = format!("{err:?}");
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError, got: {formatted}"
-    );
-    anyhow::ensure!(
-        formatted.contains("Content-Encoding") || formatted.contains("br"),
-        "error should mention the unsupported encoding: {formatted}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_decompress_off_rejects_compressed_response() -> anyhow::Result<()> {
-    // With `decompress=false`, an origin that still returns
-    // `Content-Encoding: gzip` is a configuration mistake. We refuse
-    // up-front rather than passing the raw bytes through and letting
-    // the engine surface a confusing `HashMismatch` — operators get a
-    // precise "your origin is using an encoding I'm not handling"
-    // message they can act on.
-    let payload: &[u8] = b"canonical payload";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    let compressed = gzip(payload)?;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "gzip")
-                .set_body_bytes(compressed),
-        )
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(
-        HttpOrigin::parse(&server.uri())?.with_decompress_mode(decdn_cache::DecompressMode::Strict),
-    );
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-    let err = err_of(engine.get(hash).await)?;
-    let formatted = format!("{err:?}");
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError when decompression is off and encoding is set, got: {formatted}"
-    );
-    anyhow::ensure!(
-        formatted.contains("unsupported Content-Encoding") || formatted.contains("gzip"),
-        "error should name the unsupported encoding: {formatted}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_decompress_off_passes_through_identity() -> anyhow::Result<()> {
-    // The opt-out path is still useful for origins that legitimately
-    // serve raw bytes (no Content-Encoding, or `identity`). The hash
-    // must match because we never touched the bytes.
-    let payload: &[u8] = b"canonical payload";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin =
-        Arc::new(HttpOrigin::parse(&server.uri())?.with_decompress_mode(DecompressMode::Strict));
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(bytes.as_ref() == payload, "unexpected payload");
-    Ok(())
-}
-
-// ----- Decompression: typed-error access, bombs, edge cases (#312) -----
-//
-// The variants on `OriginError` (UnsupportedEncoding, DecompressionFailed,
-// MalformedEncoding) survive the `anyhow::Error → CacheError::OriginError`
-// boundary via `CacheError::origin_error_kind`, which walks the source
-// chain. Asserting on the typed variant locks in the contract — a future
-// refactor that wraps a context layer above the typed error in a way
-// that breaks downcast (e.g. flattening into a string) would fail these
-// tests rather than silently degrading observability.
-
-/// Build a wiremock origin that serves `body` with `Content-Encoding: encoding`
-/// at `/<hash>`. Returns `(server, hash)`.
-async fn serve_encoded(encoding: &'static str, body: Vec<u8>, canonical_hash: Hash) -> MockServer {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", canonical_hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", encoding)
-                .set_body_bytes(body),
-        )
-        .mount(&server)
-        .await;
-    server
-}
-
-/// Reject a decompression bomb mid-stream. Critical security path —
-/// without this test, a regression that removed the running cap on
-/// the decoded byte count would be a memory-exhaustion `DoS` via a
-/// malicious origin.
-///
-/// The engine's `count_and_cap_stream` is the single cap layer — it
-/// enforces `max_blob_bytes` on the **decoded** stream regardless of
-/// how the encoded bytes arrived (gzip, zstd, identity), so the bomb
-/// surfaces as a generic `CacheError::OriginError` whose message
-/// names the cap. Operator-debug fidelity: still actionable; the
-/// `DecompressionFailed` variant reaches the chain only when the
-/// decoder itself fails (truncated / empty body
-/// — see the dedicated tests below).
-#[tokio::test]
-async fn http_origin_rejects_decompression_bomb() -> anyhow::Result<()> {
-    // 4 MiB of zeros gzips to ~4 KiB. Engine cap = 1 MiB so neither
-    // the Content-Length fast-path (4 KiB encoded) nor the per-chunk
-    // cap on encoded bytes would catch this — only the
-    // count_and_cap_stream running total over decoded bytes does.
-    let payload = vec![0u8; 4 * 1024 * 1024];
-    let canonical = Hash::new(&payload);
-    let compressed = gzip(&payload)?;
-    anyhow::ensure!(
-        compressed.len() < 1024 * 1024,
-        "test setup: compressed body must be smaller than the cap to \
-         exercise the running-total check, was {} bytes",
-        compressed.len()
-    );
-    let server = serve_encoded("gzip", compressed, canonical).await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-
-    let err = err_of(engine.get(canonical).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::BlobTooLarge { .. }),
-        "expected BlobTooLarge from bomb cap, got: {err:?}"
-    );
-    Ok(())
-}
-
-/// Truncated gzip body: the decoder emits an `io::Error` mid-stream.
-/// The whole point of `OriginError::DecompressionFailed` is to produce
-/// a clear "decoder rejected the body" message rather than the
-/// downstream `CacheError::HashMismatch` an operator would otherwise
-/// see (the engine never gets to verify because there's nothing to
-/// verify).
-#[tokio::test]
-async fn http_origin_truncated_gzip_surfaces_decompression_failed() -> anyhow::Result<()> {
-    let payload: &[u8] = b"truncate me, please, but only the gzip wrapper";
-    let canonical = Hash::new(payload);
-    let mut compressed = gzip(payload)?;
-    // Lop off the gzip trailer + the final byte of the deflate stream.
-    // 12+ bytes is enough to break the CRC and length checks.
-    let drop = compressed.len().saturating_sub(20);
-    compressed.truncate(drop);
-    let server = serve_encoded("gzip", compressed, canonical).await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let err = err_of(engine.get(canonical).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError, got: {err:?}"
-    );
-    let kind = err
-        .origin_error_kind()
-        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
-    anyhow::ensure!(
-        matches!(
-            kind,
-            OriginError::DecompressionFailed {
-                encoding: SupportedEncoding::Gzip,
-                ..
-            }
-        ),
-        "expected DecompressionFailed(Gzip), got: {kind:?}"
-    );
-    Ok(())
-}
-
-/// Unknown encoding surfaces typed `UnsupportedEncoding` — exercises the
-/// downcast helper, complementing `http_origin_rejects_unknown_encoding`
-/// which only asserts on the formatted message.
-#[tokio::test]
-async fn http_origin_unknown_encoding_is_typed() -> anyhow::Result<()> {
-    let payload: &[u8] = b"who knows";
-    let hash = Hash::new(payload);
-    let server = serve_encoded("br", payload.to_vec(), hash).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    let kind = err
-        .origin_error_kind()
-        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
-    let OriginError::UnsupportedEncoding { encoding } = kind else {
-        anyhow::bail!("expected UnsupportedEncoding, got: {kind:?}");
-    };
-    anyhow::ensure!(
-        encoding.as_ref() == "br",
-        "encoding string should round-trip: {encoding:?}"
-    );
-    Ok(())
-}
-
-/// Case-insensitive matching: `Content-Encoding: GZIP` is RFC-compliant
-/// and must be handled identically to lowercase `gzip`. Without an
-/// explicit test, a refactor swapping `eq_ignore_ascii_case` for `==`
-/// would silently break interop with origins that upper-case the value.
-#[tokio::test]
-async fn http_origin_accepts_uppercase_gzip_encoding() -> anyhow::Result<()> {
-    let payload: &[u8] = b"upper case is fine, RFC says so";
-    let hash = Hash::new(payload);
-    let server = serve_encoded("GZIP", gzip(payload)?, hash).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload);
-    Ok(())
-}
-
-/// Legacy `x-gzip` alias — ancient origins serve this. Same behaviour
-/// as `gzip`.
-#[tokio::test]
-async fn http_origin_accepts_x_gzip_encoding() -> anyhow::Result<()> {
-    let payload: &[u8] = b"the x prefix predates RFC 2616";
-    let hash = Hash::new(payload);
-    let server = serve_encoded("x-gzip", gzip(payload)?, hash).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload);
-    Ok(())
-}
-
-/// Multi-encoding `gzip, zstd` must be rejected. The current
-/// implementation doesn't split commas; future "smart" parsing would
-/// silently change semantics, and this test locks the explicit
-/// rejection in.
-#[tokio::test]
-async fn http_origin_rejects_multi_encoding_header() -> anyhow::Result<()> {
-    let payload: &[u8] = b"don't try to be clever";
-    let hash = Hash::new(payload);
-    let server = serve_encoded("gzip, zstd", gzip(payload)?, hash).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    let kind = err
-        .origin_error_kind()
-        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
-    anyhow::ensure!(
-        matches!(kind, OriginError::UnsupportedEncoding { .. }),
-        "expected UnsupportedEncoding for multi-encoding, got: {kind:?}"
-    );
-    Ok(())
-}
-
-/// Above the 1 MiB `DECOMPRESS_BLOCKING_THRESHOLD`, decompression runs
-/// inside `spawn_blocking`. A regression dropping the `.await` or
-/// flipping the comparator would fail this test (the current
-/// `pull_through_succeeds_above_one_mib_payload` only exercises
-/// the *hash* threshold via `FilesystemOrigin` and never decompresses).
-#[tokio::test]
-async fn http_origin_decompresses_above_blocking_threshold() -> anyhow::Result<()> {
-    // 2 MiB decompressed → crosses the 1 MiB threshold for both the
-    // raw read AND the spawn_blocking path inside the decoder.
-    let payload = vec![0xC0u8; 2 * 1024 * 1024];
-    let hash = Hash::new(&payload);
-    let server = serve_encoded("gzip", gzip(&payload)?, hash).await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(got.len() == payload.len(), "size mismatch: {}", got.len());
-    anyhow::ensure!(got[..] == payload[..], "decompressed content mismatch");
-    Ok(())
-}
-
-/// Pre-stream Content-Length rejection now applies to compressed bodies
-/// too: an origin that advertises a compressed body larger than
-/// `max_bytes` is malicious or misconfigured (compression ratios < 1
-/// are universal in practice). Catching it before any byte streams
-/// saves bandwidth and surfaces a clearer error.
-#[tokio::test]
-async fn http_origin_rejects_oversized_compressed_content_length() -> anyhow::Result<()> {
-    // 2 MiB of repeating bytes gzips to about a few KiB, but we lie to
-    // the client: serve a 5 MiB compressed body with `Content-Encoding:
-    // gzip` and `Content-Length: 5 MiB`, then cap at 1 MiB.
-    let canonical = Hash::new(b"doesn't matter");
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", canonical.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "gzip")
-                // Honest C-L describing the body; mock-server's HTTP
-                // layer fills the actual length, but it'll exceed the
-                // cap anyway.
-                .set_body_bytes(vec![0u8; 5 * 1024 * 1024]),
-        )
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-
-    let err = err_of(engine.get(canonical).await)?;
-    let msg = err.display_chain().to_string();
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from compressed C-L cap, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.contains("exceeds max"),
-        "error should name the cap: {msg}"
-    );
-    Ok(())
-}
-
-/// Empty compressed body (the `Content-Encoding: gzip` is present but
-/// the body has zero bytes) is malformed — gzip frames have minimum
-/// header overhead. The decoder rejects mid-stream with
-/// `DecompressionFailed`.
-#[tokio::test]
-async fn http_origin_empty_gzip_body_surfaces_decompression_failed() -> anyhow::Result<()> {
-    let canonical = Hash::new(b"phantom");
-    let server = serve_encoded("gzip", Vec::new(), canonical).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    let err = err_of(engine.get(canonical).await)?;
-    let kind = err
-        .origin_error_kind()
-        .ok_or_else(|| anyhow::anyhow!("expected typed downcast"))?;
-    anyhow::ensure!(
-        matches!(
-            kind,
-            OriginError::DecompressionFailed {
-                encoding: SupportedEncoding::Gzip,
-                ..
-            }
-        ),
-        "expected DecompressionFailed(Gzip), got: {kind:?}"
-    );
-    Ok(())
-}
-
-/// `BLAKE3` verify must run over the *decompressed* form (the whole
-/// point of #312). Flipping a single byte of the canonical payload
-/// before computing the expected hash would let a buggy implementation
-/// (one that hashes the raw compressed bytes) pass — this test asserts
-/// the verify happens after decompression by deliberately requesting
-/// a hash that matches the compressed bytes, not the canonical ones,
-/// and expecting `HashMismatch`.
-#[tokio::test]
-async fn http_origin_blake3_verify_runs_over_decompressed_bytes() -> anyhow::Result<()> {
-    let payload: &[u8] = b"verify-after-decompress, not before";
-    let canonical = Hash::new(payload);
-    let compressed = gzip(payload)?;
-    // Hash of the *compressed* bytes — what a regression would match.
-    let raw_hash = Hash::new(&compressed);
-    anyhow::ensure!(canonical != raw_hash, "test premise: hashes differ");
-
-    let server = serve_encoded("gzip", compressed, raw_hash).await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    // Asking for the raw-bytes hash: the decoded body has a different
-    // BLAKE3 → engine surfaces HashMismatch (proving the verify saw
-    // the canonical bytes, not the compressed ones).
-    let err = err_of(engine.get(raw_hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch (verify ran over decompressed form), got: {err:?}"
-    );
-    Ok(())
-}
-
-/// Strict mode passes through identity, regression-locks the opt-out
-/// path. (The companion test
-/// `http_origin_decompress_off_passes_through_identity` already exists;
-/// this is the "encoding header explicitly set to `identity`" variant.)
-#[tokio::test]
-async fn http_origin_strict_mode_accepts_explicit_identity() -> anyhow::Result<()> {
-    let payload: &[u8] = b"explicit identity";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "identity")
-                .set_body_bytes(payload),
-        )
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin =
-        Arc::new(HttpOrigin::parse(&server.uri())?.with_decompress_mode(DecompressMode::Strict));
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload);
-    Ok(())
-}
-
-// ----- HTTP status mapping (#375) -----
-//
-// `HttpOrigin::fetch` partitions response status into three buckets:
-//   * 404 → `OriginFetch::NotFound` — surfaced as `CacheError::NotFound`,
-//     the dedicated "object missing at origin" signal.
-//   * 2xx → success, body is read.
-//   * everything else → `anyhow::bail!`, surfaced as
-//     `CacheError::OriginError` with the status in the message.
-//
-// The 404 case has dedicated coverage above. These tests pin the
-// remaining buckets so a refactor that, say, broadens NotFound to all
-// 4xx (which would corrupt operator triage by reporting a 410 Gone or
-// 403 Forbidden as "absent") fails loudly.
-
-/// Mount a wiremock at `/<hash>` for each status. Each status gets a
-/// distinct hash so a single engine + server pair can serve the whole
-/// table — avoids the per-iteration `MockServer::start` + `tempdir`
-/// overhead that adds up across the suite.
-async fn mount_status_mocks(server: &MockServer, statuses: &[u16]) -> Vec<Hash> {
-    let mut hashes = Vec::with_capacity(statuses.len());
-    for &status in statuses {
-        let label = format!("status-mapping-{status}");
-        let hash = Hash::new(label.as_bytes());
-        Mock::given(method("GET"))
-            .and(path(format!("/{}", hash.to_hex())))
-            .respond_with(ResponseTemplate::new(status))
-            .mount(server)
-            .await;
-        hashes.push(hash);
-    }
-    hashes
-}
-
-#[tokio::test]
-async fn http_origin_4xx_other_than_404_surfaces_origin_error() -> anyhow::Result<()> {
-    // Picks a representative spread:
-    //   * 410 Gone — the case operators most often expect to be folded
-    //     into NotFound; pinning OriginError keeps a future "broaden
-    //     NotFound to all 4xx" refactor visible.
-    //   * 401/403 — auth misconfiguration.
-    //   * 400/422 — malformed request.
-    //   * 429 — rate-limited, retryable; must not cache as absent.
-    let statuses = [400u16, 401, 403, 410, 422, 429];
-    let server = MockServer::start().await;
-    let hashes = mount_status_mocks(&server, &statuses).await;
-    // 429 is transient under the new classifier (#285) and would burn
-    // the default retry budget without changing the assertion. Use a
-    // disabled-retry engine so the test stays fast and asserts the
-    // first-attempt mapping rather than the post-retry collapse.
-    let (engine, _tmp) = build_engine_no_retry(&server.uri()).await?;
-
-    for (status, hash) in statuses.iter().zip(hashes.iter()) {
-        let err = err_of(engine.get(*hash).await)?;
-        let msg = err.display_chain().to_string();
-        anyhow::ensure!(
-            matches!(err, CacheError::OriginError { .. }),
-            "expected OriginError for status {status}, got: {err:?}"
-        );
-        anyhow::ensure!(
-            msg.contains(&status.to_string()),
-            "error should name status {status}: {msg}"
-        );
-        anyhow::ensure!(
-            !engine.has(*hash).await?,
-            "non-404 4xx must not populate the cache for {status}"
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_5xx_surfaces_origin_error() -> anyhow::Result<()> {
-    // 5xx is transient origin trouble, not "object missing". Pinning
-    // `OriginError` (rather than `NotFound`) keeps the operator-facing
-    // distinction intact: `NotFound` is the signal a client uses to
-    // give up; misclassifying a 503 as `NotFound` would mask an outage
-    // as missing data.
-    let statuses = [500u16, 502, 503, 504];
-    let server = MockServer::start().await;
-    let hashes = mount_status_mocks(&server, &statuses).await;
-    // Disabled retry: this test pins the first-attempt 5xx classification.
-    // The retry-loop's behaviour on 5xx is covered by
-    // `retry_classifies_http_5xx_as_transient_then_succeeds` below.
-    let (engine, _tmp) = build_engine_no_retry(&server.uri()).await?;
-
-    for (status, hash) in statuses.iter().zip(hashes.iter()) {
-        let err = err_of(engine.get(*hash).await)?;
-        let msg = err.display_chain().to_string();
-        anyhow::ensure!(
-            matches!(err, CacheError::OriginError { .. }),
-            "expected OriginError for status {status}, got: {err:?}"
-        );
-        anyhow::ensure!(
-            msg.contains(&status.to_string()),
-            "error should name status {status}: {msg}"
-        );
-        anyhow::ensure!(
-            !engine.has(*hash).await?,
-            "5xx must not populate the cache for {status}"
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_2xx_non_200_succeeds() -> anyhow::Result<()> {
-    // `status.is_success()` is the gate, not `== 200`. RFC 9110 §15.3
-    // permits a 2xx range; an origin returning 203 (Non-Authoritative
-    // Information) or 206 should still be accepted. This pins the
-    // wider acceptance so a future tightening to `== 200` is a
-    // deliberate, test-visible decision.
-    let payload: &[u8] = b"two-oh-three is fine";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(203).set_body_bytes(payload))
-        .mount(&server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "2xx body must be served");
-    Ok(())
-}
-
-// ----- Content-Length advisory fast-path (#375) -----
-//
-// `HttpOrigin::fetch` short-circuits with an `OriginError` *before*
-// reading any body when `Content-Length > max_bytes`. The existing
-// `blob_too_large_is_rejected_via_http_origin` test trips both the
-// fast-path and the streaming cap (2 MiB body, 1 MiB cap, wiremock
-// sets honest C-L). These tests isolate the fast-path:
-//
-//   * spoof a huge `Content-Length` with no body — proves the check
-//     fires from headers alone, before any chunk read,
-//   * exercise the off-by-one boundary (cap == limit succeeds; cap + 1
-//     fails). A regression flipping `>` to `>=` would slip past the
-//     existing 2x-over test but fail here.
-
-/// Bind an ephemeral TCP port and serve exactly one response with
-/// `Content-Length: <advertised>` followed by `body_bytes`. Used to
-/// spoof a Content-Length that lies about the body size — the
-/// fast-path rejection inside `HttpOrigin::fetch` must fire on
-/// the advertised length alone, never reading the body.
-async fn spawn_spoofed_content_length_server(
-    advertised: u64,
-    body: Vec<u8>,
-) -> anyhow::Result<std::net::SocketAddr> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    tokio::spawn(async move {
-        let Ok((mut sock, _)) = listener.accept().await else {
-            return;
-        };
-        // Drain request headers — same pattern as the other raw-TCP
-        // helpers in this file.
-        let mut buf = [0u8; 4096];
-        loop {
-            match sock.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => {
-                    let seen = buf.get(..n).unwrap_or(&[]);
-                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-            }
-        }
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {advertised}\r\nContent-Type: application/octet-stream\r\n\r\n",
-        );
-        if sock.write_all(header.as_bytes()).await.is_err() {
-            return;
-        }
-        let _ = sock.write_all(&body).await;
-        // Hold the socket open so the client doesn't see EOF before it
-        // has time to act on the headers.
-        let _sock = sock;
-        std::future::pending::<()>().await;
-    });
-    Ok(addr)
-}
-
-#[tokio::test]
-async fn http_origin_rejects_advertised_oversize_before_reading_body() -> anyhow::Result<()> {
-    // Spoof Content-Length: 5 GiB but write zero body bytes. If the
-    // fast-path is wired correctly, `fetch` returns immediately with
-    // an error naming the cap. If a regression removes the C-L check,
-    // this would fall through to streaming and hit either the chunk
-    // idle timeout (much slower) or — worse — block forever waiting
-    // on a body that will never arrive.
-    let advertised: u64 = 5 * 1024 * 1024 * 1024;
-    let addr = spawn_spoofed_content_length_server(advertised, Vec::new()).await?;
-    // Tight timeouts: if the fast-path fails, the test should fail
-    // *fast* with a timeout error rather than tying up the suite.
-    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
-        .with_timeouts(Duration::from_secs(5), Duration::from_millis(500));
-
-    let tmp = tempfile::tempdir()?;
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 1).await?;
-
-    let err = err_of(engine.get(Hash::new(b"anything")).await)?;
-    let msg = err.display_chain().to_string();
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from Content-Length fast-path, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.contains("exceeds max"),
-        "error should name the fast-path message: {msg}"
-    );
-    anyhow::ensure!(
-        msg.contains(&advertised.to_string()),
-        "error should name the advertised length {advertised}: {msg}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_accepts_content_length_exactly_at_cap() -> anyhow::Result<()> {
-    // Exactly-at-cap is the right side of the `>` comparison —
-    // `len > max_bytes` must be false when `len == max_bytes`. A
-    // regression flipping to `>=` would reject this legitimate
-    // payload, so the test pins the boundary.
-    const CAP_MB: u64 = 1;
-    const CAP_BYTES: usize = 1024 * 1024;
-    let payload = vec![0xA5u8; CAP_BYTES];
-    let hash = Hash::new(&payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], CAP_MB).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        got.len() == payload.len(),
-        "exact-cap size mismatch: {} vs {}",
-        got.len(),
-        payload.len()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_rejects_content_length_one_over_cap() -> anyhow::Result<()> {
-    // Companion to the exact-cap test: `cap + 1` must trip the
-    // fast-path. Together with the exact-cap test these pin the
-    // off-by-one boundary that the existing 2x-over test cannot.
-    const CAP_MB: u64 = 1;
-    const CAP_BYTES: usize = 1024 * 1024;
-    let payload = vec![0xA6u8; CAP_BYTES + 1];
-    let hash = Hash::new(&payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&server)
-        .await;
-
-    let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], CAP_MB).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    let msg = err.display_chain().to_string();
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError at cap+1, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.contains("exceeds max"),
-        "error should name the fast-path message at boundary: {msg}"
-    );
-    Ok(())
-}
-
-// ----- Redirect handling (#375, hardened in #579) -----
-//
-// `HttpOrigin` builds its `reqwest::Client` with `redirect::Policy::none()`
-// (SSRF defence — see `HttpOrigin::new_with_user_agent`). All 3xx
-// responses come back to us as `resp.status()` and are rejected
-// outright with a typed permanent error. Origins MUST serve
-// `{base}/{hex}` directly; query/fragment are already rejected at
-// config-load by `parse_origin_url`, so a redirect was never a
-// legitimate response shape.
-//
-// The threat model: even if the configured base URL points at a
-// trusted origin, a compromised or attacker-influenced origin could
-// 3xx-redirect to `http://169.254.169.254/...` (cloud metadata) or
-// `http://127.0.0.1/...` (internal services). BLAKE3 verification
-// only fires after the body arrives; the request itself is the SSRF
-// primitive. Refusing 3xx before any follow-up TCP attempt closes
-// that window.
-
-#[tokio::test]
-async fn http_origin_rejects_302_redirect() -> anyhow::Result<()> {
-    // 302 to a would-be canonical-bytes origin. With `Policy::none()`,
-    // the redirect target must never be contacted — we assert that
-    // directly via `received_requests()`.
-    let payload: &[u8] = b"behind a 302";
-    let hash = Hash::new(payload);
-
-    let final_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&final_server)
-        .await;
-
-    let redirect_server = MockServer::start().await;
-    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
-        .mount(&redirect_server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
-    let err = err_of(engine.get(hash).await)?;
-    let msg = format!("{err:?}");
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from 302, got: {err:?}"
-    );
-    anyhow::ensure!(
-        msg.to_ascii_lowercase().contains("redirect"),
-        "error message should name redirects, got: {msg}"
-    );
-    let final_hits = received_requests_or_fail(&final_server, "302 SSRF test").await?;
-    anyhow::ensure!(
-        final_hits.is_empty(),
-        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
-        final_hits.len()
-    );
-    // Source-hit count = 1 guards against the test passing vacuously
-    // if the client errored before issuing any HTTP request (e.g. a
-    // URL-build failure on a future refactor): the SSRF assertion
-    // would still see 0 target hits, but the rejection wouldn't be
-    // proving what we think.
-    let source_hits = received_requests_or_fail(&redirect_server, "302 SSRF test source").await?;
-    anyhow::ensure!(
-        source_hits.len() == 1,
-        "expected exactly 1 request to the redirect source, got {}",
-        source_hits.len()
-    );
-    anyhow::ensure!(!engine.has(hash).await?, "rejected fetch must not cache");
-    Ok(())
-}
-
-/// Resolve `received_requests()` or fail loudly: `None` means wiremock
-/// recording is disabled, in which case the empty-vec proof of "no
-/// requests reached" is meaningless and would silently mask an SSRF
-/// regression. The redirect tests below rely on this assertion being
-/// load-bearing.
-async fn received_requests_or_fail(
-    server: &MockServer,
-    label: &str,
-) -> anyhow::Result<Vec<wiremock::Request>> {
-    server.received_requests().await.ok_or_else(|| {
-        anyhow::anyhow!(
-            "wiremock recording disabled in `{label}` — SSRF assertion would silently pass; \
-             enable recording or rewrite the test"
-        )
-    })
-}
-
-#[tokio::test]
-async fn http_origin_rejects_301_redirect() -> anyhow::Result<()> {
-    // 301 (permanent) is semantically distinct from 302 (temporary),
-    // but `Policy::none()` refuses both classes the same way. Pin
-    // that we don't accidentally distinguish them.
-    let payload: &[u8] = b"behind a 301";
-    let hash = Hash::new(payload);
-
-    let final_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&final_server)
-        .await;
-
-    let redirect_server = MockServer::start().await;
-    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(301).insert_header("Location", location.as_str()))
-        .mount(&redirect_server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from 301, got: {err:?}"
-    );
-    let final_hits = received_requests_or_fail(&final_server, "301 SSRF test").await?;
-    anyhow::ensure!(
-        final_hits.is_empty(),
-        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
-        final_hits.len()
-    );
-    let source_hits = received_requests_or_fail(&redirect_server, "301 SSRF test source").await?;
-    anyhow::ensure!(
-        source_hits.len() == 1,
-        "expected exactly 1 request to the redirect source, got {}",
-        source_hits.len()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_rejects_307_redirect() -> anyhow::Result<()> {
-    // 307 (Temporary Redirect) preserves the request method, unlike
-    // 301/302 which most clients downgrade to GET. The
-    // `status.is_redirection()` gate in `HttpOrigin::fetch` covers
-    // 300-399 uniformly, so 307/308 are refused for the same reason —
-    // pin that by exercising 307 explicitly. A future refactor that
-    // narrowed the gate to specific status codes (e.g. only 301/302)
-    // would re-open SSRF via 307/308 and this test would catch it.
-    let payload: &[u8] = b"behind a 307";
-    let hash = Hash::new(payload);
-
-    let final_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&final_server)
-        .await;
-
-    let redirect_server = MockServer::start().await;
-    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(307).insert_header("Location", location.as_str()))
-        .mount(&redirect_server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from 307, got: {err:?}"
-    );
-    let final_hits = received_requests_or_fail(&final_server, "307 SSRF test").await?;
-    anyhow::ensure!(
-        final_hits.is_empty(),
-        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
-        final_hits.len()
-    );
-    let source_hits = received_requests_or_fail(&redirect_server, "307 SSRF test source").await?;
-    anyhow::ensure!(
-        source_hits.len() == 1,
-        "expected exactly 1 request to the redirect source, got {}",
-        source_hits.len()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_redirect_to_404_origin_surfaces_redirect_error() -> anyhow::Result<()> {
-    // The 3xx itself is terminal (the redirect is not followed) — the
-    // downstream 404 server should see zero requests, and the caller
-    // surfaces `OriginError`, not `NotFound`. This pins that we don't
-    // treat a 3xx as a possible NotFound shape.
-    let hash = Hash::new(b"absent at the would-be redirect target");
-
-    let final_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&final_server)
-        .await;
-
-    let redirect_server = MockServer::start().await;
-    let location = format!("{}/{}", final_server.uri(), hash.to_hex());
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
-        .mount(&redirect_server)
-        .await;
-
-    let (engine, _tmp) = build_engine(&redirect_server.uri()).await?;
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError (3xx is terminal), got: {err:?}"
-    );
-    let final_hits = received_requests_or_fail(&final_server, "redirect-to-404 SSRF test").await?;
-    anyhow::ensure!(
-        final_hits.is_empty(),
-        "redirect target must not be contacted (SSRF defence), got {} hit(s)",
-        final_hits.len()
-    );
-    let source_hits =
-        received_requests_or_fail(&redirect_server, "redirect-to-404 SSRF test source").await?;
-    anyhow::ensure!(
-        source_hits.len() == 1,
-        "expected exactly 1 request to the redirect source, got {}",
-        source_hits.len()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_origin_rejects_redirect_to_internal_address() -> anyhow::Result<()> {
-    // The core SSRF-defence assertion (#579): even when a redirect
-    // points at an internal/loopback address, no TCP attempt is made
-    // toward it. We aim the `Location` at `http://127.0.0.1:1/...`
-    // (port 1 is reserved); the other redirect tests above prove
-    // "no TCP attempt" against a wiremock target via
-    // `received_requests().is_empty()`, but a wiremock can't be
-    // stood up on port 1, so this test pins a different invariant:
-    // the only request that left the client went to the redirect
-    // *source*, which returned a 3xx — proving the SSRF defence
-    // short-circuited at the status check, not at a connect-refused
-    // on the would-be internal target.
-    let hash = Hash::new(b"attacker-pointed");
-
-    let redirect_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(302)
-                .insert_header("Location", format!("http://127.0.0.1:1/{}", hash.to_hex())),
-        )
-        .mount(&redirect_server)
-        .await;
-
-    let origin = HttpOrigin::parse(&redirect_server.uri())?
-        .with_timeouts(Duration::from_secs(10), Duration::from_secs(5));
-    let tmp = tempfile::tempdir()?;
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 16).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from 302-to-internal, got: {err:?}"
-    );
-
-    // Exactly one request hit the redirect source — proving the
-    // 3xx was the terminal response and no follow-up attempt to
-    // the internal address was issued. A regression that resumed
-    // following redirects would either also try `127.0.0.1:1` (and
-    // hang / refuse-connect, not return `OriginError` from
-    // `is_redirection()`) or, depending on the variant, increment
-    // this counter beyond 1; the equality check defends both.
-    let source_hits =
-        received_requests_or_fail(&redirect_server, "internal-address SSRF test").await?;
-    anyhow::ensure!(
-        source_hits.len() == 1,
-        "expected exactly 1 request to the redirect source, got {}: redirects \
-         may be being followed",
-        source_hits.len()
-    );
-    Ok(())
-}
-
 // ----- origin retry policy (#285) -----------------------------------------
 
-/// Build a `CacheEngine` with a custom retry policy and no metrics
-/// wiring. Returns the engine and the temp dir whose drop cleans up.
-async fn build_engine_with_retry(
-    origin: Arc<dyn Origin>,
-    policy: RetryPolicy,
-) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
-    build_engine_with_retry_and_breaker(
-        origin,
-        policy,
-        decdn_cache::CircuitBreakerPolicy::default(),
-    )
-    .await
-}
-
-/// [`build_engine_with_retry`] with an explicit circuit-breaker policy, so a
-/// test can compare the breaker-bounded path against the breaker-disabled
-/// (`CircuitBreakerPolicy::disabled()`) path.
-async fn build_engine_with_retry_and_breaker(
-    origin: Arc<dyn Origin>,
+/// Open an engine over `origins` with `policy` and `breaker`, then set
+/// `slot` so the test origins can admit into it.
+async fn open_engine(
+    origins: Vec<Arc<dyn Origin>>,
     policy: RetryPolicy,
     breaker: decdn_cache::CircuitBreakerPolicy,
+    metrics: Option<Arc<CacheMetrics>>,
+    slot: &EngineSlot,
 ) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
         tmp.path(),
-        vec![origin as Arc<dyn Origin>],
+        origins,
         16,
         PinnedHashes::empty(),
         policy,
         breaker,
-        None,
+        metrics,
         Duration::ZERO,
     )
     .await?;
+    slot.set(engine.clone())
+        .map_err(|_| anyhow::anyhow!("engine slot set twice"))?;
     Ok((engine, tmp))
+}
+
+/// Build a `CacheEngine` over one origin with a custom retry policy and no
+/// metrics wiring. Returns the engine and the temp dir whose drop cleans up.
+async fn build_engine_with_retry(
+    origin: Arc<dyn Origin>,
+    policy: RetryPolicy,
+    slot: &EngineSlot,
+) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    open_engine(
+        vec![origin],
+        policy,
+        decdn_cache::CircuitBreakerPolicy::default(),
+        None,
+        slot,
+    )
+    .await
 }
 
 /// Tiny policy used by tests where the *count* of attempts matters but
@@ -2372,18 +348,13 @@ const fn fast_retry_policy(max_retries: u32) -> RetryPolicy {
         initial_backoff_ms: 1,
         max_backoff_ms: 5,
         jitter_ratio: 0.0,
-        // Default-shaped buffer budget so existing tests exercise
-        // the same buffer-then-commit path the engine uses for sub-4-MiB
-        // blobs. Mid-stream-retry tests below override this explicitly
-        // when they need to pin a specific code path.
-        buffered_max_bytes: 4 << 20,
     }
 }
 
 /// Origin that returns N successive `OriginPullError::Transient` failures
-/// before either yielding `Found(payload)` or, if `max_failures` is
-/// `usize::MAX`, failing forever. Counts every fetch via an `AtomicUsize`
-/// so tests can assert exact attempt totals.
+/// before admitting `payload`, or, if `max_failures` is `usize::MAX`,
+/// failing forever. Counts every fetch via an `AtomicUsize` so tests can
+/// assert exact attempt totals.
 #[derive(Debug)]
 struct FailingThenSucceedingOrigin {
     payload: bytes::Bytes,
@@ -2391,16 +362,18 @@ struct FailingThenSucceedingOrigin {
     fail_count: std::sync::atomic::AtomicUsize,
     fetch_count: std::sync::atomic::AtomicUsize,
     max_failures: usize,
+    engine: EngineSlot,
 }
 
 impl FailingThenSucceedingOrigin {
-    fn new(payload: &[u8], max_failures: usize) -> Self {
+    fn new(payload: &[u8], max_failures: usize, engine: &EngineSlot) -> Self {
         Self {
             target: Hash::new(payload),
             payload: bytes::Bytes::from(payload.to_vec()),
             fail_count: std::sync::atomic::AtomicUsize::new(0),
             fetch_count: std::sync::atomic::AtomicUsize::new(0),
             max_failures,
+            engine: Arc::clone(engine),
         }
     }
     fn fetches(&self) -> usize {
@@ -2410,7 +383,7 @@ impl FailingThenSucceedingOrigin {
 
 impl Origin for FailingThenSucceedingOrigin {
     fn kind(&self) -> OriginKind {
-        OriginKind::Http
+        OriginKind::Peer
     }
 
     fn fetch(
@@ -2432,7 +405,7 @@ impl Origin for FailingThenSucceedingOrigin {
                     "synthetic transient failure {prior}"
                 )))
             } else if hash == target {
-                Ok(OriginFetch::found_one_shot(payload))
+                admit(&self.engine, payload).await
             } else {
                 Ok(OriginFetch::NotFound)
             }
@@ -2440,27 +413,29 @@ impl Origin for FailingThenSucceedingOrigin {
     }
 }
 
-/// Origin that sleeps for a fixed `delay` before serving a successful
-/// `OriginFetch::Found(payload)`. The delay forces every concurrent
-/// `CacheEngine::get` caller to reach the coalescing table before the
-/// first owner's fetch completes — without it, an instantaneous fetch
-/// can finish before any waiter is even scheduled, making a coalescing
-/// assertion trivially pass for the wrong reason. Counts every fetch.
+/// Origin that sleeps for a fixed `delay` before admitting `payload`. The
+/// delay forces every concurrent `CacheEngine::populate` caller to reach the
+/// coalescing table before the first owner's fetch completes — without it,
+/// an instantaneous fetch can finish before any waiter is even scheduled,
+/// making a coalescing assertion trivially pass for the wrong reason. Counts
+/// every fetch.
 #[derive(Debug)]
 struct SlowOnceOrigin {
     payload: bytes::Bytes,
     target: Hash,
     fetch_count: std::sync::atomic::AtomicUsize,
     delay: Duration,
+    engine: EngineSlot,
 }
 
 impl SlowOnceOrigin {
-    fn new(payload: &[u8], delay: Duration) -> Self {
+    fn new(payload: &[u8], delay: Duration, engine: &EngineSlot) -> Self {
         Self {
             target: Hash::new(payload),
             payload: bytes::Bytes::from(payload.to_vec()),
             fetch_count: std::sync::atomic::AtomicUsize::new(0),
             delay,
+            engine: Arc::clone(engine),
         }
     }
     fn fetches(&self) -> usize {
@@ -2470,7 +445,7 @@ impl SlowOnceOrigin {
 
 impl Origin for SlowOnceOrigin {
     fn kind(&self) -> OriginKind {
-        OriginKind::Http
+        OriginKind::Peer
     }
 
     fn fetch(
@@ -2486,7 +461,7 @@ impl Origin for SlowOnceOrigin {
         Box::pin(async move {
             tokio::time::sleep(delay).await;
             if hash == target {
-                Ok(OriginFetch::found_one_shot(payload))
+                admit(&self.engine, payload).await
             } else {
                 Ok(OriginFetch::NotFound)
             }
@@ -2521,7 +496,7 @@ impl PermanentlyFailingOrigin {
 
 impl Origin for PermanentlyFailingOrigin {
     fn kind(&self) -> OriginKind {
-        OriginKind::Http
+        OriginKind::Peer
     }
 
     fn fetch(
@@ -2546,18 +521,99 @@ impl Origin for PermanentlyFailingOrigin {
     }
 }
 
+/// Origin that always returns `NotFound`. Used to simulate a mirror
+/// that doesn't have the blob — the fallback chain should advance past
+/// it to the next entry.
+#[derive(Debug)]
+struct NotFoundOrigin {
+    fetch_count: std::sync::atomic::AtomicUsize,
+}
+
+impl NotFoundOrigin {
+    const fn new() -> Self {
+        Self {
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn fetches(&self) -> usize {
+        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Origin for NotFoundOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Peer
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { Ok(OriginFetch::NotFound) })
+    }
+}
+
+/// Origin that admits a fixed `payload` on every fetch and counts fetches.
+#[derive(Debug)]
+struct PayloadOrigin {
+    payload: bytes::Bytes,
+    fetch_count: std::sync::atomic::AtomicUsize,
+    engine: EngineSlot,
+}
+
+impl PayloadOrigin {
+    fn new(payload: &[u8], engine: &EngineSlot) -> Self {
+        Self {
+            payload: bytes::Bytes::from(payload.to_vec()),
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+            engine: Arc::clone(engine),
+        }
+    }
+    fn fetches(&self) -> usize {
+        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Origin for PayloadOrigin {
+    fn kind(&self) -> OriginKind {
+        OriginKind::Peer
+    }
+
+    fn fetch(
+        &self,
+        _hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
+        self.fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let payload = self.payload.clone();
+        Box::pin(async move { admit(&self.engine, payload).await })
+    }
+}
+
 #[tokio::test]
 async fn retry_succeeds_after_transient_failures() -> anyhow::Result<()> {
     // 2 transient failures, then success on the 3rd attempt. Policy
     // allows 3 retries, so the loop has headroom.
     let payload: &[u8] = b"recovered";
-    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, 2));
-    let (engine, _tmp) =
-        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+    let slot = EngineSlot::default();
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, 2, &slot));
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        fast_retry_policy(3),
+        &slot,
+    )
+    .await?;
 
     let hash = Hash::new(payload);
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload, "payload survived retry chain");
+    engine.populate(hash).await?;
+    anyhow::ensure!(
+        &engine.read_blob(hash).await?[..] == payload,
+        "payload survived retry chain"
+    );
     anyhow::ensure!(
         origin.fetches() == 3,
         "expected exactly 3 origin attempts (2 fail + 1 success), got {}",
@@ -2570,12 +626,16 @@ async fn retry_succeeds_after_transient_failures() -> anyhow::Result<()> {
 async fn retry_exhausts_on_persistent_transient_failures() -> anyhow::Result<()> {
     // Origin fails forever. Policy allows 3 retries -> 4 total attempts.
     let payload: &[u8] = b"unreachable";
-    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
-    let (engine, _tmp) =
-        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+    let slot = EngineSlot::default();
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX, &slot));
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        fast_retry_policy(3),
+        &slot,
+    )
+    .await?;
 
-    let hash = Hash::new(payload);
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(Hash::new(payload)).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "exhausted retries should surface OriginError, got: {err:?}"
@@ -2592,12 +652,16 @@ async fn retry_exhausts_on_persistent_transient_failures() -> anyhow::Result<()>
 async fn retry_skips_permanent_failures() -> anyhow::Result<()> {
     // Permanent failure on the very first attempt — the loop must not
     // retry, even with a generous policy.
+    let slot = EngineSlot::default();
     let origin = Arc::new(PermanentlyFailingOrigin::new());
-    let (engine, _tmp) =
-        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(5)).await?;
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        fast_retry_policy(5),
+        &slot,
+    )
+    .await?;
 
-    let hash = Hash::new(b"anything");
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(Hash::new(b"anything")).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "permanent failure should surface OriginError, got: {err:?}"
@@ -2612,27 +676,22 @@ async fn retry_skips_permanent_failures() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn retry_skips_not_found_responses() -> anyhow::Result<()> {
-    // 404-equivalent: the adapter returns OriginFetch::NotFound, which
-    // is *not* an error and must not be retried. `expect(1)` on the
-    // mock panics on drop if more than one request lands.
-    let server = MockServer::start().await;
-    let hash = Hash::new(b"missing");
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1)
-        .mount(&server)
-        .await;
+    // `OriginFetch::NotFound` is *not* an error and must not be retried.
+    let slot = EngineSlot::default();
+    let origin = Arc::new(NotFoundOrigin::new());
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        fast_retry_policy(3),
+        &slot,
+    )
+    .await?;
 
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(Hash::new(b"missing")).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::NotFound { .. }),
-        "404 should map to CacheError::NotFound, got: {err:?}"
+        "NotFound should map to CacheError::NotFound, got: {err:?}"
     );
+    anyhow::ensure!(origin.fetches() == 1, "a miss is asked once");
     Ok(())
 }
 
@@ -2641,12 +700,16 @@ async fn retry_disabled_policy_makes_a_single_attempt() -> anyhow::Result<()> {
     // RetryPolicy::disabled() makes a single attempt: a transient
     // failure surfaces immediately without retrying.
     let payload: &[u8] = b"unreached";
-    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
-    let (engine, _tmp) =
-        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, RetryPolicy::disabled()).await?;
+    let slot = EngineSlot::default();
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX, &slot));
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        RetryPolicy::disabled(),
+        &slot,
+    )
+    .await?;
 
-    let hash = Hash::new(payload);
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(Hash::new(payload)).await)?;
     anyhow::ensure!(matches!(err, CacheError::OriginError { .. }));
     anyhow::ensure!(
         origin.fetches() == 1,
@@ -2657,79 +720,32 @@ async fn retry_disabled_policy_makes_a_single_attempt() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn retry_classifies_http_5xx_as_transient_then_succeeds() -> anyhow::Result<()> {
-    // wiremock's `up_to_n_times(N)` makes a mock match at most N times,
-    // after which subsequent requests fall through to the next mock
-    // (matched in registration order). This lets us script "fail twice,
-    // then succeed" without a custom Origin impl.
-    let payload: &[u8] = b"after backoff";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(2)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&server)
-        .await;
-
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload);
-    Ok(())
-}
-
-#[tokio::test]
-async fn retry_classifies_http_4xx_non_404_as_permanent() -> anyhow::Result<()> {
-    // 403 is permanent — the retry loop must not paper over what is
-    // probably an auth misconfiguration. `expect(1)` on the mock
-    // double-covers the no-retry assertion at drop time.
-    let payload: &[u8] = b"forbidden";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(403))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(5)).await?;
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(matches!(err, CacheError::OriginError { .. }));
-    Ok(())
-}
-
-#[tokio::test]
 async fn coalesced_owner_retry_unblocks_waiters_on_success() -> anyhow::Result<()> {
-    // Multiple concurrent gets for the same hash: the engine coalesces
+    // Multiple concurrent populates for the same hash: the engine coalesces
     // them through a single owner that runs the retry loop. The owner
     // retries through 2 transient failures, then succeeds; every waiter
-    // observes the final cached bytes — proof that the retry loop sits
-    // inside the coalescing critical section, not outside.
+    // observes the filled store — proof that the retry loop sits inside the
+    // coalescing critical section, not outside.
     let payload: &[u8] = b"shared via coalescing";
-    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, 2));
-    let (engine, _tmp) =
-        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(3)).await?;
+    let slot = EngineSlot::default();
+    let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, 2, &slot));
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        fast_retry_policy(3),
+        &slot,
+    )
+    .await?;
     let hash = Hash::new(payload);
 
     let mut handles = Vec::new();
     for _ in 0..6 {
         let e = engine.clone();
-        handles.push(tokio::spawn(async move { e.get(hash).await }));
+        handles.push(tokio::spawn(async move { e.populate(hash).await }));
     }
     for h in handles {
-        let bytes = h.await??;
-        anyhow::ensure!(&bytes[..] == payload);
+        h.await??;
     }
+    anyhow::ensure!(&engine.read_blob(hash).await?[..] == payload);
     // Coalescing collapses the 6 concurrent requests into one origin
     // pull. That one pull retries through 2 failures + 1 success = 3
     // origin fetches total. The exact total is the load-bearing
@@ -2757,43 +773,42 @@ async fn coalesced_owner_exhaustion_bounded_by_circuit_breaker() -> anyhow::Resu
     // `N_WAITERS` deliberately above `failure_threshold` so the breaker has to
     // shed load for the assertion to hold:
     //
-    //   1. Every concurrent get observes a `CacheError::OriginError` — no
-    //      spurious success from a stale cache hit, whether or not the breaker
-    //      short-circuited it.
+    //   1. Every concurrent populate observes a `CacheError::OriginError`.
     //   2. With the breaker DISABLED the amplification is exactly the O(N)
     //      worst case `N * (1 + max_retries)`: every waiter re-elects and burns
     //      a full budget.
     //   3. With the default breaker ENABLED the total origin fetches are capped
     //      at `failure_threshold * (1 + max_retries)` — a constant independent
-    //      of N — and therefore strictly below the O(N) case. This is what
-    //      would regress to O(N) if the breaker were unwired from pull-through.
+    //      of N — and therefore strictly below the O(N) case.
     //   4. Fetches stay at or above the no-coalescing minimum `1 + max_retries`,
     //      confirming retry actually runs before the breaker sheds.
     const N_WAITERS: u32 = 12;
     const MAX_RETRIES: u32 = 2;
 
-    // Spawn `N_WAITERS` concurrent gets at a forever-failing origin fronted by
-    // `breaker`; assert every one surfaces `OriginError`, then return the total
-    // number of origin fetches driven. Defined before the statements below to
-    // keep `clippy::items_after_statements` quiet.
+    // Spawn `N_WAITERS` concurrent populates at a forever-failing origin
+    // fronted by `breaker`; assert every one surfaces `OriginError`, then
+    // return the total number of origin fetches driven.
     async fn drive_down_origin(
         breaker: decdn_cache::CircuitBreakerPolicy,
         payload: &'static [u8],
         hash: Hash,
         n: u32,
     ) -> anyhow::Result<usize> {
-        let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
-        let (engine, _tmp) = build_engine_with_retry_and_breaker(
-            origin.clone() as Arc<dyn Origin>,
+        let slot = EngineSlot::default();
+        let origin = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX, &slot));
+        let (engine, _tmp) = open_engine(
+            vec![origin.clone() as Arc<dyn Origin>],
             fast_retry_policy(MAX_RETRIES),
             breaker,
+            None,
+            &slot,
         )
         .await?;
 
         let mut handles = Vec::new();
         for _ in 0..n {
             let e = engine.clone();
-            handles.push(tokio::spawn(async move { e.get(hash).await }));
+            handles.push(tokio::spawn(async move { e.populate(hash).await }));
         }
         for h in handles {
             match h.await? {
@@ -2857,13 +872,9 @@ async fn coalesced_owner_exhaustion_bounded_by_circuit_breaker() -> anyhow::Resu
 async fn coalesced_concurrent_misses_fire_origin_exactly_once() -> anyhow::Result<()> {
     // Minimal happy-path companion to
     // `coalesced_owner_retry_unblocks_waiters_on_success`: many simultaneous
-    // gets for an uncached hash collapse into a single origin pull when no
-    // retry budget is in play. The existing retry-flavoured tests pin
-    // `origin.fetches() == 3` (1 owner * 3 attempts) and a worst-case
-    // ceiling under sustained failure; neither pins the simpler invariant
-    // — `== 1` on the no-failure path — that #530 asks for. A regression
-    // that broke coalescing (e.g. waiters racing past the registration
-    // slot, or duplicate iroh-blobs inserts) would show up here as
+    // populates for an uncached hash collapse into a single origin pull when
+    // no retry budget is in play (#530). A regression that broke coalescing
+    // (e.g. waiters racing past the registration slot) would show up here as
     // fetches > 1 without retry noise muddying the count.
     //
     // The 25ms `SlowOnceOrigin` delay forces all 10 spawned tasks to reach
@@ -2871,633 +882,33 @@ async fn coalesced_concurrent_misses_fire_origin_exactly_once() -> anyhow::Resul
     // without it an instantaneous fetch could finish before any waiter
     // is even scheduled, making the assertion trivially pass.
     let payload: &[u8] = b"single shared origin fetch";
-    let origin = Arc::new(SlowOnceOrigin::new(payload, Duration::from_millis(25)));
-    let (engine, _tmp) =
-        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, RetryPolicy::disabled()).await?;
+    let slot = EngineSlot::default();
+    let origin = Arc::new(SlowOnceOrigin::new(
+        payload,
+        Duration::from_millis(25),
+        &slot,
+    ));
+    let (engine, _tmp) = build_engine_with_retry(
+        origin.clone() as Arc<dyn Origin>,
+        RetryPolicy::disabled(),
+        &slot,
+    )
+    .await?;
     let hash = Hash::new(payload);
 
     let mut handles = Vec::new();
     for _ in 0..10 {
         let e = engine.clone();
-        handles.push(tokio::spawn(async move { e.get(hash).await }));
+        handles.push(tokio::spawn(async move { e.populate(hash).await }));
     }
     for h in handles {
-        let bytes = h.await??;
-        anyhow::ensure!(&bytes[..] == payload);
+        h.await??;
     }
-
+    anyhow::ensure!(&engine.read_blob(hash).await?[..] == payload);
     anyhow::ensure!(
         origin.fetches() == 1,
         "coalesced concurrent misses must fire origin exactly once, got {}",
         origin.fetches()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn fs_origin_retries_on_transient_io_kind_then_succeeds() -> anyhow::Result<()> {
-    // Custom Origin that emits one Transient (synthetic Interrupted)
-    // before delegating to a real FilesystemOrigin. Verifies the retry
-    // loop fires for the FS adapter's Transient classification path.
-    #[derive(Debug)]
-    struct InterruptOnceOrigin {
-        inner: FilesystemOrigin,
-        first: std::sync::atomic::AtomicBool,
-    }
-    impl Origin for InterruptOnceOrigin {
-        fn kind(&self) -> OriginKind {
-            self.inner.kind()
-        }
-
-        fn fetch(
-            &self,
-            hash: Hash,
-            max_bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
-        {
-            let already_failed = self.first.swap(true, std::sync::atomic::Ordering::SeqCst);
-            if already_failed {
-                self.inner.fetch(hash, max_bytes)
-            } else {
-                Box::pin(async move {
-                    Err(OriginPullError::Transient(
-                        std::io::Error::from(std::io::ErrorKind::Interrupted).into(),
-                    ))
-                })
-            }
-        }
-    }
-
-    let base = tempfile::tempdir()?;
-    let payload: &[u8] = b"after interrupt";
-    let hash = Hash::new(payload);
-    // hash.to_hex() returns a stack-only ArrayString-style value; clone it
-    // so the borrow ends before we call `.get(..2)` on it via deref.
-    let hex = hash.to_hex().clone();
-    let shard = hex.get(..2).ok_or_else(|| anyhow::anyhow!("hex prefix"))?;
-    let shard_dir = base.path().join(shard);
-    tokio::fs::create_dir_all(&shard_dir).await?;
-    tokio::fs::write(shard_dir.join(&hex), payload).await?;
-
-    let inner = FilesystemOrigin::new(base.path()).await?;
-    let origin = Arc::new(InterruptOnceOrigin {
-        inner,
-        first: std::sync::atomic::AtomicBool::new(false),
-    });
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(2)).await?;
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(&got[..] == payload);
-    Ok(())
-}
-
-#[tokio::test]
-async fn fs_origin_does_not_retry_on_permission_denied() -> anyhow::Result<()> {
-    // PermissionDenied falls in the Permanent arm of classify_io_error.
-    // We synthesise it directly via a custom Origin since making a real
-    // FS path PermissionDenied is platform-specific and would skip on
-    // CI where the test runs as root in a container.
-    #[derive(Debug)]
-    struct DeniedOrigin {
-        count: std::sync::atomic::AtomicUsize,
-    }
-    impl Origin for DeniedOrigin {
-        fn kind(&self) -> OriginKind {
-            OriginKind::Filesystem
-        }
-
-        fn fetch(
-            &self,
-            _hash: Hash,
-            _max_bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
-        {
-            self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Box::pin(async move {
-                Err(OriginPullError::Permanent(
-                    std::io::Error::from(std::io::ErrorKind::PermissionDenied).into(),
-                ))
-            })
-        }
-    }
-    let origin = Arc::new(DeniedOrigin {
-        count: std::sync::atomic::AtomicUsize::new(0),
-    });
-    let (engine, _tmp) =
-        build_engine_with_retry(origin.clone() as Arc<dyn Origin>, fast_retry_policy(5)).await?;
-    let hash = Hash::new(b"denied");
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(matches!(err, CacheError::OriginError { .. }));
-    anyhow::ensure!(
-        origin.count.load(std::sync::atomic::Ordering::SeqCst) == 1,
-        "PermissionDenied must short-circuit after one attempt"
-    );
-    Ok(())
-}
-
-/// Wire-level proof that an operator-configured `cache.user_agent`
-/// actually reaches the origin. The `new_with_user_agent_accepts_custom_value`
-/// unit test in `crate::origin::http` only confirms the constructor doesn't
-/// error, leaving the "is it set on the wire?" question untested. A future
-/// reqwest builder reordering, or a typo passing the UA into the wrong
-/// builder slot, would silently ship the default — exactly the regression
-/// #435 is meant to prevent. Wiremock matches on the `User-Agent` header
-/// here; if the header doesn't match, the mock returns 404 and the engine
-/// errors out, which we assert against by checking the get succeeds.
-#[tokio::test]
-async fn http_origin_sends_configured_user_agent() -> anyhow::Result<()> {
-    use decdn_cache::parse_origin_url;
-
-    let payload: &[u8] = b"hello, decdn";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .and(header("user-agent", "MyCdn/1.0 (+ops@example.com)"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&server)
-        .await;
-
-    let url = parse_origin_url(&server.uri())?;
-    let origin = Arc::new(HttpOrigin::new_with_user_agent(
-        url,
-        "MyCdn/1.0 (+ops@example.com)",
-    )?);
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        &got[..] == payload,
-        "fetch should have succeeded — if the configured UA never reached the wire, \
-         the mock's header matcher would have served 404"
-    );
-    Ok(())
-}
-
-/// Default UA is sent on the wire when no override is configured. Pairs
-/// with the test above: together they prove the seam between the config
-/// resolver and the wire is intact in both branches.
-#[tokio::test]
-async fn http_origin_sends_default_user_agent_when_unset() -> anyhow::Result<()> {
-    use decdn_cache::{DEFAULT_USER_AGENT, parse_origin_url};
-
-    let payload: &[u8] = b"hello, decdn";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .and(header("user-agent", DEFAULT_USER_AGENT))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload))
-        .mount(&server)
-        .await;
-
-    let url = parse_origin_url(&server.uri())?;
-    let origin = Arc::new(HttpOrigin::new(url)?);
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 16).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        &got[..] == payload,
-        "default UA fetch should have succeeded"
-    );
-    Ok(())
-}
-
-// ----- mid-stream retry classification (#519) -----------------------------
-
-/// Connection-counting TCP server that ships a `Content-Length:` header
-/// plus `partial_bytes` of body before closing the socket — exercises
-/// the body-phase retry path (#519). On accept N (1-indexed) it
-/// switches to streaming the full payload and closes cleanly.
-///
-/// Returns the bound address and a shared counter incremented on each
-/// successful accept — tests assert on the counter to pin dispatch
-/// behaviour exactly. A separate counter (vs scraping `HttpOrigin`
-/// internals) is the only thing that pins "did the engine retry?"
-/// without coupling to private state.
-async fn spawn_mid_body_reset_server(
-    payload: bytes::Bytes,
-    partial_bytes: usize,
-    succeed_on_attempt: Option<usize>, // 1-indexed; None = fail every attempt
-) -> anyhow::Result<(std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cnt = counter.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            let attempt = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            // Drain headers on this connection only. A per-connection
-            // read error or EOF must NOT kill the spawned task — the
-            // engine will issue follow-up retries that need a live
-            // listener.
-            if drain_http_request_headers(&mut sock).await.is_err() {
-                continue;
-            }
-            let succeed = matches!(succeed_on_attempt, Some(n) if attempt >= n);
-            let hdr = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                payload.len()
-            );
-            if sock.write_all(hdr.as_bytes()).await.is_err() {
-                continue;
-            }
-            if succeed {
-                let _ = sock.write_all(&payload).await;
-                let _ = sock.shutdown().await;
-            } else {
-                let cut = partial_bytes.min(payload.len());
-                let slice = payload.get(..cut).unwrap_or(&[]);
-                let _ = sock.write_all(slice).await;
-                // Drop the socket without closing the write side
-                // gracefully — peer sees an early EOF mid-body, which
-                // reqwest surfaces as an `is_body()` error.
-                drop(sock);
-            }
-        }
-    });
-    Ok((addr, counter))
-}
-
-/// Read from `sock` until `\r\n\r\n` is observed (end of HTTP request
-/// headers). Maintains a 3-byte overlap across reads so a delimiter
-/// split between two `read()` calls is still detected — unlikely on
-/// loopback for a sub-100-byte reqwest GET, but cheap belt-and-
-/// suspenders. Returns the per-connection error rather than
-/// killing the caller's accept loop.
-async fn drain_http_request_headers(sock: &mut tokio::net::TcpStream) -> std::io::Result<()> {
-    let mut buf = [0u8; 4096];
-    // 3-byte tail from the previous read so a `\r\n\r\n` straddling
-    // two reads is still found.
-    let mut tail: [u8; 3] = [0; 3];
-    let mut tail_len: usize = 0;
-    loop {
-        let n = match sock.read(&mut buf).await {
-            Ok(0) => return Err(std::io::Error::other("peer closed before end of headers")),
-            Err(e) => return Err(e),
-            Ok(n) => n,
-        };
-        let mut window: Vec<u8> = Vec::with_capacity(tail_len + n);
-        window.extend_from_slice(tail.get(..tail_len).unwrap_or(&[]));
-        window.extend_from_slice(buf.get(..n).unwrap_or(&[]));
-        if window.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(());
-        }
-        // Carry up to the last 3 bytes for the next iteration's overlap.
-        let carry_from = window.len().saturating_sub(3);
-        let carry = window.get(carry_from..).unwrap_or(&[]);
-        tail_len = carry.len();
-        if let Some(slot) = tail.get_mut(..tail_len) {
-            slot.copy_from_slice(carry);
-        }
-    }
-}
-
-/// Small-blob mid-stream reset (`size_hint` <= 4 MiB) — exercises the
-/// buffer-then-commit path. The drain path classifies a mid-stream
-/// `io::Error` as Transient and re-enters the retry loop, rather than
-/// surfacing `OriginError` after one dispatch.
-#[tokio::test]
-async fn mid_stream_transient_retries_small_blob() -> anyhow::Result<()> {
-    let payload = bytes::Bytes::from_static(b"a small blob that fits in the buffered drain path");
-    let hash = Hash::new(&payload);
-    // 2 failures then success on attempt 3 — exercises the partial-
-    // success path with retries.
-    let (addr, counter) = spawn_mid_body_reset_server(payload.clone(), 8, Some(3)).await?;
-    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        got[..] == payload[..],
-        "payload survived mid-stream retry chain"
-    );
-    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
-    anyhow::ensure!(
-        dispatched == 3,
-        "expected exactly 3 dispatches (2 fail + 1 success), got {dispatched}"
-    );
-    Ok(())
-}
-
-/// Large-blob mid-stream reset (`size_hint` > 4 MiB) — exercises the
-/// streaming abort+restart path. Each failed attempt commits a partial
-/// `TempTag` worth of bytes that iroh-blobs GC reclaims; here we just
-/// pin the retry-count behaviour (the GC reclaim assertion is in the
-/// follow-up test).
-#[tokio::test]
-async fn mid_stream_transient_retries_large_blob_via_abort_restart() -> anyhow::Result<()> {
-    // 5 MiB body — above the 4 MiB `buffered_max_bytes` default, so
-    // the engine takes the streaming path. Pattern is intentionally
-    // non-trivial so partial-import bytes don't compress oddly under
-    // store-side optimisations.
-    let payload = bytes::Bytes::from(vec![0xa5_u8; 5 * 1024 * 1024]);
-    let hash = Hash::new(&payload);
-    let (addr, counter) = spawn_mid_body_reset_server(payload.clone(), 64 * 1024, Some(3)).await?;
-    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        got[..] == payload[..],
-        "5 MiB payload survived streaming abort+restart chain"
-    );
-    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
-    anyhow::ensure!(
-        dispatched == 3,
-        "expected exactly 3 dispatches on streaming abort+restart, got {dispatched}"
-    );
-    Ok(())
-}
-
-/// Large-blob mid-stream reset that never recovers — the streaming
-/// abort+restart path must exhaust the retry budget cleanly and not
-/// loop forever.
-#[tokio::test]
-async fn mid_stream_transient_exhausts_budget_large_blob() -> anyhow::Result<()> {
-    let payload = bytes::Bytes::from(vec![0x5a_u8; 5 * 1024 * 1024]);
-    let hash = Hash::new(&payload);
-    // None = fail forever; budget = 3 → 4 total dispatches.
-    let (addr, counter) = spawn_mid_body_reset_server(payload, 64 * 1024, None).await?;
-    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "exhausted mid-stream retries should surface OriginError, got: {err:?}"
-    );
-    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
-    anyhow::ensure!(
-        dispatched == 4,
-        "expected exactly 4 dispatches (1 + 3 retries), got {dispatched}"
-    );
-    Ok(())
-}
-
-/// Unknown `size_hint` (Transfer-Encoding: chunked, no Content-Length)
-/// must take the streaming path even for tiny payloads — buffering an
-/// unknown-size body could let a lying origin overrun the operator's
-/// memory budget. Retries still happen via abort+restart.
-///
-/// Mid-stream reset variant of the chunked server: ships a single short
-/// chunk then closes without a terminating `0\r\n\r\n`. Reqwest surfaces
-/// this as an `is_body()` mid-body error.
-#[tokio::test]
-async fn unknown_size_hint_uses_streaming_path_and_retries() -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cnt = counter.clone();
-    let payload: Vec<u8> = b"tiny chunked payload that needs retry".to_vec();
-    let payload_owned = payload.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            let attempt = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            // Per-connection header drain — same hygiene as
-            // `spawn_mid_body_reset_server`: don't kill the spawned
-            // task on a single failed read; carry a 3-byte overlap
-            // across reads for delimiter-split safety.
-            if drain_http_request_headers(&mut sock).await.is_err() {
-                continue;
-            }
-            if attempt >= 2 {
-                // Complete a proper chunked response on attempt 2+.
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-                    payload_owned.len()
-                );
-                let _ = sock.write_all(resp.as_bytes()).await;
-                let _ = sock.write_all(&payload_owned).await;
-                let _ = sock.write_all(b"\r\n0\r\n\r\n").await;
-                let _ = sock.shutdown().await;
-            } else {
-                // First attempt: short chunk then drop, no terminator.
-                let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n";
-                let _ = sock.write_all(resp).await;
-                drop(sock);
-            }
-        }
-    });
-    let hash = Hash::new(&payload);
-    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(got[..] == payload[..], "chunked payload retried");
-    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
-    anyhow::ensure!(
-        dispatched == 2,
-        "expected 2 dispatches (1 fail + 1 success), got {dispatched}"
-    );
-    Ok(())
-}
-
-/// Truncated gzip body under the 4 MiB threshold takes the drain path.
-/// The decoder's `io::Error` wraps a typed `OriginError::DecompressionFailed`
-/// which `classify_io_error` recognises as Permanent — the retry budget
-/// must not be burned even with retries available.
-#[tokio::test]
-async fn decompression_failure_is_permanent_under_threshold() -> anyhow::Result<()> {
-    let payload: &[u8] = b"a payload that gzip would compress but the response is truncated";
-    let hash = Hash::new(payload);
-    // Build a valid gzip stream then chop the trailing CRC/size words
-    // so the decoder errors after the magic check passes.
-    let mut compressed = Vec::new();
-    {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-        use std::io::Write as _;
-        let mut enc = GzEncoder::new(&mut compressed, Compression::default());
-        enc.write_all(payload)?;
-        enc.finish()?;
-    }
-    let drop = 8;
-    anyhow::ensure!(compressed.len() > drop, "gzip stream too short to truncate");
-    compressed.truncate(compressed.len() - drop);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Encoding", "gzip")
-                .set_body_bytes(compressed),
-        )
-        // expect(1): the decoder error is Permanent, so retry must not
-        // dispatch a second request even with budget available.
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected OriginError from truncated gzip, got: {err:?}"
-    );
-    // The typed variant must survive the body-phase classification
-    // path — the drain branch routes through the same
-    // `classify_io_error` typed-inner downcast.
-    anyhow::ensure!(
-        matches!(
-            err.origin_error_kind(),
-            Some(OriginError::DecompressionFailed {
-                encoding: SupportedEncoding::Gzip,
-                ..
-            })
-        ),
-        "expected typed DecompressionFailed(Gzip) on the error chain, got: {err:?}"
-    );
-    Ok(())
-}
-
-/// `buffered_max_bytes = 0` disables the drain branch (#519 operator
-/// opt-out). Mid-body resets on a tiny payload now route through the
-/// streaming abort+restart path instead — retry still works, but
-/// each failed attempt strands partial bytes (GC reclaim covered by
-/// a separate test).
-#[tokio::test]
-async fn buffered_max_bytes_zero_routes_through_streaming_path() -> anyhow::Result<()> {
-    let payload = bytes::Bytes::from_static(b"tiny payload that the operator chose not to buffer");
-    let hash = Hash::new(&payload);
-    let (addr, counter) = spawn_mid_body_reset_server(payload.clone(), 4, Some(2)).await?;
-    let origin = Arc::new(HttpOrigin::parse(&format!("http://{addr}/"))?);
-
-    let policy = RetryPolicy {
-        buffered_max_bytes: 0, // disable drain branch
-        ..fast_retry_policy(3)
-    };
-    let (engine, _tmp) = build_engine_with_retry(origin as Arc<dyn Origin>, policy).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(got[..] == payload[..]);
-    let dispatched = counter.load(std::sync::atomic::Ordering::SeqCst);
-    anyhow::ensure!(
-        dispatched == 2,
-        "expected 2 dispatches (streaming path with retry), got {dispatched}"
-    );
-    Ok(())
-}
-
-/// Origin advertises `size_hint = K` but its stream ships `>K` bytes —
-/// the drain path's running cap must trip and surface `BlobTooLarge`
-/// via the typed marker, not a generic `OriginError`. Pins the typed-
-/// outcome short-circuit in `pull_through_attempt`'s drain branch.
-///
-/// HTTP-based test setups can't drive this directly: reqwest stops
-/// reading at the declared `Content-Length` regardless of what the
-/// server ships. A custom `Origin` impl that lies about `size_hint`
-/// is the most direct way to exercise the running cap.
-#[tokio::test]
-async fn drain_overrun_surfaces_blob_too_large() -> anyhow::Result<()> {
-    #[derive(Debug)]
-    struct LyingSizeOrigin {
-        chunks: Vec<bytes::Bytes>,
-        advertised: u64,
-    }
-
-    impl Origin for LyingSizeOrigin {
-        fn kind(&self) -> OriginKind {
-            OriginKind::Http
-        }
-        fn fetch(
-            &self,
-            _hash: Hash,
-            _max_bytes: u64,
-        ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>>
-        {
-            let chunks = self.chunks.clone();
-            let advertised = self.advertised;
-            Box::pin(async move {
-                use futures_util::stream;
-                let stream =
-                    stream::iter(chunks.into_iter().map(Ok::<bytes::Bytes, std::io::Error>));
-                Ok(OriginFetch::Found {
-                    stream: Box::pin(stream),
-                    size_hint: Some(advertised),
-                })
-            })
-        }
-    }
-
-    // Origin advertises 1 KiB but actually streams 16 KiB. The drain
-    // cap (set below to 4 KiB via `buffered_max_bytes`) trips after
-    // the second chunk.
-    let chunks: Vec<bytes::Bytes> = (0..4)
-        .map(|_| bytes::Bytes::from(vec![0xAB_u8; 4 * 1024]))
-        .collect();
-    let origin: Arc<dyn Origin> = Arc::new(LyingSizeOrigin {
-        chunks,
-        advertised: 1024,
-    });
-    let policy = RetryPolicy {
-        // 4 KiB drain budget: bigger than the advertised 1 KiB
-        // size_hint (so the drain path is taken) but smaller than
-        // the actual 16 KiB body — overrun fires mid-drain.
-        buffered_max_bytes: 4 * 1024,
-        ..fast_retry_policy(0)
-    };
-    let (engine, _tmp) = build_engine_with_retry(origin, policy).await?;
-
-    let err = err_of(engine.get(Hash::new(b"unreached")).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::BlobTooLarge { .. }),
-        "expected BlobTooLarge from drain overrun, got: {err:?}"
-    );
-    Ok(())
-}
-
-/// Hash mismatch after a clean stream is *not* retried — that's an
-/// origin protocol violation, not a transport failure. The boundary
-/// between retry-class `io::Error` and deterministic `HashMismatch`
-/// must stay sharp; a regression that classified `HashMismatch` as
-/// Transient would burn budget on unrecoverable corruption.
-#[tokio::test]
-async fn hash_mismatch_after_streaming_is_not_retried() -> anyhow::Result<()> {
-    // Request a 5 MiB blob (above the buffered threshold to force the
-    // streaming path), but the server ships bytes whose hash doesn't
-    // match. `expect(1)` on the mock fails at drop time if the engine
-    // dispatches a second request.
-    let expected = Hash::new(b"expected payload");
-    // Ship a different payload of size > buffered_max_bytes so the
-    // streaming path is taken.
-    // Deterministic non-trivial pattern; the cast truncates the index
-    // intentionally — we just need bytes that hash to something other
-    // than `expected`.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let wrong: Vec<u8> = (0..6 * 1024 * 1024_i32).map(|i| i as u8).collect();
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", expected.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(wrong))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?);
-    let (engine, _tmp) =
-        build_engine_with_retry(origin as Arc<dyn Origin>, fast_retry_policy(3)).await?;
-
-    let err = err_of(engine.get(expected).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch, got: {err:?}"
     );
     Ok(())
 }
@@ -3508,144 +919,7 @@ async fn hash_mismatch_after_streaming_is_not_retried() -> anyhow::Result<()> {
 // `pull_through` consults `cache.origins` in declared order. The next
 // entry is tried on `NotFound`, on `Permanent` errors, and on
 // `Transient` errors after the per-origin retry budget is exhausted.
-// Deterministic per-origin failures (`HashMismatch`, `BlobTooLarge`)
-// short-circuit the chain — they indicate a misbehaving backend that
-// must surface, not be masked by trying a different mirror.
 // =====================================================================
-
-/// Origin that always returns `NotFound`. Used to simulate a mirror
-/// that doesn't have the blob — the fallback chain should advance past
-/// it to the next entry.
-#[derive(Debug)]
-struct NotFoundOrigin {
-    fetch_count: std::sync::atomic::AtomicUsize,
-}
-
-impl NotFoundOrigin {
-    const fn new() -> Self {
-        Self {
-            fetch_count: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-    fn fetches(&self) -> usize {
-        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl Origin for NotFoundOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        self.fetch_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async move { Ok(OriginFetch::NotFound) })
-    }
-}
-
-/// Origin that returns bytes whose BLAKE3 hash does not match the
-/// requested hash. Used to verify the engine surfaces `HashMismatch`
-/// without falling back — a hash mismatch is a backend misbehaviour
-/// signal, not an "is this blob present" signal, and trying the next
-/// origin would mask the underlying bug.
-#[derive(Debug)]
-struct LyingHashOrigin {
-    bogus: bytes::Bytes,
-}
-
-impl LyingHashOrigin {
-    fn new(bogus_payload: &[u8]) -> Self {
-        Self {
-            bogus: bytes::Bytes::from(bogus_payload.to_vec()),
-        }
-    }
-}
-
-impl Origin for LyingHashOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        let payload = self.bogus.clone();
-        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
-    }
-}
-
-/// Origin that wraps another and records how many `fetch` calls it
-/// receives. Used by fallback tests to assert that the chain DID or
-/// DID NOT advance to a given entry.
-#[derive(Debug)]
-struct CountingOrigin {
-    inner: Arc<dyn Origin>,
-    fetch_count: std::sync::atomic::AtomicUsize,
-}
-
-impl CountingOrigin {
-    fn new(inner: Arc<dyn Origin>) -> Self {
-        Self {
-            inner,
-            fetch_count: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-    fn fetches(&self) -> usize {
-        self.fetch_count.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl Origin for CountingOrigin {
-    fn kind(&self) -> OriginKind {
-        self.inner.kind()
-    }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        self.fetch_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.inner.fetch(hash, max_bytes)
-    }
-}
-
-/// Origin that serves a fixed `payload` on every fetch.
-#[derive(Debug)]
-struct PayloadOrigin {
-    payload: bytes::Bytes,
-}
-
-impl PayloadOrigin {
-    fn new(payload: &[u8]) -> Self {
-        Self {
-            payload: bytes::Bytes::from(payload.to_vec()),
-        }
-    }
-}
-
-impl Origin for PayloadOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        let payload = self.payload.clone();
-        Box::pin(async move { Ok(OriginFetch::found_one_shot(payload)) })
-    }
-}
 
 /// Construct a `CacheEngine` over an explicit fallback chain and a
 /// fast retry policy. Sharing this helper across the fallback tests
@@ -3654,28 +928,25 @@ impl Origin for PayloadOrigin {
 async fn build_engine_with_origins(
     origins: Vec<Arc<dyn Origin>>,
     metrics: Arc<CacheMetrics>,
+    slot: &EngineSlot,
 ) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open_full(
-        tmp.path(),
+    open_engine(
         origins,
-        16,
-        PinnedHashes::empty(),
         fast_retry_policy(3),
         decdn_cache::CircuitBreakerPolicy::default(),
         Some(metrics),
-        Duration::ZERO,
+        slot,
     )
-    .await?;
-    Ok((engine, tmp))
+    .await
 }
 
 #[tokio::test]
 async fn fallback_advances_on_notfound_to_next_origin() -> anyhow::Result<()> {
     let payload: &[u8] = b"served by mirror #2";
     let hash = Hash::new(payload);
+    let slot = EngineSlot::default();
     let first = Arc::new(NotFoundOrigin::new());
-    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let second = Arc::new(PayloadOrigin::new(payload, &slot));
     let metrics = Arc::new(CacheMetrics::default());
     let (engine, _tmp) = build_engine_with_origins(
         vec![
@@ -3683,11 +954,15 @@ async fn fallback_advances_on_notfound_to_next_origin() -> anyhow::Result<()> {
             Arc::clone(&second) as Arc<dyn Origin>,
         ],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(&bytes[..] == payload, "second origin must have served");
+    engine.populate(hash).await?;
+    anyhow::ensure!(
+        &engine.read_blob(hash).await?[..] == payload,
+        "second origin must have served"
+    );
     anyhow::ensure!(first.fetches() == 1, "primary must have been tried once");
     anyhow::ensure!(second.fetches() == 1, "fallback must have been reached");
     anyhow::ensure!(
@@ -3706,8 +981,9 @@ async fn fallback_advances_on_notfound_to_next_origin() -> anyhow::Result<()> {
 async fn fallback_advances_on_permanent_error_to_next_origin() -> anyhow::Result<()> {
     let payload: &[u8] = b"served after Permanent failure";
     let hash = Hash::new(payload);
+    let slot = EngineSlot::default();
     let first = Arc::new(PermanentlyFailingOrigin::new());
-    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let second = Arc::new(PayloadOrigin::new(payload, &slot));
     let metrics = Arc::new(CacheMetrics::default());
     let (engine, _tmp) = build_engine_with_origins(
         vec![
@@ -3715,11 +991,12 @@ async fn fallback_advances_on_permanent_error_to_next_origin() -> anyhow::Result
             Arc::clone(&second) as Arc<dyn Origin>,
         ],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(&bytes[..] == payload, "second origin must have served");
+    engine.populate(hash).await?;
+    anyhow::ensure!(engine.has(hash).await?, "second origin must have served");
     anyhow::ensure!(
         first.fetches() == 1,
         "Permanent error must not burn retry budget on origin 0"
@@ -3740,11 +1017,12 @@ async fn fallback_advances_on_permanent_error_to_next_origin() -> anyhow::Result
 async fn fallback_advances_on_transient_after_retry_exhaustion() -> anyhow::Result<()> {
     let payload: &[u8] = b"served after retry exhaustion";
     let hash = Hash::new(payload);
+    let slot = EngineSlot::default();
     // `max_failures = usize::MAX` => origin 0 transient-fails forever
     // and the retry budget runs out. With `fast_retry_policy(3)` that
     // is 1 + 3 = 4 attempts on origin 0 before the chain advances.
-    let first = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX));
-    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let first = Arc::new(FailingThenSucceedingOrigin::new(payload, usize::MAX, &slot));
+    let second = Arc::new(PayloadOrigin::new(payload, &slot));
     let metrics = Arc::new(CacheMetrics::default());
     let (engine, _tmp) = build_engine_with_origins(
         vec![
@@ -3752,11 +1030,12 @@ async fn fallback_advances_on_transient_after_retry_exhaustion() -> anyhow::Resu
             Arc::clone(&second) as Arc<dyn Origin>,
         ],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(&bytes[..] == payload, "second origin must have served");
+    engine.populate(hash).await?;
+    anyhow::ensure!(engine.has(hash).await?, "second origin must have served");
     anyhow::ensure!(
         first.fetches() == 4,
         "retry budget should be fully spent on origin 0 (1 + 3 retries), got {}",
@@ -3779,90 +1058,9 @@ async fn fallback_advances_on_transient_after_retry_exhaustion() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn fallback_does_not_advance_on_hash_mismatch() -> anyhow::Result<()> {
-    // Operator-actionable error class: a misbehaving backend served
-    // bytes that don't match the requested hash. The engine must
-    // surface that — *not* mask it by trying the next mirror — so a
-    // bad backend gets diagnosed instead of silently fronted by its
-    // peers.
-    let requested: &[u8] = b"requested payload";
-    let bogus: &[u8] = b"bogus payload that hashes differently";
-    let hash = Hash::new(requested);
-    let first = Arc::new(LyingHashOrigin::new(bogus));
-    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(requested))));
-    let metrics = Arc::new(CacheMetrics::default());
-    let (engine, _tmp) = build_engine_with_origins(
-        vec![
-            Arc::clone(&first) as Arc<dyn Origin>,
-            Arc::clone(&second) as Arc<dyn Origin>,
-        ],
-        Arc::clone(&metrics),
-    )
-    .await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::HashMismatch { .. }),
-        "expected HashMismatch from origin 0; chain must not advance, got: {err:?}",
-    );
-    anyhow::ensure!(
-        second.fetches() == 0,
-        "second origin must not be consulted after a hash mismatch",
-    );
-    anyhow::ensure!(
-        metrics.origin_fallback.get() == 0,
-        "hash mismatch must not bump the fallback counter",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn fallback_does_not_advance_on_blob_too_large() -> anyhow::Result<()> {
-    // Operator-set cap breach: surfacing this lets operators tune
-    // `max_blob_size_mb` or evict the offender, rather than silently
-    // letting a chain mirror serve under the same cap.
-    let payload = bytes::Bytes::from(vec![0xCDu8; 2 * 1024 * 1024]);
-    let hash = Hash::new(&payload);
-    let first = Arc::new(OversizedOrigin { payload });
-    let second = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(b"x"))));
-    let metrics = Arc::new(CacheMetrics::default());
-
-    // Cap at 1 MiB so the 2 MiB payload trips BlobTooLarge.
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![
-            Arc::clone(&first) as Arc<dyn Origin>,
-            Arc::clone(&second) as Arc<dyn Origin>,
-        ],
-        1,
-        PinnedHashes::empty(),
-        fast_retry_policy(3),
-        decdn_cache::CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&metrics)),
-        Duration::ZERO,
-    )
-    .await?;
-
-    let err = err_of(engine.get(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::BlobTooLarge { .. }),
-        "expected BlobTooLarge from origin 0; chain must not advance, got: {err:?}",
-    );
-    anyhow::ensure!(
-        second.fetches() == 0,
-        "second origin must not be consulted after BlobTooLarge",
-    );
-    anyhow::ensure!(
-        metrics.origin_fallback.get() == 0,
-        "BlobTooLarge must not bump the fallback counter",
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn all_origins_notfound_surfaces_notfound() -> anyhow::Result<()> {
     let hash = Hash::new(b"never-served");
+    let slot = EngineSlot::default();
     let first = Arc::new(NotFoundOrigin::new());
     let second = Arc::new(NotFoundOrigin::new());
     let metrics = Arc::new(CacheMetrics::default());
@@ -3872,10 +1070,11 @@ async fn all_origins_notfound_surfaces_notfound() -> anyhow::Result<()> {
             Arc::clone(&second) as Arc<dyn Origin>,
         ],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(hash).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::NotFound { .. }),
         "all-NotFound chain must surface NotFound (=> 404 at edge), got: {err:?}",
@@ -3896,6 +1095,7 @@ async fn all_origins_error_surfaces_origin_error_with_last_failure() -> anyhow::
     // 1 to assert origin 1's error survives into `OriginError.source`,
     // not origin 0's.
     let hash = Hash::new(b"never-served");
+    let slot = EngineSlot::default();
     let first = Arc::new(PermanentlyFailingOrigin::with_marker("primary-marker"));
     let second = Arc::new(PermanentlyFailingOrigin::with_marker("mirror-marker"));
     let metrics = Arc::new(CacheMetrics::default());
@@ -3905,10 +1105,11 @@ async fn all_origins_error_surfaces_origin_error_with_last_failure() -> anyhow::
             Arc::clone(&second) as Arc<dyn Origin>,
         ],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(hash).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "all-error chain must surface OriginError (=> 5xx at edge), got: {err:?}",
@@ -3935,9 +1136,10 @@ async fn fallback_counter_increments_per_step_in_three_origin_chain() -> anyhow:
     // 2-origin test.
     let payload: &[u8] = b"served from third mirror";
     let hash = Hash::new(payload);
+    let slot = EngineSlot::default();
     let first = Arc::new(NotFoundOrigin::new());
     let second = Arc::new(NotFoundOrigin::new());
-    let third = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let third = Arc::new(PayloadOrigin::new(payload, &slot));
     let metrics = Arc::new(CacheMetrics::default());
     let (engine, _tmp) = build_engine_with_origins(
         vec![
@@ -3946,11 +1148,12 @@ async fn fallback_counter_increments_per_step_in_three_origin_chain() -> anyhow:
             Arc::clone(&third) as Arc<dyn Origin>,
         ],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(&bytes[..] == payload, "third origin must have served");
+    engine.populate(hash).await?;
+    anyhow::ensure!(engine.has(hash).await?, "third origin must have served");
     anyhow::ensure!(first.fetches() == 1 && second.fetches() == 1 && third.fetches() == 1);
     anyhow::ensure!(
         metrics.origin_fallback.get() == 2,
@@ -3967,10 +1170,10 @@ async fn fallback_counter_increments_per_step_in_three_origin_chain() -> anyhow:
 
 #[tokio::test]
 async fn mixed_notfound_then_error_surfaces_error() -> anyhow::Result<()> {
-    // Decision documented in adr/plan: a known backend errored is more
-    // diagnostic than "no backend had it", so any non-NotFound failure
-    // beats a prior NotFound in the chain.
+    // A known backend errored is more diagnostic than "no backend had it",
+    // so any non-NotFound failure beats a prior NotFound in the chain.
     let hash = Hash::new(b"never-served");
+    let slot = EngineSlot::default();
     let first = Arc::new(NotFoundOrigin::new());
     let second = Arc::new(PermanentlyFailingOrigin::new());
     let metrics = Arc::new(CacheMetrics::default());
@@ -3980,10 +1183,11 @@ async fn mixed_notfound_then_error_surfaces_error() -> anyhow::Result<()> {
             Arc::clone(&second) as Arc<dyn Origin>,
         ],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(hash).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::OriginError { .. }),
         "mixed NotFound-then-Error chain must surface OriginError, got: {err:?}",
@@ -3992,36 +1196,40 @@ async fn mixed_notfound_then_error_surfaces_error() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn single_origin_vec_preserves_pre_284_behaviour() -> anyhow::Result<()> {
-    // Regression guard: a one-element origin vec must behave
-    // identically to the old `Some(origin)` single-origin path.
+async fn single_origin_chain_never_advances() -> anyhow::Result<()> {
     let payload: &[u8] = b"single origin success";
     let hash = Hash::new(payload);
-    let only = Arc::new(CountingOrigin::new(Arc::new(PayloadOrigin::new(payload))));
+    let slot = EngineSlot::default();
+    let only = Arc::new(PayloadOrigin::new(payload, &slot));
     let metrics = Arc::new(CacheMetrics::default());
     let (engine, _tmp) = build_engine_with_origins(
         vec![Arc::clone(&only) as Arc<dyn Origin>],
         Arc::clone(&metrics),
+        &slot,
     )
     .await?;
 
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(&bytes[..] == payload);
+    engine.populate(hash).await?;
+    anyhow::ensure!(&engine.read_blob(hash).await?[..] == payload);
     anyhow::ensure!(only.fetches() == 1);
     anyhow::ensure!(
         metrics.origin_fallback.get() == 0,
         "single-origin chain never advances; counter stays flat at zero",
     );
+    // A second populate is a local hit: no origin call.
+    engine.populate(hash).await?;
+    anyhow::ensure!(only.fetches() == 1, "a hit calls no origin");
     Ok(())
 }
 
 #[tokio::test]
 async fn empty_origin_vec_returns_no_origin() -> anyhow::Result<()> {
     let hash = Hash::new(b"impossible");
+    let slot = EngineSlot::default();
     let metrics = Arc::new(CacheMetrics::default());
-    let (engine, _tmp) = build_engine_with_origins(Vec::new(), Arc::clone(&metrics)).await?;
+    let (engine, _tmp) = build_engine_with_origins(Vec::new(), Arc::clone(&metrics), &slot).await?;
 
-    let err = err_of(engine.get(hash).await)?;
+    let err = err_of(engine.populate(hash).await)?;
     anyhow::ensure!(
         matches!(err, CacheError::NoOrigin { .. }),
         "empty chain must surface NoOrigin (cache-only mode), got: {err:?}",
@@ -4032,8 +1240,6 @@ async fn empty_origin_vec_returns_no_origin() -> anyhow::Result<()> {
     );
     Ok(())
 }
-
-use decdn_cache::OriginRangeRequest;
 
 #[tokio::test]
 async fn origin_range_request_len_and_empty() {
@@ -4051,178 +1257,6 @@ async fn origin_range_request_len_and_empty() {
     assert_eq!(z.len(), 0);
 }
 
-// ----------------------------------------------------------------------------
-// `Origin::size` — the best-effort blob-size probe that scopes a range pull
-// (#823). HTTP uses a `HEAD`; the filesystem origin stats the data object.
-// ----------------------------------------------------------------------------
-
-#[tokio::test]
-async fn http_size_returns_content_length_via_head() -> anyhow::Result<()> {
-    let payload: &[u8] = b"size me up";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    // A real origin's HEAD reply carries `Content-Length` in the header (HEAD
-    // has no body); set it explicitly so reqwest's `content_length()` sees it.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", payload.len().to_string()),
-        )
-        .mount(&server)
-        .await;
-    let origin = HttpOrigin::parse(&server.uri())?;
-
-    anyhow::ensure!(
-        origin.size(hash).await? == Some(payload.len() as u64),
-        "HEAD Content-Length must be the canonical size",
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_size_missing_object_is_none() -> anyhow::Result<()> {
-    let hash = Hash::new(b"absent");
-    let server = MockServer::start().await;
-    // No mounted HEAD route → wiremock answers 404 → unknown size.
-    let origin = HttpOrigin::parse(&server.uri())?;
-    anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "404 HEAD must degrade to None"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn http_size_compressed_object_is_unknown() -> anyhow::Result<()> {
-    // A `Content-Encoding` HEAD advertises the *encoded* length, not the
-    // canonical blob size — `size` must degrade to `None` so a wrong length
-    // never reaches bao alignment. Mirrors the S3 adapter's coverage.
-    let payload: &[u8] = b"compressed body";
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Content-Length", payload.len().to_string())
-                .insert_header("Content-Encoding", "gzip"),
-        )
-        .mount(&server)
-        .await;
-    let origin = HttpOrigin::parse(&server.uri())?;
-    anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "a compressed HEAD must degrade to None"
-    );
-    Ok(())
-}
-
-/// An origin whose `size` probe faults with a transport error; `fetch` is the
-/// trait default (never called here).
-#[derive(Debug)]
-struct FaultingSizeOrigin;
-
-impl Origin for FaultingSizeOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        Box::pin(async {
-            Err(OriginPullError::Transient(anyhow::anyhow!(
-                "unreachable in this test"
-            )))
-        })
-    }
-
-    fn size(
-        &self,
-        _hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        Box::pin(async {
-            Err(OriginPullError::Transient(anyhow::anyhow!(
-                "synthetic size-probe transport fault"
-            )))
-        })
-    }
-}
-
-#[tokio::test]
-async fn origin_size_surfaces_a_transport_fault_when_no_origin_answers() -> anyhow::Result<()> {
-    // #1129: a transport fault on the size probe is a degraded node, not an
-    // empty one. When NO origin answers and at least one faulted, the fault is
-    // the answer — swallowing it into `Ok(None)` would let the serve path
-    // terminally report `NotFound` for a node whose own origin is broken.
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(FaultingSizeOrigin) as Arc<dyn Origin>],
-        16,
-    )
-    .await?;
-    let err = err_of(engine.origin_size(Hash::new(b"x")).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::OriginError { .. }),
-        "expected the transport fault to surface, got {err:?}"
-    );
-    Ok(())
-}
-
-/// An origin whose `size` probe answers a fixed value.
-#[derive(Debug)]
-struct FixedSizeOrigin(u64);
-
-impl Origin for FixedSizeOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        Box::pin(async {
-            Err(OriginPullError::Transient(anyhow::anyhow!(
-                "unreachable in this test"
-            )))
-        })
-    }
-
-    fn size(
-        &self,
-        _hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        let size = self.0;
-        Box::pin(async move { Ok(Some(size)) })
-    }
-}
-
-#[tokio::test]
-async fn origin_size_fault_then_answer_advances_the_chain() -> anyhow::Result<()> {
-    // A faulting origin must not deny the probe when a later origin answers.
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![
-            Arc::new(FaultingSizeOrigin) as Arc<dyn Origin>,
-            Arc::new(FixedSizeOrigin(5)) as Arc<dyn Origin>,
-        ],
-        16,
-    )
-    .await?;
-    let size = engine.origin_size(Hash::new(b"sized")).await?;
-    anyhow::ensure!(
-        size == Some(5),
-        "the healthy origin's answer wins, got {size:?}"
-    );
-    Ok(())
-}
-
 /// An origin that serves only a fixed `{H}.obao4` via `fetch_outboard`.
 #[derive(Debug)]
 struct OutboardOnlyOrigin(bytes::Bytes);
@@ -4230,18 +1264,6 @@ struct OutboardOnlyOrigin(bytes::Bytes);
 impl Origin for OutboardOnlyOrigin {
     fn kind(&self) -> OriginKind {
         OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        Box::pin(async {
-            Err(OriginPullError::Transient(anyhow::anyhow!(
-                "unreachable in this test"
-            )))
-        })
     }
 
     fn fetch_outboard(
@@ -4257,14 +1279,12 @@ impl Origin for OutboardOnlyOrigin {
 }
 
 #[tokio::test]
-async fn outboard_probe_rejects_a_wrong_length_outboard_and_advances_the_chain()
--> anyhow::Result<()> {
+async fn outboard_read_rejects_a_wrong_length_outboard_and_advances_the_chain() -> anyhow::Result<()>
+{
     // A truncated `{H}.obao4` (an HTML error body under the cap, a half-written
-    // upload) can never verify against `H`. Accepting it at the serviceability
-    // probe would make the node sign `ok: true` and then hard-fail every stream
-    // for the hash — and a broken origin 1 would permanently shadow a healthy
-    // origin 2. The probe must treat a wrong length as a decline that advances
-    // the origin chain.
+    // upload) can never verify against `H`, and a broken origin 1 must not
+    // shadow a healthy origin 2. The outboard read treats a wrong length as a
+    // decline that advances the origin chain.
     use bao_tree::io::outboard::PreOrderMemOutboard;
     let payload: Vec<u8> = (0..200 * 1024u32)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
@@ -4311,74 +1331,31 @@ async fn outboard_probe_rejects_a_wrong_length_outboard_and_advances_the_chain()
     Ok(())
 }
 
-#[tokio::test]
-async fn origin_size_no_origin_configured_errors() -> anyhow::Result<()> {
-    // `CacheEngine::origin_size` with no origins returns `NoOrigin` (a coherent
-    // "can't range-pull" signal) rather than a silent `None`.
+/// An engine with no origins whose store holds `payload` whole.
+async fn engine_holding(payload: &[u8]) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
-    let err = err_of(engine.origin_size(Hash::new(b"x")).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::NoOrigin { .. }),
-        "expected NoOrigin, got {err:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn fs_size_returns_on_disk_length() -> anyhow::Result<()> {
-    let payload: &[u8] = b"on-disk canonical length";
-    let hash = Hash::new(payload);
-    let origin_dir = tempfile::tempdir()?;
-    seed_fs_blob(origin_dir.path(), hash, payload)?;
-    let origin = FilesystemOrigin::new(origin_dir.path()).await?;
-
-    anyhow::ensure!(
-        origin.size(hash).await? == Some(payload.len() as u64),
-        "fs size must be the file length",
-    );
-    // A blob that isn't on disk has no size.
-    anyhow::ensure!(
-        origin.size(Hash::new(b"never seeded")).await?.is_none(),
-        "absent fs object must be None",
-    );
-    Ok(())
+    let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+    let hash = engine.insert_blob(payload.to_vec()).await?;
+    Ok((engine, hash, tmp))
 }
 
 /// `export_bao_range` (#915, ADR 038 §Serve side) must emit the header-less bao
-/// interleaved encoding that verifies against the content root. Round-trip: cache
-/// a multi-group blob via pull-through, export an interior range as bao, then
-/// reconstruct the combined encoding (prepend the 8-byte size header) and import
-/// it into a fresh store — `import_bao_bytes` verifies every group against the
-/// root, so a clean import proves the export is honest bao for `hash`, and the
-/// decoded content equals the original aligned span byte-for-byte.
+/// interleaved encoding that verifies against the content root. Round-trip: hold
+/// a multi-group blob, export an interior range as bao, then reconstruct the
+/// combined encoding (prepend the 8-byte size header) and import it into a
+/// fresh store — `import_bao_bytes` verifies every group against the root, so a
+/// clean import proves the export is honest bao for `hash`, and the decoded
+/// content equals the original aligned span byte-for-byte.
 #[tokio::test]
 async fn export_bao_range_round_trips_and_verifies_against_root() -> anyhow::Result<()> {
     use bytes::Bytes;
     use decdn_cache::range_pull::align_range;
     use iroh_blobs::store::mem::MemStore;
 
-    // Deterministic pseudo-random blob spanning several 16 KiB groups, with a
-    // partial final group (not a group multiple) to exercise the right edge.
-    let mut payload = vec![0u8; 200 * 1024 + 1234];
-    let mut x: u32 = 0x1234_5678;
-    for b in &mut payload {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *b = x.to_le_bytes().first().copied().unwrap_or(0);
-    }
-    let hash = Hash::new(&payload);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    // Cache the blob (iroh-blobs materializes the outboard at import).
-    engine.get(hash).await?;
+    // Several 16 KiB groups, with a partial final group (not a group
+    // multiple) to exercise the right edge.
+    let payload = make_blob(200 * 1024 + 1234, 0x1234_5678);
+    let (engine, hash, _tmp) = engine_holding(&payload).await?;
 
     let blob_size = u64::try_from(payload.len())?;
     let offset = 64 * 1024u64;
@@ -4423,15 +1400,7 @@ async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
     use iroh_blobs::store::mem::MemStore;
 
     let payload = b"the whole blob, served bao from offset zero with no raw path".to_vec();
-    let hash = Hash::new(&payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    engine.get(hash).await?;
+    let (engine, hash, _tmp) = engine_holding(&payload).await?;
 
     let blob_size = u64::try_from(payload.len())?;
     let wire = engine.export_bao_range(hash, 0, 0, blob_size).await?;
@@ -4453,25 +1422,15 @@ async fn export_bao_range_whole_blob_offset_zero() -> anyhow::Result<()> {
 
 /// A 0-byte blob served whole (`export_bao_range(hash, 0, 0, 0)`) must emit an
 /// empty header-less wire form, and re-importing it round-trips to empty bytes
-/// under the same content hash — the pre-bao empty delivery, preserved on the
-/// bao path (#1054). The empty root is `Hash::new(&[])`.
+/// under the same content hash (#1054). The empty root is `Hash::new(&[])`.
 #[tokio::test]
 async fn export_bao_range_empty_blob_round_trips() -> anyhow::Result<()> {
     use bytes::Bytes;
     use decdn_cache::range_pull::align_range;
     use iroh_blobs::store::mem::MemStore;
 
-    let payload: Vec<u8> = Vec::new();
-    let hash = Hash::new(&payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    // Pull-through caches a 0-byte blob (BlobStatus::Complete { size: 0 }).
-    engine.get(hash).await?;
+    let (engine, hash, _tmp) = engine_holding(&[]).await?;
+    anyhow::ensure!(hash == Hash::new([]), "the empty blob's root");
 
     let wire = engine.export_bao_range(hash, 0, 0, 0).await?;
     anyhow::ensure!(wire.is_empty(), "0-byte blob has an empty bao wire form");
@@ -4495,16 +1454,13 @@ async fn export_bao_range_empty_blob_round_trips() -> anyhow::Result<()> {
 /// than keep serving an empty body (#1054 review). The empty blob is trivially
 /// "present" in the store, so — unlike a non-empty blob, which can be genuinely
 /// absent — eviction (not absence) is the only state that stops the empty serve,
-/// and only the added `has()` check (which honors the logical-eviction set)
-/// enforces it here. (On the non-empty path, `export_bao_range` itself has no
-/// eviction check: `export_bao` faults on a genuinely absent hash, and callers
-/// gate eviction before invoking it — see `handlers/client.rs`.)
+/// and only the `has()` check (which honors the logical-eviction set) enforces
+/// it here.
 #[tokio::test]
 async fn export_bao_range_empty_blob_evicted_errors() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
-    let engine = decdn_cache::CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
-    let empty: Vec<u8> = Vec::new();
-    let hash = Hash::new(&empty);
+    let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
+    let hash = Hash::new([]);
     // The empty blob is trivially present; a whole serve succeeds.
     anyhow::ensure!(engine.has(hash).await?, "empty blob is trivially present");
     anyhow::ensure!(
@@ -4521,46 +1477,29 @@ async fn export_bao_range_empty_blob_evicted_errors() -> anyhow::Result<()> {
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected an error for an evicted empty blob"))?;
     anyhow::ensure!(
-        matches!(err, decdn_cache::CacheError::Store(_)),
+        matches!(err, CacheError::Store(_)),
         "evicted empty blob must surface a Store error, got {err:?}"
     );
     Ok(())
 }
 
 /// The streaming export (#1132) and the buffered one must produce the SAME wire
-/// bytes — the buffered form is now literally a drain of the stream, and every
-/// existing ADR 038 round-trip test above exercises only the buffered form. This
-/// is what keeps those tests meaningful proof for the path the node actually
-/// serves from.
+/// bytes — the buffered form is a drain of the stream, and the ADR 038
+/// round-trip tests above exercise only the buffered form. This is what keeps
+/// those tests meaningful proof for the path the node actually serves from.
 ///
 /// It also asserts the stream really is chunked: a multi-group blob must arrive
 /// as MANY items, not one. A regression that collected internally and yielded a
-/// single item would pass a bytes-equality check alone while reintroducing the
-/// whole-blob allocation this exists to remove.
+/// single item would pass a bytes-equality check alone while reintroducing a
+/// whole-blob allocation.
 #[tokio::test]
 async fn export_bao_range_stream_matches_the_buffered_form_and_is_chunked() -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
     // Several 16 KiB groups with a partial final group, matching the round-trip
     // test above.
-    let mut payload = vec![0u8; 200 * 1024 + 1234];
-    let mut x: u32 = 0x1234_5678;
-    for b in &mut payload {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *b = x.to_le_bytes().first().copied().unwrap_or(0);
-    }
-    let hash = Hash::new(&payload);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    engine.get(hash).await?;
+    let payload = make_blob(200 * 1024 + 1234, 0x1234_5678);
+    let (engine, hash, _tmp) = engine_holding(&payload).await?;
 
     let blob_size = u64::try_from(payload.len())?;
     // Both a whole-blob serve and an interior range: the offset-0 case is what
@@ -4613,17 +1552,7 @@ async fn export_bao_range_stream_matches_the_buffered_form_and_is_chunked() -> a
 async fn export_bao_range_stream_empty_blob_yields_no_items() -> anyhow::Result<()> {
     use futures_util::StreamExt;
 
-    let payload: Vec<u8> = Vec::new();
-    let hash = Hash::new(&payload);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-    engine.get(hash).await?;
+    let (engine, hash, _tmp) = engine_holding(&[]).await?;
 
     let mut stream = engine.export_bao_range_stream(hash, 0, 0, 0).await?;
     let mut items = 0usize;
@@ -4632,127 +1561,5 @@ async fn export_bao_range_stream_empty_blob_yields_no_items() -> anyhow::Result<
         items += 1;
     }
     anyhow::ensure!(items == 0, "empty blob must yield no items, got {items}");
-    Ok(())
-}
-
-/// `populate` must fill a blob that takes the STREAMING commit path — the one
-/// with no post-commit read-back (#1132). The blob is well above
-/// `buffered_max_bytes`, so `should_buffer` routes it to `import_and_verify_stream`
-/// and the new `PullThroughOutcome::Committed` arm is what carries the result
-/// back.
-///
-/// It does NOT observe the absence of the read-back. `PullThroughOutcome::Committed`
-/// stops the bytes riding out in the variant, but a stray `let _ = read_local(..)`
-/// before returning it would compile and this test would not notice. So do not
-/// trust it to catch a reintroduced read-back; it proves the new arm is wired
-/// correctly and still fills the cache, which is the part a type cannot check.
-#[tokio::test]
-async fn populate_fills_via_the_streaming_commit_path() -> anyhow::Result<()> {
-    // Comfortably over the 4 MiB `buffered_max_bytes` default.
-    let mut payload = vec![0u8; 12 * 1024 * 1024];
-    let mut x: u32 = 0x9E37_79B9;
-    for b in &mut payload {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *b = x.to_le_bytes().first().copied().unwrap_or(0);
-    }
-    let hash = Hash::new(&payload);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    anyhow::ensure!(!engine.has(hash).await?, "blob must start absent");
-    engine.populate(hash).await?;
-    anyhow::ensure!(
-        engine.has(hash).await?,
-        "populate must commit the blob to the local store"
-    );
-    // And the bytes are genuinely there and correct — a commit-only outcome must
-    // not mean a half-imported blob.
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        got.as_ref() == payload.as_slice(),
-        "populated blob does not match the origin payload"
-    );
-    Ok(())
-}
-
-/// `populate` must also fill via the BUFFERED commit arm, which this blob is
-/// small enough to take (`should_buffer` routes anything at or under
-/// `buffered_max_bytes`, 4 MiB by default; a `None` hint streams regardless).
-///
-/// The buffered arm's return shape depends on `FillMode`. This pins only that
-/// the fill still works — it CANNOT distinguish the two behaviours, because
-/// `pull_through_fill`
-/// drops the payload either way and `PullThroughOutcome` is private to the crate.
-/// The correspondence itself is pinned by
-/// `engine::tests::fill_mode_determines_the_return_shape_in_both_directions`,
-/// which lives where the private types are visible.
-#[tokio::test]
-async fn populate_fills_via_the_buffered_commit_path() -> anyhow::Result<()> {
-    // Well under the 4 MiB `buffered_max_bytes` default, and the mock advertises
-    // a `Content-Length`, so `should_buffer` says yes.
-    let mut payload = vec![0u8; 64 * 1024];
-    let mut x: u32 = 0x0BAD_F00D;
-    for b in &mut payload {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        *b = x.to_le_bytes().first().copied().unwrap_or(0);
-    }
-    let hash = Hash::new(&payload);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    anyhow::ensure!(!engine.has(hash).await?, "blob must start absent");
-    engine.populate(hash).await?;
-    anyhow::ensure!(
-        engine.has(hash).await?,
-        "populate must commit the blob via the buffered arm too"
-    );
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        got.as_ref() == payload.as_slice(),
-        "buffered-arm populate stored the wrong bytes"
-    );
-    Ok(())
-}
-
-/// `get` must still receive the payload for a blob small enough to take the
-/// buffered drain — a regression guard on the `FillMode::ReturnBytes` direction.
-///
-/// Named for what it observes, not for which arm ran: an integration test cannot
-/// see `should_buffer`'s decision. The size is chosen to route through the drain,
-/// but only the unit test can confirm that it did.
-#[tokio::test]
-async fn get_returns_bytes_for_a_small_origin_blob() -> anyhow::Result<()> {
-    let payload = b"small enough to be drained, not streamed".to_vec();
-    let hash = Hash::new(&payload);
-
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-        .mount(&server)
-        .await;
-    let (engine, _tmp) = build_engine(&server.uri()).await?;
-
-    let got = engine.get(hash).await?;
-    anyhow::ensure!(
-        got.as_ref() == payload.as_slice(),
-        "get must return the drained payload, not an empty or missing blob"
-    );
     Ok(())
 }

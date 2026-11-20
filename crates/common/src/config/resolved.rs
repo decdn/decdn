@@ -447,9 +447,6 @@ pub enum ResolvedOrigin {
     Http {
         /// Validated base URL.
         url: decdn_config_types::OriginUrl,
-        /// How to handle `Content-Encoding` on the HTTP origin response
-        /// (#312). Defaults to [`decdn_config_types::DecompressMode::Auto`].
-        decompress: decdn_config_types::DecompressMode,
     },
     /// Local filesystem origin root. Directory-existence is validated
     /// when the runtime constructs the
@@ -507,9 +504,6 @@ pub struct ResolvedS3Config {
     pub prefix: String,
     /// Resolved credential source.
     pub credentials: Option<ResolvedS3Credentials>,
-    /// How to handle `Content-Encoding` on the S3 origin response
-    /// (#804). Defaults to [`decdn_config_types::DecompressMode::Auto`].
-    pub decompress: decdn_config_types::DecompressMode,
 }
 
 /// Validated runtime form of S3 credentials (#437). See

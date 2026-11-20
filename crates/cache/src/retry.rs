@@ -6,32 +6,9 @@
 //! module only decides *how many* transient retries to run and *how long*
 //! to sleep between them.
 //!
-//! ## Body-phase retry (#519)
-//!
-//! The loop also covers body-phase failures via two paths, both gated on
-//! the same `max_retries` budget:
-//!
-//! - **Buffer-then-commit (small blobs):** when the adapter advertises a
-//!   `size_hint` at or below [`RetryPolicy::buffered_max_bytes`] (default
-//!   4 MiB), the engine's per-attempt closure drains the stream into a
-//!   bounded `BytesMut` before handing it to iroh-blobs. Drain errors are
-//!   classified via the internal `classify_io_error` helper (which
-//!   recognises typed `BlobTooLargeMarker` and `OriginError::*` as
-//!   Permanent, treats `io::ErrorKind::{ConnectionReset, TimedOut,
-//!   UnexpectedEof, …}` and the catch-all `Other` as Transient) and
-//!   re-fed to the loop, so small blobs get mid-stream retries at a
-//!   bounded memory cost.
-//! - **Abort + restart (large blobs):** the engine's per-attempt closure
-//!   commits to `iroh-blobs::add_stream` directly. On mid-stream
-//!   `io::Error`, the partial `TempTag` is dropped (iroh-blobs GC
-//!   reclaims the bytes at `cache.gc_interval_sec` cadence) and the
-//!   error is classified, restarting the loop from the headers phase.
-//!   Memory stays bounded; disk amplification is
-//!   `(1 + max_retries) * max_blob_bytes` worst case until GC.
-//!
 //! ## Coalescing interaction and the retry-amplification bound (#1615)
 //!
-//! [`crate::CacheEngine::get`] coalesces concurrent misses for the same hash
+//! [`crate::CacheEngine::populate`] coalesces concurrent misses for the same hash
 //! through a single owner task (#305). The retry loop runs *inside* that owner;
 //! waiters block on the shared `Notify` until the owner either succeeds or
 //! exhausts. After an owner exhausts, one waiter re-elects itself as the next
@@ -52,29 +29,18 @@
 //!
 //! A tighter per-hash bound — the owner's failure *shared* to all waiters so
 //! not even `failure_threshold` budgets run — is deliberately NOT implemented.
-//! Coalesced waiters do not all have the same origin reach: a `populate_local`
-//! owner (local origins only, #1116) and a `get` / `populate` waiter (full
-//! chain including the paid `Peer` origin) can coalesce on one hash, and
-//! re-election is load-bearing there — a local-only owner's `NotFound` must
-//! not short-circuit a full-chain waiter that could still succeed via `Peer`.
-//! Sharing the owner's failure blindly would turn that into a wrong answer;
-//! correct sharing would have to be origin-reach-aware. The circuit-breaker
-//! already sheds the outage load without that complexity, so the shared budget
-//! is not worth its risk on this hot, cancellation-sensitive path.
+//! The circuit-breaker already sheds the outage load, so a shared budget is
+//! not worth its risk on this hot, cancellation-sensitive path.
 
 use std::future::Future;
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
 use decdn_config_types::RetryPolicy;
-use futures_util::StreamExt;
 use iroh_blobs::Hash;
 
-use crate::error::{OriginError, OriginPullError};
+use crate::error::OriginPullError;
 use crate::metrics::CacheMetrics;
-use crate::origin::{BlobTooLargeMarker, OriginByteStream};
 
 /// Compute the backoff delay before the `attempt`-th retry (0-indexed:
 /// `attempt = 0` is the first retry, immediately after the initial
@@ -186,152 +152,6 @@ where
                 attempt = attempt.saturating_add(1);
             }
         }
-    }
-}
-
-/// True when the origin's advertised `size_hint` is small enough to
-/// buffer in memory for body-phase retry classification. Unknown
-/// (`None`) hint falls through to streaming — buffering an unknown-size
-/// body would let a lying origin overrun the operator's memory budget.
-pub(crate) const fn should_buffer(size_hint: Option<u64>, buffered_max_bytes: u64) -> bool {
-    if buffered_max_bytes == 0 {
-        return false;
-    }
-    match size_hint {
-        Some(n) => n <= buffered_max_bytes,
-        None => false,
-    }
-}
-
-/// Drain `stream` into a contiguous `Bytes`, capping the buffer at
-/// `cap` bytes. Mirrors [`crate::origin::OriginFetch::collect_to_bytes`] but adds:
-///
-/// - A running cap: chunks past `cap` produce an `io::Error` whose
-///   inner is a [`BlobTooLargeMarker`], so the caller can downcast and
-///   surface `CacheError::BlobTooLarge` instead of a generic origin
-///   error.
-/// - Per-chunk `pull_through_bytes` metric bumps that mirror the streaming
-///   path's egress accounting (every byte the origin sent is
-///   billed, even on a drain that ultimately fails).
-pub(crate) async fn drain_to_bytes(
-    mut stream: OriginByteStream,
-    cap: u64,
-    metrics: Option<&Arc<CacheMetrics>>,
-) -> io::Result<Bytes> {
-    // Bound the upfront allocation regardless of `cap` so a hostile
-    // origin advertising `Content-Length: 10 TiB` (truncated to `cap`
-    // by the caller, but still potentially large) can't pre-commit a
-    // huge virtual region before the first byte arrives. Matches the
-    // 1 MiB initial-capacity hint used in `OriginFetch::collect_to_bytes`.
-    const INITIAL_CAP: usize = 1 << 20; // 1 MiB
-    let initial = usize::try_from(cap).unwrap_or(INITIAL_CAP).min(INITIAL_CAP);
-    let mut buf = BytesMut::with_capacity(initial);
-    let mut total: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if let Some(m) = metrics {
-            m.pull_through_bytes
-                .inc_by(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        }
-        total = total.saturating_add(chunk.len() as u64);
-        if total > cap {
-            return Err(io::Error::other(BlobTooLargeMarker { max_bytes: cap }));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf.freeze())
-}
-
-/// Classify a body-phase `io::Error` into the retry loop's
-/// [`OriginPullError`] taxonomy. Used by both the drain path
-/// ([`drain_to_bytes`]) and the streaming path (engine's
-/// side-channel reader) so the classification is consistent
-/// across the two body-phase entry points.
-///
-/// The decision tree:
-///
-/// 1. If the `io::Error` wraps a typed inner via
-///    `io::Error::other(typed)`, recover the typed variant first:
-///    [`BlobTooLargeMarker`] → `Permanent(BlobTooLarge)`,
-///    [`OriginError`] (e.g. `DecompressionFailed`) → `Permanent`.
-///    These are deterministic protocol or cap violations — retry
-///    won't help and would just waste budget.
-///
-/// 2. Otherwise dispatch on `io::ErrorKind`. The Transient set:
-///    `Interrupted`, `TimedOut`, `WouldBlock`, `ResourceBusy`,
-///    `BrokenPipe`, `ConnectionReset`, `ConnectionAborted`,
-///    `ConnectionRefused`, `NotConnected`, `UnexpectedEof`,
-///    `StaleNetworkFileHandle`, and the catch-all `Other`.
-///    `StaleNetworkFileHandle` (`ESTALE`) usually clears on the next
-///    path lookup of an NFS-backed file. `UnexpectedEof` is the load-bearing kind
-///    for mid-body resets behind a flaky LB — reqwest surfaces
-///    truncated Content-Length responses through it. `Other`
-///    defaults to Transient because the HTTP and S3 origin adapters
-///    wrap reqwest / SDK body errors via `io::Error::other(...)` —
-///    mostly network/body failures (resets, timeouts, truncation), so
-///    Transient is the safer default for them.
-///    Anything not in the Transient set is classified Permanent
-///    (fail-fast over retry-storm for unrecognised modes).
-pub(crate) fn classify_io_error(e: io::Error) -> OriginPullError {
-    // Peek the inner *without* consuming so we can preserve the
-    // original `e` (and its `raw_os_error` / Display) when no typed
-    // marker matches. `io::Error::from_raw_os_error` / `last_os_error`
-    // produce errors whose `into_inner()` returns `None` — consuming
-    // up front would silently strip the OS error code.
-    let has_typed_marker = e
-        .get_ref()
-        .is_some_and(|r| r.is::<BlobTooLargeMarker>() || r.is::<OriginError>());
-    if !has_typed_marker {
-        let kind = e.kind();
-        return classify_by_kind(kind, e);
-    }
-    // We confirmed a typed marker via `is::<>`; consume and chain
-    // `Box::downcast` (returns the original box back through `Err`
-    // on a mismatch). Both downcasts can only fail if a third typed
-    // variant slipped in between the `get_ref` peek and the consume
-    // — defensive fall-back rewraps and routes through `classify_by_kind`.
-    let kind = e.kind();
-    let Some(inner) = e.into_inner() else {
-        // Structurally unreachable: `get_ref` returned `Some` so the
-        // Repr is `Custom`, and `Custom`'s `into_inner` always returns
-        // `Some`. If std's invariant ever changes, fall through.
-        return classify_by_kind(kind, io::Error::from(kind));
-    };
-    let inner = match inner.downcast::<BlobTooLargeMarker>() {
-        Ok(marker) => {
-            return OriginPullError::Permanent(anyhow::anyhow!(
-                "origin body exceeded max_blob_bytes={}",
-                marker.max_bytes
-            ));
-        }
-        Err(b) => b,
-    };
-    match inner.downcast::<OriginError>() {
-        Ok(typed) => OriginPullError::Permanent(anyhow::Error::from(*typed)),
-        Err(b) => classify_by_kind(kind, io::Error::new(kind, b)),
-    }
-}
-
-/// Classify a body-phase failure by `io::ErrorKind` alone. Takes the
-/// original `io::Error` so `raw_os_error()` and any Display payload
-/// flow through unchanged into the surfaced `anyhow::Error`. Used
-/// when the typed-marker downcast didn't fire.
-fn classify_by_kind(kind: io::ErrorKind, e: io::Error) -> OriginPullError {
-    let err = anyhow::Error::new(e);
-    match kind {
-        io::ErrorKind::Interrupted
-        | io::ErrorKind::TimedOut
-        | io::ErrorKind::WouldBlock
-        | io::ErrorKind::ResourceBusy
-        | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::NotConnected
-        | io::ErrorKind::UnexpectedEof
-        | io::ErrorKind::StaleNetworkFileHandle
-        | io::ErrorKind::Other => OriginPullError::Transient(err),
-        _ => OriginPullError::Permanent(err),
     }
 }
 

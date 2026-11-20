@@ -1,23 +1,19 @@
 //! Serve-side stream-while-store e2e (#1130).
 //!
-//! A whole-blob cache miss whose origin publishes a `{H}.obao4` pre-order
-//! outboard is served by streaming straight from the origin into the paying
-//! client while teeing the bytes into the local store
-//! (`serve_via_backend_origin`, tried in `dispatch.rs` before the buffered
-//! `try_local_populate` fallback). Three journeys prove the whole tier
-//! end to end, against a real anvil chain, a real `decdn-node` daemon, and a
-//! real paid `cdn/client/v1` fetch:
+//! A cache miss whose origin publishes `{H}`, `{H}.obao4` and `{H}.sizeproof`
+//! is served by streaming straight from the origin into the paying client
+//! while teeing the bytes into the local store (`serve_via_backend_origin`).
+//! Three journeys prove the whole tier end to end, against a real anvil
+//! chain, a real `decdn-node` daemon, and a real paid `cdn/client/v1` fetch:
 //!
 //! 1. **Streams (outboard present).** The stream-while-store tier fires
 //!    (`decdn_local_outboard_serves_total` goes 0 → 1), the client gets the
 //!    exact bytes on the first attempt, and the node ends up holding the blob
 //!    in its cache (teed) — proven by a second fetch that no longer needs the
 //!    origin at all.
-//! 2. **Falls back (no outboard).** Without a published outboard the node
-//!    cannot open the stream-while-store serve tier (no `{H}.obao4` to prove
-//!    the range), so the request degrades to the buffered `populate_local`
-//!    fallback: the fetch still succeeds and is byte-correct, but the
-//!    stream-path counter never moves.
+//! 2. **Faults (no outboard).** The size proof admits the open, and the
+//!    missing `{H}.obao4` is an origin fault: the fetch fails and the node
+//!    stays healthy.
 //! 3. **Corrupt-safe.** A tampered `{H}.obao4` (a flipped byte in the middle,
 //!    so the outboard's length is unchanged and the tamper is only caught by
 //!    bao verification, not a length pre-check) must fail the client's fetch
@@ -87,11 +83,10 @@ async fn stream_while_store_serves_on_first_fetch_and_tees_into_cache() -> anyho
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stream_while_store_falls_back_to_buffered_populate_without_an_outboard()
--> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_no_outboard_fallback()))
+async fn stream_while_store_faults_without_an_outboard() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_missing_outboard_fault()))
         .await
-        .context("no-outboard fallback e2e exceeded the overall timeout")??;
+        .context("missing-outboard e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -166,11 +161,12 @@ async fn run_streams() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test B — no outboard is published: the stream-while-store serve tier
-/// declines (no `{H}.obao4` to prove the range), so the request must degrade
-/// to the buffered `try_local_populate` fallback. The fetch still succeeds and
-/// is byte-correct, but the stream-path counter must stay at zero.
-async fn run_no_outboard_fallback() -> anyhow::Result<()> {
+/// Test B — the origin publishes `{H}` and `{H}.sizeproof` but no `{H}.obao4`.
+/// The size proof admits the open to the stream-while-store tier, and the
+/// missing outboard is an ordinary origin fault (ADR 037 § Origin-tier
+/// pull-through): the fetch fails, the node commits no copy and stays
+/// healthy.
+async fn run_missing_outboard_fault() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init();
@@ -179,29 +175,30 @@ async fn run_no_outboard_fallback() -> anyhow::Result<()> {
     let node = NodeFixture::launch_pull_through_cache(&chain, "US", &[]).await?;
 
     let blob = make_blob(20 * CHUNK_GROUP + 321);
-    // No outboard: `seed_origin_blob` writes only `{H}`, not the sibling
-    // `{H}.obao4`.
+    // `seed_origin_blob` writes `{H}` and `{H}.sizeproof`, not `{H}.obao4`.
     let hash = node.seed_origin_blob(&blob)?;
 
     let client = ClientFixture::new(&chain).await?;
-
-    let outcome = client.fetch(&chain, &node, hash, U256::ZERO).await?;
+    let result = client
+        .fetch_with_deadline(&chain, &node, hash, U256::ZERO, Duration::from_secs(20))
+        .await;
     anyhow::ensure!(
-        outcome.bytes == blob,
-        "the buffered populate_local fallback must still deliver byte-correct content: got {} \
-         bytes, expected {}",
-        outcome.bytes.len(),
-        blob.len()
+        result.is_err(),
+        "a fetch against an origin with no outboard must fail, not deliver bytes"
     );
 
     let stream_serves = node
         .scrape_metric("decdn_local_outboard_serves_total")
         .await?;
     anyhow::ensure!(
-        stream_serves == 0,
-        "the stream-while-store tier must NOT fire when the origin publishes no outboard: \
+        stream_serves >= 1,
+        "the size proof must admit the open to the stream-while-store tier: \
          decdn_local_outboard_serves_total = {stream_serves}"
     );
+
+    node.wait_healthy(Duration::from_secs(30))
+        .await
+        .context("node must stay healthy after a missing-outboard origin fault")?;
 
     Ok(())
 }

@@ -1,5 +1,4 @@
 use super::*;
-use std::assert_matches;
 
 fn make_cfg() -> S3OriginConfig {
     S3OriginConfig {
@@ -10,97 +9,6 @@ fn make_cfg() -> S3OriginConfig {
         prefix: String::new(),
         credentials: Some(S3Credentials::DefaultChain { profile: None }),
     }
-}
-
-#[test]
-fn body_stream_error_gains_s3_prefix() {
-    // A plain network-fault io error (no typed marker) must come out
-    // carrying the `s3://bucket/key` request context, mirroring the
-    // header-phase `classify_get_object_error` prefix (issue #1617).
-    let log_target = "s3://decdn-blobs/ab/abcdef";
-    let raw = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
-    let wrapped = prefix_body_stream_error(log_target, raw);
-    let msg = wrapped.to_string();
-    assert!(
-        msg.starts_with(log_target),
-        "body error lost the s3://bucket/key prefix: {msg}"
-    );
-    assert!(
-        msg.contains("connection reset"),
-        "prefix wrapper dropped the underlying error text: {msg}"
-    );
-    // Kind must survive so retry routing is unchanged.
-    assert_eq!(wrapped.kind(), std::io::ErrorKind::ConnectionReset);
-    // The original message sits in `Display`, so a chain formatter must
-    // not repeat it through `source()`.
-    let chained = format!("{:#}", anyhow::Error::new(wrapped));
-    assert_eq!(
-        chained.matches("connection reset").count(),
-        1,
-        "chain repeated the original error: {chained}"
-    );
-}
-
-#[test]
-fn body_stream_error_keeps_the_original_errors_causes() {
-    // The original error carries a typed payload whose own cause is not in
-    // its `Display`, so the cause can only reach the render through
-    // `source()`.
-    #[derive(Debug, thiserror::Error)]
-    #[error("tls handshake failed")]
-    struct Tls(#[source] std::io::Error);
-
-    let raw = std::io::Error::new(
-        std::io::ErrorKind::ConnectionReset,
-        Tls(std::io::Error::other("tls alert")),
-    );
-    let wrapped = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", raw);
-    let chained = format!("{:#}", anyhow::Error::new(wrapped));
-    assert_eq!(
-        chained.matches("tls handshake failed").count(),
-        1,
-        "original error not named once: {chained}"
-    );
-    assert_eq!(
-        chained.matches("tls alert").count(),
-        1,
-        "nested cause not named once: {chained}"
-    );
-}
-
-#[test]
-fn body_stream_error_preserves_retry_classification() {
-    // The prefix wrapper must not change how `classify_io_error` routes a
-    // transient network fault: an `UnexpectedEof` (mid-body truncation)
-    // stays Transient after prefixing.
-    let raw = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated body");
-    let wrapped = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", raw);
-    assert_matches!(
-        crate::retry::classify_io_error(wrapped),
-        OriginPullError::Transient(_),
-        "prefixing broke transient classification of a mid-body EOF"
-    );
-}
-
-#[test]
-fn body_stream_error_passes_typed_marker_through() {
-    // A typed `OriginError` marker (e.g. a decode failure) must pass
-    // through untouched so `classify_io_error`'s downcast still fires and
-    // routes it Permanent. Re-wrapping it in a prefixed `String` would
-    // hide the marker and silently reclassify it as a transient `Other`.
-    let typed = std::io::Error::other(OriginError::MalformedEncoding);
-    let out = prefix_body_stream_error("s3://decdn-blobs/ab/abcdef", typed);
-    // Message is unchanged (no prefix added) …
-    assert!(
-        !out.to_string().starts_with("s3://"),
-        "typed marker was wrapped and lost its downcast identity"
-    );
-    // … and the downcast-driven classification still lands on Permanent.
-    assert_matches!(
-        crate::retry::classify_io_error(out),
-        OriginPullError::Permanent(_),
-        "typed marker no longer classifies Permanent after prefixing"
-    );
 }
 
 #[test]

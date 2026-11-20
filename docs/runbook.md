@@ -734,8 +734,10 @@ what is missing was never announced.
 failed` at `WARN`.
 
 **What it means:** a rescan resolves each candidate against the origin — one
-`HEAD`/`HeadObject`/stat per deduped candidate — to decide what this node
-advertises. A throttle window or transport outage during that pass leaves
+read of its `{H}.sizeproof` object per deduped candidate — to decide what this
+node advertises. A candidate whose size proof is missing is not advertised; one
+whose size proof does not verify is a permanent fault. Run `decdn origin
+import` for the object to write it. A throttle window or transport outage during that pass leaves
 candidates unresolved.
 
 A retry-eligible fault on a candidate an earlier pass indexed keeps that entry,
@@ -746,9 +748,8 @@ not carried, because it would read the same on every rescan and hold the entry
 until an operator intervened. A candidate first seen inside the fault window has
 nothing to carry and is simply absent until a later rescan resolves it.
 
-One case this counter cannot see: an HTTP origin reports a server-side 5xx as a
-plain "not held", indistinguishable from a 404. Its *transport* faults, and
-S3/R2 and filesystem origins throughout, do count.
+An HTTP origin reads a 403 as "not held", like a 404, and warns once. A 5xx,
+408 or 429 counts as a retry-eligible fault.
 
 The enumerate counter is the more severe of the two. A listing that fails
 produces no candidates at all, so every hash discoverable only through that

@@ -32,22 +32,16 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_smithy_http_client::{Builder as HttpBuilder, tls};
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
 use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
 use iroh_blobs::Hash;
-use tokio_util::io::ReaderStream;
 
 use super::fs::OBAO4_SUFFIX;
 use super::io_runtime::IoRuntime;
-use super::{
-    BlobTooLargeMarker, DecompressMode, Origin, OriginByteStream, OriginFetch, OriginKind,
-    OriginRangeFetch, OriginRangeRequest, OriginUrl, OutboardFetch, decompress,
-};
-use crate::error::{OriginError, OriginPullError};
+use super::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OriginUrl, OutboardFetch};
+use crate::error::OriginPullError;
 
 /// Validated, runtime-ready configuration for an [`S3Origin`].
 ///
@@ -201,13 +195,6 @@ pub struct S3Origin {
     /// Operator-configured key prefix (trailing slash already applied by
     /// the resolver). Same rationale as `bucket`.
     prefix: Arc<str>,
-    /// How to handle `Content-Encoding` on the S3 response. Defaults to
-    /// [`DecompressMode::Auto`] — see that type for the full semantics.
-    /// Override with [`Self::with_decompress_mode`]. Mirrors
-    /// [`super::HttpOrigin`] so both first-class origin backends decode
-    /// gzip/zstd objects to canonical bytes before the engine's BLAKE3
-    /// verify (#804).
-    decompress: DecompressMode,
 }
 
 impl S3Origin {
@@ -220,8 +207,8 @@ impl S3Origin {
     /// signed request, not at `load()` time. The one operator-visible
     /// caveat is the AWS SSO provider (enabled via the `sso` feature on
     /// `aws-config`): if the `~/.aws/config` profile in use is configured
-    /// for SSO and the cached SSO token has expired, the *first* `fetch`
-    /// call may fire an HTTP request to the SSO endpoint to refresh the
+    /// for SSO and the cached SSO token has expired, the *first* read
+    /// may fire an HTTP request to the SSO endpoint to refresh the
     /// token. That's a property of the AWS credential chain, not this
     /// constructor; the construction itself stays I/O-free.
     ///
@@ -354,21 +341,39 @@ impl S3Origin {
             io: IoRuntime::current()?,
             bucket: Arc::from(bucket),
             prefix: Arc::from(prefix),
-            decompress: DecompressMode::Auto,
         })
     }
 
-    /// Set the [`DecompressMode`]. See that type for the semantics of
-    /// `Auto` vs `Strict`. Defaults to `Auto`. Mirrors
-    /// [`super::HttpOrigin::with_decompress_mode`] so the wiring layer can
-    /// honour an operator-configured `decompress` knob uniformly across
-    /// backends.
-    #[must_use]
-    pub const fn with_decompress_mode(mut self, mode: DecompressMode) -> Self {
-        self.decompress = mode;
-        self
+    /// `GetObject` `key` (with `range`, when set) and answer the response, or
+    /// `Ok(None)` when the object is missing. `log_target` names the object
+    /// in errors.
+    async fn get_object(
+        &self,
+        key: &str,
+        range: Option<String>,
+        log_target: &str,
+    ) -> Result<Option<aws_sdk_s3::operation::get_object::GetObjectOutput>, OriginPullError> {
+        let sent = self
+            .io
+            .run(
+                self.client
+                    .get_object()
+                    .bucket(self.bucket.as_ref())
+                    .key(key)
+                    .set_range(range)
+                    .send(),
+            )
+            .await
+            .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?;
+        match sent {
+            Ok(resp) => Ok(Some(resp)),
+            Err(e) => classify_get_object_error(e, log_target).map(|Missing| None),
+        }
     }
 }
+
+/// The object a `GetObject` asked for does not exist.
+struct Missing;
 
 /// Classify an HTTP status code returned via an S3 `ServiceError`.
 /// 5xx and the two retry-flagged 4xx codes (408 Request Timeout, 429
@@ -377,10 +382,10 @@ const fn is_transient_status(status: u16) -> bool {
     status >= 500 || status == 408 || status == 429
 }
 
-/// Classify a `SdkError<GetObjectError>` into the cache engine's
-/// `OriginFetch` / `OriginPullError` taxonomy.
+/// Classify a `SdkError<GetObjectError>` as a missing object or an
+/// [`OriginPullError`].
 ///
-/// Returns `Ok(OriginFetch::NotFound)` only when the response is
+/// Returns `Ok(Missing)` only when the response is
 /// genuinely "object does not exist": either the modeled `NoSuchKey`
 /// variant, or an HTTP 404 whose AWS error code is `NoSuchKey`/empty.
 /// A 404 with any other code (`NoSuchBucket`, `AccessDenied`, ...) is
@@ -388,7 +393,7 @@ const fn is_transient_status(status: u16) -> bool {
 /// failures that AWS sometimes dresses up as 404 (e.g. when the
 /// principal lacks `s3:ListBucket` it returns 404 for missing objects;
 /// a typo'd bucket also surfaces as a non-modeled 404). Misclassifying
-/// those as `NotFound` would silently mask the operator's real problem.
+/// those as missing would silently mask the operator's real problem.
 ///
 /// Errors that may be cured by retry (timeouts, dispatch failures,
 /// 5xx/408/429) become `Transient`; everything else (other 4xx,
@@ -405,14 +410,14 @@ const fn is_transient_status(status: u16) -> bool {
 fn classify_get_object_error(
     err: SdkError<GetObjectError>,
     log_target: &str,
-) -> Result<OriginFetch, OriginPullError> {
+) -> Result<Missing, OriginPullError> {
     match err {
         SdkError::ServiceError(service_err) => {
             let status = service_err.raw().status().as_u16();
             let inner = service_err.into_err();
             // Modeled NoSuchKey is the canonical not-found signal.
             if matches!(inner, GetObjectError::NoSuchKey(_)) {
-                return Ok(OriginFetch::NotFound);
+                return Ok(Missing);
             }
             // Bare HTTP 404 fallback: treat as NotFound when the AWS
             // error code is empty, explicitly `NoSuchKey`, or the SDK's
@@ -428,7 +433,7 @@ fn classify_get_object_error(
                     || code.eq_ignore_ascii_case("NoSuchKey")
                     || code.eq_ignore_ascii_case("NotFound")
                 {
-                    return Ok(OriginFetch::NotFound);
+                    return Ok(Missing);
                 }
             }
             let context = format!(
@@ -437,11 +442,10 @@ fn classify_get_object_error(
             );
             // `anyhow::Error::from(inner).context(...)` preserves the
             // SDK error in the source chain — `anyhow::Error::chain()`
-            // walks through it for structured tracing, and downstream
-            // downcasts (analogous to `CacheError::origin_error_kind`
-            // for HttpOrigin) can recover the typed `GetObjectError`.
-            // Using `anyhow::anyhow!("…{inner}")` would flatten the
-            // chain to a single string and lose that.
+            // walks through it for structured tracing, and a downcast can
+            // recover the typed `GetObjectError`. Using
+            // `anyhow::anyhow!("…{inner}")` would flatten the chain to a
+            // single string and lose that.
             if is_transient_status(status) {
                 Err(OriginPullError::Transient(
                     anyhow::Error::from(inner).context(context),
@@ -498,272 +502,18 @@ fn classify_get_object_error(
     }
 }
 
-/// Classify a `HeadObject` error for the best-effort [`Origin::size`] probe.
-/// A 404 / `NotFound` is a missing object, not a fault — return `Ok(None)` so
-/// the engine degrades the range pull to a whole-blob fetch. Transient
-/// transport / 5xx faults surface as [`OriginPullError::Transient`]; anything
-/// else is [`OriginPullError::Permanent`]. Mirrors
-/// [`classify_get_object_error`] but collapses the not-found arm into the
-/// `None` size signal.
-fn classify_head_object_error(
-    err: SdkError<HeadObjectError>,
-    log_target: &str,
-) -> Result<Option<u64>, OriginPullError> {
-    match err {
-        SdkError::ServiceError(service_err) => {
-            let status = service_err.raw().status().as_u16();
-            let inner = service_err.into_err();
-            // The modeled `NotFound`, or a bare 404, means the object is absent
-            // → unknown size, degrade. HeadObject carries no response body, so
-            // the AWS error code is frequently empty on a 404; treat either
-            // signal as not-found.
-            if matches!(inner, HeadObjectError::NotFound(_)) || status == 404 {
-                return Ok(None);
-            }
-            let context = format!(
-                "{log_target}: S3 HeadObject returned {status} ({})",
-                inner.code().unwrap_or("<no error code>")
-            );
-            if is_transient_status(status) {
-                Err(OriginPullError::Transient(
-                    anyhow::Error::from(inner).context(context),
-                ))
-            } else {
-                Err(OriginPullError::Permanent(
-                    anyhow::Error::from(inner).context(context),
-                ))
-            }
-        }
-        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => {
-            Err(OriginPullError::Transient(
-                anyhow::Error::from(err)
-                    .context(format!("{log_target}: S3 HeadObject transport failure")),
-            ))
-        }
-        // Conservative: classify construction/parse and any future
-        // `#[non_exhaustive]` variant as Permanent (mirrors the GetObject path).
-        other => Err(OriginPullError::Permanent(
-            anyhow::Error::from(other).context(format!("{log_target}: S3 HeadObject failed")),
-        )),
-    }
-}
-
-/// Prepend the `s3://bucket/key` request context to a body-phase stream
-/// `io::Error`, so a mid-stream failure carries the same identifying prefix
-/// that header-phase errors get from [`classify_get_object_error`]. `#271`
-/// deferred this: the body error surfaces from `ReaderStream` after the
-/// `GetObject` future has already returned, so `log_target` has to be
-/// threaded in through a per-chunk `map` adapter rather than a single
-/// `.context(...)` call.
-///
-/// The wrapper is deliberately narrow so it does not disturb
-/// [`crate::retry::classify_io_error`], which the engine's side-channel
-/// reader runs over every body-phase `io::Error`. That classifier recovers
-/// typed markers — [`BlobTooLargeMarker`] and [`OriginError`] (e.g.
-/// `DecompressionFailed`) — by downcasting the error's inner, and routes
-/// every other error on its [`std::io::ErrorKind`]. To keep both signals
-/// intact this helper:
-///
-///   * passes a typed-marker error through **untouched** — re-wrapping it in
-///     a `String` would hide the marker and silently reclassify a
-///     deterministic permanent error as a transient `Other`; and
-///   * preserves the original `ErrorKind` on the prefixed error, so the
-///     transient/permanent routing of network faults (`UnexpectedEof`,
-///     `ConnectionReset`, …) is unchanged; and
-///   * keeps the original error's message in `Display` and its own causes on
-///     the `source()` chain (via [`PrefixedBodyError`]), so a chain formatter
-///     names each cause once and nothing under the original error is lost.
-fn prefix_body_stream_error(log_target: &str, e: std::io::Error) -> std::io::Error {
-    if e.get_ref()
-        .is_some_and(|inner| inner.is::<BlobTooLargeMarker>() || inner.is::<OriginError>())
-    {
-        return e;
-    }
-    let kind = e.kind();
-    std::io::Error::new(
-        kind,
-        PrefixedBodyError {
-            prefix: log_target.to_string(),
-            inner: e,
-        },
-    )
-}
-
-/// Error wrapper produced by [`prefix_body_stream_error`]. `Display` prepends
-/// the `s3://bucket/key` request context to the original `io::Error`'s message.
-/// `source()` continues from the original error's own source, because its
-/// message is already in `Display`: a chain formatter then names it once.
-#[derive(Debug)]
-struct PrefixedBodyError {
-    prefix: String,
-    inner: std::io::Error,
-}
-
-impl std::fmt::Display for PrefixedBodyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.prefix, self.inner)
-    }
-}
-
-impl std::error::Error for PrefixedBodyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.inner.source()
-    }
+/// The permanent fault for an object at `log_target` that ran past its
+/// `cap`.
+fn oversize(log_target: &str, cap: u64) -> OriginPullError {
+    OriginPullError::Permanent(anyhow::anyhow!(
+        "{log_target}: object is over its {cap}-byte cap; re-run `decdn origin import` for \
+         the object"
+    ))
 }
 
 impl Origin for S3Origin {
     fn kind(&self) -> OriginKind {
         OriginKind::S3
-    }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            let key = key_for(&self.prefix, hash);
-            // `s3://bucket/key` is the conventional log shape. Safe to
-            // print: the bucket comes from operator-set config and the
-            // key is `{prefix}{hex[..2]}/{hex}` over a content-addressed
-            // BLAKE3 hash — no caller-controlled bytes, no credentials.
-            // (Contrast with HttpOrigin's URL, which can carry userinfo
-            // and is redacted via `redact_for_log` on every log line.)
-            let log_target = format!("s3://{}/{}", self.bucket, key);
-
-            let resp = match self
-                .io
-                .run(
-                    self.client
-                        .get_object()
-                        .bucket(self.bucket.as_ref())
-                        .key(&key)
-                        .send(),
-                )
-                .await
-                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
-            {
-                Ok(r) => r,
-                Err(e) => return classify_get_object_error(e, &log_target),
-            };
-
-            // Classify `Content-Encoding` and apply the strict/auto policy
-            // using the same helper as the HTTP backend (#804). The BLAKE3
-            // verify in `CacheEngine` runs over canonical bytes, so a
-            // compressed body must be decoded back to canonical form before
-            // it reaches the engine. `resolve_encoding` returns `Err` for
-            // unknown encodings (e.g. `br`) and for known encodings under
-            // `DecompressMode::Strict` — both are permanent and fire before
-            // any body bytes are read.
-            let supported_encoding = match resp.content_encoding() {
-                None => None,
-                Some(enc) => match decompress::resolve_encoding(enc.trim(), self.decompress) {
-                    Ok(encoding) => encoding,
-                    Err(err) => {
-                        // Keep the operator runbook hint on the rejection: the
-                        // remediation is to store canonical bytes at the origin,
-                        // or (for gzip/zstd under `Strict`) flip to `auto`. The
-                        // `decode gzip/zstd` scoping keeps the hint honest for
-                        // unknown encodings like `br`, which `auto` cannot help.
-                        return Err(OriginPullError::Permanent(
-                            anyhow::Error::from(err).context(format!(
-                                "{log_target}: S3 origin rejected Content-Encoding — store \
-                                 canonical bytes at the origin, or set `decompress = \"auto\"` \
-                                 to decode gzip/zstd"
-                            )),
-                        ));
-                    }
-                },
-            };
-
-            // Fast-path size check from the SDK-parsed Content-Length.
-            // `content_length()` returns `Option<i64>` — negative is
-            // a deterministic protocol violation; `> max_bytes` saves
-            // us streaming bytes we'll throw away. The engine still
-            // re-checks the running total via `count_and_cap_stream`
-            // as the body arrives, so an origin that lies in the
-            // header is caught mid-flight.
-            let advertised_size: Option<u64> = match resp.content_length() {
-                Some(len) if len < 0 => {
-                    return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                        "{log_target}: origin reported negative Content-Length={len}"
-                    )));
-                }
-                Some(len) => {
-                    #[allow(clippy::cast_sign_loss)] // checked >= 0 above.
-                    let len_u64 = len as u64;
-                    if len_u64 > max_bytes {
-                        return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                            "{log_target}: Content-Length={len} exceeds max {max_bytes}"
-                        )));
-                    }
-                    Some(len_u64)
-                }
-                None => None,
-            };
-
-            // Stream the body chunk-by-chunk into the engine
-            // (issue #271). `ByteStream::into_async_read` yields a
-            // `tokio::io::AsyncBufRead` over the wire body —
-            // `aws_smithy_types`'s `Stream` impl is
-            // crate-private so we go through the AsyncRead seam,
-            // then back to `Stream<io::Result<Bytes>>` via
-            // `ReaderStream`. Chunks reach iroh-blobs'
-            // `add_stream` without the body ever sitting in
-            // process memory in full — a 10 GB S3 object never
-            // pins 10 GB of RSS.
-            //
-            // **Operator-visible diagnostics for body errors:**
-            // `aws_smithy_types::byte_stream::error::Error` is
-            // wrapped into the `io::Error` that `ReaderStream`
-            // emits and captured by the engine's
-            // `count_and_cap_stream` side channel. The `s3://`
-            // bucket/key prefix is attached to that error below via
-            // `prefix_body_stream_error`, so a mid-stream failure
-            // carries the same identifying context as the
-            // header-phase `classify_get_object_error` errors
-            // (issue #1617). The per-chunk `map` closure runs for
-            // every item, but it is a cheap passthrough on `Ok`
-            // (no allocation or formatting) and only builds the
-            // prefixed error on `Err`; it preserves the
-            // `io::ErrorKind` and any typed marker so the engine's
-            // `classify_io_error` still routes the error correctly.
-            let async_read = resp.body.into_async_read();
-            let raw_stream = ReaderStream::new(async_read);
-            // Layer the decoder (if any) onto the raw chunk stream. For an
-            // identity body this boxes the stream through unchanged; for
-            // gzip/zstd it decodes to canonical bytes. The decompressed-side
-            // `max_bytes` cap is still enforced by the engine's
-            // `count_and_cap_stream`, so a small compressed payload that
-            // decodes to a huge blob fails fast at the engine seam.
-            let stream = decompress::decode_stream(raw_stream, supported_encoding);
-            // For a decoded (compressed) body the advertised `Content-Length`
-            // is the *encoded* size, which understates the canonical length.
-            // Reporting it as `size_hint` would let the engine route a body
-            // whose encoded length fits under `buffered_max_bytes` into the
-            // buffer/drain path, where the drain cap (`buffered_max_bytes`)
-            // is applied to the *decoded* stream and falsely rejects an
-            // in-bounds blob as `BlobTooLarge` (#804). Hand `None` so the
-            // body always takes the streaming path, where
-            // `count_and_cap_stream` checks the running decoded total
-            // against the correct `max_blob_bytes`. The pre-stream
-            // `advertised_size > max_bytes` short-circuit above still runs
-            // first, so a compressed body advertising > `max_bytes` is
-            // rejected early (compression ratios < 1 make that a sound
-            // bound). Identity bodies keep the canonical-length hint.
-            let size_hint = if supported_encoding.is_some() {
-                None
-            } else {
-                advertised_size
-            };
-            // Attach the `s3://bucket/key` request context to any body-phase
-            // stream error (issue #1617). `log_target` is moved into the
-            // per-chunk `map`; it is not read again after this point.
-            let stream: OriginByteStream = Box::pin(
-                stream.map(move |item| item.map_err(|e| prefix_body_stream_error(&log_target, e))),
-            );
-            Ok(OriginFetch::Found { stream, size_hint })
-        })
     }
 
     fn fetch_range_data(
@@ -785,64 +535,55 @@ impl Origin for S3Origin {
             // the range returns the whole object and trips the length check).
             let range_val = format!("bytes={}-{}", req.fetch_start, req.fetch_end - 1);
             let want = req.len();
+            // `s3://bucket/key` is the conventional log shape. Safe to print:
+            // the bucket comes from operator-set config and the key is
+            // `{prefix}{hex[..2]}/{hex}` over a content-addressed BLAKE3 hash —
+            // no caller-controlled bytes, no credentials.
             let log_target = format!("s3://{}/{} (range {range_val})", self.bucket, data_key);
-            let resp = match self
-                .io
-                .run(
-                    self.client
-                        .get_object()
-                        .bucket(self.bucket.as_ref())
-                        .key(&data_key)
-                        .range(range_val)
-                        .send(),
-                )
-                .await
-                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
-            {
-                Ok(r) => r,
-                // Reuse the headers-phase classifier. A `NotFound` here is the
-                // data object missing or deleted mid-pull — degrade rather than
-                // error (whole-blob pull surfaces the real `NotFound`).
-                Err(e) => match classify_get_object_error(e, &log_target)? {
-                    // `classify_get_object_error` only ever produces
-                    // `NotFound` for an `Err` input; `Found` and
-                    // `AlreadyAdmitted` are present only to satisfy
-                    // exhaustiveness.
-                    OriginFetch::NotFound
-                    | OriginFetch::Found { .. }
-                    | OriginFetch::AlreadyAdmitted => {
-                        return Ok(OriginRangeFetch::Unsupported);
-                    }
-                },
+            let Some(resp) = self
+                .get_object(&data_key, Some(range_val), &log_target)
+                .await?
+            else {
+                return Ok(OriginRangeFetch::NotFound);
             };
-            // A ranged GET that decoded its body would break the offset→byte
-            // mapping the bao proof anchors on; refuse a compressed ranged
-            // object and degrade to the whole-blob path (which decodes safely).
+            // A ranged GET of a stored-compressed object returns encoded bytes,
+            // which break the offset→byte mapping the bao proof anchors on.
             if resp
                 .content_encoding()
                 .is_some_and(|e| !e.trim().is_empty())
             {
-                return Ok(OriginRangeFetch::Unsupported);
+                return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "{log_target}: object carries a Content-Encoding; store canonical bytes \
+                     with `decdn origin import`"
+                )));
             }
-            // Fast-fail on a `Content-Length` that doesn't match the requested
-            // span BEFORE collecting the body: an origin that ignored `Range`
-            // (and is about to stream the whole object) advertises the full
-            // length here, so we degrade without buffering. The exact-length
-            // gate on the collected bytes below is the load-bearing check;
-            // this only avoids reading a body we already know is wrong-sized.
-            if let Some(len) = resp.content_length()
-                && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) != want)
-            {
-                return Ok(OriginRangeFetch::Unsupported);
+            let wrong_length = |got: u64| {
+                OriginPullError::Permanent(anyhow::anyhow!(
+                    "{log_target}: answered {got} bytes for a {want}-byte range; the object \
+                     is short or the origin ignores `Range`"
+                ))
+            };
+            // Fail on a `Content-Length` that doesn't match the requested span
+            // BEFORE collecting the body: an origin that ignored `Range` (and is
+            // about to stream the whole object) advertises the full length
+            // here. The exact-length gate on the collected bytes below is the
+            // load-bearing check; this only avoids reading a body already known
+            // to be wrong-sized.
+            if let Some(len) = resp.content_length() {
+                let len = u64::try_from(len).unwrap_or(u64::MAX);
+                if len != want {
+                    return Err(wrong_length(len));
+                }
             }
             let want_usize = usize::try_from(want).unwrap_or(usize::MAX);
             let Some(data) = collect_bounded(resp.body, want_usize).await? else {
-                return Ok(OriginRangeFetch::Unsupported);
+                return Err(wrong_length(want.saturating_add(1)));
             };
             // Exact-length gate: a server that ignored `Range` (returned the
             // whole object) or returned multipart bytes is rejected here.
-            if u64::try_from(data.len()).unwrap_or(u64::MAX) != want {
-                return Ok(OriginRangeFetch::Unsupported);
+            let got = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            if got != want {
+                return Err(wrong_length(got));
             }
             Ok(OriginRangeFetch::Ranged { data })
         })
@@ -857,86 +598,21 @@ impl Origin for S3Origin {
             let data_key = key_for(&self.prefix, hash);
             let obao4_key = format!("{data_key}{OBAO4_SUFFIX}");
             let log_target = format!("s3://{}/{}", self.bucket, obao4_key);
-            let resp = match self
-                .io
-                .run(
-                    self.client
-                        .get_object()
-                        .bucket(self.bucket.as_ref())
-                        .key(&obao4_key)
-                        .send(),
-                )
-                .await
-                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
-            {
-                Ok(r) => r,
-                Err(e) => match classify_get_object_error(e, &log_target)? {
-                    // Missing outboard is the expected path for an origin
-                    // that doesn't publish `{H}.obao4`.
-                    OriginFetch::NotFound => return Ok(OutboardFetch::NotFound),
-                    // `classify_get_object_error` never actually produces
-                    // these arms for an `Err` input; only present to satisfy
-                    // exhaustiveness.
-                    OriginFetch::Found { .. } | OriginFetch::AlreadyAdmitted => {
-                        return Ok(OutboardFetch::Unsupported);
-                    }
-                },
+            let Some(resp) = self.get_object(&obao4_key, None, &log_target).await? else {
+                return Ok(OutboardFetch::NotFound);
             };
-            // An outboard over the cap degrades rather than errors, so the
-            // engine never sees it. The warn is the only record of it, for
-            // example a chunk-level outboard from a foreign tool, which costs
-            // every range pull of the blob.
+            // An outboard over the cap is malformed or foreign, for example a
+            // chunk-level outboard from another tool.
             if let Some(len) = resp.content_length()
                 && (len < 0 || u64::try_from(len).unwrap_or(u64::MAX) > outboard_max_bytes)
             {
-                tracing::warn!(
-                    target: "decdn_cache::origin::s3",
-                    log_target = %log_target,
-                    len,
-                    cap = outboard_max_bytes,
-                    "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
-                );
-                return Ok(OutboardFetch::Unsupported);
+                return Err(oversize(&log_target, outboard_max_bytes));
             }
             let cap = usize::try_from(outboard_max_bytes).unwrap_or(usize::MAX);
             let Some(bytes) = collect_bounded(resp.body, cap).await? else {
-                tracing::warn!(
-                    target: "decdn_cache::origin::s3",
-                    log_target = %log_target,
-                    cap = outboard_max_bytes,
-                    "origin outboard body ran past its cap; range pulls of this blob fall back to whole-blob",
-                );
-                return Ok(OutboardFetch::Unsupported);
+                return Err(oversize(&log_target, outboard_max_bytes));
             };
             Ok(OutboardFetch::Found(bytes))
-        })
-    }
-
-    fn has_outboard(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            let key = format!("{}{OBAO4_SUFFIX}", key_for(&self.prefix, hash));
-            let log_target = format!("s3://{}/{key}", self.bucket);
-            // `HeadObject` reads the outboard's metadata and none of its body.
-            match self
-                .io
-                .run(
-                    self.client
-                        .head_object()
-                        .bucket(self.bucket.as_ref())
-                        .key(&key)
-                        .send(),
-                )
-                .await
-                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 HeadObject"))))?
-            {
-                Ok(_) => Ok(true),
-                // A missing outboard is `Ok(None)`; any other failure is a
-                // fault.
-                Err(e) => classify_head_object_error(e, &log_target).map(|size| size.is_some()),
-            }
         })
     }
 
@@ -951,72 +627,14 @@ impl Origin for S3Origin {
                 decdn_bao_range::SIZE_PROOF_SUFFIX
             );
             let log_target = format!("s3://{}/{}", self.bucket, key);
-            let resp = match self
-                .io
-                .run(
-                    self.client
-                        .get_object()
-                        .bucket(self.bucket.as_ref())
-                        .key(&key)
-                        .send(),
-                )
-                .await
-                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 GetObject"))))?
-            {
-                Ok(r) => r,
-                // A missing proof means the origin proves no size for the
-                // blob.
-                Err(e) => match classify_get_object_error(e, &log_target)? {
-                    OriginFetch::NotFound
-                    | OriginFetch::Found { .. }
-                    | OriginFetch::AlreadyAdmitted => {
-                        return Ok(None);
-                    }
-                },
-            };
-            collect_bounded(resp.body, decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES).await
-        })
-    }
-
-    fn size(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            let key = key_for(&self.prefix, hash);
-            let log_target = format!("s3://{}/{key}", self.bucket);
-            // `HeadObject` returns the object metadata (including
-            // `Content-Length`) without transferring the body — the cheapest
-            // way to learn the canonical blob size before a range pull.
-            let resp = match self
-                .io
-                .run(
-                    self.client
-                        .head_object()
-                        .bucket(self.bucket.as_ref())
-                        .key(&key)
-                        .send(),
-                )
-                .await
-                .map_err(|e| e.map_inner(|e| e.context(format!("{log_target}: S3 HeadObject"))))?
-            {
-                Ok(r) => r,
-                Err(e) => return classify_head_object_error(e, &log_target),
-            };
-            // A `Content-Encoding` object advertises the *encoded* length here,
-            // not the canonical blob size — degrade to unknown, consistent with
-            // `fetch_range_data` refusing compressed ranges.
-            if resp
-                .content_encoding()
-                .is_some_and(|e| !e.trim().is_empty())
-            {
+            let Some(resp) = self.get_object(&key, None, &log_target).await? else {
                 return Ok(None);
+            };
+            let cap = decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES;
+            match collect_bounded(resp.body, cap).await? {
+                Some(object) => Ok(Some(object)),
+                None => Err(oversize(&log_target, cap as u64)),
             }
-            // `content_length()` is `Option<i64>`; a negative or absent value is
-            // unusable → unknown size.
-            Ok(resp
-                .content_length()
-                .and_then(|len| u64::try_from(len).ok()))
         })
     }
 }
@@ -1040,10 +658,8 @@ async fn collect_bounded(
             Ok(None) => break,
             Ok(Some(chunk)) => {
                 if buf.len().saturating_add(chunk.len()) > cap {
-                    // Over the bound → degrade. The optimization is best-effort;
-                    // an oversized span/outboard is treated as "not
-                    // range-pullable", never a hard error — and we abort here
-                    // rather than keep draining the body.
+                    // Over the bound: stop here rather than keep draining the
+                    // body. The caller reports the oversize object.
                     return Ok(None);
                 }
                 buf.extend_from_slice(&chunk);

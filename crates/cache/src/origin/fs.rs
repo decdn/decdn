@@ -15,12 +15,10 @@ use std::pin::Pin;
 
 use anyhow::Context;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
 use iroh_blobs::Hash;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt};
-use tokio_util::io::ReaderStream;
 
-use super::{Origin, OriginFetch, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
+use super::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 use crate::error::OriginPullError;
 
 /// Sibling-key suffix for the published pre-order bao outboard (`{H}.obao4`),
@@ -108,7 +106,7 @@ impl FilesystemOrigin {
     }
 
     /// Resolve `path` to a regular file inside `base`, before anything
-    /// opens it. `fetch`, `fetch_range_data`, `fetch_outboard` and `size`
+    /// opens it. `fetch_range_data`, `fetch_outboard` and `fetch_size_proof`
     /// all go through here.
     ///
     /// A symlink dropped into the shard tree by an operator mistake or
@@ -127,17 +125,17 @@ impl FilesystemOrigin {
     /// block.
     ///
     /// A path swapped between this stat and the caller's open is not
-    /// covered here. `fetch`, `fetch_outboard` and `size` re-check the type
-    /// on the opened file, which catches a device but not a FIFO: the open
-    /// blocks on a FIFO first. `fetch_range_data` does not re-check.
+    /// covered here. `fetch_outboard` re-checks the type on the opened file,
+    /// which catches a device but not a FIFO: the open blocks on a FIFO
+    /// first. `fetch_range_data` and `fetch_size_proof` do not re-check.
     ///
     /// `Ok(None)` means nothing exists at the path: no leaf, or no shard
     /// directory. Each caller maps that to its own "absent" answer. A
     /// dangling symlink — a leaf or a shard directory whose target does not
     /// exist — is not an absence: it is an operator mistake, for example an
     /// origin tree bind-mounted into a container with absolute links, so it
-    /// is a permanent failure. As an absence, `size` would report it as an
-    /// authoritative `Ok(None)` with no log at any level.
+    /// is a permanent failure. As an absence, `fetch_size_proof` would report
+    /// it as an authoritative `Ok(None)` with no log at any level.
     async fn resolve_regular(
         &self,
         path: &Path,
@@ -262,9 +260,8 @@ async fn dangling_link(path: &Path) -> Option<&Path> {
 /// is `Ok(None)` from [`FilesystemOrigin::resolve_regular`], and each read
 /// maps that, and a `NotFound` open, to its own absent answer. A symlink
 /// escape, a dangling symlink and a non-regular file are not `io::Error`s
-/// either: `resolve_regular`, and the re-checks on the opened file in
-/// `fetch`, `fetch_outboard` and `size`, emit `OriginPullError::Permanent`
-/// directly.
+/// either: `resolve_regular`, and the re-check on the opened file in
+/// `fetch_outboard`, emit `OriginPullError::Permanent` directly.
 fn classify_io_error(err: std::io::Error) -> OriginPullError {
     use std::io::ErrorKind;
     match err.kind() {
@@ -311,106 +308,20 @@ impl Origin for FilesystemOrigin {
         OriginKind::Filesystem
     }
 
-    fn fetch(
-        &self,
-        hash: Hash,
-        max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
-                return Ok(OriginFetch::NotFound);
-            };
-
-            // Open once and stat via the file handle (fstat), so the
-            // metadata we check and the bytes we read come from the
-            // same inode. The size cap does not use the stat from
-            // `resolve_regular`: the path could be swapped for a larger
-            // file or a different symlink before the open. The fstat
-            // re-checks the size and file type of what was opened. It
-            // does not re-check containment, and it cannot catch a FIFO
-            // swapped in after the resolve: the open blocks on it first.
-            //
-            // The file can also disappear between the resolve above
-            // and this open (eviction, gc, operator cleanup); treat
-            // that the same as a missing leaf and surface `NotFound`
-            // rather than a hard error, matching the resolve.
-            let file = match tokio::fs::File::open(&canonical).await {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(OriginFetch::NotFound);
-                }
-                Err(err) => {
-                    let path_msg =
-                        format!("cache.origin.path open failed for {}", canonical.display());
-                    return Err(classify_io_error(err).map_inner(|e| e.context(path_msg)));
-                }
-            };
-            let meta = file.metadata().await.map_err(|err| {
-                let path_msg = format!("cache.origin.path stat failed for {}", canonical.display());
-                classify_io_error(err).map_inner(|e| e.context(path_msg))
-            })?;
-
-            if !meta.is_file() {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} is not a regular file",
-                    canonical.display()
-                )));
-            }
-
-            let len = meta.len();
-            if len > max_bytes {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} is {len} bytes, exceeds max {max_bytes}",
-                    canonical.display()
-                )));
-            }
-
-            // Stream the file through `ReaderStream` rather than reading
-            // the entire payload into a `Vec` (issue #271). The owned
-            // `File` moves into `Take`, then into `ReaderStream`, so the
-            // fd outlives the stream rather than being borrowed; iroh
-            // -blobs' `add_stream` can drive this directly without any
-            // intermediate buffer.
-            //
-            // `take(max_bytes + 1)` provides an I/O-layer cap: a
-            // file that grew between `fstat` and the read (append,
-            // pwrite past EOF, truncate-then-extend — all happen on
-            // the same inode our fd is pinning) is bounded by the
-            // kernel's read syscall. The wrapper in
-            // [`cap_at_max_bytes`] catches the one-byte overrun and
-            // yields it as an `io::Error` carrying a typed
-            // `BlobTooLargeMarker`, which the engine surfaces as
-            // `CacheError::BlobTooLarge`.
-            //
-            // `saturating_add(1)` preserves correctness for
-            // `max_bytes == u64::MAX`: saturating rather than
-            // wrapping to `0`.
-            let reader = file.take(max_bytes.saturating_add(1));
-            let raw = ReaderStream::new(reader);
-            let stream = cap_at_max_bytes(raw, max_bytes);
-            Ok(OriginFetch::Found {
-                stream: Box::pin(stream),
-                size_hint: Some(len),
-            })
-        })
-    }
-
     fn fetch_range_data(
         &self,
         hash: Hash,
         req: OriginRangeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<OriginRangeFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
-            // A missing data object is `Unsupported`: the caller falls back
-            // to a whole-blob pull, which then surfaces the real `NotFound`.
             let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
-                return Ok(OriginRangeFetch::Unsupported);
+                return Ok(OriginRangeFetch::NotFound);
             };
 
             let mut file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(OriginRangeFetch::Unsupported);
+                    return Ok(OriginRangeFetch::NotFound);
                 }
                 Err(err) => {
                     let msg = format!("cache.origin.path open failed for {}", canonical.display());
@@ -425,9 +336,8 @@ impl Origin for FilesystemOrigin {
 
             // Seek to the aligned start and read exactly `req.len()` bytes. A
             // short read (the on-disk object is smaller than the aligned span
-            // the engine derived from the signed blob size) means the origin
-            // copy is stale/truncated — degrade to whole-blob rather than feed
-            // a partial span to verification (which would reject it anyway).
+            // the engine derived from the proven blob size) means the origin
+            // copy is stale or truncated: a permanent fault.
             if let Err(err) = file.seek(std::io::SeekFrom::Start(req.fetch_start)).await {
                 let msg = format!("cache.origin.path seek failed for {}", canonical.display());
                 return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
@@ -436,7 +346,13 @@ impl Origin for FilesystemOrigin {
             let mut data = vec![0u8; want];
             if let Err(err) = file.read_exact(&mut data).await {
                 if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Ok(OriginRangeFetch::Unsupported);
+                    return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                        "cache.origin.path entry {} is shorter than the range [{}, {}); \
+                         re-run `decdn origin import` for the object",
+                        canonical.display(),
+                        req.fetch_start,
+                        req.fetch_end
+                    )));
                 }
                 let msg = format!(
                     "cache.origin.path range read failed for {}",
@@ -464,20 +380,15 @@ impl Origin for FilesystemOrigin {
             // Check the on-disk length before reading: a wildly oversized
             // `.obao4` is malformed/foreign, and reading it first would buffer
             // the whole thing into memory only to reject it (an OOM lever for
-            // a hostile sibling). An outboard over the cap degrades to
-            // `Unsupported`, not an error, so the engine never sees it; the
-            // engine's exact-length check rejects a wrong-length outboard
-            // that fits under the cap. The warn is the only record of an
-            // oversize outboard, for example a chunk-level outboard from a
-            // foreign tool, which costs every range pull of the blob.
+            // a hostile sibling). An outboard over the cap is a permanent
+            // fault; the engine's exact-length check rejects a wrong-length
+            // outboard that fits under the cap.
             if meta.len() > outboard_max_bytes {
-                tracing::warn!(
-                    path = %canonical.display(),
-                    len = meta.len(),
-                    cap = outboard_max_bytes,
-                    "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
-                );
-                return Ok(OutboardFetch::Unsupported);
+                return Err(oversize_outboard(
+                    &canonical,
+                    meta.len(),
+                    outboard_max_bytes,
+                ));
             }
             let file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
@@ -510,25 +421,19 @@ impl Origin for FilesystemOrigin {
                 )));
             }
             if meta.len() > outboard_max_bytes {
-                tracing::warn!(
-                    path = %canonical.display(),
-                    len = meta.len(),
-                    cap = outboard_max_bytes,
-                    "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
-                );
-                return Ok(OutboardFetch::Unsupported);
+                return Err(oversize_outboard(
+                    &canonical,
+                    meta.len(),
+                    outboard_max_bytes,
+                ));
             }
             match read_capped(file, meta.len(), outboard_max_bytes).await {
                 Ok(Some(outboard)) => Ok(OutboardFetch::Found(Bytes::from(outboard))),
-                Ok(None) => {
-                    tracing::warn!(
-                        path = %canonical.display(),
-                        stat_len = meta.len(),
-                        cap = outboard_max_bytes,
-                        "origin outboard grew past its cap during the read; range pulls of this blob fall back to whole-blob",
-                    );
-                    Ok(OutboardFetch::Unsupported)
-                }
+                Ok(None) => Err(oversize_outboard(
+                    &canonical,
+                    outboard_max_bytes.saturating_add(1),
+                    outboard_max_bytes,
+                )),
                 Err(err) => {
                     let msg = format!(
                         "cache.origin.path outboard read failed for {}",
@@ -537,20 +442,6 @@ impl Origin for FilesystemOrigin {
                     Err(classify_io_error(err).map_inner(|e| e.context(msg)))
                 }
             }
-        })
-    }
-
-    fn has_outboard(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, OriginPullError>> + Send + '_>> {
-        // A stat: the outboard is a regular file inside the base. The read
-        // ([`Self::fetch_outboard`]) checks its length.
-        Box::pin(async move {
-            Ok(self
-                .resolve_regular(&self.obao4_path_for(hash))
-                .await?
-                .is_some())
         })
     }
 
@@ -567,7 +458,7 @@ impl Origin for FilesystemOrigin {
             };
             let max = MAX_SIZE_PROOF_OBJECT_BYTES as u64;
             if meta.len() > max {
-                return Ok(None);
+                return Err(oversize_size_proof(&canonical, max));
             }
             let file = match tokio::fs::File::open(&canonical).await {
                 Ok(f) => f,
@@ -581,7 +472,8 @@ impl Origin for FilesystemOrigin {
                 }
             };
             match read_capped(file, meta.len(), max).await {
-                Ok(proof) => Ok(proof.map(Bytes::from)),
+                Ok(Some(proof)) => Ok(Some(Bytes::from(proof))),
+                Ok(None) => Err(oversize_size_proof(&canonical, max)),
                 Err(err) => {
                     let msg = format!(
                         "cache.origin.path size proof read failed for {}",
@@ -590,49 +482,6 @@ impl Origin for FilesystemOrigin {
                     Err(classify_io_error(err).map_inner(|e| e.context(msg)))
                 }
             }
-        })
-    }
-
-    fn size(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            // The local data object's on-disk length IS the canonical blob size
-            // (filesystem origins never compress), so a stat is an exact,
-            // body-free answer. A missing data object is `Ok(None)`, which the
-            // trait contract reads as an authoritative absence; a dangling
-            // symlink is a permanent fault from `resolve_regular`, never an
-            // absence.
-            let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
-                return Ok(None);
-            };
-            // Open the file once, and drop it, so an object the process cannot
-            // read (mode 0600 under another user) is a fault here rather than
-            // a size that every serve then fails on at `open`. The resolve
-            // rules out a FIFO that is already in place; a FIFO swapped in
-            // after the stat can still block this open, as it can block the
-            // other reads' opens (#2802). The fstat re-checks the type of what
-            // was opened and gives the size of that inode.
-            let file = match tokio::fs::File::open(&canonical).await {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => {
-                    let msg = format!("cache.origin.path open failed for {}", canonical.display());
-                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-                }
-            };
-            let meta = file.metadata().await.map_err(|err| {
-                let msg = format!("cache.origin.path stat failed for {}", canonical.display());
-                classify_io_error(err).map_inner(|e| e.context(msg))
-            })?;
-            if !meta.is_file() {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} is not a regular file",
-                    canonical.display()
-                )));
-            }
-            Ok(Some(meta.len()))
         })
     }
 
@@ -736,56 +585,24 @@ async fn read_capped<R: AsyncRead + Unpin>(
     Ok(Some(buf))
 }
 
-/// Defense-in-depth running-cap wrapper around a chunk stream. The
-/// inner `take(max_bytes + 1)` bounds the I/O-layer read at one byte
-/// past the cap, so a file that grew during read produces a stream
-/// whose chunks sum to at most `max_bytes + 1`. This wrapper trips on
-/// the cumulative byte count and yields the overrun as an `io::Error`
-/// carrying a typed `BlobTooLargeMarker`. The engine's outer wrapper
-/// (`count_and_cap_stream`) captures the error into its side channel
-/// and yields `None` to `iroh_blobs::Blobs::add_stream`, so this error
-/// never reaches iroh-blobs directly — the engine reads the marker from
-/// the side channel once `temp_tag().await` completes and surfaces
-/// `CacheError::BlobTooLarge` to the caller.
-///
-/// The error carries no file path: the typed marker is the
-/// operator-visible signal.
-fn cap_at_max_bytes<S>(
-    stream: S,
-    max_bytes: u64,
-) -> impl Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static
-where
-    S: Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
-{
-    // **Termination after error:** the inner stream is wrapped in
-    // `Option` so that after yielding an `Err`, the next poll returns
-    // `None`. Polling a stream after a terminal error is undefined
-    // (some impls error again, some hang); the sentinel makes the
-    // wrapper deterministic and prevents iroh-blobs' `add_stream` from
-    // hanging when the upstream errors.
-    futures_util::stream::unfold((Some(stream), 0u64), move |(maybe_s, total)| async move {
-        let mut s = maybe_s?;
-        let next = s.next().await?;
-        match next {
-            Err(e) => Some((Err(e), (None, total))),
-            Ok(chunk) => {
-                let new_total = total.saturating_add(chunk.len() as u64);
-                if new_total > max_bytes {
-                    // Pack a typed `BlobTooLargeMarker` so the engine
-                    // surfaces `CacheError::BlobTooLarge`. A bare
-                    // `ErrorKind::Other` would classify as Transient
-                    // (`retry::classify_io_error`) and burn the retry
-                    // budget on a cap breach. Matches
-                    // `http.rs::response_chunk_stream`'s typed-marker
-                    // symmetry.
-                    let err = std::io::Error::other(super::BlobTooLargeMarker { max_bytes });
-                    Some((Err(err), (None, total)))
-                } else {
-                    Some((Ok(chunk), (Some(s), new_total)))
-                }
-            }
-        }
-    })
+/// The permanent fault for an outboard at `path` of `len` bytes, over its
+/// `cap`. An outboard that large is malformed or foreign, for example a
+/// chunk-level outboard from another tool.
+fn oversize_outboard(path: &Path, len: u64, cap: u64) -> OriginPullError {
+    OriginPullError::Permanent(anyhow::anyhow!(
+        "cache.origin.path outboard {} is {len} bytes, over its {cap}-byte cap; re-run \
+         `decdn origin import` for the object",
+        path.display()
+    ))
+}
+
+/// The permanent fault for a size proof object at `path` larger than `cap`.
+fn oversize_size_proof(path: &Path, cap: u64) -> OriginPullError {
+    OriginPullError::Permanent(anyhow::anyhow!(
+        "cache.origin.path size proof {} is over its {cap}-byte cap; re-run \
+         `decdn origin import` for the object",
+        path.display()
+    ))
 }
 
 #[cfg(test)]

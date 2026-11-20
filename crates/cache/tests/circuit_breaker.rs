@@ -7,7 +7,7 @@
 //! that an OPEN breaker short-circuits BEFORE the retry/backoff loop (so
 //! no backoff is incurred and the origin is never even called), that the
 //! cooldown→half-open→closed recovery cycle works end-to-end through
-//! `CacheEngine::get`, and that permanent per-object errors (404) never
+//! `CacheEngine::populate`, and that permanent per-object errors (404) never
 //! trip the breaker.
 //!
 //! Determinism: the breaker cooldown is driven by an injected
@@ -30,8 +30,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use decdn_cache::{
@@ -46,10 +46,12 @@ use std::assert_matches;
 /// - `unavailable = true`  → returns `OriginPullError::Transient` (a 5xx
 ///   storm / connect failure — the kind that, after exhausting the retry
 ///   budget, the breaker counts as origin-unavailable).
-/// - `unavailable = false` → serves the payload for the target hash.
+/// - `unavailable = false` → admits the payload for the target hash into the
+///   engine's store and answers `AlreadyAdmitted`, as the node-to-node
+///   origin does.
 ///
 /// The fetch counter is the load-bearing assertion for "fast-fail incurs
-/// no backoff": while the breaker is OPEN, `get` must short-circuit
+/// no backoff": while the breaker is OPEN, `populate` must short-circuit
 /// *before* calling `fetch`, so the counter does not move.
 #[derive(Debug)]
 struct ControllableOrigin {
@@ -57,6 +59,8 @@ struct ControllableOrigin {
     target: Hash,
     unavailable: AtomicBool,
     fetches: AtomicUsize,
+    /// The engine this origin admits into, set once the engine is open.
+    engine: OnceLock<CacheEngine>,
 }
 
 impl ControllableOrigin {
@@ -66,6 +70,7 @@ impl ControllableOrigin {
             payload: bytes::Bytes::from(payload.to_vec()),
             unavailable: AtomicBool::new(true),
             fetches: AtomicUsize::new(0),
+            engine: OnceLock::new(),
         }
     }
     fn hash(&self) -> Hash {
@@ -99,7 +104,12 @@ impl Origin for ControllableOrigin {
                     "synthetic origin-unavailable"
                 )))
             } else if hash == target {
-                Ok(OriginFetch::found_one_shot(payload))
+                let engine = self.engine.get().expect("engine set after open");
+                engine
+                    .insert_blob(payload)
+                    .await
+                    .map_err(|e| OriginPullError::Permanent(e.into()))?;
+                Ok(OriginFetch::AlreadyAdmitted)
             } else {
                 Ok(OriginFetch::NotFound)
             }
@@ -155,7 +165,6 @@ fn slow_retry() -> RetryPolicy {
         initial_backoff_ms: 60_000,
         max_backoff_ms: 60_000,
         jitter_ratio: 0.0,
-        buffered_max_bytes: 0,
     }
 }
 
@@ -185,7 +194,7 @@ async fn build(
     let clock = ManualClock::new();
     let engine = CacheEngine::open_full_with_clock(
         tmp.path(),
-        vec![origin as Arc<dyn Origin>],
+        vec![Arc::clone(&origin) as Arc<dyn Origin>],
         16,
         PinnedHashes::empty(),
         retry,
@@ -195,6 +204,10 @@ async fn build(
         Arc::new(clock.clone()),
     )
     .await?;
+    origin
+        .engine
+        .set(engine.clone())
+        .map_err(|_| anyhow::anyhow!("engine set twice"))?;
     Ok((engine, metrics, clock, tmp))
 }
 
@@ -217,7 +230,7 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
 
     // Two consecutive transient failures trip the breaker (threshold = 2).
     for _ in 0..2 {
-        let err = engine.get(hash).await.unwrap_err();
+        let err = engine.populate(hash).await.unwrap_err();
         assert_matches!(
             err,
             CacheError::OriginError { .. },
@@ -237,7 +250,7 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
 
     // Now OPEN. A miss must short-circuit: no new origin call, fast error,
     // short-circuit counter bumped. The timeout guards against a hang.
-    let res = tokio::time::timeout(Duration::from_secs(1), engine.get(hash))
+    let res = tokio::time::timeout(Duration::from_secs(1), engine.populate(hash))
         .await
         .expect("OPEN breaker miss must return immediately, not block on backoff");
     let err = res.unwrap_err();
@@ -265,7 +278,7 @@ async fn opens_on_repeated_transient_then_fast_fails_with_no_backoff() -> anyhow
 /// The trip phase runs on a paused Tokio clock, so its 60s backoff sleeps
 /// (two per miss) take no wall time: the idle runtime auto-advances to each
 /// pending sleep. The clock then resumes, so the OPEN miss runs in real
-/// time and nothing auto-advances during `get`'s cross-runtime store I/O.
+/// time and nothing auto-advances during `populate`'s cross-runtime store I/O.
 ///
 /// Two signals prove the OPEN miss incurs no backoff. A 30s real-clock
 /// timeout catches a 60s backoff from any source on the miss path. The
@@ -284,7 +297,7 @@ async fn open_breaker_skips_the_60s_backoff_loop() -> anyhow::Result<()> {
     // paused clock auto-advances through the 60s backoff sleeps instantly
     // because nothing else is runnable.
     for _ in 0..2 {
-        let r = engine.get(hash).await;
+        let r = engine.populate(hash).await;
         assert!(r.is_err());
     }
     let fetches_at_trip = origin.fetches();
@@ -298,7 +311,7 @@ async fn open_breaker_skips_the_60s_backoff_loop() -> anyhow::Result<()> {
     // the retry loop, so no backoff sleep fires and nothing exhausts. On the
     // resumed clock a leaked 60s backoff takes real time and trips the guard.
     tokio::time::resume();
-    let res = tokio::time::timeout(Duration::from_secs(30), engine.get(hash))
+    let res = tokio::time::timeout(Duration::from_secs(30), engine.populate(hash))
         .await
         .expect("OPEN breaker miss must return without a backoff sleep");
     assert!(res.is_err());
@@ -320,7 +333,7 @@ async fn open_breaker_skips_the_60s_backoff_loop() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Full recovery cycle through `get`: open → (cooldown) → half-open trial
+/// Full recovery cycle through `populate`: open → (cooldown) → half-open trial
 /// succeeds → closed, and subsequent misses are served normally.
 #[tokio::test]
 async fn half_open_trial_success_recovers_to_closed() -> anyhow::Result<()> {
@@ -335,13 +348,13 @@ async fn half_open_trial_success_recovers_to_closed() -> anyhow::Result<()> {
 
     // Trip it.
     for _ in 0..2 {
-        let _ = engine.get(hash).await;
+        let _ = engine.populate(hash).await;
     }
     assert_eq!(metrics.circuit_breaker_trips.get(), 1);
 
     // Still OPEN before cooldown: short-circuit, origin untouched.
     let fetches_open = origin.fetches();
-    let _ = engine.get(hash).await;
+    let _ = engine.populate(hash).await;
     assert_eq!(origin.fetches(), fetches_open, "still OPEN: no origin call");
 
     // Make the origin healthy and advance the manual clock past the
@@ -350,8 +363,8 @@ async fn half_open_trial_success_recovers_to_closed() -> anyhow::Result<()> {
     clk.advance(Duration::from_secs(5));
 
     // Half-open trial pull: hits the origin once, succeeds, closes.
-    let got = engine.get(hash).await?;
-    assert_eq!(&got[..], b"cb-payload-3");
+    engine.populate(hash).await?;
+    assert_eq!(&engine.read_blob(hash).await?[..], b"cb-payload-3");
     assert_eq!(
         origin.fetches(),
         fetches_open + 1,
@@ -363,9 +376,9 @@ async fn half_open_trial_success_recovers_to_closed() -> anyhow::Result<()> {
         "trial success closed it"
     );
 
-    // Now CLOSED and the blob is cached: a follow-up get is a local hit.
-    let got2 = engine.get(hash).await?;
-    assert_eq!(&got2[..], b"cb-payload-3");
+    // Now CLOSED and the blob is cached: a follow-up populate is a local hit.
+    engine.populate(hash).await?;
+    assert_eq!(origin.fetches(), fetches_open + 1, "a hit calls no origin");
     Ok(())
 }
 
@@ -383,14 +396,14 @@ async fn half_open_trial_failure_reopens() -> anyhow::Result<()> {
     .await?;
 
     for _ in 0..2 {
-        let _ = engine.get(hash).await;
+        let _ = engine.populate(hash).await;
     }
     assert_eq!(metrics.circuit_breaker_trips.get(), 1);
 
     // Cooldown elapses, but the origin is STILL unavailable.
     clk.advance(Duration::from_secs(5));
     let fetches_before_trial = origin.fetches();
-    let _ = engine.get(hash).await; // half-open trial — fails
+    let _ = engine.populate(hash).await; // half-open trial — fails
     assert_eq!(
         origin.fetches(),
         fetches_before_trial + 1,
@@ -405,7 +418,7 @@ async fn half_open_trial_failure_reopens() -> anyhow::Result<()> {
 
     // Immediately after re-open (no further cooldown): short-circuit again.
     let fetches_after_trial = origin.fetches();
-    let _ = engine.get(hash).await;
+    let _ = engine.populate(hash).await;
     assert_eq!(
         origin.fetches(),
         fetches_after_trial,
@@ -437,7 +450,7 @@ async fn permanent_not_found_never_trips_breaker() -> anyhow::Result<()> {
 
     let hash = Hash::new(b"never-exists");
     for _ in 0..20 {
-        let err = engine.get(hash).await.unwrap_err();
+        let err = engine.populate(hash).await.unwrap_err();
         assert_matches!(
             err,
             CacheError::NotFound { .. },
@@ -478,7 +491,7 @@ async fn disabled_breaker_never_short_circuits() -> anyhow::Result<()> {
     .await?;
 
     for _ in 0..10 {
-        let _ = engine.get(hash).await;
+        let _ = engine.populate(hash).await;
     }
     assert_eq!(metrics.circuit_breaker_trips.get(), 0);
     assert_eq!(metrics.circuit_breaker_short_circuits.get(), 0);
@@ -508,7 +521,7 @@ async fn concurrent_misses_while_open_all_fast_fail() -> anyhow::Result<()> {
 
     // Trip the breaker (sequential, to make the trip deterministic).
     for _ in 0..2 {
-        let _ = engine.get(hash).await;
+        let _ = engine.populate(hash).await;
     }
     let fetches_at_trip = origin.fetches();
 
@@ -517,7 +530,7 @@ async fn concurrent_misses_while_open_all_fast_fail() -> anyhow::Result<()> {
     let mut handles = Vec::new();
     for _ in 0..50 {
         let e = engine.clone();
-        handles.push(tokio::spawn(async move { e.get(hash).await }));
+        handles.push(tokio::spawn(async move { e.populate(hash).await }));
     }
     let results = tokio::time::timeout(Duration::from_secs(5), async {
         let mut out = Vec::new();

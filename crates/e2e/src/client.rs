@@ -62,10 +62,10 @@ use decdn_node::handlers::timestamp_skew::now_us as timestamp_now_us;
 /// the tap decides it has gone idle.
 const WIRE_TAP_IDLE: Duration = Duration::from_secs(5);
 /// How long the tap waits for the *first* frame. Far larger than
-/// [`WIRE_TAP_IDLE`] because the first frame is gated on the node's entire
-/// reactive backend fill (`try_local_populate`, budgeted at
-/// `cache.node_pull_timeout_sec`), not on an idle pause — a tapped blob is
-/// deliberately absent from the store.
+/// [`WIRE_TAP_IDLE`] because the first frame is gated on the node's
+/// own-origin fill (its `{H}.sizeproof` read, admission and the first range
+/// window), not on an idle pause — a tapped blob is deliberately absent from
+/// the store.
 const WIRE_TAP_FIRST_FRAME: Duration = Duration::from_secs(30);
 /// How long [`ClientFixture::discovery_open`] waits for the dial, and again
 /// for the answer.

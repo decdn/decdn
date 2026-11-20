@@ -670,10 +670,7 @@ fn expand_env_per_field_error_context() -> anyhow::Result<()> {
         }),
         ("cache.origin.url", |c, v| {
             c.cache = Some(types::CacheConfig {
-                origin: Some(types::OriginConfig::Http {
-                    url: v.to_string(),
-                    decompress: None,
-                }),
+                origin: Some(types::OriginConfig::Http { url: v.to_string() }),
                 ..Default::default()
             });
         }),
@@ -754,7 +751,6 @@ fn expand_env_substitutes_cache_origin_url() -> anyhow::Result<()> {
         cache: Some(types::CacheConfig {
             origin: Some(types::OriginConfig::Http {
                 url: "https://origin.example/${HOME}/bucket".to_string(),
-                decompress: None,
             }),
             ..Default::default()
         }),
@@ -1189,10 +1185,7 @@ fn resolve_cache_origin_fs_expands_tilde_in_path() -> anyhow::Result<()> {
 fn resolve_cache_rejects_empty_http_origin_url() -> anyhow::Result<()> {
     let cli = empty_cache_args();
     let toml = types::CacheConfig {
-        origin: Some(types::OriginConfig::Http {
-            url: String::new(),
-            decompress: None,
-        }),
+        origin: Some(types::OriginConfig::Http { url: String::new() }),
         ..Default::default()
     };
     let err = resolve_cache(&cli, Some(&toml), Path::new("/tmp"))
@@ -1539,7 +1532,6 @@ fn resolve_cache_accepts_array_of_origins_preserving_order() -> anyhow::Result<(
         origins: Some(vec![
             types::OriginConfig::Http {
                 url: "https://primary.example/".to_string(),
-                decompress: None,
             },
             types::OriginConfig::Fs {
                 path: PathBuf::from("/var/lib/decdn/mirror"),
@@ -1584,11 +1576,9 @@ fn resolve_cache_rejects_both_origin_and_origins() -> anyhow::Result<()> {
     let toml = types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
             url: "https://one.example/".to_string(),
-            decompress: None,
         }),
         origins: Some(vec![types::OriginConfig::Http {
             url: "https://two.example/".to_string(),
-            decompress: None,
         }]),
         ..Default::default()
     };
@@ -1637,7 +1627,6 @@ fn resolve_cache_origin_singular_resolves_to_one_element_vec() -> anyhow::Result
     let toml = types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
             url: "https://only.example/".to_string(),
-            decompress: None,
         }),
         ..Default::default()
     };
@@ -1682,7 +1671,6 @@ fn resolve_cache_relay_foreign_namespaces_defaults_false_with_origin() -> anyhow
     let toml = types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
             url: "https://origin.example/".to_string(),
-            decompress: None,
         }),
         ..Default::default()
     };
@@ -1718,7 +1706,6 @@ fn resolve_cache_relay_foreign_namespaces_explicit_true_overrides_origin_default
     let toml = types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
             url: "https://origin.example/".to_string(),
-            decompress: None,
         }),
         relay_foreign_namespaces: Some(true),
         ..Default::default()
@@ -1737,7 +1724,6 @@ fn origin_cache(pull_through: Option<bool>) -> types::CacheConfig {
     types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
             url: "https://origin.example/".to_string(),
-            decompress: None,
         }),
         node_to_node_pull_through_enabled: pull_through,
         ..Default::default()
@@ -1813,11 +1799,9 @@ fn resolve_cache_accepts_duplicate_origins_without_erroring() -> anyhow::Result<
         origins: Some(vec![
             types::OriginConfig::Http {
                 url: "https://shared.example/".to_string(),
-                decompress: None,
             },
             types::OriginConfig::Http {
                 url: "https://shared.example/".to_string(),
-                decompress: None,
             },
         ]),
         ..Default::default()
@@ -1857,12 +1841,8 @@ fn resolve_cache_origins_propagates_per_entry_error_with_index() -> anyhow::Resu
         origins: Some(vec![
             types::OriginConfig::Http {
                 url: "https://good.example/".to_string(),
-                decompress: None,
             },
-            types::OriginConfig::Http {
-                url: String::new(),
-                decompress: None,
-            },
+            types::OriginConfig::Http { url: String::new() },
         ]),
         ..Default::default()
     };
@@ -1887,11 +1867,9 @@ fn resolve_cache_origins_accumulates_every_bad_entry() -> anyhow::Result<()> {
         origins: Some(vec![
             types::OriginConfig::Http {
                 url: String::new(), // idx 0: empty URL
-                decompress: None,
             },
             types::OriginConfig::Http {
                 url: "https://good.example/".to_string(), // idx 1: valid
-                decompress: None,
             },
             types::OriginConfig::Fs {
                 path: std::path::PathBuf::new(), // idx 2: empty path
@@ -1923,7 +1901,6 @@ fn resolve_cache_rejects_non_http_origin_url() -> anyhow::Result<()> {
     let toml = types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
             url: "file:///etc/passwd".to_string(),
-            decompress: None,
         }),
         ..Default::default()
     };
@@ -1964,7 +1941,6 @@ fn resolve_cache_origin_http_from_toml_round_trips() -> anyhow::Result<()> {
     let toml = types::CacheConfig {
         origin: Some(types::OriginConfig::Http {
             url: "https://origin.example/".to_string(),
-            decompress: None,
         }),
         ..Default::default()
     };
@@ -2178,7 +2154,7 @@ fn resolve_cache_accepts_max_blob_below_cache_size() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ----- pinned_hashes / decompress (#276, #312) -----
+// ----- pinned_hashes (#276) -----
 
 fn make_hex_hash(seed: u8) -> String {
     use std::fmt::Write as _;
@@ -2644,89 +2620,6 @@ fn resolve_cache_accepts_user_agent_with_tab() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn resolve_cache_http_decompress_strict_via_file() -> anyhow::Result<()> {
-    let cli = cache_cli(None, None);
-    let file = types::CacheConfig {
-        origin: Some(types::OriginConfig::Http {
-            url: "https://origin.example/".to_string(),
-            decompress: Some(decdn_config_types::DecompressMode::Strict),
-        }),
-        ..types::CacheConfig::default()
-    };
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    match resolved.origins.into_iter().next() {
-        Some(ResolvedOrigin::Http { decompress, .. }) => {
-            anyhow::ensure!(matches!(
-                decompress,
-                decdn_config_types::DecompressMode::Strict
-            ));
-        }
-        other => anyhow::bail!("expected Http origin, got: {other:?}"),
-    }
-    Ok(())
-}
-
-#[test]
-fn resolve_cache_s3_decompress_strict_via_file() -> anyhow::Result<()> {
-    let cli = cache_cli(None, None);
-    let file = cache_with_s3(types::S3OriginConfig {
-        decompress: Some(decdn_config_types::DecompressMode::Strict),
-        ..s3_cfg("decdn-blobs")
-    });
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    match resolved.origins.into_iter().next() {
-        Some(ResolvedOrigin::S3(s3)) => {
-            anyhow::ensure!(matches!(
-                s3.decompress,
-                decdn_config_types::DecompressMode::Strict
-            ));
-        }
-        other => anyhow::bail!("expected S3 origin, got: {other:?}"),
-    }
-    Ok(())
-}
-
-#[test]
-fn resolve_cache_s3_decompress_defaults_to_auto() -> anyhow::Result<()> {
-    let cli = cache_cli(None, None);
-    let file = cache_with_s3(s3_cfg("decdn-blobs"));
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    match resolved.origins.into_iter().next() {
-        Some(ResolvedOrigin::S3(s3)) => {
-            anyhow::ensure!(matches!(
-                s3.decompress,
-                decdn_config_types::DecompressMode::Auto
-            ));
-        }
-        other => anyhow::bail!("expected S3 origin, got: {other:?}"),
-    }
-    Ok(())
-}
-
-#[test]
-fn resolve_cache_http_decompress_defaults_to_auto() -> anyhow::Result<()> {
-    let cli = cache_cli(None, None);
-    let file = types::CacheConfig {
-        origin: Some(types::OriginConfig::Http {
-            url: "https://origin.example/".to_string(),
-            decompress: None,
-        }),
-        ..types::CacheConfig::default()
-    };
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    match resolved.origins.into_iter().next() {
-        Some(ResolvedOrigin::Http { decompress, .. }) => {
-            anyhow::ensure!(matches!(
-                decompress,
-                decdn_config_types::DecompressMode::Auto
-            ));
-        }
-        other => anyhow::bail!("expected Http origin, got: {other:?}"),
-    }
-    Ok(())
-}
-
 // ----- #437: S3 origin schema -----
 //
 // The tests below pin the shape of the schema validators and the
@@ -2746,7 +2639,6 @@ fn s3_cfg(bucket: &str) -> types::S3OriginConfig {
         path_style: None,
         prefix: None,
         credentials: None,
-        decompress: None,
     }
 }
 
@@ -2767,7 +2659,6 @@ fn resolve_cache_origin_s3_happy_path() -> anyhow::Result<()> {
         path_style: Some(true),
         prefix: Some("blobs".to_string()),
         credentials: None,
-        decompress: None,
     });
     let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
     match resolved.origins.into_iter().next() {
@@ -3085,7 +2976,6 @@ fn http_origin_rejects_missing_url_field() -> anyhow::Result<()> {
     assert_origin_toml_rejects(
         r#"
                 kind = "http"
-                decompress = "auto"
             "#,
         &["missing field", "url"],
     )
@@ -3143,7 +3033,6 @@ fn resolve_cache_origin_s3_static_credentials_round_trip() -> anyhow::Result<()>
             secret_access_key: secret::SecretString::new("test-secret-value"),
             session_token: Some(secret::SecretString::new("STS-token")),
         }),
-        decompress: None,
     });
     let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
     let creds = match resolved.origins.into_iter().next() {
@@ -3184,7 +3073,6 @@ fn resolve_cache_origin_s3_default_chain_no_profile() -> anyhow::Result<()> {
         path_style: None,
         prefix: None,
         credentials: Some(types::S3Credentials::DefaultChain { profile: None }),
-        decompress: None,
     });
     let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
     let creds = match resolved.origins.into_iter().next() {
@@ -3223,7 +3111,6 @@ fn resolve_cache_origin_s3_default_chain_empty_profile_collapses_to_none() -> an
         credentials: Some(types::S3Credentials::DefaultChain {
             profile: Some(String::new()),
         }),
-        decompress: None,
     });
     let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
     let creds = match resolved.origins.into_iter().next() {
@@ -3281,7 +3168,6 @@ fn expand_env_substitutes_s3_bucket_and_region() -> anyhow::Result<()> {
                 path_style: None,
                 prefix: None,
                 credentials: None,
-                decompress: None,
             })),
             ..Default::default()
         }),
@@ -3309,7 +3195,6 @@ fn expand_env_substitutes_s3_endpoint_and_prefix() -> anyhow::Result<()> {
                 path_style: None,
                 prefix: Some("blobs-${HOME}/".to_string()),
                 credentials: None,
-                decompress: None,
             })),
             ..Default::default()
         }),
@@ -3346,7 +3231,6 @@ fn expand_env_substitutes_s3_static_credentials() -> anyhow::Result<()> {
                     secret_access_key: secret::SecretString::new("${HOME}-secret"),
                     session_token: Some(secret::SecretString::new("${HOME}-token")),
                 }),
-                decompress: None,
             })),
             ..Default::default()
         }),
@@ -3395,7 +3279,6 @@ fn expand_env_substitutes_s3_default_chain_profile() -> anyhow::Result<()> {
                 credentials: Some(types::S3Credentials::DefaultChain {
                     profile: Some("${HOME}-prof".to_string()),
                 }),
-                decompress: None,
             })),
             ..Default::default()
         }),
@@ -3441,7 +3324,6 @@ fn expand_secret_error_on_missing_env_var_does_not_leak_partial_value() -> anyho
                     secret_access_key: secret::SecretString::new("does-not-matter"),
                     session_token: None,
                 }),
-                decompress: None,
             })),
             ..Default::default()
         }),
@@ -3458,31 +3340,6 @@ fn expand_secret_error_on_missing_env_var_does_not_leak_partial_value() -> anyho
     anyhow::ensure!(
         !msg.contains("AKIA") && !msg.contains("suffix"),
         "error must not echo any cleartext from the secret value: {msg}"
-    );
-    Ok(())
-}
-
-// ----- flat decompress field rejection -----
-
-#[test]
-fn http_origin_flat_top_level_decompress_field_rejected() -> anyhow::Result<()> {
-    // A flat `decompress` field directly under `[cache]` is rejected
-    // by `deny_unknown_fields`. Sibling of the flat
-    // `origin_url`/`origin_path` rejection tests below.
-    let toml_body = format!(
-        "{}\n\n[cache]\ndecompress = \"strict\"\n",
-        complete_toml_body()
-    );
-    let dir = data_dir_with_keystore()?;
-    let path = write_minimal_toml(&dir, &toml_body)?;
-    let args = run_args_with_data_dir(dir.path());
-    let err = resolve_config(Some(&path), &args)
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
-    let msg = format!("{err:#}");
-    anyhow::ensure!(
-        msg.contains("decompress") && msg.contains("unknown field"),
-        "error must call out the flat `decompress` key: {msg}"
     );
     Ok(())
 }
@@ -3578,7 +3435,6 @@ fn resolve_origin_retry_parses_full_section() -> anyhow::Result<()> {
             initial_backoff_ms: 50,
             max_backoff_ms: 2_000,
             jitter_ratio: 0.25,
-            buffered_max_bytes: 8 << 20, // 8 MiB
         }),
         ..types::CacheConfig::default()
     };
@@ -3588,7 +3444,6 @@ fn resolve_origin_retry_parses_full_section() -> anyhow::Result<()> {
     anyhow::ensure!(p.initial_backoff_ms == 50);
     anyhow::ensure!(p.max_backoff_ms == 2_000);
     anyhow::ensure!((p.jitter_ratio - 0.25).abs() < f64::EPSILON);
-    anyhow::ensure!(p.buffered_max_bytes == 8 << 20);
     Ok(())
 }
 
@@ -3669,70 +3524,6 @@ fn resolve_origin_retry_rejects_jitter_out_of_range() -> anyhow::Result<()> {
             "error message should reference jitter_ratio, got: {msg}"
         );
     }
-    Ok(())
-}
-
-#[test]
-fn resolve_origin_retry_rejects_buffered_max_bytes_above_ceiling() -> anyhow::Result<()> {
-    // #519 hard ceiling: buffered_max_bytes > 64 MiB is almost
-    // certainly an operator typo. The streaming abort+restart
-    // path covers any blob size without raising this knob.
-    let cli = cache_cli(None, None);
-    let file = types::CacheConfig {
-        origin_retry: Some(decdn_config_types::RetryPolicy {
-            buffered_max_bytes: MAX_BUFFERED_MAX_BYTES + 1,
-            ..decdn_config_types::RetryPolicy::default()
-        }),
-        ..types::CacheConfig::default()
-    };
-    let err = resolve_cache(&cli, Some(&file), Path::new("/tmp"))
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected rejection for too-large buffered_max_bytes"))?;
-    let msg = format!("{err:#}");
-    anyhow::ensure!(
-        msg.contains("buffered_max_bytes"),
-        "error message should reference buffered_max_bytes, got: {msg}"
-    );
-    anyhow::ensure!(
-        msg.contains("hard ceiling"),
-        "error message should explain the ceiling rationale, got: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_origin_retry_accepts_buffered_max_bytes_at_ceiling() -> anyhow::Result<()> {
-    // Boundary: exactly the ceiling is allowed; only > ceiling is
-    // rejected. Pins the inclusive-bound semantics so a future
-    // edit can't accidentally flip the inequality.
-    let cli = cache_cli(None, None);
-    let file = types::CacheConfig {
-        origin_retry: Some(decdn_config_types::RetryPolicy {
-            buffered_max_bytes: MAX_BUFFERED_MAX_BYTES,
-            ..decdn_config_types::RetryPolicy::default()
-        }),
-        ..types::CacheConfig::default()
-    };
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    anyhow::ensure!(resolved.origin_retry.buffered_max_bytes == MAX_BUFFERED_MAX_BYTES);
-    Ok(())
-}
-
-#[test]
-fn resolve_origin_retry_accepts_buffered_max_bytes_zero() -> anyhow::Result<()> {
-    // `0` disables the buffer path entirely (operator opt-out;
-    // documented in `RetryPolicy::buffered_max_bytes`). Must
-    // resolve cleanly.
-    let cli = cache_cli(None, None);
-    let file = types::CacheConfig {
-        origin_retry: Some(decdn_config_types::RetryPolicy {
-            buffered_max_bytes: 0,
-            ..decdn_config_types::RetryPolicy::default()
-        }),
-        ..types::CacheConfig::default()
-    };
-    let resolved = resolve_cache(&cli, Some(&file), Path::new("/tmp"))?;
-    anyhow::ensure!(resolved.origin_retry.buffered_max_bytes == 0);
     Ok(())
 }
 

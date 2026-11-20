@@ -1,9 +1,9 @@
 use super::*;
 
-// `RetryPolicy` value-type tests (defaults / disabled) moved to the
-// `decdn-config-types` leaf crate alongside the struct (#578). What
-// stays here is the `delay_for` backoff math, which lives in this
-// crate because it needs `rand`.
+// `RetryPolicy` value-type tests (defaults / disabled) live in the
+// `decdn-config-types` leaf crate alongside the struct (#578). What stays
+// here is the `delay_for` backoff math, which lives in this crate because it
+// needs `rand`.
 
 #[test]
 fn delay_for_doubles_until_max_cap() {
@@ -11,8 +11,7 @@ fn delay_for_doubles_until_max_cap() {
         max_retries: 10,
         initial_backoff_ms: 100,
         max_backoff_ms: 800,
-        jitter_ratio: 0.0,     // deterministic
-        buffered_max_bytes: 0, // not exercised by delay_for
+        jitter_ratio: 0.0, // deterministic
     };
     let d0 = delay_for(p, 0);
     let d1 = delay_for(p, 1);
@@ -34,7 +33,6 @@ fn delay_for_clamps_jitter_above_one() {
         initial_backoff_ms: 100,
         max_backoff_ms: 1000,
         jitter_ratio: 5.0,
-        buffered_max_bytes: 0,
     };
     for _ in 0..32 {
         let d = delay_for(p, 0);
@@ -52,7 +50,6 @@ fn delay_for_handles_huge_attempt_without_panic() {
         initial_backoff_ms: 1,
         max_backoff_ms: 60_000,
         jitter_ratio: 0.0,
-        buffered_max_bytes: 0,
     };
     // 10_000 is well above 64; `checked_shl` returns None and the
     // saturating multiply collapses to `max_backoff_ms`.
@@ -80,7 +77,6 @@ fn delay_for_jitter_stays_within_equal_jitter_band() {
             initial_backoff_ms: 1000,
             max_backoff_ms: 10_000,
             jitter_ratio,
-            buffered_max_bytes: 4 << 20,
         };
         for _ in 0..256 {
             let ms = delay_for(p, 0).as_millis();
@@ -102,7 +98,6 @@ fn delay_for_zero_jitter_is_deterministic() {
         initial_backoff_ms: 100,
         max_backoff_ms: 10_000,
         jitter_ratio: 0.0,
-        buffered_max_bytes: 4 << 20,
     };
     let baseline = delay_for(p, 2);
     assert_eq!(baseline.as_millis(), 400);
@@ -122,17 +117,8 @@ fn delay_for_zero_initial_backoff_is_zero_regardless_of_jitter() {
         initial_backoff_ms: 0,
         max_backoff_ms: 10_000,
         jitter_ratio: 0.5,
-        buffered_max_bytes: 4 << 20,
     };
     for attempt in 0..8 {
         assert_eq!(delay_for(p, attempt), Duration::ZERO);
     }
-}
-
-/// `ESTALE` usually clears on the next path lookup of an NFS-backed file,
-/// so it is retry-eligible, not a permanent fault.
-#[test]
-fn a_stale_file_handle_is_transient() {
-    let err = io::Error::from(io::ErrorKind::StaleNetworkFileHandle);
-    assert!(classify_io_error(err).is_transient());
 }

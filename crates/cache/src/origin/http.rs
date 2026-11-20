@@ -1,34 +1,34 @@
 //! HTTP origin backend.
 //!
-//! Fetches blobs from `{base_url}/{blake3_hex}`. The base URL is opaque
-//! per-node config; it is never put on the wire (see ADR 012 — "no external
-//! origin URLs are ever exposed").
+//! Reads blobs from `{base_url}/{blake3_hex}` and their `{hex}.obao4` and
+//! `{hex}.sizeproof` siblings. The base URL is opaque per-node config; it is
+//! never put on the wire (see ADR 012 — "no external origin URLs are ever
+//! exposed").
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
 use bytes::{Bytes, BytesMut};
-use futures_util::Stream;
 use iroh_blobs::Hash;
 use reqwest::StatusCode;
-use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, RANGE};
+use reqwest::header::RANGE;
 
 use super::fs::OBAO4_SUFFIX;
 use super::io_runtime::IoRuntime;
 use super::{
-    DEFAULT_USER_AGENT, DecompressMode, Origin, OriginFetch, OriginKind, OriginRangeFetch,
-    OriginRangeRequest, OriginUrl, OutboardFetch, decompress, parse_origin_url, redact_for_log,
+    DEFAULT_USER_AGENT, Origin, OriginKind, OriginRangeFetch, OriginRangeRequest, OriginUrl,
+    OutboardFetch, parse_origin_url, redact_for_log,
 };
-use crate::error::{OriginError, OriginPullError};
+use crate::error::OriginPullError;
 
 /// How long to wait for the TCP/TLS handshake to complete. Per-request total
-/// duration is intentionally *not* bounded because `max_blob_size_mb` can be
-/// as large as 10 GB and no single total-request timeout fits both small and
-/// large blobs. Instead, we pair this with phase-level timeouts below.
+/// duration is intentionally *not* bounded because a range window or an
+/// outboard can be large, and no single total-request timeout fits both small
+/// and large reads. Instead, we pair this with phase-level timeouts below.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ceiling on how long the origin may take to respond with headers after
@@ -38,10 +38,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Ceiling on the idle gap between body chunks. Bounds the time a
-/// slow-trickle origin can tie up a task — total bytes are capped by
-/// `max_bytes`, but without this check a pathological origin could send
-/// a single byte per second within the total cap and keep the task alive
-/// for days.
+/// slow-trickle origin can tie up a task — total bytes are capped per read,
+/// but without this check a pathological origin could send a single byte per
+/// second within the cap and keep the task alive for days.
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Origin backed by a plain HTTP(S) endpoint serving content-addressed blobs
@@ -56,29 +55,11 @@ pub struct HttpOrigin {
     base_url: OriginUrl,
     response_headers_timeout: Duration,
     chunk_idle_timeout: Duration,
-    /// How to handle `Content-Encoding` on the response. Defaults to
-    /// [`DecompressMode::Auto`] — see that type for the full semantics.
-    /// Override with [`Self::with_decompress_mode`].
-    decompress: DecompressMode,
-    /// One bit per outboard-decline status class (see
-    /// [`outboard_decline_class`]) that has already logged at warn. An origin
-    /// that answers 403 for a missing key (an S3 REST endpoint without
-    /// `s3:ListBucket`, a CDN with origin access control) declines the outboard of every
-    /// blob, so each class warns once per origin and logs at debug after that.
-    /// Shared across clones, which are the same origin.
-    outboard_declines_warned: Arc<AtomicU8>,
-}
-
-/// The warn-once bit for a non-success, non-404, non-retriable outboard GET
-/// status: 401, 403 and 3xx each have their own class; every other status
-/// shares the last one.
-fn outboard_decline_class(status: StatusCode) -> u8 {
-    match status {
-        StatusCode::UNAUTHORIZED => 1,
-        StatusCode::FORBIDDEN => 1 << 1,
-        s if s.is_redirection() => 1 << 2,
-        _ => 1 << 3,
-    }
+    /// Whether a `403` answer has already logged at warn. An origin in front
+    /// of a bucket without `s3:ListBucket` answers 403 for every missing key,
+    /// so the first one warns and the rest log at debug. Shared across
+    /// clones, which are the same origin.
+    forbidden_warned: Arc<AtomicBool>,
 }
 
 impl HttpOrigin {
@@ -117,11 +98,9 @@ impl HttpOrigin {
     /// Fails outside a tokio runtime, or when the reqwest client cannot be
     /// built (an invalid `user_agent`).
     pub fn new_with_user_agent(base_url: OriginUrl, user_agent: &str) -> anyhow::Result<Self> {
-        // We want to inspect `Content-Encoding` and run the body through
-        // our own decoders, so disable reqwest's built-in transparent
-        // decompression — otherwise reqwest would strip the header and
-        // hand back already-decompressed bytes, masking what the origin
-        // actually sent and bypassing our `UnsupportedEncoding` error path.
+        // Disable reqwest's transparent decompression: a range window is
+        // verified byte for byte against the bao tree, so the bytes must be
+        // the ones the origin stored, never a decoded body.
         //
         // `redirect::Policy::none()` defuses SSRF (#579): the configured
         // base URL is validated by `parse_origin_url`, but reqwest's
@@ -160,36 +139,21 @@ impl HttpOrigin {
             base_url,
             response_headers_timeout: RESPONSE_HEADERS_TIMEOUT,
             chunk_idle_timeout: CHUNK_IDLE_TIMEOUT,
-            decompress: DecompressMode::Auto,
-            outboard_declines_warned: Arc::new(AtomicU8::new(0)),
+            forbidden_warned: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Whether `status` is the first outboard decline of its class on this
-    /// origin. Marks the class as seen.
-    fn first_outboard_decline(&self, status: StatusCode) -> bool {
-        let bit = outboard_decline_class(status);
-        let seen = self
-            .outboard_declines_warned
-            .fetch_or(bit, Ordering::Relaxed);
-        seen & bit == 0
-    }
-
-    /// Log a deterministic outboard decline: at warn for the first decline of
-    /// its status class on this origin, at debug after that.
-    fn log_outboard_decline(&self, url_log: &str, status: StatusCode) {
-        if self.first_outboard_decline(status) {
+    /// Log a `403` the origin answered for `url_log`, read as a missing key:
+    /// at warn the first time on this origin, at debug after that.
+    fn log_forbidden(&self, url_log: &str) {
+        if self.forbidden_warned.swap(true, Ordering::Relaxed) {
+            tracing::debug!(url = %url_log, "origin answered 403; reading it as a missing object");
+        } else {
             tracing::warn!(
                 url = %url_log,
-                %status,
-                "origin declined the outboard GET; range pulls fall back to whole-blob \
-                 (further declines with this status class log at debug)",
-            );
-        } else {
-            tracing::debug!(
-                url = %url_log,
-                %status,
-                "origin declined the outboard GET; range pulls fall back to whole-blob",
+                "origin answered 403; reading it as a missing object, as an origin in front \
+                 of a bucket without list permission answers for a missing key. If the \
+                 object exists, check the origin's permissions (further 403s log at debug)",
             );
         }
     }
@@ -215,12 +179,15 @@ impl HttpOrigin {
         self
     }
 
-    /// Set the [`DecompressMode`]. See that type for the semantics of
-    /// `Auto` vs `Strict`. Defaults to `Auto`.
-    #[must_use]
-    pub const fn with_decompress_mode(mut self, mode: DecompressMode) -> Self {
-        self.decompress = mode;
-        self
+    /// The URL of `name` under the base URL.
+    fn url_for(&self, name: &str, hash: Hash) -> Result<reqwest::Url, OriginPullError> {
+        // URL build can only fail on a malformed hash or a pathological base
+        // URL — both are caller-side bugs, never transient.
+        self.base_url
+            .as_url()
+            .join(name)
+            .with_context(|| format!("failed to build URL for {hash}"))
+            .map_err(OriginPullError::Permanent)
     }
 }
 
@@ -262,9 +229,8 @@ fn classify_reqwest_error(e: reqwest::Error) -> OriginPullError {
 
 /// Status-code classification per RFC 9110 + operational practice:
 /// 5xx, 408 (Request Timeout), and 429 (Too Many Requests) are retriable;
-/// every other 4xx is permanent. `404` is intercepted earlier as
-/// `OriginFetch::NotFound`; this helper assumes the caller already
-/// excluded it.
+/// every other 4xx is permanent. `404` and `403` are intercepted earlier as
+/// a missing object; this helper assumes the caller already excluded them.
 fn is_transient_status(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
@@ -276,158 +242,6 @@ impl Origin for HttpOrigin {
         OriginKind::Http
     }
 
-    fn fetch(
-        &self,
-        hash: Hash,
-        max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            // URL build can only fail on a malformed hash or a
-            // pathological base URL — both are caller-side bugs, never
-            // transient.
-            let url = self
-                .base_url
-                .as_url()
-                .join(&hash.to_hex())
-                .with_context(|| format!("failed to build URL for {hash}"))
-                .map_err(OriginPullError::Permanent)?;
-            // Always log the redacted form — `url` may inherit userinfo
-            // from `base_url`, and errors go to logs.
-            let url_log = redact_for_log(&url);
-
-            let resp = self
-                .send(self.client.get(url.clone()), &format!("GET {url_log}"))
-                .await?;
-
-            let status = resp.status();
-            // SSRF defence (#579): with `redirect::Policy::none()` (set
-            // in the client builder), reqwest returns 3xx responses
-            // straight to us instead of following. Refuse them with a
-            // clear operator-visible message rather than letting the
-            // generic "returned 302" path fire — origins must serve
-            // `{base}/{hex}` directly. Permanent because a compliant
-            // origin will not redirect; retrying won't change that.
-            if status.is_redirection() {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "origin GET {url_log} returned {status}; redirects are disabled \
-                     to prevent SSRF — origin must serve {{base}}/{{hex}} directly"
-                )));
-            }
-            if status == StatusCode::NOT_FOUND {
-                return Ok(OriginFetch::NotFound);
-            }
-            if !status.is_success() {
-                let err = anyhow::anyhow!("origin GET {url_log} returned {status}");
-                return Err(if is_transient_status(status) {
-                    OriginPullError::Transient(err)
-                } else {
-                    OriginPullError::Permanent(err)
-                });
-            }
-
-            // Capture the encoding before consuming the body. RFC 9110
-            // § 5.6.7 restricts the header to ASCII tokens; a value
-            // that fails `to_str()` is a malformed origin response,
-            // not "no encoding". Surfacing `MalformedEncoding` keeps
-            // a buggy or hostile origin from smuggling raw compressed
-            // bytes past the decompression layer.
-            let encoding = match resp.headers().get(CONTENT_ENCODING) {
-                None => String::new(),
-                Some(v) => match v.to_str() {
-                    Ok(s) => s.to_string(),
-                    Err(_) => {
-                        // Malformed header is a deterministic origin
-                        // protocol violation — won't be cured by retry.
-                        return Err(OriginPullError::Permanent(
-                            OriginError::MalformedEncoding.into(),
-                        ));
-                    }
-                },
-            };
-            let trimmed = encoding.trim();
-            // Classify the encoding and apply the strict/auto policy in one
-            // place shared with the S3 backend. `Err` covers both unknown
-            // encodings (e.g. `br`) and known encodings rejected under
-            // `Strict` — both are permanent and fire before any body bytes
-            // are read.
-            let supported_encoding = match decompress::resolve_encoding(trimmed, self.decompress) {
-                Ok(encoding) => encoding,
-                Err(err) => return Err(OriginPullError::Permanent(err.into())),
-            };
-
-            // Fast-path rejection using the advertised length before
-            // we read anything. For identity bodies, encoded length is
-            // payload length and must not exceed `max_bytes`. For
-            // compressed bodies, encoded length is decoupled from
-            // decompressed length, but a compressed body advertising
-            // > max_bytes is malicious or misconfigured (compression
-            // ratios < 1 are universal in practice).
-            let advertised_len = resp.content_length();
-            if let Some(len) = advertised_len
-                && len > max_bytes
-            {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "origin GET {url_log} advertises {len} bytes, exceeds max {max_bytes}"
-                )));
-            }
-
-            // Build the body stream:
-            //   1. response_chunk_stream pulls encoded chunks via
-            //      `resp.chunk()` (a `stream::unfold` so we own the
-            //      poll loop and the per-chunk idle timer)
-            //   2. wrap with per-chunk idle timeout + cap on the encoded
-            //      size (defense against unbounded slow-trickle / lying
-            //      origins; the same `max_bytes` cap the advertised-length
-            //      check above uses, applied to
-            //      encoded bytes for compressed responses — compression
-            //      ratios < 1 mean this is also a sound bound on the
-            //      decoded size).
-            //   3. for compressed responses, layer the decoder via
-            //      `decompress::decode_stream` — see that module for the
-            //      decoder sandwich and how the decompressed-side cap is
-            //      enforced by the engine's `count_and_cap_stream` (a 1 KB
-            //      compressed payload that decompresses to 100 GB fails
-            //      fast at the engine seam without ever pinning that
-            //      memory).
-            let idle_timeout = self.chunk_idle_timeout;
-            let raw_stream = response_chunk_stream(resp, idle_timeout, max_bytes, url_log);
-
-            // Layer the decoder (if any) onto the encoded chunk stream.
-            // Decoder errors (truncated body, bad magic, mid-stream
-            // checksum mismatch) are wrapped as a typed
-            // `OriginError::DecompressionFailed` inside the shared helper so
-            // `crate::retry::classify_io_error` routes them into
-            // `OriginPullError::Permanent` (decoder failures aren't
-            // retryable; the body is corrupt).
-            let decoded_stream = decompress::decode_stream(raw_stream, supported_encoding);
-
-            // For a decoded (compressed) response the advertised
-            // `Content-Length` is the *encoded* length, which understates
-            // the canonical length. Reporting it as `size_hint` would let
-            // the engine route a body whose encoded length fits under
-            // `buffered_max_bytes` into the buffer/drain path, where the
-            // drain cap (`buffered_max_bytes`) is applied to the *decoded*
-            // stream and falsely rejects an in-bounds blob as
-            // `BlobTooLarge` (#804). Hand `None` for compressed bodies so
-            // they always take the streaming path, where
-            // `count_and_cap_stream` checks the running decoded total
-            // against the correct `max_blob_bytes`. The pre-stream
-            // `advertised_len > max_bytes` short-circuit above still runs
-            // first (compressed-len > max_bytes already implies
-            // decoded-len > max_bytes under sane ratios). For identity
-            // responses the hint is the canonical length.
-            let size_hint = if supported_encoding.is_some() {
-                None
-            } else {
-                advertised_len
-            };
-            Ok(OriginFetch::Found {
-                stream: decoded_stream,
-                size_hint,
-            })
-        })
-    }
-
     fn fetch_range_data(
         &self,
         hash: Hash,
@@ -436,16 +250,8 @@ impl Origin for HttpOrigin {
         Box::pin(async move {
             // Ranged data read. `Range: bytes=a-(b-1)` is inclusive-end. A
             // compliant origin answers `206 Partial Content` with exactly the
-            // requested span. A `200` means the origin ignored `Range` and
-            // would stream the whole blob — refuse and let the engine
-            // whole-blob pull instead of buffering the entire object here. A
-            // retriable status is a fault (see `get_range_bytes`).
-            let data_url = self
-                .base_url
-                .as_url()
-                .join(&hash.to_hex())
-                .with_context(|| format!("failed to build URL for {hash}"))
-                .map_err(OriginPullError::Permanent)?;
+            // requested span (see `get_range_bytes`).
+            let data_url = self.url_for(&hash.to_hex(), hash)?;
             // Empty span only for a zero-length blob — nothing to range.
             if req.is_empty() {
                 return Ok(OriginRangeFetch::Ranged { data: Bytes::new() });
@@ -456,7 +262,7 @@ impl Origin for HttpOrigin {
             let range_val = format!("bytes={}-{}", req.fetch_start, req.fetch_end - 1);
             let want = req.len();
             let Some(data) = self.get_range_bytes(&data_url, &range_val, want).await? else {
-                return Ok(OriginRangeFetch::Unsupported);
+                return Ok(OriginRangeFetch::NotFound);
             };
             Ok(OriginRangeFetch::Ranged { data })
         })
@@ -468,44 +274,11 @@ impl Origin for HttpOrigin {
         outboard_max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
-            let hex = hash.to_hex();
-            let obao4_url = self
-                .base_url
-                .as_url()
-                .join(&format!("{hex}{OBAO4_SUFFIX}"))
-                .with_context(|| format!("failed to build outboard URL for {hash}"))
-                .map_err(OriginPullError::Permanent)?;
-            self.get_outboard_bounded(&obao4_url, outboard_max_bytes)
-                .await
-        })
-    }
-
-    fn has_outboard(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            let hex = hash.to_hex();
-            let url = self
-                .base_url
-                .as_url()
-                .join(&format!("{hex}{OBAO4_SUFFIX}"))
-                .with_context(|| format!("failed to build outboard URL for {hash}"))
-                .map_err(OriginPullError::Permanent)?;
-            let url_log = redact_for_log(&url);
-            let resp = self
-                .send(self.client.head(url.clone()), &format!("HEAD {url_log}"))
-                .await?;
-            let status = resp.status();
-            // The statuses classify as in `get_outboard_bounded`: a retriable
-            // status is a fault, and any other non-success (a 404, a
-            // redirect, a permission decline) is no outboard.
-            if !status.is_success() && is_transient_status(status) {
-                return Err(OriginPullError::Transient(anyhow::anyhow!(
-                    "origin outboard HEAD {url_log} answered {status}"
-                )));
-            }
-            Ok(status.is_success())
+            let url = self.url_for(&format!("{}{OBAO4_SUFFIX}", hash.to_hex()), hash)?;
+            Ok(match self.get_bounded(&url, outboard_max_bytes).await? {
+                Some(bytes) => OutboardFetch::Found(bytes),
+                None => OutboardFetch::NotFound,
+            })
         })
     }
 
@@ -514,95 +287,12 @@ impl Origin for HttpOrigin {
         hash: Hash,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
-            let hex = hash.to_hex();
-            let url = self
-                .base_url
-                .as_url()
-                .join(&format!("{hex}{}", decdn_bao_range::SIZE_PROOF_SUFFIX))
-                .with_context(|| format!("failed to build size proof URL for {hash}"))
-                .map_err(OriginPullError::Permanent)?;
-            // The sibling is read like the outboard sibling, with the proof
-            // cap. A missing or declined proof is `None`: the origin proves no
-            // size for the hash.
+            let url = self.url_for(
+                &format!("{}{}", hash.to_hex(), decdn_bao_range::SIZE_PROOF_SUFFIX),
+                hash,
+            )?;
             let max = decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES as u64;
-            Ok(match self.get_outboard_bounded(&url, max).await? {
-                OutboardFetch::Found(bytes) => Some(bytes),
-                OutboardFetch::NotFound | OutboardFetch::Unsupported => None,
-            })
-        })
-    }
-
-    fn size(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        Box::pin(async move {
-            let hex = hash.to_hex();
-            let url = self
-                .base_url
-                .as_url()
-                .join(&hex)
-                .with_context(|| format!("failed to build URL for {hash}"))
-                .map_err(OriginPullError::Permanent)?;
-            let url_log = redact_for_log(&url);
-            // A `HEAD` is the cheapest way to learn the canonical length — no
-            // body crosses the wire.
-            let resp = self
-                .send(self.client.head(url.clone()), &format!("HEAD {url_log}"))
-                .await?;
-            let status = resp.status();
-            // Status classification mirrors `fetch` and the S3 adapter's
-            // `classify_head_object_error`: only a 404 asserts absence and
-            // degrades to `Ok(None)`; every other non-success is a fault the
-            // caller must not read as "the origin does not hold the object".
-            // The distinction is load-bearing well beyond the range-pull
-            // degrade: `probe_origin_chain` feeds the origin-only serve gate
-            // and the DHT announce set, and an `Ok(None)` there is an
-            // authoritative absence — memoised under the negative TTL, signed
-            // as `NotFound` to a paying client, and grounds for the
-            // republisher to unschedule the hash. A 503 must never do that.
-            // Redirects stay disabled (SSRF, #579); a 3xx is a deterministic
-            // origin misconfiguration, so it classifies as permanent like the
-            // other non-transient statuses. Callers that only wanted the
-            // best-effort range scope swallow the error and degrade to a
-            // whole-blob `fetch`, which re-surfaces a persistent fault at
-            // full severity.
-            if status == StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
-            if !status.is_success() {
-                let err = anyhow::anyhow!("origin HEAD {url_log} returned {status}");
-                return Err(if is_transient_status(status) {
-                    OriginPullError::Transient(err)
-                } else {
-                    OriginPullError::Permanent(err)
-                });
-            }
-            // A `Content-Encoding` response advertises the *encoded* length in
-            // `Content-Length`, not the canonical blob size the bao tree needs
-            // — the same trap `fetch` sidesteps for `size_hint`. Treat as
-            // unknown so a compressed origin degrades to a whole-blob pull
-            // rather than feeding a wrong size into bao alignment. (A compressed
-            // *ranged* fetch is separately caught downstream: the S3 adapter
-            // refuses it explicitly, and the HTTP adapter's exact-length gate +
-            // bao verification reject it — either way it degrades, never serves.)
-            if resp
-                .headers()
-                .get(CONTENT_ENCODING)
-                .is_some_and(|v| !v.is_empty())
-            {
-                return Ok(None);
-            }
-            // Read the `Content-Length` header directly rather than
-            // `resp.content_length()`: the latter reflects the (empty) HEAD
-            // response body, not the header, so it cannot surface the object's
-            // true length; the header carries it. A malformed/absent header →
-            // unknown size, degrade.
-            Ok(resp
-                .headers()
-                .get(CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.trim().parse::<u64>().ok()))
+            self.get_bounded(&url, max).await
         })
     }
 }
@@ -644,85 +334,84 @@ impl HttpOrigin {
         })
     }
 
-    /// GET `url` and buffer the whole body, capped at `max_bytes`, as an
-    /// [`OutboardFetch`]. A genuine 404 is [`OutboardFetch::NotFound`]. A
+    /// Classify a non-success `status` the origin answered to `what` on
+    /// `url_log`. `Ok(())` means the object is missing: a 404, or a 403,
+    /// which an origin in front of a bucket answers for a missing key. A
     /// retriable status (5xx/408/429 per [`is_transient_status`]) is an
-    /// [`OriginPullError::Transient`]: the origin errs, it does not decline.
-    /// Any other non-success status — redirect (disabled per #579), permission
-    /// decline — degrades to [`OutboardFetch::Unsupported`] and warns once per
-    /// status class on this origin. A transport fault on the send or the body
-    /// read is an [`OriginPullError`] too.
-    async fn get_outboard_bounded(
+    /// [`OriginPullError::Transient`]. A redirect (disabled per #579) and
+    /// every other status are an [`OriginPullError::Permanent`].
+    fn missing_or_fault(
+        &self,
+        status: StatusCode,
+        url_log: &str,
+        what: &str,
+    ) -> Result<(), OriginPullError> {
+        if status == StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        if status == StatusCode::FORBIDDEN {
+            self.log_forbidden(url_log);
+            return Ok(());
+        }
+        if status.is_redirection() {
+            return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "origin {what} {url_log} returned {status}; redirects are disabled to prevent \
+                 SSRF — origin must serve {{base}}/{{hex}} directly"
+            )));
+        }
+        let err = anyhow::anyhow!("origin {what} {url_log} answered {status}");
+        Err(if is_transient_status(status) {
+            OriginPullError::Transient(err)
+        } else {
+            OriginPullError::Permanent(err)
+        })
+    }
+
+    /// GET `url` and buffer the whole body, capped at `max_bytes`. `Ok(None)`
+    /// when the object is missing ([`Self::missing_or_fault`]). A body over the
+    /// cap is malformed or foreign (for example a chunk-level outboard from
+    /// another tool) and is an [`OriginPullError::Permanent`]. A transport
+    /// fault on the send or the body read is an [`OriginPullError`] too.
+    async fn get_bounded(
         &self,
         url: &reqwest::Url,
         max_bytes: u64,
-    ) -> Result<OutboardFetch, OriginPullError> {
+    ) -> Result<Option<Bytes>, OriginPullError> {
         let url_log = redact_for_log(url);
         let resp = self
             .send(self.client.get(url.clone()), &format!("GET {url_log}"))
             .await?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(OutboardFetch::NotFound);
-        }
-        // A retriable status is a fault, not a decline. An `Unsupported` here
-        // looks the same as an origin that publishes no outboards, so an
-        // outage would degrade every range pull of the blob and leave no fault
-        // record. As an error, the engine warns and tries the next origin; the
-        // serve-miss probe latches the fault (#1129) and degrades that pull to
-        // a whole-blob populate. Retriable statuses classify as in the S3
-        // adapter's `classify_get_object_error`.
         let status = resp.status();
-        if !status.is_success() && is_transient_status(status) {
-            return Err(OriginPullError::Transient(anyhow::anyhow!(
-                "origin outboard GET {url_log} answered {status}"
-            )));
-        }
-        // A deterministic decline (3xx — redirects are disabled, #579 —
-        // 401/403) degrades rather than errors: the optimization is
-        // best-effort. The engine never logs an `Unsupported`, so the first
-        // decline of each class warns; repeats log at debug.
         if !status.is_success() {
-            self.log_outboard_decline(&url_log, status);
-            return Ok(OutboardFetch::Unsupported);
+            self.missing_or_fault(status, &url_log, "GET")?;
+            return Ok(None);
         }
-        // An outboard over the cap degrades rather than errors, so the engine
-        // never sees it. The warn is the only record of it, for example a
-        // chunk-level outboard from a foreign tool, which costs every range
-        // pull of the blob.
-        if let Some(len) = resp.content_length()
-            && len > max_bytes
-        {
-            tracing::warn!(
-                url = %url_log,
-                len,
-                cap = max_bytes,
-                "origin outboard is larger than its cap; range pulls of this blob fall back to whole-blob",
-            );
-            return Ok(OutboardFetch::Unsupported);
+        let oversize = || {
+            OriginPullError::Permanent(anyhow::anyhow!(
+                "origin GET {url_log} body is over its {max_bytes}-byte cap; re-run `decdn \
+                 origin import` for the object"
+            ))
+        };
+        if resp.content_length().is_some_and(|len| len > max_bytes) {
+            return Err(oversize());
         }
-        let Some(bytes) = self
+        match self
             .collect_capped(resp, max_bytes, url_log.clone())
             .await?
-        else {
-            tracing::warn!(
-                url = %url_log,
-                cap = max_bytes,
-                "origin outboard body ran past its cap; range pulls of this blob fall back to whole-blob",
-            );
-            return Ok(OutboardFetch::Unsupported);
-        };
-        Ok(OutboardFetch::Found(bytes))
+        {
+            Some(bytes) => Ok(Some(bytes)),
+            None => Err(oversize()),
+        }
     }
 
-    /// GET `url` with a `Range` header and buffer the partial body. Returns
-    /// `Ok(None)` when the origin does not honor the range (any non-retriable
-    /// status other than `206`, e.g. a `200` whole-blob response) or the
-    /// returned span is not exactly `want` bytes — both degrade the engine to a
-    /// whole-blob pull. A retriable status (5xx/408/429 per
-    /// [`is_transient_status`]) is an [`OriginPullError::Transient`], never a
-    /// decline. `want` is capped both as the buffer ceiling and as an exact-length
-    /// check, so an origin that streams the whole object on a `200` is rejected
-    /// at the header (status) before any large buffer is committed.
+    /// GET `url` with a `Range` header and buffer the partial body. `Ok(None)`
+    /// when the object is missing ([`Self::missing_or_fault`]). Any other
+    /// answer that is not a `206` of exactly `want` bytes — a `200` whole-blob
+    /// response from an origin that ignores `Range`, a multipart or truncated
+    /// body — is an [`OriginPullError::Permanent`]. `want` is both the buffer
+    /// ceiling and the exact-length check, so an origin that streams the whole
+    /// object on a `200` is rejected at the header (status) before any large
+    /// buffer is committed.
     async fn get_range_bytes(
         &self,
         url: &reqwest::Url,
@@ -736,40 +425,41 @@ impl HttpOrigin {
                 &format!("GET {url_log} (range)"),
             )
             .await?;
-        // A retriable status is a fault, not a decline: a decline reads as an
-        // origin that cannot serve ranges, which hides an outage behind a
-        // whole-blob pull with no fault record. As in the outboard GET.
         let status = resp.status();
-        if !status.is_success() && is_transient_status(status) {
-            return Err(OriginPullError::Transient(anyhow::anyhow!(
-                "origin GET {url_log} (range) answered {status}"
-            )));
-        }
-        // Only `206 Partial Content` is an honored range. A `200` means the
-        // origin ignored `Range` and is sending the whole blob — degrade
-        // before reading the (potentially huge) body.
-        if status != StatusCode::PARTIAL_CONTENT {
+        if !status.is_success() {
+            self.missing_or_fault(status, &url_log, "GET (range)")?;
             return Ok(None);
         }
+        // Only `206 Partial Content` is an honored range. A `200` means the
+        // origin ignored `Range` and is sending the whole blob — refuse
+        // before reading the (potentially huge) body.
+        if status != StatusCode::PARTIAL_CONTENT {
+            return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "origin GET {url_log} (range) answered {status}, not 206; the origin must \
+                 serve byte ranges"
+            )));
+        }
+        let wrong_length = |got: u64| {
+            OriginPullError::Permanent(anyhow::anyhow!(
+                "origin GET {url_log} (range {range_val}) answered {got} bytes for a \
+                 {want}-byte range"
+            ))
+        };
         // A `206` whose advertised `Content-Length` already differs from the
-        // requested span is a misbehaving origin — degrade BEFORE collecting
-        // the body rather than buffering up to `want` bytes only to reject
-        // them. `collect_capped` caps at `want`, and the exact-length gate
-        // below is the load-bearing check, but a wrong `Content-Length` lets
-        // us skip the read entirely.
+        // requested span fails BEFORE the body is collected.
         if let Some(len) = resp.content_length()
             && len != want
         {
-            return Ok(None);
+            return Err(wrong_length(len));
         }
-        let Some(bytes) = self.collect_capped(resp, want, url_log).await? else {
-            return Ok(None);
+        let Some(bytes) = self.collect_capped(resp, want, url_log.clone()).await? else {
+            return Err(wrong_length(want.saturating_add(1)));
         };
         // A `206` whose body length differs from the requested span is a
         // misbehaving origin (multipart/byteranges, off-by-one, truncation).
-        // Degrade rather than feed a wrong-length span to verification.
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != want {
-            return Ok(None);
+        let got = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if got != want {
+            return Err(wrong_length(got));
         }
         Ok(Some(bytes))
     }
@@ -777,10 +467,9 @@ impl HttpOrigin {
     /// Drain `resp`'s body into `Bytes`, aborting (returning `Ok(None)`) the
     /// moment the cumulative size exceeds `max_bytes`. Per-chunk idle timeout
     /// bounds a slow-trickle origin. Transport errors mid-body surface as
-    /// `Transient`. The range path buffers (rather than streams) because the
-    /// payloads are bounded: the outboard is `O(blob/256)` and the data span
-    /// is at most one [`crate::RANGE_PULL_WINDOW_BYTES`] window, both far
-    /// below the whole-blob streaming threshold that motivated #271.
+    /// `Transient`. Every read buffers: the outboard is `O(blob/256)`, the
+    /// size proof is a few KiB and a data window is at most one
+    /// [`crate::RANGE_PULL_WINDOW_BYTES`].
     async fn collect_capped(
         &self,
         mut resp: reqwest::Response,
@@ -803,9 +492,6 @@ impl HttpOrigin {
                 Ok(Ok(None)) => break,
                 Ok(Ok(Some(chunk))) => {
                     if buf.len().saturating_add(chunk.len()) > cap {
-                        // Over the bound → degrade (the optimization is
-                        // best-effort; a too-big sibling/span is treated as
-                        // "not range-pullable", never a hard error).
                         return Ok(None);
                     }
                     buf.extend_from_slice(&chunk);
@@ -814,64 +500,6 @@ impl HttpOrigin {
         }
         Ok(Some(buf.freeze()))
     }
-}
-
-/// Build the per-chunk stream over `resp.chunk()`. Wraps each chunk
-/// fetch in a `tokio::time::timeout` to bound slow-trickle origins
-/// (idle gap), and runs a per-chunk cap that aborts the moment
-/// cumulative encoded bytes exceed `max_bytes`. reqwest transport
-/// errors are converted to `io::Error::other(...)` since
-/// `iroh_blobs::Blobs::add_stream` expects `io::Result<Bytes>`; the
-/// transient/permanent classification we'd normally apply is not
-/// recoverable mid-stream anyway (the engine surfaces stream errors
-/// as a generic origin failure).
-fn response_chunk_stream(
-    resp: reqwest::Response,
-    idle_timeout: Duration,
-    max_bytes: u64,
-    url_log: String,
-) -> impl Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static {
-    // **Termination after error:** wrap `resp` in `Option` so polling
-    // stops once we yield `Err`. After an error or cap breach,
-    // calling `resp.chunk()` again is undefined behaviour for reqwest
-    // (the body stream may be in a torn-down state); the sentinel
-    // makes the wrapper deterministic and prevents iroh-blobs'
-    // `add_stream` from hanging on a re-poll.
-    futures_util::stream::unfold(
-        (Some(resp), 0u64, idle_timeout, url_log),
-        move |(maybe_resp, total, idle, url_log)| async move {
-            let mut resp = maybe_resp?;
-            let chunk = match tokio::time::timeout(idle, resp.chunk()).await {
-                Err(_elapsed) => {
-                    let err = std::io::Error::other(format!(
-                        "origin GET {url_log} body read stalled for {idle:?} after {total} bytes buffered"
-                    ));
-                    return Some((Err(err), (None, total, idle, url_log)));
-                }
-                Ok(Err(reqwest_err)) => {
-                    let err = std::io::Error::other(format!(
-                        "origin GET {url_log} body read failed: {reqwest_err}"
-                    ));
-                    return Some((Err(err), (None, total, idle, url_log)));
-                }
-                Ok(Ok(None)) => return None,
-                Ok(Ok(Some(chunk))) => chunk,
-            };
-            let next_total = total.saturating_add(chunk.len() as u64);
-            if next_total > max_bytes {
-                // Pack a typed `BlobTooLargeMarker` so the engine
-                // surfaces `CacheError::BlobTooLarge` rather than
-                // generic `OriginError`. This is the *encoded*-side
-                // cap; for compressed bodies an encoded overrun
-                // implies a decoded overrun (compression ratios <1
-                // in practice), so the same typed shape is the right
-                // operator-visible error.
-                let err = std::io::Error::other(super::BlobTooLargeMarker { max_bytes });
-                return Some((Err(err), (None, total, idle, url_log)));
-            }
-            Some((Ok(chunk), (Some(resp), next_total, idle, url_log)))
-        },
-    )
 }
 
 #[cfg(test)]

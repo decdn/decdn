@@ -53,8 +53,8 @@ impl ClientHandler {
     /// Attempt to fill a cache miss by pulling from an upstream node (#831). The
     /// cache engine's `NodeOrigin` (last in the origin chain) does the discovery
     /// → discovery opens → ranked paid pull → populate; here we trigger it via
-    /// `cache.populate` (which fills the store WITHOUT returning the blob or
-    /// bumping `bytes_returned` — this is an internal fill, not client egress),
+    /// `cache.populate` (which fills the store without returning the blob: an
+    /// internal fill, not client egress),
     /// bounded by `timeout` so a slow upstream can't pin the delivery path. The
     /// subsequent normal delivery streams the populated bytes from the store and
     /// accounts the served-bytes metrics there. Returns whether the blob is now
@@ -114,90 +114,6 @@ impl ClientHandler {
         }
     }
 
-    /// Attempt to fill a cache miss from the node's OWN configured origins only
-    /// (#1116), via [`CacheEngine::populate_local`](super::CacheEngine::populate_local) — which skips the paid `Peer`
-    /// node→node origin, so this fronts no upstream USDC. Bounded by `timeout`
-    /// like [`Self::try_pull_through`]. A clean miss (`NotFound`/`NoOrigin` — the
-    /// operator's origin lacks it, or only a `Peer` origin is configured) is the
-    /// normal unfillable case; the caller then falls through to the node→node
-    /// paths. A [`FillOutcome::HardFault`] means the operator's OWN origin faulted
-    /// (an S3 5xx, an open breaker, an fs I/O error) — the caller may still try a
-    /// further tier, but must not let a later clean miss launder the fault into a
-    /// signed `NotFound` (#1129). A timeout is a clean miss: nothing is warmed in
-    /// the background (#1610 removed the detached warm), so the blob is re-fetched
-    /// on the next real client request (see [`Self::on_local_populate_timeout`]).
-    pub(super) async fn try_local_populate(&self, hash: Hash, timeout: Duration) -> FillOutcome {
-        let span = fill_span("local", hash);
-        let outcome = self
-            .local_populate(hash, timeout)
-            .instrument(span.clone())
-            .await;
-        span.record("outcome", outcome.as_str());
-        outcome
-    }
-
-    /// The body of [`Self::try_local_populate`], run inside its span.
-    async fn local_populate(&self, hash: Hash, timeout: Duration) -> FillOutcome {
-        match tokio::time::timeout(timeout, self.cache.populate_local(hash)).await {
-            Ok(Ok(())) => FillOutcome::Filled,
-            Ok(Err(e @ (CacheError::NotFound { .. } | CacheError::NoOrigin { .. }))) => {
-                tracing::debug!(%hash, error = %e.display_chain(), "reactive local-origin pull-through found no source");
-                FillOutcome::CleanMiss
-            }
-            // Transient — the operator's own origin is down. See
-            // [`Self::try_pull_through`] for why the split is exactly these two
-            // variants and not a catch-all.
-            Ok(Err(
-                e @ (CacheError::OriginError { .. }
-                | CacheError::Store(_)
-                | CacheError::Internal(_)),
-            )) => {
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e.display_chain(), "reactive local-origin pull-through hit a transient backend fault");
-                FillOutcome::HardFault
-            }
-            // Deterministic (`BlobTooLarge` / `HashMismatch` / `VerifyFailed`):
-            // recurs every request, so it is not evidence this node is degraded.
-            Ok(Err(e)) => {
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e.display_chain(), "reactive local-origin pull-through hit a permanent cache-engine error");
-                FillOutcome::CleanMiss
-            }
-            Err(_) => self.on_local_populate_timeout(hash, timeout).await,
-        }
-    }
-
-    /// Handle a reactive local-origin populate deadline expiry (#1116). Serves the
-    /// blob if a concurrent fill landed it in the store at the instant the
-    /// deadline fired (so a node with node→node OFF doesn't report `CacheMiss` for
-    /// a blob that is now present), otherwise meters the timeout and reports the
-    /// miss.
-    ///
-    /// A deadline expiry is a [`FillOutcome::CleanMiss`], not a fault — see
-    /// [`Self::on_pull_through_timeout`] for why.
-    pub(super) async fn on_local_populate_timeout(
-        &self,
-        hash: Hash,
-        timeout: Duration,
-    ) -> FillOutcome {
-        match self.cache.has(hash).await {
-            Ok(true) => return FillOutcome::Filled,
-            Ok(false) => {}
-            Err(e) => {
-                // A store-lookup fault at the deadline is a store error, not a
-                // timeout: meter it as an error and return — do NOT also count a
-                // timeout or emit a misleading "timed out" line for it. It is a
-                // genuine local store fault, so the node is degraded, not empty.
-                self.metrics.node_pull_through_error();
-                tracing::warn!(%hash, error = %e.display_chain(), "reactive local-origin pull-through store lookup failed after deadline");
-                return FillOutcome::HardFault;
-            }
-        }
-        self.metrics.node_pull_through_timeout();
-        tracing::debug!(%hash, ?timeout, "reactive local-origin pull-through timed out");
-        FillOutcome::CleanMiss
-    }
-
     /// The partial-serve gate (#1506): whether `[byte_offset, byte_offset +
     /// byte_len)` is already fully present in the LOCAL cache of a blob
     /// `serve_audit` reports unserveable (not `Complete`) — the counterpart
@@ -226,7 +142,7 @@ impl ClientHandler {
     ///
     /// Reuses [`CacheEngine::missing_ranges`](super::CacheEngine::missing_ranges)'s
     /// own size contract — the same `blob_size` the own-origin spine resolves
-    /// via [`CacheEngine::origin_size`](super::CacheEngine::origin_size) for the
+    /// via [`CacheEngine::origin_presence`](super::CacheEngine::origin_presence) for the
     /// ORIGIN-backed case; here the size comes from the LOCAL store's own
     /// bitfield, since a purely local partial has no origin to probe.
     pub(super) async fn partial_hit_size(
@@ -354,8 +270,7 @@ impl ClientHandler {
                 // timeout. Meter it as an error only — counting it as a timeout too
                 // would contaminate `node_pull_through_timeout`, whose whole job is
                 // to separate "slow/wedged upstream" from "broken store", and send
-                // an operator chasing the network while the disk is dying. Same rule
-                // `on_local_populate_timeout` states.
+                // an operator chasing the network while the disk is dying.
                 self.metrics.node_pull_through_error();
                 tracing::warn!(%hash, error = %e.display_chain(), "node-to-node pull-through store lookup failed after deadline");
                 faulted = true;

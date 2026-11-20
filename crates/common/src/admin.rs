@@ -16,7 +16,7 @@
 //!
 //! The helper [`parse_hash_arg`] returns [`struct@Hash`] from the
 //! `decdn-config-types` leaf crate (the same leaf the typed config
-//! fields `DecompressMode`, `RetryPolicy`, `OriginUrl`, `PinnedHashes`
+//! fields `RetryPolicy`, `OriginUrl`, `PinnedHashes`
 //! come from). That keeps `decdn-cache`/iroh-blobs out of the publisher
 //! CLI's dependency tree (#578); the daemon's `evict` handler converts
 //! the leaf hash to the blob-store hash at its boundary via

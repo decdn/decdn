@@ -343,7 +343,7 @@ pub struct PaymentChainConfig {
 /// Cache section of the config file.
 ///
 /// `deny_unknown_fields` is set so that a misplaced origin field (a flat
-/// `origin_url` / `origin_path` / `decompress` directly under `[cache]`)
+/// `origin_url` / `origin_path` directly under `[cache]`)
 /// gets a clear "unknown field" error at config load instead of a silent
 /// "no origin configured" surprise at the first cache miss. Origin
 /// settings live under the tagged `[cache.origin]` table — see
@@ -425,31 +425,12 @@ pub struct CacheConfig {
     /// "entry was ignored" surprise hours later when the operator
     /// discovers the blob got evicted anyway.
     pub pinned_hashes: Option<Vec<String>>,
-    /// Origin pull-through retry policy (#285, extended in #519).
-    /// Controls exponential backoff for transient HTTP / S3 /
-    /// filesystem errors *and* the body-phase retry strategy for
-    /// mid-stream `io::Error`s. Absent => defaults from
+    /// Origin pull-through retry policy (#285). Controls exponential
+    /// backoff for transient origin errors. Absent => defaults from
     /// [`decdn_config_types::RetryPolicy::default`] (3 retries, 100ms
-    /// initial backoff doubling to 10s cap, 10% jitter,
-    /// `buffered_max_bytes = 4 MiB`). `max_retries = 0` opts out and
-    /// makes one attempt with no retry; `buffered_max_bytes = 0`
-    /// independently disables the body-phase buffer path so all
-    /// body-phase failures route through the streaming abort+restart
-    /// path. Set once at startup; changes require a restart.
-    ///
-    /// **Body-phase retry trade-offs (#519):**
-    ///
-    /// - **Buffer-then-commit** applies when the origin's advertised
-    ///   `size_hint` is at or below `buffered_max_bytes`. The body
-    ///   drains into memory before the iroh-blobs commit, so failed
-    ///   attempts cost RAM (bounded by `buffered_max_bytes` per
-    ///   in-flight fetch) but leave no on-disk garbage.
-    /// - **Abort + restart** applies above the threshold or when
-    ///   `size_hint` is unknown. Each failed attempt strands up to
-    ///   `max_blob_size_mb` of partial-import bytes until iroh-blobs
-    ///   GC reclaims them at `cache.gc_interval_sec` cadence.
-    ///   Worst-case disk amplification per fetch is
-    ///   `(1 + max_retries) * max_blob_size_mb`.
+    /// initial backoff doubling to 10s cap, 10% jitter).
+    /// `max_retries = 0` opts out and makes one attempt with no retry.
+    /// Set once at startup; changes require a restart.
     ///
     /// `decdn_config_types::RetryPolicy` carries `#[serde(default)]` so
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
@@ -720,15 +701,16 @@ pub struct ServeEconomicsConfig {
 /// Origin backend selection (#437). Tagged on the inner `kind` field.
 ///
 /// `deny_unknown_fields` is set on the enum and on each variant's
-/// payload so that an operator typo (`decompres = "auto"` on the Http
-/// variant, for instance) fails at config load instead of silently
-/// no-opping.
+/// payload so that an operator typo (`pth = "..."` on the Fs variant, for
+/// instance) fails at config load instead of silently no-opping.
+///
+/// Every origin publishes each blob's data `{hex}`, its `{hex}.obao4`
+/// outboard and its `{hex}.sizeproof`, as `decdn origin import` writes them.
 ///
 /// ```toml
 /// [cache.origin]
 /// kind = "http"
 /// url = "https://origin.example/"
-/// decompress = "auto"          # optional; defaults to "auto"
 ///
 /// # — or —
 /// [cache.origin]
@@ -771,13 +753,6 @@ pub enum OriginConfig {
         /// Base URL; must be `http`/`https` and is path-normalized to
         /// end with `/` so `{base}.join(&hex)` produces `{base}/{hex}`.
         url: String,
-        /// How to handle `Content-Encoding` on the HTTP response
-        /// (#312). `"auto"` (default) decompresses gzip/zstd
-        /// transparently; `"strict"` refuses any non-identity
-        /// encoding. The BLAKE3 content-address is computed over the
-        /// canonical (decompressed) form, so `"strict"` is only safe
-        /// for origins guaranteed to serve already-canonical bytes.
-        decompress: Option<decdn_config_types::DecompressMode>,
     },
     /// Local filesystem origin rooted at `path`; blobs live at
     /// `{path}/{hex[0..2]}/{hex}`.
@@ -834,14 +809,6 @@ pub struct S3OriginConfig {
     /// chain (env vars, `~/.aws/credentials`, IAM role / instance
     /// profile).
     pub credentials: Option<S3Credentials>,
-    /// How to handle `Content-Encoding` on the S3 response (#804).
-    /// `"auto"` (default) decompresses gzip/zstd transparently;
-    /// `"strict"` refuses any non-identity encoding. The BLAKE3
-    /// content-address is computed over the canonical (decompressed)
-    /// form, so `"strict"` is only safe for origins guaranteed to serve
-    /// already-canonical bytes. Mirrors the HTTP origin's `decompress`
-    /// knob.
-    pub decompress: Option<decdn_config_types::DecompressMode>,
 }
 
 /// S3 credential source (#437). Tagged on the inner `source` field.

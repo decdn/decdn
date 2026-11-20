@@ -67,8 +67,8 @@ use crate::range_pull::{AlignedRange, IROH_BLOCK_SIZE};
 pub const RANGE_PULL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
 /// [`crate::CacheEngine::origin_range_wire`] draws that run at once. A caller
-/// past the bound waits for a permit rather than degrading, because the degrade
-/// is a whole-blob origin pull — more egress, not less.
+/// past the bound waits for a permit: the ranged draw is the only way a node
+/// serves its own origin.
 pub const MAX_CONCURRENT_RANGE_PULLS: usize = 4;
 
 /// How long a draw waits on a full [`MAX_CONCURRENT_RANGE_PULLS`] pool before it
@@ -161,13 +161,14 @@ pub(crate) struct OriginWindow {
 }
 
 /// What an origin answered for one window. A wrong-length answer is kept apart
-/// from a decline because the two paths judge it differently: the range pull
-/// degrades, and the origin-range wire reports [`CacheError::VerifyFailed`].
+/// from a decline because the two are judged differently: a decline is an
+/// origin fault ([`CacheError::OriginError`]), a wrong length cannot verify
+/// ([`CacheError::VerifyFailed`]).
 #[derive(Debug)]
 pub(crate) enum WindowFetch {
     /// The origin served the window at its exact length.
     Window(OriginWindow),
-    /// The origin declined the window (no `Range`, object absent or short).
+    /// The origin has no data object for the window.
     Declined { start: u64, end: u64 },
     /// The origin served `got` bytes for the `[start, end)` window.
     WrongLength { start: u64, end: u64, got: usize },
@@ -196,8 +197,7 @@ impl OriginRangeCursor {
     /// ([`within_origin_timeout`]).
     ///
     /// Meters every fetched window as `pull_through_bytes`. The outboard read
-    /// is metered where it happens, in
-    /// [`crate::CacheEngine::origin_fetch_outboard_bytes`].
+    /// is metered where it happens, in the engine's outboard fetch.
     ///
     /// # Errors
     ///
@@ -279,7 +279,7 @@ impl OriginRangeCursor {
             source: e.into_inner(),
         })? {
             OriginRangeFetch::Ranged { data } => data,
-            OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => {
+            OriginRangeFetch::NotFound => {
                 return Ok(Some(WindowFetch::Declined { start, end }));
             }
         };

@@ -13,9 +13,9 @@ fn fake_metrics(
 ) -> HashMap<String, f64> {
     let mut m = HashMap::new();
     m.insert("decdn_node_uptime_seconds".into(), uptime);
-    m.insert("decdn_cache_hits_total".into(), hits);
-    m.insert("decdn_cache_misses_total".into(), misses);
-    m.insert("decdn_cache_bytes_returned_total".into(), bytes);
+    m.insert("decdn_serve_cache_hit_total".into(), hits);
+    m.insert("decdn_serve_cache_miss_total".into(), misses);
+    m.insert("decdn_bytes_served_total".into(), bytes);
     m.insert("decdn_dispatch_in_flight".into(), in_flight);
     m.insert("decdn_active_connections".into(), conns);
     m.insert("decdn_rpc_healthy".into(), rpc);
@@ -34,9 +34,9 @@ fn snapshot_reads_known_fields() {
         1.0,
     ));
     assert_eq!(s.uptime_seconds, 312);
-    assert_eq!(s.cache_hits, 812);
-    assert_eq!(s.cache_misses, 94);
-    assert_eq!(s.cache_bytes_returned, 14_900_000);
+    assert_eq!(s.serve_cache_hits, 812);
+    assert_eq!(s.serve_cache_misses, 94);
+    assert_eq!(s.bytes_served, 14_900_000);
     assert_eq!(s.dispatch_in_flight, 2);
     assert_eq!(s.active_connections, 4);
     assert!(s.rpc_healthy);
@@ -48,10 +48,19 @@ fn snapshot_missing_fields_default_to_zero() {
     // not crash — render the missing fields as 0 so the operator
     // sees they're not flowing rather than getting an opaque error.
     let s = Snapshot::from_metrics(&HashMap::new());
-    assert_eq!(s.cache_hits, 0);
-    assert_eq!(s.cache_misses, 0);
-    assert_eq!(s.cache_bytes_returned, 0);
+    assert_eq!(s.serve_cache_hits, 0);
+    assert_eq!(s.serve_cache_misses, 0);
+    assert_eq!(s.bytes_served, 0);
     assert!(!s.rpc_healthy);
+}
+
+#[test]
+fn snapshot_counts_partial_hits_as_hits() {
+    let mut m = fake_metrics(0.0, 5.0, 3.0, 0.0, 0.0, 0.0, 1.0);
+    m.insert("decdn_serve_cache_partial_hit_total".into(), 2.0);
+    let s = Snapshot::from_metrics(&m);
+    assert_eq!(s.serve_cache_hits, 7);
+    assert_eq!(s.serve_cache_misses, 3);
 }
 
 #[test]

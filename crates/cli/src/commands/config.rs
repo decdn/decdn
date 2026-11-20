@@ -885,7 +885,6 @@ fn insert_origin_block(template: &str, spec: &OriginSpec) -> anyhow::Result<Stri
                  # endpoint_url = \"https://<accountid>.r2.cloudflarestorage.com\"  # for R2/B2/MinIO; omit for AWS\n\
                  # path_style = true                         # required true for MinIO\n\
                  # prefix = \"blobs/\"                         # optional key prefix; final key is {{prefix}}{{hex[0..2]}}/{{hex}}\n\
-                 # decompress = \"auto\"                       # \"auto\" decompresses gzip/zstd, \"strict\" refuses non-identity encodings\n\
                  # [cache.origin.credentials]\n\
                  # source = \"default-chain\"                  # or \"static\" with access_key_id = \"...\" and secret_access_key = \"...\"\n"
             )
@@ -1049,7 +1048,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # [cache.origin]
 # kind = "http"
 # url = "https://origin.example/"
-# decompress = "auto"                      # optional; "auto" decompresses gzip/zstd, "strict" refuses non-identity encodings
 # — or a local filesystem origin (blobs at {path}/{hex[0..2]}/{hex}):
 # [cache.origin]
 # kind = "fs"
@@ -1062,7 +1060,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # endpoint_url = "https://<accountid>.r2.cloudflarestorage.com"  # for R2/B2/MinIO; omit for AWS
 # path_style = true                         # required true for MinIO; AWS/R2 default to virtual-hosted-style
 # prefix = "blobs/"                         # optional key prefix; final key is {prefix}{hex[0..2]}/{hex}
-# decompress = "auto"                       # optional; mirrors the HTTP origin's knob
 # [cache.origin.credentials]               # omit entirely to use the AWS default credential chain (env / ~/.aws / IAM role)
 # source = "default-chain"                  # or "static" with access_key_id = "..." and secret_access_key = "..."
 # Multi-origin fallback (#284), tried in order on a miss:

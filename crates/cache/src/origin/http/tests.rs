@@ -4,20 +4,34 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::*;
 use crate::origin::log_capture::LogBuffer;
 
+/// Mount a `GET` of `/{name}` answering `response`.
+async fn mount_get(server: &MockServer, name: String, response: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path(format!("/{name}")))
+        .respond_with(response)
+        .mount(server)
+        .await;
+}
+
+/// The request covering the first KiB of a blob.
+const FIRST_KIB: OriginRangeRequest = OriginRangeRequest {
+    fetch_start: 0,
+    fetch_end: 1024,
+};
+
 /// A published sibling `{hex}.obao4` is fetched in full via
-/// `fetch_outboard` alone (no data GET at all, #1130 stream-while-store
-/// seam).
+/// `fetch_outboard` alone (no data GET at all).
 #[tokio::test]
 async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let hash = Hash::new(b"http-outboard-marker");
-    let hex = hash.to_hex();
     let outboard_bytes = vec![0xABu8; 4096];
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard_bytes.clone()))
-        .mount(&server)
-        .await;
+    mount_get(
+        &server,
+        format!("{}.obao4", hash.to_hex()),
+        ResponseTemplate::new(200).set_body_bytes(outboard_bytes.clone()),
+    )
+    .await;
     let origin = HttpOrigin::parse(&server.uri())?;
 
     match origin.fetch_outboard(hash, 1 << 20).await? {
@@ -27,72 +41,69 @@ async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
                 "outboard bytes mismatch"
             );
         }
-        other => anyhow::bail!("expected Found, got {other:?}"),
+        OutboardFetch::NotFound => anyhow::bail!("expected Found, got NotFound"),
     }
     Ok(())
 }
 
-/// A `404` on the sibling outboard is `NotFound`, not an error.
+/// A `404` or a `403` on the sibling outboard is `NotFound`, not an error:
+/// an origin in front of a bucket without list permission answers 403 for a
+/// missing key.
 #[tokio::test]
-async fn fetch_outboard_404_is_not_found() -> anyhow::Result<()> {
+async fn fetch_outboard_404_and_403_are_not_found() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let hash = Hash::new(b"http-outboard-missing-marker");
-    let hex = hash.to_hex();
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
     let origin = HttpOrigin::parse(&server.uri())?;
-
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_outboard(hash, 1 << 20).await?,
-            OutboardFetch::NotFound
-        ),
-        "404 must be NotFound",
-    );
+    for status in [404u16, 403] {
+        let hash = Hash::new(format!("http-outboard-missing-{status}").as_bytes());
+        mount_get(
+            &server,
+            format!("{}.obao4", hash.to_hex()),
+            ResponseTemplate::new(status),
+        )
+        .await;
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_outboard(hash, 1 << 20).await?,
+                OutboardFetch::NotFound
+            ),
+            "{status} must be NotFound",
+        );
+    }
     Ok(())
 }
 
-/// A deterministic decline (403 here) degrades to `Unsupported` rather than
-/// erroring — the optimization is best-effort. Among non-404 statuses, only
-/// the retriable ones (5xx/408/429) fault; see
-/// `fetch_outboard_5xx_is_a_transient_fault_not_a_decline`.
+/// A `401` on the sibling outboard is a permanent fault: it reads the same on
+/// every request and is not a missing key.
 #[tokio::test]
-async fn fetch_outboard_non_404_decline_is_unsupported() -> anyhow::Result<()> {
+async fn fetch_outboard_401_is_a_permanent_fault() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let hash = Hash::new(b"http-outboard-forbidden-marker");
-    let hex = hash.to_hex();
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&server)
-        .await;
+    let hash = Hash::new(b"http-outboard-unauthorized-marker");
+    mount_get(
+        &server,
+        format!("{}.obao4", hash.to_hex()),
+        ResponseTemplate::new(401),
+    )
+    .await;
     let origin = HttpOrigin::parse(&server.uri())?;
 
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_outboard(hash, 1 << 20).await?,
-            OutboardFetch::Unsupported
-        ),
-        "a 403 decline must degrade to Unsupported",
-    );
+    match origin.fetch_outboard(hash, 1 << 20).await {
+        Err(err) => anyhow::ensure!(!err.is_transient(), "a 401 is permanent: {err}"),
+        Ok(fetch) => anyhow::bail!("a 401 must fault, got Ok({fetch:?})"),
+    }
     Ok(())
 }
 
-/// An outboard GET 503 is a transient fault, never a decline (#2826); see
-/// `get_outboard_bounded`.
+/// An outboard GET 503 is a transient fault (#2826); see `missing_or_fault`.
 #[tokio::test]
-async fn fetch_outboard_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Result<()> {
+async fn fetch_outboard_5xx_is_a_transient_fault() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let hash = Hash::new(b"http-outboard-outage-marker");
-    let hex = hash.to_hex();
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
+    mount_get(
+        &server,
+        format!("{}.obao4", hash.to_hex()),
+        ResponseTemplate::new(503),
+    )
+    .await;
     let origin = HttpOrigin::parse(&server.uri())?;
 
     match origin.fetch_outboard(hash, 1 << 20).await {
@@ -105,36 +116,11 @@ async fn fetch_outboard_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Resu
     Ok(())
 }
 
-/// Each outboard-decline status class warns once per origin: a repeat of the
-/// class logs at debug, a new class warns again, and clones share the state.
-#[tokio::test]
-async fn outboard_decline_warns_once_per_status_class() -> anyhow::Result<()> {
-    let origin = HttpOrigin::parse("http://127.0.0.1:1")?;
-    let clone = origin.clone();
-    let steps = [
-        (&origin, StatusCode::FORBIDDEN, true),
-        (&origin, StatusCode::FORBIDDEN, false),
-        (&clone, StatusCode::FORBIDDEN, false),
-        (&clone, StatusCode::UNAUTHORIZED, true),
-        (&origin, StatusCode::FOUND, true),
-        (&origin, StatusCode::TEMPORARY_REDIRECT, false),
-        (&origin, StatusCode::GONE, true),
-        (&clone, StatusCode::METHOD_NOT_ALLOWED, false),
-    ];
-    for (o, status, want) in steps {
-        anyhow::ensure!(
-            o.first_outboard_decline(status) == want,
-            "first_outboard_decline({status}) must be {want}",
-        );
-    }
-    Ok(())
-}
-
-/// The first outboard decline of a status class logs at warn and a repeat logs
-/// at debug. The bit logic alone cannot catch swapped `warn!`/`debug!` arms
-/// (#2856), so this pins the levels in the formatted output.
+/// A `403` read as a missing object logs at warn the first time on an origin
+/// and at debug after that; clones share the state. The warn is the
+/// operator's only record that the origin's permissions may hide objects.
 #[test]
-fn outboard_decline_logs_warn_once_then_debug() -> anyhow::Result<()> {
+fn forbidden_logs_warn_once_then_debug() -> anyhow::Result<()> {
     let logs = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())
@@ -147,45 +133,36 @@ fn outboard_decline_logs_warn_once_then_debug() -> anyhow::Result<()> {
     tracing::subscriber::with_default(subscriber, || {
         let _guard = runtime.enter();
         let origin = HttpOrigin::parse("http://127.0.0.1:1")?;
-        origin.log_outboard_decline("http://127.0.0.1:1/h.obao4", StatusCode::FORBIDDEN);
-        origin.log_outboard_decline("http://127.0.0.1:1/h.obao4", StatusCode::FORBIDDEN);
+        let clone = origin.clone();
+        origin.log_forbidden("http://127.0.0.1:1/h.obao4");
+        clone.log_forbidden("http://127.0.0.1:1/h.sizeproof");
         anyhow::Ok(())
     })?;
 
     let text = logs.contents();
     let lines: Vec<&str> = text
         .lines()
-        .filter(|l| l.contains("declined the outboard GET"))
+        .filter(|l| l.contains("answered 403"))
         .collect();
     anyhow::ensure!(
         matches!(
             lines.as_slice(),
             [first, second] if first.contains("WARN") && second.contains("DEBUG")
         ),
-        "expected one WARN then one DEBUG decline line:\n{text}"
+        "expected one WARN then one DEBUG 403 line:\n{text}"
     );
     Ok(())
 }
 
-/// A ranged-data GET 503 is a transient fault, never a decline: a decline
-/// reads as an origin that cannot serve ranges and hides the outage behind a
-/// whole-blob pull. See `get_range_bytes`.
+/// A ranged-data GET 503 is a transient fault. See `get_range_bytes`.
 #[tokio::test]
-async fn fetch_range_data_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Result<()> {
+async fn fetch_range_data_5xx_is_a_transient_fault() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let hash = Hash::new(b"http-range-outage-marker");
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
+    mount_get(&server, hash.to_hex().clone(), ResponseTemplate::new(503)).await;
     let origin = HttpOrigin::parse(&server.uri())?;
-    let req = OriginRangeRequest {
-        fetch_start: 0,
-        fetch_end: 1024,
-    };
 
-    match origin.fetch_range_data(hash, req).await {
+    match origin.fetch_range_data(hash, FIRST_KIB).await {
         Err(err) => anyhow::ensure!(
             err.is_transient(),
             "a 503 must classify as Transient; got a permanent fault: {err}"
@@ -195,35 +172,70 @@ async fn fetch_range_data_5xx_is_a_transient_fault_not_a_decline() -> anyhow::Re
     Ok(())
 }
 
-/// A ranged-data GET 404 is a decline, not a fault: the range path degrades
-/// to a whole-blob pull, which answers the absence authoritatively.
+/// A ranged-data GET 404 is a missing data object: `NotFound`.
 #[tokio::test]
-async fn fetch_range_data_404_is_unsupported() -> anyhow::Result<()> {
+async fn fetch_range_data_404_is_not_found() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let hash = Hash::new(b"http-range-missing-marker");
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
+    mount_get(&server, hash.to_hex().clone(), ResponseTemplate::new(404)).await;
     let origin = HttpOrigin::parse(&server.uri())?;
-    let req = OriginRangeRequest {
-        fetch_start: 0,
-        fetch_end: 1024,
-    };
 
     anyhow::ensure!(
         matches!(
-            origin.fetch_range_data(hash, req).await?,
-            OriginRangeFetch::Unsupported
+            origin.fetch_range_data(hash, FIRST_KIB).await?,
+            OriginRangeFetch::NotFound
         ),
-        "a 404 range GET must degrade to Unsupported",
+        "a 404 range GET must be NotFound",
     );
     Ok(())
 }
 
+/// An origin that ignores `Range` and answers `200` with the whole object is
+/// a permanent fault: the range path needs byte ranges.
+#[tokio::test]
+async fn fetch_range_data_200_is_a_permanent_fault() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let hash = Hash::new(b"http-range-ignored-marker");
+    mount_get(
+        &server,
+        hash.to_hex().clone(),
+        ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]),
+    )
+    .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+
+    match origin.fetch_range_data(hash, FIRST_KIB).await {
+        Err(err) => anyhow::ensure!(
+            !err.is_transient() && format!("{err:#}").contains("not 206"),
+            "a 200 range answer must be a permanent fault: {err:#}"
+        ),
+        Ok(fetch) => anyhow::bail!("a 200 range answer must fault, got Ok({fetch:?})"),
+    }
+    Ok(())
+}
+
+/// A `206` with a body shorter than the requested span is a permanent fault.
+#[tokio::test]
+async fn fetch_range_data_wrong_length_206_is_a_permanent_fault() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let hash = Hash::new(b"http-range-short-marker");
+    mount_get(
+        &server,
+        hash.to_hex().clone(),
+        ResponseTemplate::new(206).set_body_bytes(vec![0u8; 100]),
+    )
+    .await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+
+    match origin.fetch_range_data(hash, FIRST_KIB).await {
+        Err(err) => anyhow::ensure!(!err.is_transient(), "a short 206 is permanent: {err}"),
+        Ok(fetch) => anyhow::bail!("a short 206 must fault, got Ok({fetch:?})"),
+    }
+    Ok(())
+}
+
 /// 5xx, 408 and 429 are retriable; every other status is not. Shared by the
-/// whole-blob GET, the size HEAD, the ranged-data GET and the outboard GET.
+/// ranged-data GET and the sibling GETs.
 #[test]
 fn is_transient_status_classification_matches_rfc_9110() -> anyhow::Result<()> {
     for code in [500, 503, 599, 408, 429] {
@@ -237,126 +249,107 @@ fn is_transient_status_classification_matches_rfc_9110() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An outboard whose advertised `Content-Length` exceeds
-/// `outboard_max_bytes` degrades to `Unsupported` rather than buffering —
-/// the OOM guard on the one outboard read a range pull makes.
+/// An outboard over `outboard_max_bytes` is a permanent fault rather than a
+/// buffer — the OOM guard on the one outboard read a range pull makes.
 #[tokio::test]
-async fn fetch_outboard_oversize_is_unsupported() -> anyhow::Result<()> {
+async fn fetch_outboard_oversize_is_a_permanent_fault() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let hash = Hash::new(b"http-outboard-oversize-marker");
-    let hex = hash.to_hex();
-    let huge = vec![0x5Au8; 8192];
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(huge))
-        .mount(&server)
-        .await;
+    mount_get(
+        &server,
+        format!("{}.obao4", hash.to_hex()),
+        ResponseTemplate::new(200).set_body_bytes(vec![0x5Au8; 8192]),
+    )
+    .await;
     let origin = HttpOrigin::parse(&server.uri())?;
 
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_outboard(hash, 1024).await?,
-            OutboardFetch::Unsupported
-        ),
-        "oversize outboard must degrade to Unsupported",
-    );
-    Ok(())
-}
-
-/// A `HEAD` 404 is an authoritative absence: `size` answers `Ok(None)`
-/// so the probe chain reads it as `Absent`.
-#[tokio::test]
-async fn size_404_is_none() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let hash = Hash::new(b"http-size-missing-marker");
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-    let origin = HttpOrigin::parse(&server.uri())?;
-
-    anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
-        "a 404 must degrade to an unknown size, not error",
-    );
-    Ok(())
-}
-
-/// A `HEAD` 503 is a transient fault, never an absence (#1815): folding it
-/// into `Ok(None)` made `probe_origin_chain` answer `Absent` for an origin
-/// mid-outage — the serve gate then signed an authoritative `NotFound`,
-/// memoised under the negative TTL, and the DHT republisher unscheduled
-/// the hash entirely.
-#[tokio::test]
-async fn size_5xx_is_a_transient_fault_not_an_absence() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let hash = Hash::new(b"http-size-outage-marker");
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-    let origin = HttpOrigin::parse(&server.uri())?;
-
-    match origin.size(hash).await {
+    match origin.fetch_outboard(hash, 1024).await {
         Err(err) => anyhow::ensure!(
-            err.is_transient(),
-            "a 503 is worth waiting out; got a permanent fault: {err}"
+            !err.is_transient() && format!("{err:#}").contains("over its 1024-byte cap"),
+            "an oversize outboard must be a permanent fault: {err:#}"
         ),
-        Ok(size) => anyhow::bail!("a 503 must fault, got Ok({size:?})"),
+        Ok(fetch) => anyhow::bail!("an oversize outboard must fault, got Ok({fetch:?})"),
     }
     Ok(())
 }
 
-/// A `HEAD` 403 is a permanent fault: it will read the same on every
-/// probe, so fault-aware callers must not hold state open for it — but it
-/// is still not an absence the serve gate may sign. Mirrors the S3
-/// adapter's `classify_head_object_error`.
+/// A published `{hex}.sizeproof` is read verbatim; a `404` or a `403` is no
+/// proof (`None`), a `503` a transient fault.
 #[tokio::test]
-async fn size_non_404_decline_is_a_permanent_fault() -> anyhow::Result<()> {
+async fn fetch_size_proof_classifies_its_status() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let hash = Hash::new(b"http-size-forbidden-marker");
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(403))
-        .mount(&server)
-        .await;
     let origin = HttpOrigin::parse(&server.uri())?;
+    let object = decdn_bao_range::size_proof_object(5, b"proof");
 
-    match origin.size(hash).await {
-        Err(err) => anyhow::ensure!(
-            !err.is_transient(),
-            "a 403 reads the same on every probe; got a transient fault: {err}"
-        ),
-        Ok(size) => anyhow::bail!("a 403 must fault, got Ok({size:?})"),
+    let present = Hash::new(b"http-size-proof-present");
+    mount_get(
+        &server,
+        format!("{}.sizeproof", present.to_hex()),
+        ResponseTemplate::new(200).set_body_bytes(object.clone()),
+    )
+    .await;
+    anyhow::ensure!(
+        origin.fetch_size_proof(present).await?.as_deref() == Some(object.as_slice()),
+        "a 200 must return the object"
+    );
+
+    for status in [404u16, 403] {
+        let hash = Hash::new(format!("http-size-proof-{status}").as_bytes());
+        mount_get(
+            &server,
+            format!("{}.sizeproof", hash.to_hex()),
+            ResponseTemplate::new(status),
+        )
+        .await;
+        anyhow::ensure!(
+            origin.fetch_size_proof(hash).await?.is_none(),
+            "{status} must be no proof"
+        );
+    }
+
+    let outage = Hash::new(b"http-size-proof-503");
+    mount_get(
+        &server,
+        format!("{}.sizeproof", outage.to_hex()),
+        ResponseTemplate::new(503),
+    )
+    .await;
+    match origin.fetch_size_proof(outage).await {
+        Err(err) => anyhow::ensure!(err.is_transient(), "a 503 is transient: {err}"),
+        Ok(got) => anyhow::bail!("a 503 must fault, got Ok({got:?})"),
     }
     Ok(())
 }
 
-/// A successful `HEAD` reports the object's `Content-Length`.
+/// A `{hex}.sizeproof` over its cap is a broken object: a permanent fault,
+/// never an absence.
 #[tokio::test]
-async fn size_reads_content_length_on_success() -> anyhow::Result<()> {
+async fn fetch_size_proof_oversize_is_a_permanent_fault() -> anyhow::Result<()> {
     let server = MockServer::start().await;
-    let hash = Hash::new(b"http-size-present-marker");
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).insert_header("content-length", "12345"))
-        .mount(&server)
-        .await;
+    let hash = Hash::new(b"http-size-proof-oversize");
+    mount_get(
+        &server,
+        format!("{}.sizeproof", hash.to_hex()),
+        ResponseTemplate::new(200).set_body_bytes(vec![
+            0u8;
+            decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES
+                + 1
+        ]),
+    )
+    .await;
     let origin = HttpOrigin::parse(&server.uri())?;
 
-    anyhow::ensure!(
-        origin.size(hash).await? == Some(12345),
-        "a 200 must surface the Content-Length",
-    );
+    match origin.fetch_size_proof(hash).await {
+        Err(err) => anyhow::ensure!(!err.is_transient(), "oversize is permanent: {err}"),
+        Ok(got) => anyhow::bail!("an oversize proof must fault, got Ok({got:?})"),
+    }
     Ok(())
 }
 
-/// `DEFAULT_USER_AGENT` (#435, now in the `decdn-config-types` leaf
-/// crate per #578) embeds that crate's `CARGO_PKG_VERSION` so origin
-/// operators can attribute pull-through traffic. The `decdn-node/`
-/// prefix is the stable contract — operators grep it in access logs.
+/// `DEFAULT_USER_AGENT` (#435, in the `decdn-config-types` leaf crate per
+/// #578) embeds that crate's `CARGO_PKG_VERSION` so origin operators can
+/// attribute pull-through traffic. The `decdn-node/` prefix is the stable
+/// contract — operators grep it in access logs.
 #[test]
 fn default_user_agent_has_expected_prefix_and_version() -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -385,42 +378,5 @@ async fn new_with_user_agent_accepts_custom_value() -> anyhow::Result<()> {
 fn new_outside_a_runtime_is_an_error() -> anyhow::Result<()> {
     let url = parse_origin_url("https://origin.example/")?;
     anyhow::ensure!(HttpOrigin::new(url).is_err(), "built outside a runtime");
-    Ok(())
-}
-
-/// The outboard-presence probe is a `HEAD`: a 200 is an outboard, a 404 or a
-/// deterministic decline is none, and a 503 is a transient fault. No `GET`
-/// reaches the server.
-#[tokio::test]
-async fn has_outboard_heads_the_sibling_and_classifies_its_status() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let statuses = [
-        (200u16, Some(true)),
-        (404, Some(false)),
-        (403, Some(false)),
-        (503, None),
-    ];
-    for (status, _) in statuses {
-        let hash = Hash::new(format!("http-has-outboard-{status}").as_bytes());
-        Mock::given(method("HEAD"))
-            .and(path(format!("/{}.obao4", hash.to_hex())))
-            .respond_with(ResponseTemplate::new(status))
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&server)
-        .await;
-    let origin = HttpOrigin::parse(&server.uri())?;
-    for (status, want) in statuses {
-        let hash = Hash::new(format!("http-has-outboard-{status}").as_bytes());
-        match (origin.has_outboard(hash).await, want) {
-            (Ok(got), Some(want)) => anyhow::ensure!(got == want, "{status}: got {got}"),
-            (Err(err), None) => anyhow::ensure!(err.is_transient(), "{status}: {err}"),
-            (got, _) => anyhow::bail!("{status}: unexpected {got:?}"),
-        }
-    }
     Ok(())
 }

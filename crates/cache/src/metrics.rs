@@ -19,23 +19,18 @@
 //!
 //! Operators reason about cache health from four ratios:
 //!
-//! - **Hit rate** — `decdn_cache_hits_total / (decdn_cache_hits_total +
-//!   decdn_cache_misses_total)`. **The two terms do not share a scope.**
-//!   `hits` is bumped only inside `CacheEngine::get`, which the paid serve
-//!   path never calls — it streams through `export_bao_range_stream`.
-//!   `misses` is also bumped by `populate`/`populate_local` and
-//!   `pull_through_range`, which the serve-path fill tiers do call. So on a
-//!   node serving paying clients the numerator is pinned at zero while the
-//!   denominator climbs with real traffic, and the ratio reads a populated,
-//!   permanent 0% — not an empty series. Read the node crate's
-//!   `decdn_serve_cache_{hit,partial_hit,miss}_total` for the serve-path hit
-//!   rate.
+//! - **Hit rate** — `(decdn_serve_cache_hit_total +
+//!   decdn_serve_cache_partial_hit_total) / (decdn_serve_cache_hit_total +
+//!   decdn_serve_cache_partial_hit_total + decdn_serve_cache_miss_total)`.
+//!   The node crate's serve path owns this family: the engine serves every
+//!   blob by range through `export_bao_range_stream` and counts no hits.
+//!   `decdn_cache_misses_total` counts `populate` fills, not serves, so it
+//!   is no hit-rate term.
 //! - **Origin egress amplification** —
 //!   `decdn_cache_pull_through_bytes_total / decdn_bytes_served_total`.
 //!   Approaches — and on a pure pass-through stays just under — 1.0; trends
 //!   toward 0 as cached content gets re-served. The denominator is the node
-//!   crate's wire-write counter rather than `decdn_cache_bytes_returned_total`,
-//!   which is `get`-scoped and holds at zero under a full serve load. The two
+//!   crate's wire-write counter. The two
 //!   terms count different byte populations, which is why the pass-through
 //!   ceiling sits below 1.0 rather than on it: `pull_through_bytes` is raw
 //!   origin content, while `bytes_served` is the bao wire form — content plus
@@ -59,24 +54,11 @@
 //!   low by up to roughly the walk-to-mark window over
 //!   `cache.gc_interval_sec`, as a fraction of its value.
 //!
-//! Hit/miss accounting (#418): on `Ok` and on the cache-domain error
-//! returns (`NoOrigin`, evicted `NotFound`, origin `NotFound`,
-//! `HashMismatch`, `BlobTooLarge`, `OriginError`), `CacheEngine::get`
-//! bumps exactly one of `hits` or `misses`.
-//!
-//! Store I/O error carve-out (`CacheError::Store`): these surface via
-//! `tracing::error!` and split by phase.
-//!
-//! - **Local-lookup phase** (`has`, `read_local` before pull-through is
-//!   initiated): a Store error here means the cache can't *determine*
-//!   whether the blob is present, so neither counter is bumped. A
-//!   degraded local store does not silently classify reads as misses.
-//! - **Pull-through phase** (after the miss is already determined —
-//!   e.g., `add_bytes` fails to persist verified origin bytes): the
-//!   `misses` and `pull_through_bytes` bumps that fired earlier in
-//!   `pull_through` stay bumped. The miss genuinely happened, the
-//!   origin egress was genuinely paid, and the failure surfaces both
-//!   via `tracing::error!` and as the get-call's `Err`.
+//! Miss accounting (#418): `CacheEngine::populate` bumps `misses` once per
+//! fill that finds the blob absent (or refused), however the fill resolves.
+//! A store I/O error on the local lookup (`has`) bumps nothing: the cache
+//! can't *determine* whether the blob is present, so a degraded local store
+//! does not silently classify reads as misses.
 //!
 //! The cache crate owns this group rather than re-exporting node-side
 //! state so the cache stays self-describing. Node wires `Arc<CacheMetrics>`
@@ -124,32 +106,20 @@ pub struct CacheMetrics {
     /// a healthy primary backend suggests the chain is masking an
     /// outage that should be paged on instead.
     pub origin_fallback: Counter,
-    /// `get()` calls served from the local store (#418). Includes both
-    /// first-attempt hits and waiter retries that find the blob present
-    /// after a coalesced concurrent pull-through completes (the
-    /// engine's coalescing is between in-process tasks fronting the
-    /// same hash, not between network peers). Paired with `misses`;
-    /// see the module-level doc for the hits-XOR-misses contract and
-    /// the store-error carve-out.
-    pub hits: Counter,
-    /// `get()` calls that did not find the blob locally (#418). Bumped
-    /// once on every operator-evicted `NotFound` return and once at
-    /// the entry of every pull-through — the latter covers all
-    /// pull-through outcomes (`Ok` and any later error, including a
-    /// `Store` error from `add_bytes`) without enumerating each
-    /// variant. See the module-level doc for the contract with `hits`
-    /// and the per-phase store-error carve-out.
+    /// `populate()` calls that did not find the blob locally (#418). Bumped
+    /// once on every operator-evicted `NotFound` return and once at the
+    /// entry of every pull-through — the latter covers all pull-through
+    /// outcomes without enumerating each. See the module-level doc for the
+    /// store-error carve-out.
     pub misses: Counter,
-    /// Total bytes returned to the caller of `get()` on success (#418).
-    /// Counts both cache-hit and pull-through-success paths.
-    pub bytes_returned: Counter,
     /// Bytes fetched from origin during pull-through (#418). Counted
     /// the moment bytes are received from origin, regardless of whether
     /// they pass BLAKE3 verification or land in the store — origin
     /// egress is paid either way. On the range-pull path this includes each
     /// `{H}.obao4` outboard the origin serves, wrong-length copies too; a
     /// cached outboard is not re-counted. Distinguishes 'serving from cache'
-    /// vs. 'paying origin egress' when paired with `bytes_returned`.
+    /// vs. 'paying origin egress' when paired with the node's
+    /// `decdn_bytes_served_total`.
     pub pull_through_bytes: Counter,
     /// iroh-blobs GC sweep cycles observed (#518). Bumped once per
     /// `add_protected` callback fire, after the pre-sweep snapshot
@@ -201,16 +171,14 @@ pub struct CacheMetrics {
     /// `decdn_cache_gc_bytes_reclaimed_total`.
     pub gc_bytes_reclaimed: Counter,
     /// Best-effort named-tag deletions that failed (#860/#837). Bumped when
-    /// `evict()` (DMCA/corruption takedown) or the drain-path hash-mismatch
-    /// arm cannot delete a blob's protecting named tag. Serving is unaffected
-    /// — an evict's logical-evicted set still blocks `get`/`has`, and a
-    /// mismatch still returns `HashMismatch` — but the bytes stay GC-protected
-    /// on disk because the tag survives, and nothing re-attempts the delete.
+    /// `evict()` (DMCA/corruption takedown) cannot delete a blob's protecting
+    /// named tag. Serving is unaffected — the logical-evicted set still blocks
+    /// `has`/`populate` — but the bytes stay GC-protected on disk because the
+    /// tag survives, and nothing re-attempts the delete.
     ///
     /// Operator-actionable: any sustained nonzero rate means disk reclaim is
-    /// stuck. For an `evict()` failure that is a DMCA/compliance concern (the
-    /// takedown stopped serving but did not reclaim the bytes); for the drain
-    /// path it is the #837 unbounded-disk-growth leak under a hostile origin.
+    /// stuck, a DMCA/compliance concern (the takedown stopped serving but did
+    /// not reclaim the bytes).
     /// A persistently nonzero rate warrants investigating the iroh-blobs tag
     /// store (a wedged store actor, I/O errors); the engine also emits a
     /// `tracing::warn!` per failure.
@@ -226,7 +194,7 @@ pub struct CacheMetrics {
     /// answering "held" or "not held".
     ///
     /// Operator-actionable: a rescan resolves each candidate against the origin
-    /// to decide what this node advertises, so a throttled `HeadObject` window
+    /// to decide what this node advertises, so a throttled origin read window
     /// during a rescan would otherwise shrink the announce set silently. A
     /// retry-eligible fault keeps whatever entry an earlier pass indexed, so a
     /// sustained nonzero rate means the node may still be advertising content
@@ -376,9 +344,10 @@ pub struct CacheMetrics {
     /// Size lookups that the local store could not prove and that every
     /// origin answered with no `{H}.sizeproof`
     /// (`decdn_cache_size_proof_origin_missing_total`). The node states no
-    /// size for such a blob and does not serve it from its origin. Nonzero
-    /// means origin objects lack the proof `decdn origin import` writes; one
-    /// lookup per blob counts at most once per miss window.
+    /// size for such a blob and does not serve it from its origin. A nonzero
+    /// rate for content the origin holds means its objects lack the proof
+    /// `decdn origin import` writes. Each lookup counts, including one the
+    /// presence memo answers.
     ///
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_size_proof_origin_missing_total`.

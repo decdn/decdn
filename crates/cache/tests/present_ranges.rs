@@ -20,8 +20,7 @@ async fn absent_hash_reports_empty_incomplete() -> anyhow::Result<()> {
 #[tokio::test]
 async fn complete_blob_reports_complete() -> anyhow::Result<()> {
     let payload = util::make_blob(200 * 1024);
-    let (engine, hash, _tmp, _srv) = util::engine_with_whole_blob(&payload).await?;
-    engine.populate(hash).await?; // whole-blob fill
+    let (engine, hash, _tmp) = util::engine_with_whole_blob(&payload).await?;
     let pr: PresentRanges = engine.present_ranges(hash).await?;
     assert!(pr.is_complete());
     assert!(!pr.is_empty());
@@ -97,8 +96,7 @@ async fn missing_ranges_covers_absent_span() -> anyhow::Result<()> {
 async fn missing_ranges_empty_on_complete_blob() -> anyhow::Result<()> {
     let payload = util::make_blob(200 * 1024);
     let blob_size = u64::try_from(payload.len())?;
-    let (engine, hash, _tmp, _srv) = util::engine_with_whole_blob(&payload).await?;
-    engine.populate(hash).await?; // whole-blob fill → Complete
+    let (engine, hash, _tmp) = util::engine_with_whole_blob(&payload).await?;
 
     // A complete blob has every range present, so nothing is ever missing.
     let missing = engine.missing_ranges(hash, 0, 0, blob_size).await?;

@@ -1,19 +1,74 @@
-use super::*;
+use std::future::Future;
+use std::pin::Pin;
 
-/// Write `payload` into an `Origin`-shaped on-disk layout (`<origin_dir>/<2-hex
-/// shard>/<full-hex hash>`) so a [`crate::FilesystemOrigin`] pointed at
-/// `origin_dir` can serve it. Shared by the ADR 040 end-to-end policy tests
-/// below — each needs several distinct one-off blobs.
-fn write_origin_blob(origin_dir: &std::path::Path, payload: &[u8]) -> anyhow::Result<crate::Hash> {
-    let hash = crate::Hash::new(payload);
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let dir = origin_dir.join(shard);
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(hex.as_str()), payload)?;
-    Ok(hash)
+use super::*;
+use crate::origin::{OriginFetch, OriginKind};
+
+/// A whole-blob origin shaped like the node-to-node origin: `fetch` admits the
+/// blob into the engine's store itself and answers `AlreadyAdmitted`, so a
+/// `populate` runs its real fill path (admission, segment, recency).
+#[derive(Debug, Default)]
+struct AdmittingOrigin {
+    engine: std::sync::OnceLock<CacheEngine>,
+    blobs: std::collections::HashMap<Hash, bytes::Bytes>,
+}
+
+impl crate::Origin for AdmittingOrigin {
+    fn fetch(
+        &self,
+        hash: Hash,
+        _max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let (Some(engine), Some(blob)) = (self.engine.get(), self.blobs.get(&hash)) else {
+                return Ok(OriginFetch::NotFound);
+            };
+            engine
+                .insert_blob(blob.clone())
+                .await
+                .map_err(|e| crate::OriginPullError::Permanent(anyhow::Error::from(e)))?;
+            Ok(OriginFetch::AlreadyAdmitted)
+        })
+    }
+
+    fn kind(&self) -> OriginKind {
+        OriginKind::Peer
+    }
+}
+
+/// A cache in `dir` whose one origin admits `payloads` on `populate`, and
+/// their hashes in order.
+async fn admitting_cache(
+    dir: &std::path::Path,
+    payloads: &[Vec<u8>],
+) -> anyhow::Result<(CacheEngine, Vec<Hash>)> {
+    let hashes: Vec<Hash> = payloads.iter().map(Hash::new).collect();
+    let origin = Arc::new(AdmittingOrigin {
+        engine: std::sync::OnceLock::new(),
+        blobs: hashes
+            .iter()
+            .copied()
+            .zip(payloads.iter().map(|p| bytes::Bytes::from(p.clone())))
+            .collect(),
+    });
+    let cache =
+        CacheEngine::open(dir, vec![Arc::clone(&origin) as Arc<dyn crate::Origin>], 16).await?;
+    let _ = origin.engine.set(cache.clone());
+    Ok((cache, hashes))
+}
+
+/// A cache in `dir` holding `payloads`, inserted in order, and their hashes.
+async fn seeded_cache(
+    dir: &std::path::Path,
+    payloads: &[Vec<u8>],
+) -> anyhow::Result<(CacheEngine, Vec<Hash>)> {
+    let cache = CacheEngine::open(dir, Vec::new(), 16).await?;
+    let mut hashes = Vec::new();
+    for payload in payloads {
+        hashes.push(cache.insert_blob(payload.clone()).await?);
+    }
+    Ok((cache, hashes))
 }
 
 #[test]
@@ -187,34 +242,20 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
         }
     }
 
-    let older_payload = b"eviction policy test: older blob";
-    let newer_payload = b"eviction policy test: newer blob";
-    let older_hash = crate::Hash::new(older_payload);
-    let newer_hash = crate::Hash::new(newer_payload);
-
-    let origin_dir = tempfile::tempdir()?;
-    for (hash, payload) in [(older_hash, older_payload), (newer_hash, newer_payload)] {
-        let hex = hash.to_hex();
-        let shard = hex
-            .get(..2)
-            .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-        let dir = origin_dir.path().join(shard);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(hex.as_str()), payload)?;
-    }
-
     let cache_dir = tempfile::tempdir()?;
-    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
+    // Insert older first, then newer, so the two access times are ordered.
+    let (cache, hashes) = seeded_cache(
         cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn crate::Origin>],
-        16,
+        &[
+            b"eviction policy test: older blob".to_vec(),
+            b"eviction policy test: newer blob".to_vec(),
+        ],
     )
     .await?;
-
-    // Touch older first, then newer, so the two access times are ordered.
-    let _ = cache.get(older_hash).await?;
-    let _ = cache.get(newer_hash).await?;
+    let (older_hash, newer_hash) = match hashes.as_slice() {
+        [older, newer] => (*older, *newer),
+        _ => anyhow::bail!("two hashes"),
+    };
 
     let sizes = cache.size_snapshot().await?;
     let metrics = CacheMetrics::default();
@@ -266,25 +307,11 @@ async fn sweep_orders_via_injected_policy() -> anyhow::Result<()> {
 #[tokio::test]
 async fn disk_clamp_drives_eviction_below_configured_size() -> anyhow::Result<()> {
     const GIB: u64 = 1024 * 1024 * 1024;
-    let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-
-    let mut hashes = Vec::new();
-    for i in 0..4u32 {
-        let payload = format!("disk clamp test: blob #{i}").into_bytes();
-        hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
-    }
-
-    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
-        cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn crate::Origin>],
-        16,
-    )
-    .await?;
-    for hash in &hashes {
-        let _ = cache.get(*hash).await?;
-    }
+    let payloads: Vec<Vec<u8>> = (0..4u32)
+        .map(|i| format!("disk clamp test: blob #{i}").into_bytes())
+        .collect();
+    let (cache, hashes) = seeded_cache(cache_dir.path(), &payloads).await?;
 
     let metrics = CacheMetrics::default();
     let policy: Arc<dyn crate::EvictionPolicy> = Arc::new(crate::LruEviction);
@@ -330,30 +357,17 @@ async fn disk_clamp_drives_eviction_below_configured_size() -> anyhow::Result<()
 /// restart on its first tick, with no traffic, instead of starving (#2221).
 #[tokio::test]
 async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<()> {
-    let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-
-    let mut hashes = Vec::new();
-    for i in 0..4u32 {
-        let payload = format!("restart eviction test: blob #{i}").into_bytes();
-        hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
-    }
-    {
-        let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
-        let cache = CacheEngine::open(
-            cache_dir.path(),
-            vec![origin as std::sync::Arc<dyn crate::Origin>],
-            16,
-        )
-        .await?;
-        for hash in &hashes {
-            let _ = cache.get(*hash).await?;
-        }
+    let payloads: Vec<Vec<u8>> = (0..4u32)
+        .map(|i| format!("restart eviction test: blob #{i}").into_bytes())
+        .collect();
+    let hashes = {
+        let (cache, hashes) = seeded_cache(cache_dir.path(), &payloads).await?;
         cache.shutdown().await?;
-    }
+        hashes
+    };
 
-    // Reopen with no origin and serve nothing: every blob is from before
-    // the restart.
+    // Reopen and serve nothing: every blob is from before the restart.
     let cache = CacheEngine::open(cache_dir.path(), Vec::new(), 16).await?;
     let metrics = CacheMetrics::default();
     let policy: Arc<dyn crate::EvictionPolicy> = Arc::new(crate::LruEviction);
@@ -400,8 +414,8 @@ async fn restarted_over_limit_cache_evicts_without_traffic() -> anyhow::Result<(
 /// [`crate::policy::TinyLfuEstimator`] feeding both a
 /// [`crate::policy::ProbationAdmission`] and the
 /// [`crate::policy::TinyLfuEviction`] sweep policy. Admits many
-/// distinct one-hit blobs (real `populate_local` misses through a real
-/// `CacheEngine` + `FilesystemOrigin`), drives one real [`sweep`] under a
+/// distinct one-hit blobs (real `populate` misses through a real
+/// `CacheEngine` and a whole-blob origin), drives one real [`sweep`] under a
 /// small `probation_target_pct`, and asserts the probation footprint the
 /// sweep leaves behind is under the cap while a twice-requested blob has
 /// graduated to `Main` — the observable [`CacheEngine::segment_of`] exposes.
@@ -414,23 +428,15 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
     let probation_target_pct: u64 = 10;
     let cache_bytes: u64 = 1_000;
 
-    let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-
-    let mut cold_hashes = Vec::new();
-    for i in 0..20u32 {
-        let payload = format!("probation cap test: one-hit blob #{i}").into_bytes();
-        cold_hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
-    }
-    let hot_hash = write_origin_blob(origin_dir.path(), b"probation cap test: hot blob")?;
-
-    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
-        cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn crate::Origin>],
-        16,
-    )
-    .await?;
+    let mut payloads: Vec<Vec<u8>> = (0..20u32)
+        .map(|i| format!("probation cap test: one-hit blob #{i}").into_bytes())
+        .collect();
+    payloads.push(b"probation cap test: hot blob".to_vec());
+    let (cache, mut cold_hashes) = admitting_cache(cache_dir.path(), &payloads).await?;
+    let hot_hash = cold_hashes
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("hot hash"))?;
 
     let freq: std::sync::Arc<dyn crate::FrequencyEstimator> =
         std::sync::Arc::new(TinyLfuEstimator::new(4096));
@@ -440,13 +446,13 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
         promotion_threshold,
     }));
 
-    // Each cold blob is one served miss: `populate_local` fills (admission
-    // reads estimate 0 < threshold, so Probation) and the paired serve emits
-    // the one sighting via `observe_hit` (estimate -> 1). ADR 040 splits the
-    // fill from the hit signal, so the test drives both, mirroring the real
+    // Each cold blob is one served miss: `populate` fills (admission reads
+    // estimate 0 < threshold, so Probation) and the paired serve emits the one
+    // sighting via `observe_hit` (estimate -> 1). ADR 040 splits the fill from
+    // the hit signal, so the test drives both, mirroring the real
     // fill-then-serve path.
     for hash in &cold_hashes {
-        cache.populate_local(*hash).await?;
+        cache.populate(*hash).await?;
         cache.observe_hit(*hash);
     }
     // The hot blob is requested twice. First request: fill admits (estimate
@@ -454,9 +460,9 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
     // request: fill is a hit (no re-admission), serve observes (estimate ->
     // 2), so the shared estimator now reads >= threshold for the sweep below
     // to promote.
-    cache.populate_local(hot_hash).await?;
+    cache.populate(hot_hash).await?;
     cache.observe_hit(hot_hash);
-    cache.populate_local(hot_hash).await?;
+    cache.populate(hot_hash).await?;
     cache.observe_hit(hot_hash);
 
     for hash in cold_hashes.iter().chain(std::iter::once(&hot_hash)) {
@@ -521,23 +527,11 @@ async fn probation_cap_bounds_one_hit_wonders() -> anyhow::Result<()> {
 async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
     use crate::policy::{TinyLfuEstimator, TinyLfuEviction};
 
-    let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
-
-    let hot_hash = write_origin_blob(origin_dir.path(), b"cold scan test: hot blob")?;
-    let mut cold_hashes = Vec::new();
-    for i in 0..10u32 {
-        let payload = format!("cold scan test: cold blob #{i}").into_bytes();
-        cold_hashes.push(write_origin_blob(origin_dir.path(), &payload)?);
-    }
-
-    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
-        cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn crate::Origin>],
-        16,
-    )
-    .await?;
+    let mut payloads = vec![b"cold scan test: hot blob".to_vec()];
+    payloads.extend((0..10u32).map(|i| format!("cold scan test: cold blob #{i}").into_bytes()));
+    let (cache, mut cold_hashes) = admitting_cache(cache_dir.path(), &payloads).await?;
+    let hot_hash = cold_hashes.remove(0);
 
     let freq: std::sync::Arc<dyn crate::FrequencyEstimator> =
         std::sync::Arc::new(TinyLfuEstimator::new(4096));
@@ -550,11 +544,11 @@ async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
     // sighting via `observe_hit`, bumping the shared estimator each time (ADR
     // 040 splits fill from the hit signal).
     for _ in 0..20 {
-        cache.populate_local(hot_hash).await?;
+        cache.populate(hot_hash).await?;
         cache.observe_hit(hot_hash);
     }
     for hash in &cold_hashes {
-        cache.populate_local(*hash).await?;
+        cache.populate(*hash).await?;
         cache.observe_hit(*hash);
     }
 
@@ -603,30 +597,22 @@ async fn hot_set_survives_cold_scan() -> anyhow::Result<()> {
 /// path stays plain LRU, independent of the `tinylfu` wiring.
 #[tokio::test]
 async fn lru_default_unchanged() -> anyhow::Result<()> {
-    let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
 
-    let a = write_origin_blob(origin_dir.path(), b"lru golden test: blob A")?;
-    let b = write_origin_blob(origin_dir.path(), b"lru golden test: blob B")?;
-    let c = write_origin_blob(origin_dir.path(), b"lru golden test: blob C")?;
-    let d = write_origin_blob(origin_dir.path(), b"lru golden test: blob D")?;
-
-    let origin = std::sync::Arc::new(crate::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
-        cache_dir.path(),
-        vec![origin as std::sync::Arc<dyn crate::Origin>],
-        16,
-    )
-    .await?;
-
     // No frequency estimator, no custom admission policy: exactly the
-    // engine's out-of-the-box defaults.
-    let _ = cache.get(a).await?;
-    let _ = cache.get(b).await?;
-    let _ = cache.get(c).await?;
-    let _ = cache.get(d).await?;
-    // Re-access B: the golden recency order is now oldest-first A, C, D, B.
-    let _ = cache.get(b).await?;
+    // engine's out-of-the-box defaults. Blobs land in order A, B, C, D.
+    let payloads: Vec<Vec<u8>> = ["A", "B", "C", "D"]
+        .iter()
+        .map(|n| format!("lru golden test: blob {n}").into_bytes())
+        .collect();
+    let (cache, hashes) = seeded_cache(cache_dir.path(), &payloads).await?;
+    let [a, b, c, d] = hashes.as_slice() else {
+        anyhow::bail!("four hashes");
+    };
+    let (a, b, c, d) = (*a, *b, *c, *d);
+    // Re-access B (a hit): the golden recency order is now oldest-first A,
+    // C, D, B.
+    cache.populate(b).await?;
 
     let sizes = cache.size_snapshot().await?;
     let metrics = CacheMetrics::default();

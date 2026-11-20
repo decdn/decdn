@@ -5,7 +5,7 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 > **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
 The config *vocabulary* — the value types a deCDN node's configuration is written in
-(`RetryPolicy`, `DecompressMode`, `OriginUrl`, `OriginKind`, `Hash`, `PinnedHashes`) — factored
+(`RetryPolicy`, `OriginUrl`, `OriginKind`, `Hash`, `PinnedHashes`) — factored
 out so that `decdn-cache` and `decdn-common` can share them without depending on each other.
 
 A leaf crate — `serde`, `url` and `anyhow`, nothing heavier. No `iroh-blobs`, no

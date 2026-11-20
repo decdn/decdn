@@ -14,9 +14,9 @@ fn snap(
         uptime_seconds: uptime,
         active_connections: conns,
         dispatch_in_flight: in_flight,
-        cache_hits: hits,
-        cache_misses: misses,
-        cache_bytes_returned: bytes,
+        serve_cache_hits: hits,
+        serve_cache_misses: misses,
+        bytes_served: bytes,
         unredeemed_usdc: 0,
         rpc_healthy: healthy,
     }
@@ -90,13 +90,13 @@ fn write_top_table_first_tick_no_deltas() {
         "in_flight row missing: {out}"
     );
     assert!(
-        out.contains("cache_hit_rate"),
-        "hit_rate row missing: {out}"
+        out.contains("serve_cache_hit_rate"),
+        "hit rate row missing: {out}"
     );
     for needle in [
-        "cache_hits_total",
-        "cache_misses_total",
-        "cache_bytes_returned_total",
+        "serve_cache_hits_total",
+        "serve_cache_misses_total",
+        "bytes_served_total",
     ] {
         assert!(out.contains(needle), "row {needle} missing: {out}");
     }
@@ -116,7 +116,7 @@ fn write_top_table_renders_per_second_when_prev_present() {
     )
     .unwrap();
     let out = String::from_utf8(buf).unwrap();
-    // /sec column for cache_hits_total should be "6.0" since
+    // /sec column for serve_cache_hits_total should be "6.0" since
     // (812-800)/2 = 6.0. Asserted as substring rather than line
     // shape so column-width tweaks don't break the test.
     assert!(out.contains("6.0"), "hits/s missing: {out}");
@@ -134,9 +134,9 @@ fn write_top_table_renders_unredeemed_usdc_row() {
         uptime_seconds: 312,
         active_connections: 4,
         dispatch_in_flight: 2,
-        cache_hits: 812,
-        cache_misses: 94,
-        cache_bytes_returned: 14_900_000,
+        serve_cache_hits: 812,
+        serve_cache_misses: 94,
+        bytes_served: 14_900_000,
         unredeemed_usdc: 12_345_678,
         rpc_healthy: true,
     };
@@ -173,7 +173,7 @@ fn write_top_table_hit_rate_na_on_empty_cache() {
     )
     .unwrap();
     let out = String::from_utf8(buf).unwrap();
-    assert!(out.contains("n/a"), "hit_rate must show n/a on 0/0: {out}");
+    assert!(out.contains("n/a"), "hit rate must show n/a on 0/0: {out}");
 }
 
 #[test]

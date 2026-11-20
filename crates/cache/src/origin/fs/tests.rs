@@ -1,5 +1,4 @@
 use super::*;
-use crate::origin::log_capture::LogBuffer;
 
 #[tokio::test]
 async fn new_rejects_missing_path() -> anyhow::Result<()> {
@@ -51,12 +50,20 @@ async fn path_for_uses_two_char_shard() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The range request covering the first `len` bytes of a blob.
+const fn first_bytes(len: u64) -> OriginRangeRequest {
+    OriginRangeRequest {
+        fetch_start: 0,
+        fetch_end: len,
+    }
+}
+
 /// A symlink in the shard directory pointing outside the base must
-/// be rejected — that's the whole point of the per-fetch
+/// be rejected — that's the whole point of the per-read
 /// containment check (see issue #374).
 #[cfg(unix)]
 #[tokio::test]
-async fn fetch_rejects_symlink_pointing_outside_base() -> anyhow::Result<()> {
+async fn range_read_rejects_symlink_pointing_outside_base() -> anyhow::Result<()> {
     let outside = tempfile::tempdir()?;
     let secret = outside.path().join("secret");
     tokio::fs::write(&secret, b"top secret").await?;
@@ -64,215 +71,42 @@ async fn fetch_rejects_symlink_pointing_outside_base() -> anyhow::Result<()> {
     let inside = tempfile::tempdir()?;
     let origin = FilesystemOrigin::new(inside.path()).await?;
     let hash = Hash::new(b"marker");
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let shard_dir = inside.path().join(shard);
-    tokio::fs::create_dir_all(&shard_dir).await?;
-    let link = shard_dir.join(hex.as_str());
+    let link = origin.path_for(hash);
+    create_parent(&link).await?;
     tokio::fs::symlink(&secret, &link).await?;
 
-    let err = origin
-        .fetch(hash, 1024)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("symlink outside base should have been rejected"))?
-        .to_string();
-    anyhow::ensure!(err.contains("outside base"), "error lacked context: {err}");
-    Ok(())
+    let err = origin.fetch_range_data(hash, first_bytes(4)).await.err();
+    ensure_permanent("fetch_range_data", err, "outside base")
 }
 
 /// A symlink that still resolves to a regular file inside the base
 /// is fine — we're guarding against escape, not symlinks per se.
 #[cfg(unix)]
 #[tokio::test]
-async fn fetch_follows_symlink_inside_base() -> anyhow::Result<()> {
+async fn range_read_follows_symlink_inside_base() -> anyhow::Result<()> {
     let inside = tempfile::tempdir()?;
     let origin = FilesystemOrigin::new(inside.path()).await?;
 
     // Drop the real file in a sibling directory under base, then
     // place a symlink at the expected sharded location that points
     // at it. canonicalize() resolves to the real file, which is
-    // still under base, so the fetch should succeed.
+    // still under base, so the read succeeds.
     let real_dir = inside.path().join("real");
     tokio::fs::create_dir_all(&real_dir).await?;
     let real_file = real_dir.join("blob");
     tokio::fs::write(&real_file, b"hello").await?;
 
     let hash = Hash::new(b"marker");
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let shard_dir = inside.path().join(shard);
-    tokio::fs::create_dir_all(&shard_dir).await?;
-    let link = shard_dir.join(hex.as_str());
+    let link = origin.path_for(hash);
+    create_parent(&link).await?;
     tokio::fs::symlink(&real_file, &link).await?;
 
-    let fetched = origin.fetch(hash, 1024).await?;
-    let bytes = fetched
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("expected Found, got NotFound"))?;
-    anyhow::ensure!(bytes.as_ref() == b"hello", "got: {bytes:?}");
-    Ok(())
-}
-
-/// A missing file should still surface as `NotFound`, even though
-/// `canonicalize` is the first syscall and errors when the leaf
-/// doesn't exist.
-#[tokio::test]
-async fn fetch_missing_file_is_not_found() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let origin = FilesystemOrigin::new(tmp.path()).await?;
-    let hash = Hash::new(b"marker");
-    match origin.fetch(hash, 1024).await? {
-        OriginFetch::NotFound => Ok(()),
-        OriginFetch::Found { .. } => anyhow::bail!("expected NotFound"),
-        OriginFetch::AlreadyAdmitted => {
-            anyhow::bail!("FilesystemOrigin never admits directly; expected NotFound")
+    match origin.fetch_range_data(hash, first_bytes(5)).await? {
+        OriginRangeFetch::Ranged { data } => {
+            anyhow::ensure!(data.as_ref() == b"hello", "got: {data:?}");
         }
+        OriginRangeFetch::NotFound => anyhow::bail!("expected Ranged, got NotFound"),
     }
-}
-
-/// `fstat`-time cap rejection: a file whose `metadata().len()`
-/// already exceeds `max_bytes` is rejected upfront in the prologue,
-/// before any stream is constructed. This is the cheap path —
-/// catches the legitimate "operator pre-seeded an oversized
-/// blob" case without paying for `take(max_bytes + 1)` /
-/// `ReaderStream` setup.
-#[tokio::test]
-async fn fetch_rejects_oversize_file_at_fstat_prologue() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let origin = FilesystemOrigin::new(tmp.path()).await?;
-    let hash = Hash::new(b"oversize-marker");
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let shard_dir = tmp.path().join(shard);
-    tokio::fs::create_dir_all(&shard_dir).await?;
-    let payload = vec![0xAAu8; 8 * 1024];
-    tokio::fs::write(shard_dir.join(hex.as_str()), &payload).await?;
-
-    // 8 KiB on disk, 1 KiB cap → prologue rejects (no stream
-    // is built; this is the expected fast path).
-    let err = origin
-        .fetch(hash, 1024)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("oversize fstat must be rejected"))?;
-    let msg = format!("{err:#}");
-    anyhow::ensure!(
-        msg.contains("exceeds max"),
-        "fstat-time cap message lost actionable wording: {msg}"
-    );
-    Ok(())
-}
-
-/// Mid-stream cap (`cap_at_max_bytes`) is the defense for the
-/// TOCTOU window: between `fstat` and the actual read, the file
-/// could grow on the same inode (append, pwrite past EOF,
-/// truncate-then-extend). The kernel bound is
-/// `take(max_bytes + 1)`; this test exercises the wrapper that
-/// catches the one-byte overrun.
-///
-/// We can't deterministically stage a TOCTOU race in a unit
-/// test without OS-level coordination, so we drive
-/// `cap_at_max_bytes` directly with a synthetic upstream that
-/// produces `max_bytes + 1` bytes — same chunk-shape that
-/// `ReaderStream::new(file.take(max_bytes + 1))` would emit on
-/// a grew-during-read file.
-#[tokio::test]
-async fn cap_at_max_bytes_rejects_one_byte_overrun() -> anyhow::Result<()> {
-    use futures_util::StreamExt;
-    let chunks: Vec<std::io::Result<Bytes>> = vec![
-        Ok(Bytes::from(vec![0xAAu8; 1024])),
-        // 1025th byte — should trip the running-total cap.
-        Ok(Bytes::from(vec![0xBBu8; 1])),
-    ];
-    let upstream = futures_util::stream::iter(chunks);
-    let mut stream = Box::pin(cap_at_max_bytes(upstream, 1024));
-
-    // First chunk: 1024 bytes, exactly at cap, must pass through.
-    let first = stream
-        .next()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("expected first chunk"))?;
-    let first = first.map_err(|e| anyhow::anyhow!("first chunk errored: {e}"))?;
-    anyhow::ensure!(
-        first.len() == 1024,
-        "first chunk truncated: {}",
-        first.len()
-    );
-
-    // Second chunk: 1 byte, would push total to 1025 > 1024,
-    // wrapper must error.
-    let second = stream
-        .next()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("expected second chunk"))?;
-    let err = second
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("second chunk should have errored"))?;
-    // Cap breach is signalled via a typed `BlobTooLargeMarker`
-    // packed into the `io::Error` inner so the engine can
-    // surface `CacheError::BlobTooLarge` (not a generic
-    // `OriginError`). Operator-visible Display still mentions
-    // the cap; assert on the typed shape because that's what
-    // the engine's downcast walks.
-    let has_marker = err.get_ref().is_some_and(
-        <dyn std::error::Error + Send + Sync>::is::<crate::origin::BlobTooLargeMarker>,
-    );
-    anyhow::ensure!(
-        has_marker,
-        "wrapper error lost typed BlobTooLargeMarker inner: {err}"
-    );
-    anyhow::ensure!(
-        err.to_string().contains("max_blob_bytes=1024"),
-        "wrapper Display lost cap-value wording: {err}"
-    );
-    Ok(())
-}
-
-/// The streaming path keeps the file descriptor alive across many
-/// `poll_next` calls — `ReaderStream` owns the `Take<File>` and
-/// drives one read per poll. A regression that borrowed `&mut
-/// file` instead of moving ownership would close the fd between
-/// chunks and either truncate the read or blow up; this test
-/// catches that by asking for a payload large enough to require
-/// multiple reads (default `ReaderStream` chunk = 4 KiB) and
-/// asserting the full bytes come back.
-#[tokio::test]
-async fn fetch_streams_multi_chunk_payload() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let origin = FilesystemOrigin::new(tmp.path()).await?;
-    // 32 KiB → 8 chunks at the default 4 KiB ReaderStream size.
-    let payload = (0..32u8)
-        .flat_map(|i| std::iter::repeat_n(i, 1024))
-        .collect::<Vec<_>>();
-    let hash = Hash::new(&payload);
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let shard_dir = tmp.path().join(shard);
-    tokio::fs::create_dir_all(&shard_dir).await?;
-    tokio::fs::write(shard_dir.join(hex.as_str()), &payload).await?;
-
-    let fetched = origin.fetch(hash, 1 << 20).await?;
-    let bytes = fetched
-        .collect_to_bytes()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("expected Found"))?;
-    anyhow::ensure!(
-        bytes.len() == payload.len(),
-        "streamed length mismatch: {} vs {}",
-        bytes.len(),
-        payload.len()
-    );
-    anyhow::ensure!(bytes.as_ref() == payload.as_slice(), "byte mismatch");
     Ok(())
 }
 
@@ -365,51 +199,47 @@ async fn fetch_range_data_returns_span() -> anyhow::Result<()> {
                 "span mismatch",
             );
         }
-        other => anyhow::bail!("expected Ranged, got {other:?}"),
+        OriginRangeFetch::NotFound => anyhow::bail!("expected Ranged, got NotFound"),
     }
     Ok(())
 }
 
-/// A missing data object, or one shorter than the requested span (a stale
-/// origin copy), degrades to `Unsupported`, never an error.
+/// A missing data object is `NotFound`, never an error.
 #[tokio::test]
-async fn fetch_range_data_missing_or_short_object_is_unsupported() -> anyhow::Result<()> {
+async fn fetch_range_data_missing_object_is_not_found() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let origin = FilesystemOrigin::new(tmp.path()).await?;
-    let canonical = tokio::fs::canonicalize(tmp.path()).await?;
     let absent = Hash::new(b"no-such-object");
-    let req = OriginRangeRequest {
-        fetch_start: 0,
-        fetch_end: 16 * 1024,
-    };
     anyhow::ensure!(
         matches!(
-            origin.fetch_range_data(absent, req).await?,
-            OriginRangeFetch::Unsupported
+            origin
+                .fetch_range_data(absent, first_bytes(16 * 1024))
+                .await?,
+            OriginRangeFetch::NotFound
         ),
-        "missing object must degrade",
-    );
-
-    let payload = vec![7u8; 32 * 1024];
-    let hash = seed_blob_with_outboard(&canonical, &payload).await?;
-    let past_end = OriginRangeRequest {
-        fetch_start: 16 * 1024,
-        fetch_end: 48 * 1024,
-    };
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_range_data(hash, past_end).await?,
-            OriginRangeFetch::Unsupported
-        ),
-        "a short read must degrade",
+        "a missing object must be NotFound",
     );
     Ok(())
 }
 
+/// A data object shorter than the requested span (a stale or truncated
+/// origin copy) is a permanent fault.
+#[tokio::test]
+async fn fetch_range_data_short_object_is_permanent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let canonical = tokio::fs::canonicalize(tmp.path()).await?;
+    let hash = seed_blob_with_outboard(&canonical, &vec![7u8; 32 * 1024]).await?;
+    let past_end = OriginRangeRequest {
+        fetch_start: 16 * 1024,
+        fetch_end: 48 * 1024,
+    };
+    let err = origin.fetch_range_data(hash, past_end).await.err();
+    ensure_permanent("fetch_range_data", err, "shorter than the range")
+}
+
 /// A blob with a published sibling `{hex}.obao4` returns the outboard
-/// bytes verbatim via `fetch_outboard` alone (no data read). This is the
-/// failing-first TDD test for #1130's stream-while-store seam — written
-/// before `fetch_outboard` existed on the trait.
+/// bytes verbatim via `fetch_outboard` alone (no data read).
 #[tokio::test]
 async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -428,7 +258,7 @@ async fn fetch_outboard_returns_sibling_obao4() -> anyhow::Result<()> {
                 "outboard bytes mismatch"
             );
         }
-        other => anyhow::bail!("expected Found, got {other:?}"),
+        OutboardFetch::NotFound => anyhow::bail!("expected Found, got NotFound"),
     }
     Ok(())
 }
@@ -449,31 +279,29 @@ async fn fetch_outboard_missing_sibling_is_not_found() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An oversize sibling outboard (beyond `outboard_max_bytes`) degrades
-/// rather than buffering — a hostile/foreign `{H}.obao4` can't force a huge
-/// read.
+/// An outboard over `outboard_max_bytes` is a permanent fault that names
+/// its path, its length and the cap — a hostile/foreign `{H}.obao4` can't
+/// force a huge read.
 #[tokio::test]
-async fn fetch_outboard_oversize_is_unsupported() -> anyhow::Result<()> {
+async fn fetch_outboard_oversize_is_permanent() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let origin = FilesystemOrigin::new(tmp.path()).await?;
     let canonical = tokio::fs::canonicalize(tmp.path()).await?;
-    let payload = vec![3u8; 64 * 1024];
-    let hash = seed_blob_with_outboard(&canonical, &payload).await?;
+    let hash = seed_blob_with_outboard(&canonical, &vec![3u8; 64 * 1024]).await?;
+    let obao4 = origin.obao4_path_for(hash);
     // Cap the outboard read at 1 byte — the real outboard is larger.
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_outboard(hash, 1).await?,
-            OutboardFetch::Unsupported
-        ),
-        "oversize outboard must degrade",
-    );
-    Ok(())
+    let err = origin.fetch_outboard(hash, 1).await.err();
+    ensure_permanent("fetch_outboard", err, "over its 1-byte cap")?;
+    ensure_permanent(
+        "fetch_outboard",
+        origin.fetch_outboard(hash, 1).await.err(),
+        &obao4.display().to_string(),
+    )
 }
 
-/// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap degrades
-/// to `Unsupported` rather than being returned. The length checks before
-/// the read reject it; `read_capped_stops_one_byte_past_the_cap` covers
-/// the read's own bound.
+/// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap is rejected
+/// on its metadata length, before any read; `read_capped_stops_one_byte_past_the_cap`
+/// covers the read's own bound.
 #[tokio::test]
 async fn fetch_outboard_oversize_rejected_before_read() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -497,14 +325,49 @@ async fn fetch_outboard_oversize_rejected_before_read() -> anyhow::Result<()> {
     .await?;
 
     // 4 KiB cap — the 8 MiB outboard is rejected on its metadata length.
+    let err = origin.fetch_outboard(hash, 4 * 1024).await.err();
+    ensure_permanent("fetch_outboard", err, "is 8388608 bytes")
+}
+
+/// A published `{hex}.sizeproof` is read verbatim; a missing one is `None`.
+#[tokio::test]
+async fn fetch_size_proof_reads_the_sibling() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"size-proof-marker");
+    let path = origin.size_proof_path_for(hash);
+    create_parent(&path).await?;
+    let object = decdn_bao_range::size_proof_object(5, b"proof");
+    tokio::fs::write(&path, &object).await?;
+
+    let got = origin.fetch_size_proof(hash).await?;
     anyhow::ensure!(
-        matches!(
-            origin.fetch_outboard(hash, 4 * 1024).await?,
-            OutboardFetch::Unsupported
-        ),
-        "multi-MiB outboard must degrade without buffering",
+        got.as_deref() == Some(object.as_slice()),
+        "size proof object mismatch: {got:?}"
+    );
+    anyhow::ensure!(
+        origin
+            .fetch_size_proof(Hash::new(b"no-such-proof"))
+            .await?
+            .is_none(),
+        "a missing size proof must be None"
     );
     Ok(())
+}
+
+/// A `{hex}.sizeproof` over its cap is a broken object: a permanent fault,
+/// never an absence.
+#[tokio::test]
+async fn fetch_size_proof_oversize_is_permanent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let hash = Hash::new(b"oversize-size-proof");
+    let path = origin.size_proof_path_for(hash);
+    create_parent(&path).await?;
+    tokio::fs::write(&path, vec![0u8; MAX_SIZE_PROOF_OBJECT_BYTES + 1]).await?;
+
+    let err = origin.fetch_size_proof(hash).await.err();
+    ensure_permanent("fetch_size_proof", err, "over its")
 }
 
 /// Create the shard directory that holds `path`.
@@ -517,7 +380,8 @@ async fn create_parent(path: &Path) -> anyhow::Result<()> {
 }
 
 /// A base directory removed after construction is a permanent fault, not an
-/// absence of every hash: a probe of one hash between rescans surfaces it.
+/// absence of every hash: a presence read of one hash between rescans
+/// surfaces it.
 #[tokio::test]
 async fn a_vanished_base_is_permanent_not_absent() -> anyhow::Result<()> {
     let parent = tempfile::tempdir()?;
@@ -526,12 +390,16 @@ async fn a_vanished_base_is_permanent_not_absent() -> anyhow::Result<()> {
     let origin = FilesystemOrigin::new(&base).await?;
     let hash = Hash::new(b"vanished-base");
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
+        origin.fetch_size_proof(hash).await?.is_none(),
         "a missing hash under a present base is an absence"
     );
 
     tokio::fs::remove_dir_all(&base).await?;
-    ensure_permanent("size", origin.size(hash).await.err(), "no longer exists")
+    ensure_permanent(
+        "fetch_size_proof",
+        origin.fetch_size_proof(hash).await.err(),
+        "no longer exists",
+    )
 }
 
 /// Require a `Permanent` error whose message carries `needle`.
@@ -550,7 +418,7 @@ fn ensure_permanent(what: &str, err: Option<OriginPullError>, needle: &str) -> a
 }
 
 /// A sibling outboard symlinked outside the base is refused before any
-/// read, the same containment `fetch` applies to the data object.
+/// read, the same containment every read applies to the data object.
 #[cfg(unix)]
 #[tokio::test]
 async fn fetch_outboard_rejects_symlink_pointing_outside_base() -> anyhow::Result<()> {
@@ -592,7 +460,7 @@ async fn fetch_outboard_follows_symlink_inside_base() -> anyhow::Result<()> {
                 "outboard bytes mismatch"
             );
         }
-        other => anyhow::bail!("expected Found, got {other:?}"),
+        OutboardFetch::NotFound => anyhow::bail!("expected Found, got NotFound"),
     }
     Ok(())
 }
@@ -636,9 +504,9 @@ async fn fetch_outboard_rejects_a_directory_named_like_the_outboard() -> anyhow:
 /// A special file inside the base is refused by every read with "not a
 /// regular file", before any open. A Unix socket stands in for a FIFO:
 /// its open fails rather than blocks, so the error message, not the
-/// timeout, shows the check ran first. The data object and the outboard
-/// are symlinks to one socket at a short path, because the sharded path
-/// exceeds the socket address limit on macOS.
+/// timeout, shows the check ran first. The data object, the outboard and
+/// the size proof are symlinks to one socket at a short path, because the
+/// sharded path exceeds the socket address limit on macOS.
 #[cfg(unix)]
 #[tokio::test]
 async fn every_read_rejects_a_special_file_inside_base() -> anyhow::Result<()> {
@@ -654,19 +522,14 @@ async fn every_read_rejects_a_special_file_inside_base() -> anyhow::Result<()> {
     create_parent(&data).await?;
     tokio::fs::symlink(&socket, &data).await?;
     tokio::fs::symlink(&socket, origin.obao4_path_for(hash)).await?;
+    tokio::fs::symlink(&socket, origin.size_proof_path_for(hash)).await?;
 
     let limit = Duration::from_secs(5);
     let needle = "not a regular file";
-    let fetch = timeout(limit, origin.fetch(hash, 1 << 20)).await?;
-    ensure_permanent("fetch", fetch.err(), needle)?;
-    let req = OriginRangeRequest {
-        fetch_start: 0,
-        fetch_end: 1024,
-    };
-    let range = timeout(limit, origin.fetch_range_data(hash, req)).await?;
+    let range = timeout(limit, origin.fetch_range_data(hash, first_bytes(1024))).await?;
     ensure_permanent("fetch_range_data", range.err(), needle)?;
-    let size = timeout(limit, origin.size(hash)).await?;
-    ensure_permanent("size", size.err(), needle)?;
+    let proof = timeout(limit, origin.fetch_size_proof(hash)).await?;
+    ensure_permanent("fetch_size_proof", proof.err(), needle)?;
     let outboard = timeout(limit, origin.fetch_outboard(hash, 1 << 20)).await?;
     ensure_permanent("fetch_outboard", outboard.err(), needle)
 }
@@ -759,21 +622,29 @@ async fn read_capped_stale_hint_leaves_no_spare_capacity() -> anyhow::Result<()>
 }
 
 /// A leaf symlink whose target does not exist is a permanent fault, never
-/// the authoritative absence `Ok(None)`: as an absence, `size` would memoise
-/// the hash as absent and drop it from the rescan with no log (#2801).
+/// an absence: as an absence, the presence walk would memoise the hash as
+/// absent and drop it from the rescan with no log (#2801).
 #[cfg(unix)]
 #[tokio::test]
 async fn a_dangling_leaf_symlink_is_permanent() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let origin = FilesystemOrigin::new(tmp.path()).await?;
     let hash = Hash::new(b"dangling-leaf");
+    let needle = "symlink whose target does not exist";
+
     let data = origin.path_for(hash);
     create_parent(&data).await?;
     tokio::fs::symlink(origin.base().join("missing-target"), &data).await?;
+    let range = origin.fetch_range_data(hash, first_bytes(1024)).await;
+    ensure_permanent("fetch_range_data", range.err(), needle)?;
 
-    let needle = "symlink whose target does not exist";
-    ensure_permanent("size", origin.size(hash).await.err(), needle)?;
-    ensure_permanent("fetch", origin.fetch(hash, 1 << 20).await.err(), needle)
+    let proof = origin.size_proof_path_for(hash);
+    tokio::fs::symlink(origin.base().join("missing-proof-target"), &proof).await?;
+    ensure_permanent(
+        "fetch_size_proof",
+        origin.fetch_size_proof(hash).await.err(),
+        needle,
+    )
 }
 
 /// A shard directory that is a dangling symlink is a permanent fault too:
@@ -791,8 +662,12 @@ async fn a_dangling_shard_directory_symlink_is_permanent() -> anyhow::Result<()>
         .to_path_buf();
     tokio::fs::symlink(origin.base().join("missing-shard"), &shard).await?;
 
-    let err = origin.size(hash).await.err();
-    ensure_permanent("size", err, "symlink whose target does not exist")
+    let err = origin.fetch_size_proof(hash).await.err();
+    ensure_permanent(
+        "fetch_size_proof",
+        err,
+        "symlink whose target does not exist",
+    )
 }
 
 /// A valid symlinked shard directory with no leaf under it is still a plain
@@ -813,17 +688,16 @@ async fn a_missing_leaf_under_a_valid_shard_symlink_is_absent() -> anyhow::Resul
     tokio::fs::symlink(&real, &shard).await?;
 
     anyhow::ensure!(
-        origin.size(hash).await?.is_none(),
+        origin.fetch_size_proof(hash).await?.is_none(),
         "a missing leaf under a valid shard symlink must stay absent"
     );
     Ok(())
 }
 
-/// A data object the process cannot read is a permanent fault from `size`,
-/// not a size that every serve then fails on at `open` (#2801).
+/// A data object the process cannot read is a permanent fault (#2801).
 #[cfg(unix)]
 #[tokio::test]
-async fn size_of_an_unreadable_file_is_permanent() -> anyhow::Result<()> {
+async fn range_read_of_an_unreadable_file_is_permanent() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir()?;
@@ -839,8 +713,8 @@ async fn size_of_an_unreadable_file_is_permanent() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let err = origin.size(hash).await.err();
-    ensure_permanent("size", err, "open failed")
+    let err = origin.fetch_range_data(hash, first_bytes(4)).await.err();
+    ensure_permanent("fetch_range_data", err, "open failed")
 }
 
 /// `ESTALE` usually clears on the next path lookup, which `canonicalize`
@@ -853,55 +727,8 @@ fn a_stale_file_handle_is_transient() {
     assert!(!classify_io_error(denied).is_transient());
 }
 
-/// An outboard over its cap degrades to `Unsupported`, which the engine
-/// never sees, so the warn is the operator's only record. It names the
-/// path, the length and the cap (#2801).
-#[test]
-fn an_oversize_outboard_warns_with_its_path_and_cap() -> anyhow::Result<()> {
-    let logs = LogBuffer::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .finish();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let tmp = tempfile::tempdir()?;
-    let (outcome, obao4) = tracing::subscriber::with_default(subscriber, || {
-        runtime.block_on(async {
-            let origin = FilesystemOrigin::new(tmp.path()).await?;
-            let hash = seed_blob_with_outboard(origin.base(), &vec![3u8; 64 * 1024]).await?;
-            let outcome = origin.fetch_outboard(hash, 1).await?;
-            anyhow::Ok((outcome, origin.obao4_path_for(hash)))
-        })
-    })?;
-
-    anyhow::ensure!(
-        matches!(outcome, OutboardFetch::Unsupported),
-        "an oversize outboard must degrade"
-    );
-    let text = logs.contents();
-    anyhow::ensure!(
-        text.contains("WARN") && text.contains("larger than its cap"),
-        "expected the oversize warn:\n{text}"
-    );
-    anyhow::ensure!(
-        text.contains(&obao4.display().to_string()),
-        "the warn must name the outboard path {}:\n{text}",
-        obao4.display()
-    );
-    anyhow::ensure!(
-        text.contains("cap=1"),
-        "the warn must name the cap:\n{text}"
-    );
-    Ok(())
-}
-
 /// A dangling `.obao4` symlink is a permanent fault from `fetch_outboard`,
-/// never the degrade `Unsupported`: as a degrade it would silently cost every
-/// range pull of the blob, the same silence #2801 closes for the data leaf.
-/// The engine still serves the blob — the range probe latches the fault and
-/// the miss falls through to the buffered whole-blob path.
+/// the same as for the data leaf (#2801).
 #[cfg(unix)]
 #[tokio::test]
 async fn a_dangling_outboard_symlink_is_permanent() -> anyhow::Result<()> {
@@ -914,20 +741,4 @@ async fn a_dangling_outboard_symlink_is_permanent() -> anyhow::Result<()> {
 
     let err = origin.fetch_outboard(hash, 1 << 20).await.err();
     ensure_permanent("fetch_outboard", err, "symlink whose target does not exist")
-}
-
-/// The outboard-presence probe stats the sibling `{hex}.obao4`: true when it
-/// exists, false when it does not.
-#[tokio::test]
-async fn has_outboard_stats_the_sibling() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let origin = FilesystemOrigin::new(tmp.path()).await?;
-    let canonical = tokio::fs::canonicalize(tmp.path()).await?;
-    let hash = seed_blob_with_outboard(&canonical, &vec![9u8; 64 * 1024]).await?;
-    anyhow::ensure!(origin.has_outboard(hash).await?, "a published outboard");
-    anyhow::ensure!(
-        !origin.has_outboard(Hash::new(b"no-such-blob")).await?,
-        "no outboard for an unknown hash"
-    );
-    Ok(())
 }
