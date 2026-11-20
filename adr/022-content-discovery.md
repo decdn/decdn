@@ -188,7 +188,7 @@ When an origin loses its seat in a namespace, every attestation that it signed i
 
 **How a holder gets an attestation.**
 
-- **Origin.** A seated origin whose own backend holds `H` signs its own attestation on demand. It signs in the lowest namespace that it is seated in. It stamps `timestamp_us` from its own clock and signs its configured TTL. An origin node that holds no seat signs nothing.
+- **Origin.** A seated origin whose own backend holds `H` signs its own attestation on demand. It signs in the lowest namespace that it is seated in. It stamps `timestamp_us` from its own clock and signs its configured TTL. An origin node that holds no seat signs nothing. When its own backend holds a hash that it cannot attest, it asks for an early seat-set read, at most once a minute, so a newly seated origin attests its content within a minute.
 - **Relay.** A relay gets the attestation on its pull leg. Every `ok: true` `StreamResponse` carries the serving node's live attestation in `StreamResponseExt.origin_attestation`, a seated origin's own included ([ADR 005 § Serving rule](005-protocol.md#serving-rule)). The relay verifies the attestation, stores it and puts it in each record that it publishes for the hash. The pull path refuses an upstream whose served answer carries no valid attestation: the requester drops that upstream at discovery, before it ranks or pays it. A handshake that fails this check is an `unattested` fault.
 
 **Store.** A node keeps one attestation per hash: the valid one that expires last. It persists the store under `<data_dir>/attestations/`, so the store survives a restart.

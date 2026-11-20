@@ -73,13 +73,16 @@ impl ClientHandler {
         {
             return true;
         }
-        if own
-            && matches!(
-                self.cache.origin_probe_presence(hash).await,
-                decdn_cache::OriginPresence::Present(_)
-            )
-        {
-            return attestations.attest_own(bytes).is_some();
+        if matches!(
+            self.cache.origin_probe_presence(hash).await,
+            decdn_cache::OriginPresence::Present(_)
+        ) {
+            if own {
+                return attestations.attest_own(bytes).is_some();
+            }
+            // The own backend holds content this node cannot attest: its
+            // operator may hold a seat the seat set has not read yet.
+            attestations.verifier().request_seat_refresh();
         }
         live.is_some()
     }

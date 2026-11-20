@@ -30,6 +30,10 @@ pub trait SeatedOrigins: Send + Sync + std::fmt::Debug {
     /// holds none. A seated node signs its own attestations in it.
     fn first_namespace(&self, operator: &Address) -> Option<U256>;
 
+    /// Ask for an early re-read of the seat set: an operator may hold a seat
+    /// the set has not seen yet.
+    fn request_refresh(&self);
+
     /// How many operators hold at least one seat.
     fn len(&self) -> usize;
 
@@ -118,6 +122,10 @@ impl SeatedOrigins for SeatedOriginSet {
             .unwrap_or_else(PoisonError::into_inner)
             .get(operator)
             .and_then(|namespaces| namespaces.iter().min().copied())
+    }
+
+    fn request_refresh(&self) {
+        self.on_miss.request();
     }
 
     fn len(&self) -> usize {

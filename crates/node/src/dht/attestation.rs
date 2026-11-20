@@ -73,6 +73,13 @@ impl AttestationVerifier {
             .filter(|namespace| self.admits(*namespace, operator))
     }
 
+    /// Ask the seat set for an early re-read, rate-limited by the seat
+    /// snapshot. A node whose own backend holds a hash it cannot attest calls
+    /// this, so a newly seated origin attests its content within a minute.
+    pub fn request_seat_refresh(&self) {
+        self.seated.request_refresh();
+    }
+
     /// The operator whose signature `attestation` carries for `hash`, or
     /// `None` when the signature does not recover. Says nothing about
     /// validity; see [`Self::verify`].
