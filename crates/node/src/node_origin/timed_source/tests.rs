@@ -103,7 +103,7 @@ impl<S: BlobSource> BlobSource for Offering<S> {
 }
 
 /// A leg keeps the attestation its upstream offers once it verifies, and
-/// leaves an invalid one behind.
+/// refuses an upstream whose attestation is invalid.
 #[tokio::test]
 async fn a_leg_keeps_the_attestation_its_upstream_offers() {
     use crate::dht::attestation::test_support::{attest, verifier};
@@ -112,17 +112,18 @@ async fn a_leg_keeps_the_attestation_its_upstream_offers() {
     let root = inner.root();
     let range = align_range(0, 0, 4 * 1024).unwrap();
     let attestations = Arc::new(Attestations::in_memory(verifier(), None));
+    let offered = attest(root);
     let source = TimedSource::new(
         Offering {
             inner,
-            attestation: attest(root),
+            attestation: offered.clone(),
         },
         Arc::new(Metrics::new()),
         Some(Arc::clone(&attestations)),
     );
     let (_, reader) = source.open(root, range.clone()).await.unwrap();
     drop(reader);
-    assert_eq!(attestations.held(&root), Some(attest(root)));
+    assert_eq!(attestations.held(&root), Some(offered));
 
     let stale = Arc::new(Attestations::in_memory(verifier(), None));
     let inner = ScriptedSource::new(vec![7u8; 4 * 1024]).unwrap();
@@ -134,8 +135,10 @@ async fn a_leg_keeps_the_attestation_its_upstream_offers() {
         Arc::new(Metrics::new()),
         Some(Arc::clone(&stale)),
     );
-    let (_, reader) = source.open(root, range).await.unwrap();
-    drop(reader);
+    assert!(
+        source.open(root, range).await.is_err(),
+        "an upstream that offers no valid attestation is refused"
+    );
     assert_eq!(stale.held(&root), None, "signed for another hash");
 }
 

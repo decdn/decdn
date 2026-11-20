@@ -19,18 +19,20 @@ fn closer(nodes: Vec<NodeId>) -> CloserNodes {
 /// checks only their length.
 fn att() -> OriginAttestation {
     OriginAttestation {
-        rate_per_mb: 10,
+        namespace_id: [7; 32],
         timestamp_us: 1_700_000_000_000_000,
-        slash_sig: vec![0x5A; SLASH_SIG_LEN],
+        ttl_sec: DEFAULT_ATTESTATION_TTL_SEC,
+        sig: vec![0x5A; SLASH_SIG_LEN],
     }
 }
 
-/// An attestation at its widest encoding: every varint at ten bytes.
+/// An attestation at its widest encoding: every varint at its widest.
 fn widest_att() -> OriginAttestation {
     OriginAttestation {
-        rate_per_mb: u64::MAX,
+        namespace_id: [0xFF; 32],
         timestamp_us: u64::MAX,
-        slash_sig: vec![0x5A; SLASH_SIG_LEN],
+        ttl_sec: u32::MAX,
+        sig: vec![0x5A; SLASH_SIG_LEN],
     }
 }
 
@@ -351,13 +353,14 @@ fn dht_frame_ceiling_holds_the_largest_message() -> Result<(), postcard::Error> 
 
     let batch_len = postcard::to_allocvec(&batch)?.len();
     // 1 discriminant + 2 (entry count 192) + 192 × (32 hash + 2 + 200 bitmap
-    // + 86 attestation) + 32 holder. The attestation is 2 × 10 varint bytes
-    // plus 1 + 65 for the signature.
-    assert_eq!(batch_len, 61_475, "BatchStoreRequest at full width");
+    // + 113 attestation) + 32 holder. The attestation is a 32-byte namespace,
+    // a 10-byte timestamp varint, a 5-byte TTL varint, and 1 + 65 for the
+    // signature.
+    assert_eq!(batch_len, 66_659, "BatchStoreRequest at full width");
     let response_len = postcard::to_allocvec(&find_value_response)?.len();
-    // 1 + 32 hash + 1 + 50 × (32 node + 2 + 200 bitmap + 86 attestation) + 1
+    // 1 + 32 hash + 1 + 50 × (32 node + 2 + 200 bitmap + 113 attestation) + 1
     // + 20 × 32.
-    assert_eq!(response_len, 16_675, "FindValueResponse at full width");
+    assert_eq!(response_len, 18_025, "FindValueResponse at full width");
 
     let others = [
         DhtMessage::FindValue(sample_find_value_request()),
@@ -548,7 +551,7 @@ fn closer_nodes_try_new_enforces_cap() {
 fn attestation_decode_rejects_a_wrong_signature_length() -> Result<(), postcard::Error> {
     for len in [0, SLASH_SIG_LEN - 1, SLASH_SIG_LEN + 1] {
         let bytes = postcard::to_allocvec(&OriginAttestation {
-            slash_sig: vec![0; len],
+            sig: vec![0; len],
             ..att()
         })?;
         assert!(
@@ -560,28 +563,40 @@ fn attestation_decode_rejects_a_wrong_signature_length() -> Result<(), postcard:
 }
 
 #[test]
-fn attestation_round_trips_through_its_signed_body() {
-    let a = att();
-    let body = a.signed_body([3; 32]);
-    assert!(body.ok);
-    assert_eq!(body.hash, [3; 32]);
-    let resp = crate::client::StreamResponse {
-        body,
-        slash_sig: a.slash_sig.clone(),
+fn attestation_is_live_inside_its_lifetime_only() {
+    let a = OriginAttestation {
+        timestamp_us: 10_000_000_000,
+        ttl_sec: MIN_ATTESTATION_TTL_SEC,
+        ..att()
     };
-    assert_eq!(OriginAttestation::from_response(&resp), Some(a));
+    let ttl_us = u64::from(MIN_ATTESTATION_TTL_SEC) * 1_000_000;
+    assert_eq!(a.expires_at_us(), a.timestamp_us + ttl_us);
+    assert_eq!(a.half_life_at_us(), a.timestamp_us + ttl_us / 2);
+    assert!(a.is_live_at(a.timestamp_us));
+    assert!(a.is_live_at(a.expires_at_us() - 1));
+    assert!(!a.is_live_at(a.expires_at_us()), "expired at its TTL");
+    // A timestamp ahead of the verifier's clock by more than the skew bound
+    // is not live yet.
+    let ahead = a.timestamp_us - MAX_ATTESTATION_FUTURE_SKEW_US;
+    assert!(a.is_live_at(ahead));
+    assert!(!a.is_live_at(ahead - 1));
 }
 
 #[test]
-fn a_refusal_attests_nothing() {
-    let resp = crate::client::StreamResponse {
-        body: crate::client::StreamResponseBody {
-            ok: false,
-            ..att().signed_body([3; 32])
-        },
-        slash_sig: vec![0; SLASH_SIG_LEN],
-    };
-    assert_eq!(OriginAttestation::from_response(&resp), None);
+fn attestation_ttl_bounds() {
+    for (ttl_sec, ok) in [
+        (MIN_ATTESTATION_TTL_SEC - 1, false),
+        (MIN_ATTESTATION_TTL_SEC, true),
+        (DEFAULT_ATTESTATION_TTL_SEC, true),
+        (MAX_ATTESTATION_TTL_SEC, true),
+        (MAX_ATTESTATION_TTL_SEC + 1, false),
+    ] {
+        assert_eq!(
+            OriginAttestation { ttl_sec, ..att() }.ttl_in_bounds(),
+            ok,
+            "ttl {ttl_sec}"
+        );
+    }
 }
 
 #[test]

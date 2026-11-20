@@ -1,11 +1,11 @@
 //! The seated-origin set (ADR 022 § Origin Attestation).
 //!
-//! An operator holds an origin seat when `OriginAssignment.getOrigins(n)`
-//! contains it for at least one namespace `n`. Every DHT record's origin
-//! attestation must recover to an operator in this set, so the set is what
-//! makes a record valid. Seats are tracked per `(namespace, operator)` pair: an
-//! operator unseated from one namespace stays in the set while it holds a seat
-//! in another.
+//! An operator holds an origin seat in namespace `n` when
+//! `OriginAssignment.getOrigins(n)` contains it. An origin attestation for
+//! namespace `n` is valid only while its signer holds a seat in `n`, so the set
+//! is what makes an attestation valid. Seats are tracked per `(namespace,
+//! operator)` pair: unseating an operator from one namespace voids its
+//! attestations in that namespace only.
 //!
 //! [`SeatedOriginSet`] is the in-memory projection. The snapshot in
 //! [`crate::origin_seat_watcher`] fills it from `OriginAssignment` and keeps it
@@ -23,8 +23,12 @@ use crate::chain_events::refresh::RefreshTrigger;
 
 /// Read-only view of the seated-origin set.
 pub trait SeatedOrigins: Send + Sync + std::fmt::Debug {
-    /// Whether `operator` holds an origin seat in at least one namespace.
-    fn is_seated(&self, operator: &Address) -> bool;
+    /// Whether `operator` holds an origin seat in `namespace`.
+    fn is_seated_in(&self, namespace: U256, operator: &Address) -> bool;
+
+    /// The lowest namespace `operator` holds a seat in, or `None` when it
+    /// holds none. A seated node signs its own attestations in it.
+    fn first_namespace(&self, operator: &Address) -> Option<U256>;
 
     /// How many operators hold at least one seat.
     fn len(&self) -> usize;
@@ -95,16 +99,25 @@ impl SeatedOriginSet {
 }
 
 impl SeatedOrigins for SeatedOriginSet {
-    fn is_seated(&self, operator: &Address) -> bool {
+    fn is_seated_in(&self, namespace: U256, operator: &Address) -> bool {
         let seated = self
             .seats
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(operator);
+            .get(operator)
+            .is_some_and(|namespaces| namespaces.contains(&namespace));
         if !seated {
             self.on_miss.request();
         }
         seated
+    }
+
+    fn first_namespace(&self, operator: &Address) -> Option<U256> {
+        self.seats
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(operator)
+            .and_then(|namespaces| namespaces.iter().min().copied())
     }
 
     fn len(&self) -> usize {

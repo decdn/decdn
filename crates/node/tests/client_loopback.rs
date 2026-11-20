@@ -16347,6 +16347,8 @@ async fn an_open_on_a_partial_answers_by_whether_it_covers_the_span() -> anyhow:
     // Block 1's middle group is missing.
     admit_span(&cache, blob, 0, block).await?;
     admit_span(&cache, blob, total - group, group).await?;
+    // The fixture handler attests registered payloads.
+    support::register_payload(&plaintext);
 
     let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
     let (target, _server_eth, server_ep, server_task, _metrics) =

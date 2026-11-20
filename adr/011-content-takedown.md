@@ -409,11 +409,11 @@ The backstops are reactive, not preventive. Governance removes a bad origin, un-
 
 ### Namespace 0
 
-`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. `addOrigin(0, op)` reverts for every caller, because `ownerOf(0)` is the zero address. A hash becomes discoverable only through an operator that holds an origin seat in a registered namespace, whose origin attestation every DHT record carries ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0), [ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)).
+`namespaceId == 0` has no publisher and no authorized origins. `OriginAssignment` holds no set for it: `getOrigins(0)` is empty and `isAuthorizedOrigin(0, op)` is always false. `addOrigin(0, op)` reverts for every caller, because `ownerOf(0)` is the zero address. Namespace 0 holds no seats, so it attests nothing. A hash becomes discoverable and servable only through an operator that holds an origin seat in a registered namespace, whose live origin attestation every DHT record and every served answer carries ([ADR 002 § Namespace 0](002-content-addressing.md#namespace-0), [ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)).
 
 ### Unassigned namespaces
 
-A registered namespace with no seated origin is **unassigned**. No operator is authorized as origin for its content, but the protocol still permits cache-only serving from any bonded operator that happens to hold the blob — see [ADR 005 § Discovery opens](005-protocol.md#discovery-opens). A publisher who never seats an origin prevents any new origin from picking up the namespace's content from canonical storage; cached copies eventually expire. This is by design — it lets a publisher withdraw a content set from the network by leaving its namespace unassigned or unseating its origins.
+A registered namespace with no seated origin is **unassigned**. No operator is authorized as origin for its content, and no operator signs an origin attestation in it. A cached copy stays servable only while its holder holds a live attestation for the hash in some namespace ([ADR 005 § Serving rule](005-protocol.md#serving-rule)). When a publisher unseats its origins, their attestations in the namespace become invalid at each node's next seat-set read, and the caches stop serving within one attestation TTL (at most 24 h). This is by design: it lets a publisher withdraw a content set from the network by leaving its namespace unassigned or unseating its origins. A publisher that keeps its origins seated and has them stop attesting a hash withdraws that hash within the TTL that they sign ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)).
 
 ### Duplicate-address rejection
 
@@ -439,7 +439,7 @@ Net: blacklisting an operator is O(1) on-chain (one ejection call), consumers en
 
 ### Permissionless property
 
-This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for registered namespaces. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via the publisher-vetting plane. Discovery follows the origin role: a cached copy is discoverable only with the attestation of the seated origin that served it ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). Namespace 0 has no authorized origins at all. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
+This authority extends the DAO's role from negative-only (blacklisting) to positive-and-negative (assignment + blacklisting) for registered namespaces. Cache-only serving remains permissionless — any bonded operator may fetch cached blobs from authorized origins and re-serve them regardless of `OriginAssignment` membership; only the *origin* role becomes DAO-gated, via the publisher-vetting plane. Serving and discovery follow the origin role: a cached copy is servable and discoverable only while its holder holds a live attestation of a seated origin ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). Namespace 0 has no authorized origins at all. See [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh) for the updated permissionless-role model.
 
 ## Node Behavior
 

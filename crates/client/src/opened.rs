@@ -308,10 +308,7 @@ impl OpenedStream {
             size_proof: resp_ext.size_proof().cloned(),
             rate_per_mb,
             interval_bytes: CHUNK_BYTES,
-            origin_attestation: resp_ext
-                .origin_attestation
-                .clone()
-                .or_else(|| decdn_protocol::OriginAttestation::from_response(&resp)),
+            origin_attestation: resp_ext.origin_attestation.clone(),
         };
         let window = deadlines.window;
         let (progress_counter, floor, sampler) = throughput_floor(deadlines);

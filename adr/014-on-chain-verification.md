@@ -37,7 +37,7 @@ StreamResponse {hash, ok, rate_per_mb, timestamp_us, slash_sig} ++ Ext {outcome,
 
 No signed field holds the blob size. A response states the size only in its size proof, which the receiver verifies against `hash` ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)). No slashing condition reads the size.
 
-`hash` echoes the hash of the `StreamRequest`. Implementers must include it when they build and verify the EIP-712 typed data. The signed `StreamResponse` names no pool or payer. It is a statement by the node about its own serve of a hash, so a third party can verify it without the request. A seated origin's `StreamResponse` with `ok: true` is therefore also the origin attestation that a DHT record carries ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
+`hash` echoes the hash of the `StreamRequest`. Implementers must include it when they build and verify the EIP-712 typed data. The signed `StreamResponse` names no pool or payer. It is a statement by the node about its own serve of a hash, so a third party can verify it without the request. The origin attestation that a DHT record carries is a separate EIP-712 type, `OriginAttestation`, signed under the same `SlashJudge` domain. No contract reads it ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any subsequent change is a Tier 3 ALPN bump.
 
 #### EIP-712 Type Definitions
 

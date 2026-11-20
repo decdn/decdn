@@ -584,6 +584,14 @@ pub struct CacheConfig {
     /// configured, `true` (relay) when none is. Set this explicitly to
     /// override either default. Node-local; `cache.*` is restart-required.
     pub relay_foreign_namespaces: Option<bool>,
+    /// The lifetime, in seconds, this node signs into the origin attestations
+    /// it issues for content its own backend holds (ADR 022 § Origin
+    /// Attestation). Read only when the operator holds an origin seat. It is
+    /// the takedown latency of a hash this origin stops attesting, and the
+    /// time its content outlives the origin going offline. Must lie in
+    /// `[3600, 86400]`. Absent =>
+    /// [`decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC`] (43200, 12 h).
+    pub attestation_ttl_sec: Option<u32>,
     /// Number of discovered providers a node-to-node pull opens a
     /// voucher-less discovery stream on before ranking (#831). Absent =>
     /// [`crate::config::DEFAULT_NODE_PULL_OPEN_FANOUT`] (5). Higher widens

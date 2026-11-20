@@ -18,7 +18,7 @@
 //! | Spend delegation | [`capability`] (the signed capability), [`capability_grant`] (its transferable `dcap1:` form) |
 //! | Lane state | [`lane`] (the seller's per-lane watermark), [`store`] (persistence traits and in-memory stores, the settlement ledger among them), [`earnings`] (sums over the ledger for `decdn node earnings`), [`deployment`] (which `PaymentPool` a state belongs to) |
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
-//! | Response signatures | [`stream_sig`] (the `slash_sig` on stream responses and the `SlashJudge` domain), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
+//! | Response signatures | [`stream_sig`] (the `slash_sig` on stream responses and the `SlashJudge` domain), [`origin_attestation`] (origin attestations), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
 //! | Keys | [`eth_identity`] (Web3 Secret Storage keystores and the `PrivateKeySigner` they load) |
 //! | Contract bindings | [`payment_pool`] (`PaymentPool`, `FeeRouter`, `CctpSweepReceiver`),[`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
 //! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding), [`log_scan`] (bounded `eth_getLogs` windows that learn a provider's range cap) |
@@ -85,6 +85,7 @@ pub mod lane;
 pub mod lane_signer;
 pub mod node_register;
 pub mod origin_assignment;
+pub mod origin_attestation;
 pub mod payment_pool;
 pub mod pool_open_error;
 pub mod publisher_registry;
@@ -123,6 +124,10 @@ pub use erc20::Erc20;
 pub use lane::{
     FoldAxis, LaneChain, LaneKey, LaneState, PoolError, PoolId, PreimageApplied, RedeemClaim,
     VoucherApplied,
+};
+pub use origin_attestation::{
+    ORIGIN_ATTESTATION_TYPEHASH, origin_attestation_signing_hash,
+    recover_origin_attestation_signer, sign_origin_attestation,
 };
 pub use pool_open_error::{
     PoolLifecycleRevert, PoolOpenFailureReason, is_erc20_allowance_shortfall, is_pool_not_open,

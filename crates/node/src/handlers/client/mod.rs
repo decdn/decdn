@@ -563,6 +563,12 @@ enum ServeRejectReason {
     /// relay the hash during this fetch, and another node may (ADR 002
     /// §Retrieval by namespace).
     ForeignNamespaceDeclined,
+    /// The node holds the blob but no live, valid origin attestation for it,
+    /// and cannot sign its own (ADR 022 § Origin Attestation): its origin
+    /// stopped attesting the hash, or lost its seat. Ships
+    /// [`StreamError::Declined`] (see [`Self::wire_error`]): this node will not
+    /// serve the hash until it holds a live attestation again.
+    Unattested,
     /// The node has been unable to reach the chain for longer than
     /// `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving while
     /// chain-stale), so its deny-set, pool-solvency, and signer-cap guards are
@@ -623,7 +629,8 @@ impl ServeRejectReason {
             | Self::HashDenied
             | Self::ChainHashDenied
             | Self::OriginDenied
-            | Self::ForeignNamespaceDeclined => StreamError::Declined,
+            | Self::ForeignNamespaceDeclined
+            | Self::Unattested => StreamError::Declined,
         }
     }
 }
@@ -892,9 +899,11 @@ pub struct ClientHandlerDeps {
     /// gate — the same fail-open shape as an unwired [`PoolRoute::pool_view`].
     pub chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
     /// The origin attestations this node holds (ADR 022 § Origin
-    /// Attestation). An `ok: true` response forwards the one held for its hash
-    /// in `StreamResponseExt.origin_attestation`, so a pulling relay can
-    /// advertise what it pulls. `None` (tests without a DHT) forwards none.
+    /// Attestation). The node serves a hash only while it holds a live one,
+    /// and an `ok: true` response forwards it in
+    /// `StreamResponseExt.origin_attestation`, so a pulling relay can serve
+    /// and advertise what it pulls. `None` (tests without a DHT) disables the
+    /// gate and forwards none.
     pub attestations: Option<Arc<crate::attestations::Attestations>>,
     // Optional wiring — `None` unless the deployment enables the feature.
     /// Deadline for the node-to-node cache-miss pull, so a slow upstream

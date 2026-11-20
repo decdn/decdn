@@ -1169,7 +1169,7 @@ async fn build_chain_and_handlers(
         &cfg.identity.data_dir,
         Some(crate::attestations::SelfOrigin {
             signer: Arc::clone(&infra.eth_signer),
-            rate_per_mb: cfg.payment.rate_per_mb,
+            ttl_sec: cfg.cache.attestation_ttl_sec,
         }),
     ));
     let dht_handler = Arc::new(DhtHandler::new(
@@ -1919,6 +1919,24 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         cfg.cache.relay_foreign_namespaces,
         Arc::clone(&infra.node_metrics),
         cache_inserts_rx,
+        republish_stop.clone(),
+    ));
+
+    // Origin attestation refresh (ADR 022 § Origin Attestation): from half
+    // its lifetime on, each held attestation is replaced from this node's own
+    // seat, the DHT, or a seated origin, so the node keeps serving and
+    // publishing what it holds. The DHT and origin sources need the
+    // node-to-node pull dependencies, provisioned once the buyer pool is up.
+    tasks.spawn(crate::node_origin::attestation_refresh::run(
+        crate::node_origin::attestation_refresh::Refresher {
+            attestations: Arc::clone(&ch.attestations),
+            cache: infra.cache.clone(),
+            metrics: Arc::clone(&infra.node_metrics),
+            pull: infra
+                .node_origin
+                .as_ref()
+                .map(crate::node_origin::NodeOrigin::deps_arc),
+        },
         republish_stop.clone(),
     ));
 

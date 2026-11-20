@@ -1682,9 +1682,10 @@ fn stream_response_frame_ceiling_holds_the_largest_response()
         slash_sig: vec![0x09; SLASH_SIG_LEN],
     };
     let attestation = crate::dht::OriginAttestation {
-        rate_per_mb: u64::MAX,
+        namespace_id: [0xFF; 32],
         timestamp_us: u64::MAX,
-        slash_sig: vec![0x0D; SLASH_SIG_LEN],
+        ttl_sec: u32::MAX,
+        sig: vec![0x0D; SLASH_SIG_LEN],
     };
     let response_len = encode_stream_response(
         &response,
@@ -1717,8 +1718,8 @@ fn stream_response_frame_ceiling_holds_the_largest_response()
         }),
     )?
     .len();
-    assert_eq!(response_len, 6272, "served StreamResponse at full width");
-    assert_eq!(refusal_len, 1944, "refusal StreamResponse at full width");
+    assert_eq!(response_len, 6299, "served StreamResponse at full width");
+    assert_eq!(refusal_len, 1971, "refusal StreamResponse at full width");
     assert!(refusal_len < response_len);
     assert!(response_len > MAX_CLIENT_CONTROL_FRAME as usize);
     assert!(

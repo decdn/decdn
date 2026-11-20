@@ -747,6 +747,7 @@ fn takedown_reject_reasons_are_declined() {
         ServeRejectReason::BlobTooLarge,
         ServeRejectReason::RangeNotSatisfiable,
         ServeRejectReason::ForeignNamespaceDeclined,
+        ServeRejectReason::Unattested,
     ] {
         assert_eq!(
             reason.wire_error(),
