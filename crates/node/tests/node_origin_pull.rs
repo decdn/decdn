@@ -3651,7 +3651,7 @@ fn signed_response(
     let ext = match error {
         None => StreamResponseExt::served(
             support::size_proof_for(req.hash, total_bytes),
-            None,
+            Some(test_support::attest(req.hash)),
             decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes)),
         ),
         Some(error) => StreamResponseExt::refused(error, decdn_protocol::Coverage::empty()),

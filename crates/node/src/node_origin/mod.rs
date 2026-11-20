@@ -43,6 +43,7 @@
 //! buyer bootstrap failed — `fetch` returns [`OriginFetch::NotFound`], a clean
 //! miss that leaves the handler behaving exactly as it did before pull-through.
 
+pub(crate) mod attestation_refresh;
 mod backend_source;
 mod buyer_route;
 pub use buyer_route::BuyerPool;
@@ -1390,6 +1391,9 @@ enum OpenDrop {
     /// The peer's `payment_pools` hint does not route it to the buyer's pool,
     /// so it refuses that pool as `Declined`.
     PoolNotAccepted,
+    /// The peer served the blob without a valid origin attestation, so this
+    /// node could not serve what it pulls (ADR 022 § Origin Attestation).
+    Unattested,
 }
 
 /// What the discovery rounds of one miss saw (#2366): the counts a
@@ -1423,7 +1427,8 @@ impl OpenTally {
             | OpenDrop::NoAddress
             | OpenDrop::Unverifiable
             | OpenDrop::OverCeiling
-            | OpenDrop::PoolNotAccepted => &mut self.dropped,
+            | OpenDrop::PoolNotAccepted
+            | OpenDrop::Unattested => &mut self.dropped,
         };
         *slot = slot.saturating_add(1);
     }
@@ -2103,6 +2108,20 @@ async fn open_candidate(
         return Err(OpenDrop::PoolNotAccepted);
     }
     let served = opened.served();
+    // A served answer must carry a valid origin attestation, or this node
+    // could not serve what it pulls (ADR 022 § Origin Attestation). Dropped
+    // before it is ranked, so no pull ever pays for it. Not a reputation
+    // event: the attestation's validity is this node's own reading of the
+    // seat set.
+    if served
+        && !deps
+            .attestations
+            .keep_offered(hash_bytes, opened.ext().origin_attestation.as_ref())
+    {
+        opened.cancel();
+        debug!(peer = %pk, "node-origin: discovered holder served without a valid origin attestation; dropping it");
+        return Err(OpenDrop::Unattested);
+    }
     let holds_nothing = !served && opened.coverage().is_empty();
     let error = opened.ext().error().cloned();
     // An assigned origin's `NotFound` says it has not filled the blob yet: its
@@ -3065,10 +3084,19 @@ async fn pull_from_candidate_in_span(
         Arc::clone(&deps.metrics),
     );
     let (header, whole) = match handshake.await {
-        Ok(pair) => {
-            deps.attestations
-                .keep_offered(hash_bytes, pair.0.origin_attestation.as_ref());
+        Ok(pair)
+            if deps
+                .attestations
+                .keep_offered(hash_bytes, pair.0.origin_attestation.as_ref()) =>
+        {
             pair
+        }
+        Ok(_) => {
+            // Served without a valid origin attestation: this node could not
+            // serve what it pulls. The stream drops unread, so no voucher is
+            // paid.
+            debug!(%provider_addr, "node-origin: upstream served without a valid origin attestation");
+            return Err(PullMiss::Clean);
         }
         Err(err) => {
             // No bytes pulled, no voucher paid — nothing to settle.

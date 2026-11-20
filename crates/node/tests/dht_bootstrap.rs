@@ -479,6 +479,9 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?, 2);
     let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
     cache.admit_bao(hash, ranges, bao).await?;
+    // A node publishes a hash only while it holds a live attestation for it.
+    let attestations = test_support::self_signing();
+    assert!(attestations.keep(*hash.as_bytes(), test_support::attest(*hash.as_bytes())));
     let scheduler = Arc::new(RepublishScheduler::new());
     let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(16);
     let stop = CancellationToken::new();
@@ -491,7 +494,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         )]))),
         Arc::clone(&scheduler),
         cache,
-        test_support::self_signing(),
+        attestations,
         true,
         Arc::new(decdn_node::metrics::Metrics::new()),
         inserts_rx,
@@ -522,7 +525,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
             .records
             .lock()
             .unwrap()
-            .providers_at(&ContentHash::from_bytes(*h.as_bytes()), now_us, |_| true)
+            .providers_at(&ContentHash::from_bytes(*h.as_bytes()), now_us, |_, _| true)
             .into_iter()
             .filter(|p| p.node == holder)
             .count()
@@ -948,6 +951,7 @@ struct Publisher {
     ep: Endpoint,
     holder: NodeId,
     cache: decdn_cache::CacheEngine,
+    attestations: Arc<decdn_node::attestations::Attestations>,
     stop: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<()>,
     _cache_dir: tempfile::TempDir,
@@ -986,6 +990,7 @@ impl Publisher {
         let scheduler = Arc::new(RepublishScheduler::new());
         let inserts = cache.subscribe_inserts();
         seed(&cache, &scheduler);
+        let attestations = test_support::self_signing();
         let stop = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(run_republish(
             dht_conns(&ep),
@@ -996,7 +1001,7 @@ impl Publisher {
             )]))),
             Arc::clone(&scheduler),
             cache.clone(),
-            test_support::self_signing(),
+            Arc::clone(&attestations),
             true,
             Arc::new(Metrics::new()),
             inserts,
@@ -1007,10 +1012,19 @@ impl Publisher {
             ep,
             holder,
             cache,
+            attestations,
             stop,
             task,
             _cache_dir: cache_dir,
         })
+    }
+
+    /// Hold a live attestation for `hash`, as a relay does once it pulls it.
+    fn attest(&self, hash: iroh_blobs::Hash) {
+        assert!(
+            self.attestations
+                .keep(*hash.as_bytes(), test_support::attest(*hash.as_bytes()))
+        );
     }
 
     /// This publisher's coverage for `hash` at the server, once a record lands.
@@ -1024,7 +1038,11 @@ impl Publisher {
         .unwrap();
         let mut records = self.server.records.lock().unwrap();
         records
-            .providers_at(&ContentHash::from_bytes(*hash.as_bytes()), now_us, |_| true)
+            .providers_at(
+                &ContentHash::from_bytes(*hash.as_bytes()),
+                now_us,
+                |_, _| true,
+            )
             .into_iter()
             .find(|p| p.node == self.holder)
             .map(|p| p.coverage)
@@ -1048,6 +1066,7 @@ impl Publisher {
         let total = 4 * decdn_bao_range::CHUNK_GROUP_BYTES;
         let (root, plaintext, outboard) = synth_blob(usize::try_from(total).unwrap(), 1);
         let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+        self.attest(hash);
         self.cache.admit_bao(hash, ranges, bao).await.unwrap();
         assert!(
             self.await_record(hash).await.is_some(),
@@ -1076,6 +1095,7 @@ async fn run_republish_publishes_a_ranged_partial_once_its_first_block_verifies(
 -> anyhow::Result<()> {
     let p = Publisher::start(|_, _| {}).await?;
     let blob = TwoBlockBlob::new();
+    p.attest(blob.hash());
     let block = decdn_protocol::DISCOVERY_BLOCK_BYTES;
 
     blob.admit(&p.cache, 0, block).await;
@@ -1113,6 +1133,7 @@ async fn run_republish_publishes_a_seeded_partial_when_its_first_block_verifies(
         assert_eq!(scheduler.seed_cold_start([seeded]), 1);
     })
     .await?;
+    p.attest(blob.hash());
     // One group first, so the store holds a partial with no whole block —
     // the shape a restart finds mid-fill.
     blob.admit(&p.cache, 0, group).await;

@@ -18,8 +18,9 @@
 //! timestamp in the signed body (ADR 022 §STORE Flow).
 //!
 //! Every record also carries an [`OriginAttestation`]: a seated origin's
-//! signed `StreamResponse` for the hash (ADR 022 § Origin Attestation). It is
-//! not a holder claim, so it stays valid whichever holder carries it.
+//! signed, expiring statement that it serves the hash in a namespace (ADR 022
+//! § Origin Attestation). It is not a holder claim, so it stays valid
+//! whichever holder carries it, until it expires.
 //! Verifying it needs `alloy`, so the check lives in `decdn-incentive` and
 //! `decdn-node`; this crate carries the bytes.
 //!
@@ -47,14 +48,13 @@
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
-use crate::client::{StreamResponse, StreamResponseBody};
 use crate::coverage::Coverage;
 use crate::identity::{ContentHash, NodeId};
 use crate::message::SLASH_SIG_LEN;
 
 /// Wire-level maximum number of providers a [`FindValueResponse`] may carry
 /// (ADR 022 §Content Records and TTL). With 200-byte coverage bitmaps and full
-/// origin attestations it bounds a full response to the 16,675 bytes in
+/// origin attestations it bounds a full response to the 18,025 bytes in
 /// ADR 022 §DHT Bandwidth Analysis, inside [`MAX_DHT_FRAME`].
 ///
 /// Enforced at the wire boundary by `deserialize_providers`; oversize values
@@ -83,54 +83,84 @@ pub const MAX_BATCH_STORE_HASHES: usize = 192;
 /// responses alike. The largest legitimate message is a full
 /// [`BatchStoreRequest`]: [`MAX_BATCH_STORE_HASHES`] entries, each a 32-byte
 /// hash, a [`Coverage`] of up to 202 bytes and an [`OriginAttestation`] of up
-/// to 86 bytes, plus the holder — 61,475 bytes. The largest response is a full
-/// [`FindValueResponse`] at 16,675 bytes. The
+/// to 113 bytes, plus the holder — 66,659 bytes. The largest response is a full
+/// [`FindValueResponse`] at 18,025 bytes. The
 /// `dht_frame_ceiling_holds_the_largest_message` test pins the margin.
-pub const MAX_DHT_FRAME: u32 = 64 * 1024;
+pub const MAX_DHT_FRAME: u32 = 72 * 1024;
 
-/// A seated origin's signed serve of a hash (ADR 022 § Origin Attestation):
-/// the signed fields of its `StreamResponse` that a record does not already
-/// carry, plus the signature. The record supplies the hash, and `ok` is always
-/// `true`, so neither is stored.
+/// The shortest lifetime an origin attestation may carry, in seconds (1 h).
+pub const MIN_ATTESTATION_TTL_SEC: u32 = 3_600;
+
+/// The longest lifetime an origin attestation may carry, in seconds (24 h).
+/// It bounds the takedown latency of a hash its origin stops attesting.
+pub const MAX_ATTESTATION_TTL_SEC: u32 = 86_400;
+
+/// The lifetime an origin signs when its operator sets none, in seconds (12 h).
+pub const DEFAULT_ATTESTATION_TTL_SEC: u32 = 43_200;
+
+/// How far ahead of the verifier's clock an attestation's `timestamp_us` may
+/// lie, in microseconds (30 s). It absorbs clock skew between the origin and
+/// the verifier, and it stops an origin from stretching a lifetime past
+/// [`MAX_ATTESTATION_TTL_SEC`] with a future timestamp.
+pub const MAX_ATTESTATION_FUTURE_SKEW_US: u64 = 30_000_000;
+
+/// A seated origin's signed statement that it serves a hash in a namespace,
+/// for a bounded time (ADR 022 § Origin Attestation). The record supplies the
+/// hash, so it is not stored here.
 ///
-/// The attestation is valid when the signature over the rebuilt
-/// [`StreamResponseBody`] recovers to an operator that holds an origin seat in
-/// at least one namespace. Nothing here is checked at decode beyond the
+/// The origin signs the EIP-712 `OriginAttestation(bytes32 hash,uint256
+/// namespaceId,uint64 timestampUs,uint32 ttlSec)` with its operator key. The
+/// attestation is valid when the signature recovers to an operator that holds
+/// an origin seat in `namespace_id`, `ttl_sec` lies in
+/// `[MIN_ATTESTATION_TTL_SEC, MAX_ATTESTATION_TTL_SEC]`, and the attestation
+/// is live ([`Self::is_live_at`]). Nothing here is checked at decode beyond the
 /// signature length; the verifier owns validity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OriginAttestation {
-    /// The origin's quoted rate in its signed response.
-    pub rate_per_mb: u64,
-    /// The timestamp the origin signed. Validity never reads it.
+    /// The namespace the origin attests the hash in, as a big-endian
+    /// `uint256`. Namespace 0 holds no seats, so it attests nothing.
+    pub namespace_id: [u8; 32],
+    /// The origin's clock when it signed, in microseconds since the Unix
+    /// epoch.
     pub timestamp_us: u64,
-    /// The origin's 65-byte EIP-712 `StreamResponse` signature. Any other
-    /// length fails decode.
+    /// The attestation's lifetime in seconds, from `timestamp_us`.
+    pub ttl_sec: u32,
+    /// The origin's 65-byte EIP-712 signature. Any other length fails decode.
     #[serde(deserialize_with = "deserialize_slash_sig")]
-    pub slash_sig: Vec<u8>,
+    pub sig: Vec<u8>,
 }
 
 impl OriginAttestation {
-    /// Take the attestation from an origin's own signed `ok: true` response.
-    /// A refusal attests nothing, so `ok: false` yields `None`.
+    /// The instant the attestation expires, in microseconds since the Unix
+    /// epoch.
     #[must_use]
-    pub fn from_response(resp: &StreamResponse) -> Option<Self> {
-        resp.body.ok.then(|| Self {
-            rate_per_mb: resp.body.rate_per_mb,
-            timestamp_us: resp.body.timestamp_us,
-            slash_sig: resp.slash_sig.clone(),
-        })
+    pub const fn expires_at_us(&self) -> u64 {
+        self.timestamp_us
+            .saturating_add((self.ttl_sec as u64).saturating_mul(1_000_000))
     }
 
-    /// Rebuild the signed `StreamResponse` body this attestation covers for
-    /// `hash`, with `ok: true`.
+    /// Whether `ttl_sec` lies in `[MIN_ATTESTATION_TTL_SEC,
+    /// MAX_ATTESTATION_TTL_SEC]`.
     #[must_use]
-    pub const fn signed_body(&self, hash: [u8; 32]) -> StreamResponseBody {
-        StreamResponseBody {
-            hash,
-            ok: true,
-            rate_per_mb: self.rate_per_mb,
-            timestamp_us: self.timestamp_us,
-        }
+    pub const fn ttl_in_bounds(&self) -> bool {
+        self.ttl_sec >= MIN_ATTESTATION_TTL_SEC && self.ttl_sec <= MAX_ATTESTATION_TTL_SEC
+    }
+
+    /// Whether the attestation is live at `now_us`: `now − ttl < timestamp ≤
+    /// now + MAX_ATTESTATION_FUTURE_SKEW_US`. Says nothing about the
+    /// signature or the seat.
+    #[must_use]
+    pub const fn is_live_at(&self, now_us: u64) -> bool {
+        self.timestamp_us <= now_us.saturating_add(MAX_ATTESTATION_FUTURE_SKEW_US)
+            && self.expires_at_us() > now_us
+    }
+
+    /// The instant a holder starts to refresh the attestation: half its
+    /// lifetime after `timestamp_us`, in microseconds since the Unix epoch.
+    #[must_use]
+    pub const fn half_life_at_us(&self) -> u64 {
+        self.timestamp_us
+            .saturating_add((self.ttl_sec as u64).saturating_mul(500_000))
     }
 }
 
@@ -294,7 +324,7 @@ pub struct Provider {
     pub node: NodeId,
     /// Discovery blocks this holder reports covering.
     pub coverage: Coverage,
-    /// The seated origin's signed serve of the hash.
+    /// A seated origin's attestation for the hash.
     pub attestation: OriginAttestation,
 }
 
@@ -305,7 +335,7 @@ pub struct Provider {
 /// in XOR keyspace, used by the requester to continue iterative lookup.
 ///
 /// Responders MUST NOT emit more than [`MAX_PROVIDERS_PER_HASH`] providers or
-/// more than [`MAX_CLOSER_NODES`] closer nodes — the 16,675-byte worst case in
+/// more than [`MAX_CLOSER_NODES`] closer nodes — the 18,025-byte worst case in
 /// ADR 022 §DHT Bandwidth Analysis, and so [`MAX_DHT_FRAME`], depend on these
 /// bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,7 +371,7 @@ pub struct StoreRequest {
     pub holder: NodeId,
     /// Discovery blocks the holder reports covering for `hash`.
     pub coverage: Coverage,
-    /// The seated origin's signed serve of `hash`.
+    /// A seated origin's attestation for `hash`.
     pub attestation: OriginAttestation,
 }
 

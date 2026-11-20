@@ -1160,12 +1160,13 @@ impl NodeOrigin {
                 // releases its pin at once.
                 drop(stream_guard);
                 let size_proof = opened.ext().size_proof().cloned();
-                let attestation = opened.ext().origin_attestation.clone().or_else(|| {
-                    decdn_protocol::OriginAttestation::from_response(opened.response())
-                });
-                deps.attestations
-                    .keep_offered(hash_bytes, attestation.as_ref());
+                let attested = deps
+                    .attestations
+                    .keep_offered(hash_bytes, opened.ext().origin_attestation.as_ref());
                 opened.cancel();
+                if !attested {
+                    return Err(HandshakeFault::clean("unattested"));
+                }
                 return Ok((total_bytes, size_proof, None));
             };
             let answered_at = opened.answered_at();
@@ -1177,8 +1178,13 @@ impl NodeOrigin {
             drop(stream_guard);
             return match adopted {
                 Ok((header, reader)) => {
-                    deps.attestations
-                        .keep_offered(hash_bytes, header.origin_attestation.as_ref());
+                    if !deps
+                        .attestations
+                        .keep_offered(hash_bytes, header.origin_attestation.as_ref())
+                    {
+                        drop(reader);
+                        return Err(HandshakeFault::clean("unattested"));
+                    }
                     let size_proof = header.size_proof.clone();
                     let primed = PrimedHandshake {
                         key: PrimeKey {
@@ -1225,8 +1231,13 @@ impl NodeOrigin {
             match handshake.await {
                 Ok((header, reader)) => {
                     drop(stream_guard);
-                    deps.attestations
-                        .keep_offered(hash_bytes, header.origin_attestation.as_ref());
+                    if !deps
+                        .attestations
+                        .keep_offered(hash_bytes, header.origin_attestation.as_ref())
+                    {
+                        drop(reader);
+                        return Err(HandshakeFault::clean("unattested"));
+                    }
                     let total_bytes = header.total_bytes;
                     let size_proof = header.size_proof.clone();
                     let primed = PrimedHandshake {
@@ -1278,10 +1289,14 @@ impl NodeOrigin {
         };
         let total_bytes = header.total_bytes;
         let size_proof = header.size_proof.clone();
-        deps.attestations
+        let attested = deps
+            .attestations
             .keep_offered(hash_bytes, header.origin_attestation.as_ref());
         let _ = header_pull.abort();
         drop(stream_guard);
+        if !attested {
+            return Err(HandshakeFault::clean("unattested"));
+        }
         Ok((total_bytes, size_proof, None))
     }
 }

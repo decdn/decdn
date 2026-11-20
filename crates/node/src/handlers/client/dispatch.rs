@@ -738,16 +738,29 @@ impl ClientHandler {
         // The tier pick ends the clock's admission phase.
         let request_class;
         let admitted_at = std::time::Instant::now();
+        // A node serves a hash only while it holds a live origin attestation
+        // for it (ADR 022 § Origin Attestation). A hit checks here; a miss gets
+        // its attestation from the fill that lands the blob: the own-origin
+        // leg signs one, and the pull leg refuses an upstream that offers none.
+        let partial_size = if audit.is_serveable() {
+            None
+        } else {
+            self.partial_hit_size(hash, req.byte_offset, req.byte_len)
+                .await
+        };
+        if (audit.is_serveable() || partial_size.is_some()) && !self.attested(hash).await {
+            drop(pin.take());
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::Unattested, rate_per_mb)
+                .await;
+        }
         if audit.is_serveable() {
             request_class = RequestClass::CacheHit;
             // Serve-path hit rate (see `Metrics::serve_cache_hit`). Metered on the
             // availability decision itself, ahead of the shed gate, so the ratio
             // stays a property of the store rather than of current pressure.
             self.metrics.serve_cache_hit();
-        } else if let Some(size) = self
-            .partial_hit_size(hash, req.byte_offset, req.byte_len)
-            .await
-        {
+        } else if let Some(size) = partial_size {
             // Partial-serve gate (#1506): a blob that isn't `Complete` may
             // still fully cover the requested span. When it does, serve
             // straight from cache instead of running the miss-path fill legs
@@ -828,6 +841,14 @@ impl ClientHandler {
             match self.cache.origin_probe_presence(hash).await {
                 decdn_cache::OriginPresence::Present(total)
                     if self.cache.size_proof(hash, total).await.is_none() => {}
+                decdn_cache::OriginPresence::Present(_) if !self.attested(hash).await => {
+                    // The own backend holds the blob, but this node holds no
+                    // origin seat to attest it with, and no live attestation
+                    // from another origin (ADR 022 § Origin Attestation).
+                    return self
+                        .respond_error(&mut send, &req, ServeRejectReason::Unattested, rate_per_mb)
+                        .await;
+                }
                 decdn_cache::OriginPresence::Present(total) => {
                     origin_proven = true;
                     match self.cache.origin_outboard_published(hash, total).await {

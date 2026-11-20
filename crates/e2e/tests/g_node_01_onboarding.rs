@@ -333,9 +333,25 @@ async fn run_journey() -> anyhow::Result<()> {
     // The node advertises its configured rate verbatim — the delivery floor is
     // a redemption-time credit clamp, not a quote gate — so it is enough here
     // that a servable node answers a discovery open with a real rate.
-    let opened = client.discovery_open(&chain, &node, hash).await?;
-    let answer = opened.response().body.clone();
-    opened.cancel();
+    //
+    // A node serves its own backend's content only while it holds an origin
+    // seat to attest it with (ADR 022 § Origin Attestation). Seating needs an
+    // active bond, so a vetted publisher seats the operator now. The daemon
+    // reads the seat on its next snapshot: an open it cannot yet attest pulls
+    // that re-read forward, at most once a minute.
+    let publisher = PrivateKeySigner::random();
+    chain.vet_publisher(publisher.address()).await?;
+    let namespace = chain.create_namespace(&publisher).await?;
+    chain.add_origin(&publisher, namespace, operator).await?;
+    decdn_e2e::time::mine_past_snapshot_margin(chain.admin()).await?;
+    let answer = poll(Duration::from_secs(150), || async {
+        let opened = client.discovery_open(&chain, &node, hash).await?;
+        let answer = opened.response().body.clone();
+        opened.cancel();
+        Ok(answer.ok.then_some(answer))
+    })
+    .await?
+    .context("the daemon never attested its own content after its operator was seated")?;
     assert!(answer.ok, "the node holds the blob");
     assert!(
         answer.rate_per_mb > 0,

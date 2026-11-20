@@ -106,6 +106,7 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::ChainHashDenied => "chain_hash_denied",
         ServeRejectReason::OriginDenied => "origin_denied",
         ServeRejectReason::ForeignNamespaceDeclined => "foreign_declined",
+        ServeRejectReason::Unattested => "unattested",
         ServeRejectReason::ChainStale => "chain_stale",
     }
 }
@@ -260,6 +261,7 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         ServeRejectReason::ForeignNamespaceDeclined => {
             metrics.serve_stream_rejected_foreign_declined();
         }
+        ServeRejectReason::Unattested => metrics.serve_stream_rejected_unattested(),
         ServeRejectReason::ChainStale => {
             metrics.serve_stream_rejected_chain_stale();
         }

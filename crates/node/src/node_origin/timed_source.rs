@@ -47,8 +47,9 @@ pub(crate) async fn timed_open<R>(
 
 /// A [`BlobSource`] that wraps each reader of `S` in a [`TimedReader`] whose
 /// clock starts before `S` opens the pull. Each leg's upstream also offers an
-/// origin attestation for the hash, which this keeps when it is valid (ADR 022
-/// § Origin Attestation).
+/// origin attestation for the hash, which this keeps when it is valid; a leg
+/// whose upstream offers no valid one, while the node holds none, fails to
+/// open (ADR 022 § Origin Attestation).
 pub(crate) struct TimedSource<S> {
     inner: S,
     metrics: Arc<Metrics>,
@@ -82,8 +83,10 @@ impl<S: BlobSource> BlobSource for TimedSource<S> {
         Box::pin(async move {
             let opened =
                 timed_open(self.inner.open(hash, range), Arc::clone(&self.metrics)).await?;
-            if let Some(attestations) = &self.attestations {
-                attestations.keep_offered(hash, opened.0.origin_attestation.as_ref());
+            if let Some(attestations) = &self.attestations
+                && !attestations.keep_offered(hash, opened.0.origin_attestation.as_ref())
+            {
+                anyhow::bail!("upstream served without a valid origin attestation");
             }
             Ok(opened)
         })

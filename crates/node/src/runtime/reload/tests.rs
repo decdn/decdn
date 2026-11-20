@@ -92,6 +92,7 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             eviction_tick_secs: 1,
             node_to_node_pull_through_enabled: false,
             relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
+            attestation_ttl_sec: decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC,
             node_pull_open_fanout: decdn_common::config::DEFAULT_NODE_PULL_OPEN_FANOUT,
             node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
             node_pull_stall_window_sec: decdn_common::config::DEFAULT_NODE_PULL_STALL_WINDOW_SEC,

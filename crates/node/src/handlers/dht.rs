@@ -8,7 +8,8 @@
 //!   (ADR 022 § Origin Attestation), per-publisher quota (200), global LRU
 //!   (100k), per-hash provider cap (50), receiver-anchored TTL (1 h).
 //! - `FindValue` consults the record store + the routing table. Its
-//!   `providers` leave out a record whose attesting origin lost its seat;
+//!   `providers` leave out a record whose attestation expired or whose
+//!   attesting origin lost its seat in the attested namespace;
 //!   its `closer_nodes` name only bonded peers (ADR 022 §Routing Table); per
 //!   ADR 022 §Lookup integrity the requester-side filters (XOR-distance,
 //!   active-staker, negative-cache, randomisation) stay the
@@ -122,7 +123,8 @@ pub struct DhtHandler {
     /// in-memory set.
     staker_set: Arc<dyn StakerSet>,
     /// Checks each record's origin attestation on `Store` admission and
-    /// re-checks the signer's seat on every `FindValue` answer (ADR 022
+    /// re-checks its liveness and the signer's seat on every `FindValue`
+    /// answer (ADR 022
     /// § Origin Attestation).
     verifier: AttestationVerifier,
     rate_limiter: Arc<DhtRateLimiter>,
@@ -637,29 +639,36 @@ impl DhtHandler {
             .collect()
     }
 
-    /// Admit `attestation` for `hash` when its signer holds an origin seat
-    /// now. `known` is the signer a stored record already recovered for the
-    /// same attestation bytes; without it the signature is recovered here.
+    /// Admit `attestation` for `hash` when it is valid now: live, and signed
+    /// by an origin seated in its namespace. `known` is the signer a stored
+    /// record already recovered for the same attestation bytes; without it
+    /// the signature is recovered here.
     fn attested_by(
         &self,
         hash: decdn_protocol::ContentHash,
         attestation: &wire::OriginAttestation,
         known: Option<alloy::primitives::Address>,
     ) -> Option<AttestedBy> {
+        let now_us = now_us();
+        if !attestation.ttl_in_bounds() || !attestation.is_live_at(now_us) {
+            return None;
+        }
         let signer = known.or_else(|| self.verifier.recover(*hash.as_bytes(), attestation))?;
-        self.verifier.admits(&signer).then(|| AttestedBy {
-            attestation: attestation.clone(),
-            signer,
-        })
+        self.verifier
+            .still_valid(attestation, &signer, now_us)
+            .then(|| AttestedBy {
+                attestation: attestation.clone(),
+                signer,
+            })
     }
 
     /// `Store` admission (ADR 022 §STORE Flow):
     /// 1. `holder == authenticated NodeId` (caller invariant; rejects with
     ///    `accepted: false` on mismatch, never inserts).
     /// 2. `StakerSet::is_active(holder)` (caller's cached set).
-    /// 3. The origin attestation recovers to a seated origin (ADR 022
-    ///    § Origin Attestation); a re-publish of the same attestation reuses
-    ///    the stored signer.
+    /// 3. The origin attestation is live and recovers to an origin seated in
+    ///    its namespace (ADR 022 § Origin Attestation); a re-publish of the
+    ///    same attestation reuses the stored signer.
     /// 4. Record-store insert under per-publisher quota + global LRU +
     ///    per-hash provider cap. The store returns whether the record
     ///    was newly inserted, refreshed, or hard-rejected at the
@@ -707,7 +716,8 @@ impl DhtHandler {
         }
 
         // Step 3: origin attestation (ADR 022 § Origin Attestation). The
-        // record must trace to an origin that holds a seat now.
+        // record must carry a live attestation from an origin that holds a
+        // seat in the attested namespace now.
         let known = self
             .known_signers(
                 req.holder,
@@ -769,7 +779,9 @@ impl DhtHandler {
     fn handle_find_value(&self, req: wire::FindValueRequest) -> wire::FindValueResponse {
         let now_us = now_us();
         let providers = if let Ok(mut store) = self.records.lock() {
-            store.providers_at(&req.hash, now_us, |signer| self.verifier.admits(signer))
+            store.providers_at(&req.hash, now_us, |attestation, signer| {
+                self.verifier.still_valid(attestation, signer, now_us)
+            })
         } else {
             tracing::error!("dht FindValue: record-store mutex poisoned; returning empty");
             Vec::new()

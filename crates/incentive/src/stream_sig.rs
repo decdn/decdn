@@ -14,9 +14,7 @@
 //! (from the `StreamRequest`); in this implementation's wire shape it is
 //! echoed back in `decdn_protocol::StreamResponseBody.hash` and is part of the
 //! EIP-712 signed set: a verifier reconstructs the typed data from the
-//! response body's own fields. The signed set names no pool or payer, so a
-//! seated origin's `ok: true` response doubles as the origin attestation a DHT
-//! record carries (ADR 022 § Origin Attestation).
+//! response body's own fields.
 //!
 //! # Domain
 //!
@@ -177,24 +175,6 @@ impl StreamSlashData {
     ) -> Result<Signature, alloy::signers::Error> {
         let hash = self.signing_hash(domain);
         signer.sign_hash_sync(&hash)
-    }
-
-    /// Recover the operator that signed `attestation` for `hash` (ADR 022
-    /// § Origin Attestation). The caller decides validity by checking the
-    /// returned address against its seated-origin set.
-    ///
-    /// # Errors
-    ///
-    /// [`StreamSlashError::InvalidSignature`] if the signature does not parse
-    /// or does not recover.
-    pub fn recover_attestation_signer(
-        hash: [u8; 32],
-        attestation: &decdn_protocol::OriginAttestation,
-        domain: &Eip712Domain,
-    ) -> Result<Address, StreamSlashError> {
-        let sig = Signature::try_from(attestation.slash_sig.as_slice())
-            .map_err(|_| StreamSlashError::InvalidSignature)?;
-        Self::from_response_body(&attestation.signed_body(hash)).recover_signer(&sig, domain)
     }
 
     /// Recover the address that produced `signature` over this data under

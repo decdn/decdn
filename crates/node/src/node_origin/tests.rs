@@ -1165,6 +1165,7 @@ fn each_open_drop_lands_in_one_trail_count() {
         OpenDrop::NoAddress,
         OpenDrop::Unverifiable,
         OpenDrop::OverCeiling,
+        OpenDrop::Unattested,
     ] {
         tally.record(drop);
     }
@@ -1189,7 +1190,7 @@ fn each_open_drop_lands_in_one_trail_count() {
             opened: 7,
             unreachable: 1,
             absent: 1,
-            dropped: 5,
+            dropped: 6,
             holders: 2,
             spans: true,
             handshakes: 1,

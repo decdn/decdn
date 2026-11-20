@@ -52,6 +52,41 @@ impl ClientHandler {
         self.receipt_sink.record(receipt);
     }
 
+    /// Whether this node may serve `hash` (ADR 022 § Origin Attestation): it
+    /// holds a live, valid origin attestation for it, or its operator holds an
+    /// origin seat, its own backend holds the hash, and it signs its own now.
+    /// A seated origin re-signs from half the lifetime on. `true` for the
+    /// empty blob, which carries no content to attest or take down, and when
+    /// no attestation store is wired (tests without a DHT).
+    pub(super) async fn attested(&self, hash: Hash) -> bool {
+        let Some(attestations) = &self.attestations else {
+            return true;
+        };
+        if hash == Hash::EMPTY {
+            return true;
+        }
+        let bytes = *hash.as_bytes();
+        let live = attestations.live(&bytes);
+        let own = attestations.can_attest_own();
+        if let Some(live) = &live
+            && (!own || crate::handlers::timestamp_skew::now_us() < live.half_life_at_us())
+        {
+            return true;
+        }
+        if matches!(
+            self.cache.origin_probe_presence(hash).await,
+            decdn_cache::OriginPresence::Present(_)
+        ) {
+            if own {
+                return attestations.attest_own(bytes).is_some();
+            }
+            // The own backend holds content this node cannot attest: its
+            // operator may hold a seat the seat set has not read yet.
+            attestations.verifier().request_seat_refresh();
+        }
+        live.is_some()
+    }
+
     /// Sign an `ok: true` response for `req` at `rate_per_mb`, whose outcome is
     /// the size proof of the `total_bytes`-byte blob (ADR 005 § Bounded byte
     /// ranges), which the cache engine keeps or builds. Every success path
@@ -138,12 +173,12 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("stream slash_sig signing failed: {e}"))?
             .as_bytes()
             .to_vec();
-        // An `ok: true` response forwards the origin attestation this node
-        // holds for the hash (ADR 022 § Origin Attestation), so the pulling
-        // relay can advertise what it pulls.
+        // An `ok: true` response forwards the live origin attestation this
+        // node holds for the hash (ADR 022 § Origin Attestation), so the
+        // pulling relay can serve and advertise what it pulls.
         let origin_attestation = body
             .ok
-            .then(|| self.attestations.as_ref()?.held(&body.hash))
+            .then(|| self.attestations.as_ref()?.live(&body.hash))
             .flatten();
         Ok((
             StreamResponse { body, slash_sig },
