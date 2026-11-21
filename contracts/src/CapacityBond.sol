@@ -361,12 +361,11 @@ contract CapacityBond is
     ///         appeal reverses one — so reversing the most-recent slash falls
     ///         the watermark back to an older slash that still stands rather
     ///         than wrongly clearing it (ADR 036 § Slashing zero-out —
-    ///         multi-slash). Expected to stay small in practice — a slash drops
-    ///         active bond (auto-ejecting below `bondFloorAtActivation / 2`), so re-slashing
-    ///         costs the operator a fresh re-bond each cycle — but this is an
-    ///         economic deterrent, not a hard cap; the recompute scan reads from
-    ///         the tail and breaks at the first standing slash, so it is cheap
-    ///         even if the list is long.
+    ///         multi-slash). A slash drops active bond and auto-ejects the
+    ///         operator below `bondFloorAtActivation / 2`, but ejection does not
+    ///         stop further slashes, so the list has no hard cap. The recompute
+    ///         scan reads from the tail and breaks at the first standing slash,
+    ///         so it is cheap even if the list is long.
     mapping(address operator => uint256[]) internal _operatorSlashIds;
 
     /// @notice Sum of all TOKEN currently held in slash escrow (status
@@ -1539,9 +1538,11 @@ contract CapacityBond is
     ///         on every start. Deliberately two scalar getters rather than one
     ///         `uint256[]` return: a dynamic-array getter costs several hundred
     ///         bytes of ABI-encoding bytecode, and this contract sits close to
-    ///         the EIP-170 runtime ceiling. Lists are short in practice — a slash
-    ///         auto-ejects below `bondFloorAtActivation / 2`, so re-slashing an operator
-    ///         requires a fresh re-bond first.
+    ///         the EIP-170 runtime ceiling. The list has no hard bound: `slash`
+    ///         does not check `ejected`, and ejection keeps the NodeId binding,
+    ///         so an ejected operator stays slashable. Each slash pushes one id
+    ///         and consumers read by index, so a long list costs reads, not a
+    ///         revert.
     function operatorSlashCount(address operator) external view returns (uint256) {
         return _operatorSlashIds[operator].length;
     }
