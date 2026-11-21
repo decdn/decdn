@@ -150,6 +150,9 @@ decdn-client = { workspace = true, features = ["test-util"] }
 # propagate, so the lib's own test build needs the feature via a dev-dep — same
 # shape as `decdn-client` above.
 decdn-incentive = { workspace = true, features = ["test-util"] }
+# `CacheEngine::insert_blob` / `read_blob` (`test-util`) seed a test cache with
+# whole blobs; same shape as `decdn-client` above.
+decdn-cache = { workspace = true, features = ["s3", "test-util"] }
 tempfile = { workspace = true }
 # Property-based tests for the DHT routing table (`src/dht/routing.rs`):
 # xor_distance metric laws and the fixed-bucket / within-K invariants under

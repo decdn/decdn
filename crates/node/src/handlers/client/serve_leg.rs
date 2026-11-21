@@ -270,6 +270,35 @@ impl ClientHandler {
         })
     }
 
+    /// End the stream for a frame read of `hash` that failed with `e` before
+    /// the leg sent any `ChunkData`. A fill fault there (a missing or broken
+    /// origin object, an upstream that failed) is a refusal: the node writes
+    /// a `StreamError` for [`ServeRejectReason::InternalError`] and the
+    /// requester asks another node (ADR 005 § Deferred admission). A fault
+    /// the peer caused ([`super::wire::is_peer_attributable`]: a client that
+    /// left, a payment fault) or a fault after the first frame passes
+    /// through unchanged.
+    async fn refuse_fill_fault(
+        &self,
+        send: &mut SendStream,
+        e: anyhow::Error,
+        hash: Hash,
+        delivered: u64,
+    ) -> anyhow::Result<ServeEnd> {
+        if delivered > 0 || super::wire::is_peer_attributable(&e) {
+            return Err(e);
+        }
+        tracing::warn!(
+            %hash,
+            error = %format_args!("{e:#}"),
+            "fill faulted before the first chunk; refusing the stream"
+        );
+        self.write_midstream_refusal(send, ServeRejectReason::InternalError)
+            .await
+            .map_err(|write| write.context(format!("{e:#}")))?;
+        Ok(ServeEnd::Refused(ServeRejectReason::InternalError))
+    }
+
     /// [`Self::acquire_credit`], with the miss leg's client-abandon metering: a
     /// peer-attributable fault or a stop that the payer caused counts as a
     /// pull-through abandon. A chunk that passes its proof-wait ceiling does not:
@@ -486,7 +515,13 @@ impl ClientHandler {
             {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
-                Err(e) => return self.stop_at_held_cap(send, e, hash, delivered).await,
+                Err(e) => {
+                    let e = match self.stop_at_held_cap(send, e, hash, delivered).await {
+                        Err(e) => e,
+                        stopped => return stopped,
+                    };
+                    return self.refuse_fill_fault(send, e, hash, delivered).await;
+                }
             };
             let clen = frame.total() as u64;
 

@@ -11,14 +11,13 @@
 //! through the [`ClientHandler`].
 //!
 //! Two shapes of origin:
-//! 1. The origin publishes the sibling `{H}.obao4` outboard → the handler
-//!    answers from `HEAD`s of the data and the outboard, then streams after
-//!    admission (outboard GETs, `206` ranged data GETs per draw), serves the
-//!    span, and a partial request leaves the blob **partial** (never a
-//!    whole-blob GET).
-//! 2. The origin does NOT publish the outboard → the spine declines and the
-//!    handler falls back to the buffered whole-blob pull, still serving the
-//!    correct range bytes ("fallback is always correct", ADR 037).
+//! 1. The origin publishes `{H}`, `{H}.obao4` and `{H}.sizeproof` → the handler
+//!    answers from the memoised size proof, then streams after admission
+//!    (outboard GETs, `206` ranged data GETs per draw), serves the span, and a
+//!    partial request leaves the blob **partial** (never a whole-blob GET).
+//! 2. One of those objects is missing or broken, or the origin ignores `Range`
+//!    → an origin fault: the stream ends before any `ChunkData`, and the node
+//!    commits nothing and never reads the whole blob.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -286,7 +285,9 @@ async fn ranged_paid_pull(
                 }
             }
             ClientMessage::StreamEnd => break,
-            ClientMessage::StreamError(e) => anyhow::bail!("stream error mid-delivery: {e:?}"),
+            ClientMessage::StreamError(e) => {
+                anyhow::bail!("stream error after {cumulative} bytes: {e:?}")
+            }
             other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
         }
     }
@@ -426,33 +427,6 @@ async fn write_frame_to(send: &mut SendStream, payload: &[u8]) -> anyhow::Result
         .map_err(|e| anyhow::anyhow!("write frame: {e}"))
 }
 
-/// Serve the own-origin serviceability probe: the ranged GET of the blob's first
-/// chunk group, which the node reads before it signs a two-leg serve. Mount it
-/// before a test's own data mocks, so the probe wins over a mock that fails
-/// every ranged GET.
-async fn mount_range_probe(server: &MockServer, hex: &str, blob: &[u8]) {
-    mount_size_proof(server, hex, blob).await;
-    let end = blob.len().min(16 * 1024);
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .and(header("range", probe_range_val(blob.len()).as_str()))
-        .respond_with(
-            ResponseTemplate::new(206).set_body_bytes(blob.get(..end).unwrap_or_default().to_vec()),
-        )
-        .mount(server)
-        .await;
-}
-
-/// Answer a `HEAD` of the sibling `{hex}.obao4` with `status`: the outboard
-/// presence probe an open reads before it answers.
-async fn mount_outboard_head(server: &MockServer, hex: &str, status: u16) {
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(status))
-        .mount(server)
-        .await;
-}
-
 /// Serve the `{hex}.sizeproof` sibling `decdn origin import` writes, which
 /// proves the blob's size before the node states it (ADR 005 § Bounded
 /// byte ranges).
@@ -469,11 +443,6 @@ async fn mount_size_proof(server: &MockServer, hex: &str, blob: &[u8]) {
         .respond_with(ResponseTemplate::new(200).set_body_bytes(eo.size_proof_object()))
         .mount(server)
         .await;
-}
-
-/// The `Range` header value of the serviceability probe for a `len`-byte blob.
-fn probe_range_val(len: usize) -> String {
-    format!("bytes=0-{}", len.min(16 * 1024).saturating_sub(1))
 }
 
 /// Count `received_requests` matching a predicate, failing loudly if wiremock
@@ -508,22 +477,14 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
-    // (1) HEAD → canonical blob size (no body); the origin size probe.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
+    // (1) the size proof the open answers from.
+    mount_size_proof(&server, &hex, &blob).await;
     // (2) sibling outboard GET.
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
     // (3) ranged data GET → 206 with exactly the aligned span. NOTE: there is
     // deliberately NO whole-blob (un-ranged) GET mounted, so any attempt to
     // pull the whole blob would 404 and fail — the range path must be used.
@@ -583,15 +544,12 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
         want.len()
     );
 
-    // The origin served the range, NOT the whole blob: exactly one ranged GET
-    // beside the serviceability probe, and zero un-ranged GETs on the data object.
-    let probe = probe_range_val(blob.len());
+    // The origin served the range, NOT the whole blob: exactly one ranged GET,
+    // and zero un-ranged GETs on the data object.
     let ranged_gets = count_requests(&server, |r| {
         r.method.as_str() == "GET"
             && r.url.path() == format!("/{hex}")
-            && r.headers
-                .get("range")
-                .is_some_and(|v| v.to_str().is_ok_and(|v| v != probe))
+            && r.headers.contains_key("range")
     })
     .await?;
     let wholeblob_gets = count_requests(&server, |r| {
@@ -625,434 +583,19 @@ async fn cold_range_request_pulls_only_the_range_from_origin() -> anyhow::Result
     Ok(())
 }
 
-/// A TRUNCATED `{H}.obao4` (wrong length for the probed size) must be treated
-/// exactly like a missing one: the serviceability probe declines, no `ok: true`
-/// is signed for the streaming tier, and the buffered whole-blob fallback
-/// serves. Accepting it would sign first and then hard-fail every stream for
-/// this hash on the first draw's verify.
-#[tokio::test(flavor = "multi_thread")]
-async fn truncated_outboard_declines_before_signing_and_falls_back() -> anyhow::Result<()> {
-    let (blob, outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
-
-    let truncated = outboard
-        .get(..outboard.len().saturating_sub(7))
-        .ok_or_else(|| anyhow::anyhow!("outboard too short for the fixture"))?
-        .to_vec();
-
-    let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(truncated))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
-        .mount(&server)
-        .await;
-
-    let pool_id = B256::repeat_byte(0x68);
-    let client_eth = Arc::new(PrivateKeySigner::random());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
-    // Enable the buffered whole-blob pull-through the fallback relies on.
-    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
-        pool_id,
-        client_eth.address(),
-        &server_eth,
-        server_id,
-        Some(Duration::from_secs(15)),
-    )
-    .await?;
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let got = ranged_paid_pull(
-        &client_ep,
-        target,
-        client_node_id,
-        &client_eth,
-        pool_id,
-        provider,
-        hash,
-        0,
-        0,
-        RATE_PER_MB,
-    )
-    .await?;
-    anyhow::ensure!(
-        got.as_slice() == blob.as_slice(),
-        "the buffered fallback must deliver the whole blob byte-exact"
-    );
-    anyhow::ensure!(cache.has(hash).await?, "the fallback caches the blob");
-    // The streaming tier was never entered: a truncated outboard declines at
-    // the probe, before any signature.
-    anyhow::ensure!(
-        counter_value(&metrics, "local_outboard_serves_total")? == 0,
-        "a truncated outboard must not enter the two-leg tier"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn range_request_without_outboard_falls_back_to_whole_blob() -> anyhow::Result<()> {
-    let (blob, _outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
-    let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
-
-    let server = MockServer::start().await;
-    // HEAD answers (the size probe succeeds), but NO `{H}.obao4` is published,
-    // so the range pull declines. A plain whole-blob GET IS served, so the
-    // buffered fallback can fill the cache.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 404).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
-        .mount(&server)
-        .await;
-
-    let pool_id = B256::repeat_byte(0x43);
-    let client_eth = Arc::new(PrivateKeySigner::random());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
-    // Enable the buffered whole-blob pull-through the fallback relies on.
-    let (handler, cache, _metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
-        pool_id,
-        client_eth.address(),
-        &server_eth,
-        server_id,
-        Some(Duration::from_secs(15)),
-    )
-    .await?;
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let got = ranged_paid_pull(
-        &client_ep,
-        target,
-        client_node_id,
-        &client_eth,
-        pool_id,
-        provider,
-        hash,
-        req_off,
-        req_len,
-        RATE_PER_MB,
-    )
-    .await?;
-
-    let want = blob
-        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
-        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
-    anyhow::ensure!(
-        got.as_slice() == want,
-        "fallback must still deliver the correct range bytes"
-    );
-    // The fallback fetched the whole blob, so the node is now a full holder.
-    anyhow::ensure!(
-        cache.has(hash).await?,
-        "the whole-blob fallback must complete and cache the blob"
-    );
-    // Prove the fallback used an *un-ranged* whole-blob GET and never issued a
-    // ranged data GET: with no `{H}.obao4` the range pull declines at the
-    // outboard probe, so no `Range` request should ever hit the data object.
-    let hex = hash.to_hex();
-    let ranged_gets = count_requests(&server, |r| {
-        r.method.as_str() == "GET"
-            && r.url.path() == format!("/{hex}")
-            && r.headers.contains_key("range")
-    })
-    .await?;
-    let wholeblob_gets = count_requests(&server, |r| {
-        r.method.as_str() == "GET"
-            && r.url.path() == format!("/{hex}")
-            && !r.headers.contains_key("range")
-    })
-    .await?;
-    anyhow::ensure!(
-        ranged_gets == 0,
-        "no ranged GET should occur once the outboard probe misses, saw {ranged_gets}"
-    );
-    anyhow::ensure!(
-        wholeblob_gets >= 1,
-        "the fallback must fetch the whole blob with an un-ranged GET"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// An outboard GET 503 is a fault the serve-miss probe records (#2826), yet the
-/// range still delivers through the buffered whole-blob fallback: the fault
-/// counts as a pull-through error, and the pull never enters the two-leg tier.
-#[tokio::test(flavor = "multi_thread")]
-async fn range_request_with_outboard_outage_falls_back_to_whole_blob() -> anyhow::Result<()> {
-    let (blob, _outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
-    let (req_off, req_len) = (16 * 1024u64, 32 * 1024u64);
-
-    let server = MockServer::start().await;
-    mount_size_proof(&server, &hex, &blob).await;
-    // HEAD answers and a plain whole-blob GET is served, but `{H}.obao4`
-    // answers 503: the outboard half of the probe faults.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 503).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
-        .mount(&server)
-        .await;
-
-    let pool_id = B256::repeat_byte(0x7A);
-    let client_eth = Arc::new(PrivateKeySigner::random());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
-    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
-        pool_id,
-        client_eth.address(),
-        &server_eth,
-        server_id,
-        Some(Duration::from_secs(15)),
-    )
-    .await?;
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let got = ranged_paid_pull(
-        &client_ep,
-        target,
-        client_node_id,
-        &client_eth,
-        pool_id,
-        provider,
-        hash,
-        req_off,
-        req_len,
-        RATE_PER_MB,
-    )
-    .await?;
-
-    let want = blob
-        .get(usize::try_from(req_off)?..usize::try_from(req_off + req_len)?)
-        .ok_or_else(|| anyhow::anyhow!("requested range out of bounds"))?;
-    anyhow::ensure!(
-        got.as_slice() == want,
-        "an outboard outage must still deliver the correct range bytes"
-    );
-    anyhow::ensure!(
-        cache.has(hash).await?,
-        "the whole-blob fallback must complete and cache the blob"
-    );
-    let ranged_gets = count_requests(&server, |r| {
-        r.method.as_str() == "GET"
-            && r.url.path() == format!("/{hex}")
-            && r.headers.contains_key("range")
-    })
-    .await?;
-    anyhow::ensure!(
-        ranged_gets == 0,
-        "no ranged GET should occur once the outboard probe faults, saw {ranged_gets}"
-    );
-    anyhow::ensure!(
-        counter_value(&metrics, "local_outboard_serves_total")? == 0,
-        "a faulted outboard probe must not enter the two-leg tier"
-    );
-    anyhow::ensure!(
-        counter_value(&metrics, "node_pull_through_errors_total")? == 1,
-        "the outboard 503 must count as a pull-through error, not a silent decline"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// An outboard GET 503 with no other fill tier configured refuses as
-/// `InternalError` (a degraded node), never `NotFound` (an empty one), and
-/// nothing is signed (#2826).
-#[tokio::test(flavor = "multi_thread")]
-async fn own_origin_outboard_outage_refuses_internal_error_not_cache_miss() -> anyhow::Result<()> {
-    let (blob, _outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
-
-    let server = MockServer::start().await;
-    mount_size_proof(&server, &hex, &blob).await;
-    // The size answers but the outboard answers 503. Nothing else is mounted:
-    // no fill tier can serve.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 503).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-
-    let pool_id = B256::repeat_byte(0x7B);
-    let client_eth = Arc::new(PrivateKeySigner::random());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
-        pool_id,
-        client_eth.address(),
-        &server_eth,
-        server_id,
-        None,
-    )
-    .await?;
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
-    let binding_signature = client_eth
-        .sign_hash_sync(&binding_hash)?
-        .as_bytes()
-        .to_vec();
-    let ext = StreamRequestExt {
-        binding: Some(ClientBinding {
-            ethereum_address: client_eth.address().into(),
-            binding_signature,
-        }),
-        capability: None,
-        pull_through: true,
-    };
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id.into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    let payload =
-        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
-    write_frame_to(&mut send, &payload).await?;
-    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(!resp.body.ok, "a faulted node must refuse");
-    conn.close(0u32.into(), b"done");
-
-    anyhow::ensure!(
-        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
-        "an outboard 503 must refuse as InternalError (degraded node)"
-    );
-    anyhow::ensure!(
-        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
-        "a degraded node must not be reported as an empty one"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn unauthorized_range_request_triggers_no_origin_fetch() -> anyhow::Result<()> {
     // A ranged cache-miss request WITHOUT an ownership binding must not make the
     // node front any origin egress: with a pool view wired, the node refuses an
-    // unbound request before its origin probe, so neither the range pull nor
-    // the whole-blob fallback is initiated. This closes the griefing vector
-    // where an unpaid client induces origin HEAD/range traffic.
+    // unbound request before its origin presence read, so no origin read is
+    // initiated. This closes the griefing vector where an unpaid client
+    // induces origin size-proof/outboard/range traffic.
     let (blob, outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
     // Mount the full range-pull surface; the assertion is that NONE of it is hit.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
@@ -1173,20 +716,12 @@ async fn resume_to_end_range_pull_serves_tail() -> anyhow::Result<()> {
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", range_val.as_str()))
@@ -1279,20 +814,12 @@ async fn end_past_the_blob_own_origin_cold_miss_serves_clamped_tail() -> anyhow:
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", range_val.as_str()))
@@ -1374,11 +901,6 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
-        .mount(&server)
-        .await;
 
     let pool_id = B256::repeat_byte(0x47);
     let client_eth = Arc::new(PrivateKeySigner::random());
@@ -1396,7 +918,7 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
     )
     .await?;
     // Pre-populate the blob so the ranged request is a cache hit.
-    cache.populate(hash).await?;
+    cache.insert_blob(blob.clone()).await?;
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -1470,11 +992,6 @@ async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()>
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
-        .mount(&server)
-        .await;
 
     let pool_id = B256::repeat_byte(0x48);
     let client_eth = Arc::new(PrivateKeySigner::random());
@@ -1492,7 +1009,7 @@ async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()>
     )
     .await?;
     // Pre-populate the blob so the ranged request is a cache hit.
-    cache.populate(hash).await?;
+    cache.insert_blob(blob.clone()).await?;
 
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
@@ -1551,9 +1068,7 @@ fn parse_byte_range(h: &str) -> Option<(u64, u64)> {
 
 /// A WHOLE-BLOB cold miss whose own origin publishes the `{H}.obao4` outboard is
 /// served through the own-origin two-leg path (`serve_via_backend_origin`):
-/// dispatch confirms serviceability (origin size + published outboard + a
-/// ranged first-group read),
-/// signs `ok:true`, and runs the local pull leg (fill the cache from origin)
+/// dispatch reads the origin's size proof, signs `ok:true`, and runs the local pull leg (fill the cache from origin)
 /// beside the serve leg (stream the filling cache to the paying client). This
 /// asserts the dispatch selection reaches `serve_via_backend_origin` — the
 /// `decdn_local_outboard_serves_total` tier counter fires once — and that the
@@ -1578,24 +1093,15 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
+    // (1) the size proof the open answers from.
     mount_size_proof(&server, &hex, &blob).await;
-    // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    // (2) sibling outboard GET: the dispatch serviceability outboard probe. The
-    //     pull leg's draws reuse the copy that probe cached (#2061).
-    mount_outboard_head(&server, &hex, 200).await;
+    // (2) sibling outboard GET: the pull leg's first draw reads it, and later
+    //     draws reuse the cached copy (#2061).
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
     // (3) ranged data GET → 206 with the whole aligned span (the single full-miss
     //     gap the local pull leg draws).
     Mock::given(method("GET"))
@@ -1653,7 +1159,7 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
     );
 
     // The own-origin serve-miss tier fired exactly once — proof dispatch selected
-    // `serve_via_backend_origin` rather than a fallback tier.
+    // `serve_via_backend_origin` rather than another tier.
     anyhow::ensure!(
         counter_value(&metrics, "local_outboard_serves_total")? == 1,
         "the own-origin two-leg serve tier must fire once"
@@ -1668,8 +1174,8 @@ async fn whole_blob_own_origin_miss_serves_via_backend_origin() -> anyhow::Resul
             && counter_value(&metrics, "serve_first_byte_hit_seconds_count")? == 0,
         "a serve that ran a fill tier must be classified a miss, not a hit"
     );
-    // The outboard is read from the origin once per hash: the serviceability
-    // probe caches it and every draw reuses it (#2061).
+    // The outboard is read from the origin once per hash: the first draw caches
+    // it and every later draw reuses it (#2061).
     let obao_gets = count_requests(&server, |r| {
         r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
     })
@@ -1715,20 +1221,12 @@ async fn bounded_whole_blob_own_origin_miss_streams_via_backend_origin() -> anyh
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", range_val.as_str()))
@@ -1824,20 +1322,12 @@ async fn bounded_unaligned_offset_own_origin_miss_streams_the_exact_bytes() -> a
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", range_val.as_str()))
@@ -1923,14 +1413,6 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2054,11 +1536,8 @@ async fn throwaway_open_then_real_open_shares_one_multi_draw_fill() -> anyhow::R
         *counts.entry(range.as_str()).or_default() += 1;
     }
     let repeated: Vec<(&str, usize)> = counts.into_iter().filter(|&(_, n)| n > 1).collect();
-    // The serviceability probe also starts at byte 0, but it is not a draw: a
-    // repeated probe is not the exception this allows.
-    let probe = probe_range_val(blob.len());
     let first_draw_repeated_once = |&(range, n): &(&str, usize)| {
-        n == 2 && range != probe && parse_byte_range(range).is_some_and(|(start, _)| start == 0)
+        n == 2 && parse_byte_range(range).is_some_and(|(start, _)| start == 0)
     };
     anyhow::ensure!(
         repeated.len() <= 1 && repeated.iter().all(first_draw_repeated_once),
@@ -2089,14 +1568,6 @@ async fn tail_open_ahead_of_a_stalled_owner_does_not_starve() -> anyhow::Result<
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2213,19 +1684,10 @@ async fn tail_open_ahead_of_a_stalled_owner_does_not_starve() -> anyhow::Result<
 #[allow(clippy::too_many_lines)]
 async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Result<()> {
     let (blob, outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -2317,27 +1779,14 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
     })
     .await?;
     anyhow::ensure!(wholeblob_gets == 0, "saw {wholeblob_gets} un-ranged GET(s)");
-    // The serviceability probe is a ranged GET too, but it is not a draw: count
-    // it apart. The cancelled fill's draw and the real open's re-draw can both
-    // reach the origin.
-    let probe = probe_range_val(blob.len());
-    let is_probe = |r: &Request| {
-        r.headers
-            .get("range")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == probe)
-    };
-    let is_ranged_get = |r: &Request| {
+    // The cancelled fill's draw and the real open's re-draw can both reach the
+    // origin.
+    let draws = count_requests(&server, |r: &Request| {
         r.method.as_str() == "GET"
             && r.url.path() == format!("/{hex}")
             && r.headers.contains_key("range")
-    };
-    let probes = count_requests(&server, |r| is_ranged_get(r) && is_probe(r)).await?;
-    let draws = count_requests(&server, |r| is_ranged_get(r) && !is_probe(r)).await?;
-    anyhow::ensure!(
-        probes <= 1,
-        "the range probe latches after one read, saw {probes} probes"
-    );
+    })
+    .await?;
     anyhow::ensure!(
         draws <= 2,
         "a torn-down throwaway costs at most one duplicate draw, saw {draws}"
@@ -2347,46 +1796,94 @@ async fn throwaway_open_torn_down_before_real_open_still_serves() -> anyhow::Res
     Ok(())
 }
 
-/// An origin that publishes a valid `{H}.obao4` but ignores `Range` (a data GET
-/// answers `200` with the whole body). The open answers from the outboard's
-/// `HEAD`. Admission at the first proof reads the first chunk group, sees the
-/// decline, and refuses the stream before any chunk. The next request for the
-/// hash degrades before it signs: the buffered whole-blob fallback serves.
-#[tokio::test(flavor = "multi_thread")]
-async fn no_range_origin_is_refused_after_admission_then_degrades() -> anyhow::Result<()> {
-    let (blob, outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
+/// How a broken own origin answers the reads a two-leg serve makes after
+/// admission. Every case publishes a valid `{H}.sizeproof`, so the open
+/// answers `ok: true`.
+#[derive(Clone, Copy, Debug)]
+enum BrokenObject {
+    /// `{H}.obao4` answers `404`: the origin does not publish the outboard.
+    MissingOutboard,
+    /// `{H}.obao4` answers `503`.
+    OutboardOutage,
+    /// `{H}.obao4` is shorter than the proven size needs.
+    TruncatedOutboard,
+    /// The data object ignores `Range`: a ranged GET answers `200` with the
+    /// whole body.
+    NoRangeSupport,
+    /// A ranged data GET answers `500`.
+    RangeOutage,
+    /// `{H}` answers `404`: the origin publishes the size proof and the
+    /// outboard but not the data.
+    MissingData,
+}
 
-    let server = MockServer::start().await;
-    mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
+/// Mount the origin for `case`: the size proof, the outboard and the data
+/// object, one of them broken as `case` says.
+async fn mount_broken_origin(
+    server: &MockServer,
+    case: BrokenObject,
+    blob: &[u8],
+    outboard: &[u8],
+    hex: &str,
+) {
+    mount_size_proof(server, hex, blob).await;
+    let outboard_response = match case {
+        BrokenObject::MissingOutboard => ResponseTemplate::new(404),
+        BrokenObject::OutboardOutage => ResponseTemplate::new(503),
+        BrokenObject::TruncatedOutboard => ResponseTemplate::new(200).set_body_bytes(
+            outboard
+                .get(..outboard.len().saturating_sub(7))
+                .unwrap_or_default(),
+        ),
+        BrokenObject::NoRangeSupport | BrokenObject::RangeOutage | BrokenObject::MissingData => {
+            ResponseTemplate::new(200).set_body_bytes(outboard.to_vec())
+        }
+    };
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
-        .mount(&server)
+        .respond_with(outboard_response)
+        .mount(server)
         .await;
-    // Every data GET, ranged or not, gets the whole body with a `200`.
+    let data_response = match case {
+        BrokenObject::NoRangeSupport => ResponseTemplate::new(200).set_body_bytes(blob.to_vec()),
+        BrokenObject::RangeOutage => ResponseTemplate::new(500),
+        BrokenObject::MissingData => ResponseTemplate::new(404),
+        BrokenObject::MissingOutboard
+        | BrokenObject::OutboardOutage
+        | BrokenObject::TruncatedOutboard => {
+            ResponseTemplate::new(206).set_body_bytes(blob.to_vec())
+        }
+    };
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(blob.clone()))
-        .mount(&server)
+        .respond_with(data_response)
+        .mount(server)
         .await;
+}
+
+/// A missing or broken own-origin object is an origin fault (ADR 037 §
+/// Origin-tier pull-through). The open answers `ok: true` from the size proof,
+/// the payer's first proof admits the stream, and the fill then fails: the
+/// node refuses the stream with a `StreamError` for `InternalError` before
+/// any `ChunkData`. The node never reads the whole blob
+/// from its origin, commits nothing to its store, and reports the fault as
+/// its own, never as a cache miss.
+///
+/// The pull runs under a hard `timeout`: the pull leg's terminal signal must
+/// reach the serve leg and end the stream, so a hang fails the test rather than
+/// stalling the run.
+#[allow(clippy::too_many_lines)] // one linear integration-test scenario
+async fn broken_origin_object_faults_before_any_chunk(case: BrokenObject) -> anyhow::Result<()> {
+    let (blob, outboard, hash) = blob_with_outboard();
+    let hex = hash.to_hex();
+    let server = MockServer::start().await;
+    mount_broken_origin(&server, case, &blob, &outboard, &hex).await;
 
     let pool_id = B256::repeat_byte(0x6B);
     let client_eth = Arc::new(PrivateKeySigner::random());
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
-    // Enable the buffered whole-blob pull-through the degrade relies on.
     let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         pool_id,
@@ -2396,92 +1893,287 @@ async fn no_range_origin_is_refused_after_admission_then_degrades() -> anyhow::R
         Some(Duration::from_secs(15)),
     )
     .await?;
-
+    cache.set_origin_read_budget(Duration::from_secs(2), 1_000_000);
     let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let server_task = spawn_server(server_ep.clone(), handler);
 
     let client_sk = fresh_key();
     let client_node_id = B256::from(*client_sk.public().as_bytes());
     let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let pull = || {
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            ranged_paid_pull(
-                &client_ep,
-                target.clone(),
-                client_node_id,
-                &client_eth,
-                pool_id,
-                provider,
-                hash,
-                0,
-                0,
-                RATE_PER_MB,
-            ),
-        )
+    let pulled = tokio::time::timeout(
+        Duration::from_secs(20),
+        ranged_paid_pull(
+            &client_ep,
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            client_node_id,
+            &client_eth,
+            pool_id,
+            server_eth.address(),
+            hash,
+            0,
+            0,
+            RATE_PER_MB,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{case:?}: a broken origin must end the stream, not hang"))?;
+    let Err(err) = pulled else {
+        anyhow::bail!("{case:?}: a broken origin must not deliver the blob");
     };
-    let refused = pull()
-        .await
-        .map_err(|_| anyhow::anyhow!("a no-Range origin must refuse, not hang"))?;
+    // The open answered `ok: true` from the size proof; the stream then ended
+    // with a `StreamError` for `InternalError` (wire `Declined`) before any
+    // `ChunkData`.
     anyhow::ensure!(
-        refused.is_err(),
-        "the first stream is refused after admission"
+        !err.to_string().contains("delivery refused"),
+        "{case:?}: the open answers from the size proof, got: {err:#}"
     );
     anyhow::ensure!(
-        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 1,
-        "an unusable range refuses as a miss"
+        err.to_string().contains("stream error after 0 bytes")
+            && err.to_string().contains("Declined"),
+        "{case:?}: a StreamError(Declined) before any ChunkData, got: {err:#}"
     );
-    let got = pull()
-        .await
-        .map_err(|_| anyhow::anyhow!("a no-Range origin must degrade, not hang"))??;
+
     anyhow::ensure!(
-        got.as_slice() == blob.as_slice(),
-        "the buffered fallback must deliver the whole blob byte-exact"
+        !cache.has(hash).await? && cache.present_ranges(hash).await?.held_bytes() == 0,
+        "{case:?}: a faulted fill commits nothing"
     );
-    anyhow::ensure!(cache.has(hash).await?, "the fallback caches the blob");
+    let wholeblob_gets = count_requests(&server, |r| {
+        r.method.as_str() == "GET"
+            && r.url.path() == format!("/{hex}")
+            && !r.headers.contains_key("range")
+    })
+    .await?;
+    anyhow::ensure!(
+        wholeblob_gets == 0,
+        "{case:?}: the node never reads the whole blob, saw {wholeblob_gets} un-ranged GET(s)"
+    );
     anyhow::ensure!(
         counter_value(&metrics, "local_outboard_serves_total")? == 1,
-        "only the first request enters the two-leg tier"
+        "{case:?}: the stream takes the own-origin two-leg tier"
     );
-    // The degrade comes from the range half: the outboard was read once, and the
-    // probe's ranged read of the first chunk group reached the origin once.
-    let obao_gets = count_requests(&server, |r| {
-        r.method.as_str() == "GET" && r.url.path() == format!("/{hex}.obao4")
-    })
-    .await?;
-    anyhow::ensure!(obao_gets == 1, "one outboard read, got {obao_gets}");
-    let probe = probe_range_val(blob.len());
-    let probe_gets = count_requests(&server, |r| {
-        r.url.path() == format!("/{hex}")
-            && r.headers
-                .get("range")
-                .is_some_and(|v| v.to_str().is_ok_and(|v| v == probe))
-    })
-    .await?;
-    anyhow::ensure!(probe_gets == 1, "one probe range read, got {probe_gets}");
+    anyhow::ensure!(
+        counter_value(&metrics, "node_pull_local_fault_total")? == 1,
+        "{case:?}: the fill fails as a local-origin fault"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
+        "{case:?}: a broken origin must not be reported as an empty node"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
+        "{case:?}: the node refuses the stream with a StreamError before any ChunkData"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "node_pull_through_errors_total")? == 1,
+        "{case:?}: the fault counts as an own-origin pull-through error"
+    );
+
+    // The engine memoised the fault, so the next open refuses at open with no
+    // origin read, instead of answering `ok: true` and refusing after the
+    // payer's first proof.
+    let origin_reads = count_requests(&server, |r| r.method.as_str() == "GET").await?;
+    let again = tokio::time::timeout(
+        Duration::from_secs(20),
+        ranged_paid_pull(
+            &client_ep,
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            client_node_id,
+            &client_eth,
+            pool_id,
+            server_eth.address(),
+            hash,
+            0,
+            0,
+            RATE_PER_MB,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{case:?}: the second open must end, not hang"))?;
+    let Err(again) = again else {
+        anyhow::bail!("{case:?}: a memoised fault must not deliver the blob");
+    };
+    anyhow::ensure!(
+        again.to_string().contains("delivery refused"),
+        "{case:?}: the next open refuses at open, got: {again:#}"
+    );
+    anyhow::ensure!(
+        count_requests(&server, |r| r.method.as_str() == "GET").await? == origin_reads,
+        "{case:?}: the memoised fault reads no origin object"
+    );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
-/// #1129 through the spine's serviceability probe: a TRANSPORT fault on the own
-/// origin's size probe (HEAD → 500) with no other fill tier configured must
-/// terminally refuse as `InternalError` (a degraded node), never `NotFound` (an
-/// empty one). Guards the dispatch fault latch against `origin_size` swallowing
-/// the fault into a clean decline.
+/// A data object that stops serving after the stream has sent bytes is a
+/// fault mid-stream, not a refusal: the node already sent `ChunkData`, so it
+/// cannot answer with a refusal class. The stream ends without hanging, the
+/// node keeps only the verified prefix, the refusal counter stays at zero,
+/// and the engine memoises the fault so the next open refuses at open.
 #[tokio::test(flavor = "multi_thread")]
-async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> anyhow::Result<()> {
+#[allow(clippy::too_many_lines)] // one linear integration-test scenario
+async fn a_data_object_that_fails_mid_stream_ends_the_stream() -> anyhow::Result<()> {
+    // A little over one range window, so the pull draws a second window after
+    // the first has streamed.
+    let window = usize::try_from(decdn_cache::RANGE_PULL_WINDOW_BYTES)?;
+    let blob: Vec<u8> = (0..window + 200 * 1024)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let hash = Hash::from_bytes(*ob.root.as_bytes());
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ob.data.clone()))
+        .mount(&server)
+        .await;
+    // The first window serves; every later window answers 404.
+    let origin_bytes = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range);
+            match span {
+                Some((0, end)) => usize::try_from(end)
+                    .ok()
+                    .and_then(|end| origin_bytes.get(..=end))
+                    .map_or_else(
+                        || ResponseTemplate::new(416),
+                        |body| ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
+                    ),
+                _ => ResponseTemplate::new(404),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x6C);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        Some(Duration::from_secs(15)),
+    )
+    .await?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let pull = || {
+        ranged_paid_pull(
+            &client_ep,
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            client_node_id,
+            &client_eth,
+            pool_id,
+            server_eth.address(),
+            hash,
+            0,
+            0,
+            RATE_PER_MB,
+        )
+    };
+    let pulled = tokio::time::timeout(Duration::from_secs(30), pull())
+        .await
+        .map_err(|_| anyhow::anyhow!("a mid-stream fault must end the stream, not hang"))?;
+    let Err(err) = pulled else {
+        anyhow::bail!("a data object that stops serving must not deliver the blob");
+    };
+    anyhow::ensure!(
+        !err.to_string().contains("delivery refused")
+            && !err.to_string().contains("stream error after 0 bytes"),
+        "the stream answered ok and sent bytes before it failed, got: {err:#}"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 0,
+        "a fault after the first ChunkData is not a refusal"
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "the node never holds a blob it could not fill"
+    );
+    anyhow::ensure!(
+        cache.present_ranges(hash).await?.held_bytes() > 0,
+        "the node keeps the verified prefix it streamed"
+    );
+
+    let again = tokio::time::timeout(Duration::from_secs(20), pull())
+        .await
+        .map_err(|_| anyhow::anyhow!("the second open must end, not hang"))?;
+    anyhow::ensure!(
+        again.is_err_and(|e| e.to_string().contains("delivery refused")),
+        "the memoised fault refuses the next open at open"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_outboard_faults_before_any_chunk() -> anyhow::Result<()> {
+    broken_origin_object_faults_before_any_chunk(BrokenObject::MissingOutboard).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outboard_outage_faults_before_any_chunk() -> anyhow::Result<()> {
+    broken_origin_object_faults_before_any_chunk(BrokenObject::OutboardOutage).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_outboard_faults_before_any_chunk() -> anyhow::Result<()> {
+    broken_origin_object_faults_before_any_chunk(BrokenObject::TruncatedOutboard).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_range_origin_faults_before_any_chunk() -> anyhow::Result<()> {
+    broken_origin_object_faults_before_any_chunk(BrokenObject::NoRangeSupport).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_data_object_faults_before_any_chunk() -> anyhow::Result<()> {
+    broken_origin_object_faults_before_any_chunk(BrokenObject::MissingData).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn range_read_outage_faults_before_any_chunk() -> anyhow::Result<()> {
+    broken_origin_object_faults_before_any_chunk(BrokenObject::RangeOutage).await
+}
+
+/// #1129 through the own-origin presence read: a TRANSPORT fault on the own
+/// origin's `{H}.sizeproof` read (GET → 500) with no other fill tier configured
+/// must terminally refuse as `InternalError` (a degraded node) before any
+/// signature, never `NotFound` (an empty one). Guards the dispatch fault latch
+/// against `CacheEngine::origin_presence` swallowing the fault into a clean
+/// absence.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_size_proof_fault_refuses_internal_error_not_cache_miss() -> anyhow::Result<()> {
     let (blob, _outboard, hash) = blob_with_outboard();
     let hex = hash.to_hex();
     drop(blob);
 
     let server = MockServer::start().await;
-    // The size probe faults (5xx is a transport-class fault for `size`, unlike
-    // a 404's clean decline). Nothing else is mounted: no fill tier can serve.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
+    // The size-proof read faults (5xx is a transport-class fault, unlike a
+    // 404's clean absence). Nothing else is mounted: no fill tier can serve.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/{hex}{}",
+            decdn_bao_range::SIZE_PROOF_SUFFIX
+        )))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -2550,146 +2242,7 @@ async fn own_origin_size_probe_fault_refuses_internal_error_not_cache_miss() -> 
 
     anyhow::ensure!(
         counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
-        "a size-probe transport fault must refuse as InternalError (degraded node)"
-    );
-    anyhow::ensure!(
-        counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
-        "a degraded node must not be reported as an empty one"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// #1129 through the range half of the serviceability probe: the size and the
-/// outboard answer, so the open answers `ok: true`. At admission the ranged read
-/// of the first chunk group times out. The stream must refuse as
-/// `InternalError` (a degraded node, wire `Declined`) before any chunk, never
-/// `NotFound` (an empty one).
-#[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)]
-async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() -> anyhow::Result<()>
-{
-    let (blob, outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
-
-    let server = MockServer::start().await;
-    mount_size_proof(&server, &hex, &blob).await;
-    // The size and the outboard answer, but the probe's ranged read of the first
-    // chunk group hangs past the origin read budget set below: a transport-class
-    // timeout fault, unlike a decline. Nothing else is mounted: no fill tier can
-    // serve.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .and(header("range", probe_range_val(blob.len()).as_str()))
-        .respond_with(ResponseTemplate::new(206).set_delay(Duration::from_secs(5)))
-        .mount(&server)
-        .await;
-
-    let pool_id = B256::repeat_byte(0x6C);
-    let client_eth = Arc::new(PrivateKeySigner::random());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
-        pool_id,
-        client_eth.address(),
-        &server_eth,
-        server_id,
-        None,
-    )
-    .await?;
-    cache.set_origin_read_budget(Duration::from_millis(500), 1_000_000);
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    // A bound whole-blob open, read the refusal, close.
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
-    let binding_signature = client_eth
-        .sign_hash_sync(&binding_hash)?
-        .as_bytes()
-        .to_vec();
-    let ext = StreamRequestExt {
-        binding: Some(ClientBinding {
-            ethereum_address: client_eth.address().into(),
-            binding_signature,
-        }),
-        capability: None,
-        pull_through: true,
-    };
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id.into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    let payload =
-        encode_stream_request(&req, Some(&ext)).map_err(|e| anyhow::anyhow!("encode req: {e}"))?;
-    write_frame_to(&mut send, &payload).await?;
-    let (resp, _resp_ext) = read_stream_response(&mut recv).await?;
-    anyhow::ensure!(resp.body.ok, "the open answers from the outboard's HEAD");
-    let first_proof = Voucher {
-        pool_id,
-        signer: client_eth.address(),
-        provider: server_eth.address(),
-        amount: U256::from(1u64),
-        bytes_delivered: U256::from(64 * 1024u64),
-        chain_root: B256::ZERO,
-        chunk_price: U256::ZERO,
-    }
-    .sign(client_eth.as_ref(), &voucher_dom())
-    .map_err(|e| anyhow::anyhow!("sign voucher: {e}"))?;
-    write_client_msg(
-        &mut send,
-        &ClientMessage::Voucher(signed_to_wire_voucher(&first_proof)?),
-    )
-    .await?;
-    match read_client_msg(&mut recv).await? {
-        ClientMessage::StreamError(decdn_protocol::client::StreamError::Declined) => {}
-        other => anyhow::bail!("expected Declined before any ChunkData, got {other:?}"),
-    }
-    conn.close(0u32.into(), b"done");
-
-    anyhow::ensure!(
-        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
-        "a range-probe transport fault must refuse as InternalError (degraded node)"
-    );
-    anyhow::ensure!(
-        cache.in_flight_total(hash).is_none(),
-        "the refused stream starts no fill"
+        "a size-proof transport fault must refuse as InternalError (degraded node)"
     );
     anyhow::ensure!(
         counter_value(&metrics, "serve_stream_rejected_cache_miss_total")? == 0,
@@ -2701,7 +2254,7 @@ async fn own_origin_range_probe_fault_refuses_internal_error_not_cache_miss() ->
 }
 
 /// The spine's own pre-signature bounds gate, on a COLD miss: an out-of-bounds
-/// bounded request against a serviceable own origin must be refused
+/// bounded request against an own origin that proves the size must be refused
 /// `RangeNotSatisfiable` before any `ok: true` is signed — and the floor
 /// reservation it releases must not leak, so a follow-up in-bounds request on
 /// the same handler still serves.
@@ -2721,20 +2274,12 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
     );
 
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", range_val.as_str()))
@@ -2866,20 +2411,12 @@ async fn span_capped_floor_accepts_a_small_range_a_window_poor_pool() -> anyhow:
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}")))
         .and(header("range", range_val.as_str()))
@@ -3034,18 +2571,9 @@ async fn interior_hold_own_origin_miss_pulls_only_the_gaps() -> anyhow::Result<(
         .to_vec();
 
     let server = MockServer::start().await;
+    // (1) the size proof the open answers from.
     mount_size_proof(&server, &hex, &blob).await;
-    // (1) HEAD → canonical blob size: the dispatch serviceability size probe.
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    // (2) sibling outboard GET: the dispatch serviceability probe AND the pull
-    //     leg's range-encode outboard fetch.
-    mount_outboard_head(&server, &hex, 200).await;
+    // (2) sibling outboard GET: the pull leg's range-encode outboard fetch.
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -3229,14 +2757,6 @@ async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -3368,120 +2888,6 @@ async fn a_bounded_miss_seeds_only_the_held_ranges_inside_it() -> anyhow::Result
     Ok(())
 }
 
-/// SERVE-LEVEL NO-HANG: an origin fetch failure on the own-origin serve-miss path
-/// must FAIL the serve, not hang it. Dispatch signs `ok:true` from the origin size
-/// and the outboard's `HEAD`, admission's ranged first-group probe succeeds, but
-/// the ranged data GET the
-/// local pull leg draws returns `500` — so `origin_range_wire` errors, the pull
-/// leg records a terminal `pull_result`/`pull_ended`, and the serve leg races that
-/// terminal against its present-range watch and FAILS the gap it is waiting on. The
-/// client must see a delivery error / stream reset, never a clean whole blob.
-///
-/// The whole `ranged_paid_pull` is wrapped in a hard `timeout`, so a genuine hang
-/// (the failure this test guards against) surfaces as a test failure rather than a
-/// stuck run. This is the integration-level twin of `run_local_pull_leg`'s unit
-/// no-hang proof: it shows the pull-leg terminal signal propagates all the way
-/// through `serve_leg` to the paying client.
-#[tokio::test(flavor = "multi_thread")]
-async fn own_origin_serve_fails_not_hangs_on_origin_fetch_error() -> anyhow::Result<()> {
-    let (blob, outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
-    let hex = hash.to_hex();
-
-    let server = MockServer::start().await;
-    mount_size_proof(&server, &hex, &blob).await;
-    // (1) HEAD → size probe SUCCEEDS (serviceability).
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    // (2) outboard HEAD and GET SUCCEED: dispatch signs `ok:true` from the
-    //     HEAD, and with the range probe below admission commits to the two-leg
-    //     serve.
-    mount_outboard_head(&server, &hex, 200).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}.obao4")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
-        .mount(&server)
-        .await;
-    mount_range_probe(&server, &hex, &blob).await;
-    // (3) the ranged data GET the local pull leg draws FAILS with a 500. The pull
-    //     leg's `origin_range_wire` errors; this is a local-origin fault, so the
-    //     serve must terminate with an error rather than wait forever.
-    Mock::given(method("GET"))
-        .and(path(format!("/{hex}")))
-        .and(header_exists("range"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-
-    let pool_id = B256::repeat_byte(0x53);
-    let client_eth = Arc::new(PrivateKeySigner::random());
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
-    let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
-        &server.uri(),
-        pool_id,
-        client_eth.address(),
-        &server_eth,
-        server_id,
-        None,
-    )
-    .await?;
-
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    // A hang is the failure mode under test: bound the whole exchange so it becomes
-    // a test failure, not a stuck run.
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(20),
-        ranged_paid_pull(
-            &client_ep,
-            target,
-            client_node_id,
-            &client_eth,
-            pool_id,
-            provider,
-            hash,
-            0,
-            0,
-            RATE_PER_MB,
-        ),
-    )
-    .await;
-
-    let inner = outcome.map_err(|_| {
-        anyhow::anyhow!(
-            "own-origin serve HUNG on an origin fetch error — no terminal signal reached the client"
-        )
-    })?;
-    anyhow::ensure!(
-        inner.is_err(),
-        "an origin fetch failure must fail the serve; the client must not receive a clean whole blob"
-    );
-
-    // The dispatch tier still fired (serviceability passed, `ok:true` was signed) —
-    // this is a mid-serve failure of the committed two-leg path, not a fallback.
-    anyhow::ensure!(
-        counter_value(&metrics, "local_outboard_serves_total")? == 1,
-        "the own-origin two-leg serve tier must have been selected before the origin fault"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// Spawn a server that handles each inbound connection on its OWN task, so two
 /// concurrent `cdn/client/v1` requests are served in parallel. The default
 /// `support::spawn_server` awaits `handler.accept` INLINE in its accept loop, so a
@@ -3595,19 +3001,10 @@ async fn handler_two_pools_over_http_origin(
 #[allow(clippy::too_many_lines)]
 async fn mid_blob_open_behind_a_paying_owners_frontier_attaches() -> anyhow::Result<()> {
     let (blob, outboard, hash) = large_blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
 
     let server = MockServer::start().await;
     mount_size_proof(&server, &hex, &blob).await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
@@ -3811,23 +3208,14 @@ async fn concurrent_whole_blob_own_origin_misses_coalesce_to_one_pull() -> anyho
     let range_val = format!("bytes={a_start}-{}", a_end - 1);
 
     let server = MockServer::start().await;
-    // HEAD → canonical blob size (the dispatch serviceability size probe).
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    // sibling outboard GET (serviceability probe + the pull leg's range-encode
-    // outboard fetch).
-    mount_outboard_head(&server, &hex, 200).await;
+    // The size proof the open answers from, and the sibling outboard the pull
+    // leg's range encode reads.
+    mount_size_proof(&server, &hex, &blob).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
     // The ranged data GET — DELAYED so the owning request holds the live fill
     // across a wide window while the second request attaches to it. If coalescing
     // is absent, BOTH requests reach here and this mock records TWO matching GETs;
@@ -3988,8 +3376,8 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
     anyhow::ensure!(hash_a != hash_b, "the two blobs must have distinct hashes");
 
     let server = MockServer::start().await;
-    // Mount HEAD + sibling-outboard GET + a DELAYED ranged data GET for each hash,
-    // so both fills are in flight concurrently.
+    // Mount the size proof + sibling-outboard GET + a DELAYED ranged data GET for
+    // each hash, so both fills are in flight concurrently.
     let mut range_vals = Vec::new();
     for (blob, outboard, hash) in [
         (&blob_a, &outboard_a, hash_a),
@@ -4004,20 +3392,12 @@ async fn two_concurrent_disjoint_own_origin_misses_two_fetches_no_wedge() -> any
             .ok_or_else(|| anyhow::anyhow!("aligned span out of bounds"))?
             .to_vec();
         let range_val = format!("bytes={a_start}-{}", a_end - 1);
-        Mock::given(method("HEAD"))
-            .and(path(format!("/{hex}")))
-            .respond_with(
-                ResponseTemplate::new(200).insert_header("Content-Length", size.to_string()),
-            )
-            .mount(&server)
-            .await;
-        mount_outboard_head(&server, &hex, 200).await;
+        mount_size_proof(&server, &hex, blob).await;
         Mock::given(method("GET"))
             .and(path(format!("/{hex}.obao4")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard.clone()))
             .mount(&server)
             .await;
-        mount_range_probe(&server, &hex, blob).await;
         Mock::given(method("GET"))
             .and(path(format!("/{hex}")))
             .and(header("range", range_val.as_str()))
@@ -4175,14 +3555,14 @@ fn bound_ext(
     })
 }
 
-/// The own-origin probe that runs before admission goes through the probe
-/// memo: two opens for the same hash the origin lacks reach the origin with one
-/// `HEAD`, and both answer `NotFound`.
+/// The own-origin presence read that runs before admission goes through the
+/// presence memo: two opens for the same hash the origin lacks reach the origin
+/// with one `{H}.sizeproof` read, and both answer `NotFound`.
 #[tokio::test(flavor = "multi_thread")]
-async fn repeat_opens_for_an_absent_hash_probe_the_origin_once() -> anyhow::Result<()> {
+async fn repeat_opens_for_an_absent_hash_read_the_origin_once() -> anyhow::Result<()> {
     let hash = Hash::new(b"a blob no origin holds");
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
+    Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(404))
         .mount(&server)
         .await;
@@ -4237,10 +3617,12 @@ async fn repeat_opens_for_an_absent_hash_probe_the_origin_once() -> anyhow::Resu
             "an absent hash answers NotFound"
         );
     }
-    let heads = count_requests(&server, |r| r.method.as_str() == "HEAD").await?;
+    let size_proof_path = format!("/{}{}", hash.to_hex(), decdn_bao_range::SIZE_PROOF_SUFFIX);
+    let reads = count_requests(&server, |_| true).await?;
+    let proof_reads = count_requests(&server, |r| r.url.path() == size_proof_path).await?;
     anyhow::ensure!(
-        heads == 1,
-        "two opens must cost one origin HEAD, saw {heads}"
+        reads == 1 && proof_reads == 1,
+        "two opens must cost one origin size-proof read, saw {reads} reads"
     );
 
     conn.close(0u32.into(), b"done");
@@ -4251,29 +3633,20 @@ async fn repeat_opens_for_an_absent_hash_probe_the_origin_once() -> anyhow::Resu
 /// An own-origin open on a pool that cannot cover the span answers before
 /// admission, and its admission refuses `Unfunded` at the first proof, before
 /// any `ChunkData`. The fill never starts, and the origin sees no outboard
-/// read and no range read: the open reads only memoised `HEAD`s.
+/// read and no range read: the open reads only the memoised size proof.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn an_underfunded_own_origin_open_is_refused_at_admission_and_reads_no_range()
 -> anyhow::Result<()> {
     let (blob, outboard, hash) = blob_with_outboard();
-    let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
     let server = MockServer::start().await;
-    Mock::given(method("HEAD"))
-        .and(path(format!("/{hex}")))
-        .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", blob_size.to_string()),
-        )
-        .mount(&server)
-        .await;
-    mount_outboard_head(&server, &hex, 200).await;
     Mock::given(method("GET"))
         .and(path(format!("/{hex}.obao4")))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
         .mount(&server)
         .await;
-    mount_range_probe(&server, &hex, &blob).await;
+    mount_size_proof(&server, &hex, &blob).await;
 
     let pool_id = B256::repeat_byte(0x7B);
     let client_eth = Arc::new(PrivateKeySigner::random());

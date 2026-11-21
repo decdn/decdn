@@ -34,6 +34,7 @@ use crate::error::{CacheError, CacheResult};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
 use crate::outboard_cache::OutboardCache;
+use crate::retry::ReadGuard;
 
 /// The time budget for one origin read of the range-pull path — an outboard
 /// fetch or one data window. A read of `len` bytes gets
@@ -67,8 +68,8 @@ use crate::range_pull::{AlignedRange, IROH_BLOCK_SIZE};
 pub const RANGE_PULL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
 /// [`crate::CacheEngine::origin_range_wire`] draws that run at once. A caller
-/// past the bound waits for a permit rather than degrading, because the degrade
-/// is a whole-blob origin pull — more egress, not less.
+/// past the bound waits for a permit: the ranged draw is the only way a node
+/// serves its own origin.
 pub const MAX_CONCURRENT_RANGE_PULLS: usize = 4;
 
 /// How long a draw waits on a full [`MAX_CONCURRENT_RANGE_PULLS`] pool before it
@@ -161,13 +162,14 @@ pub(crate) struct OriginWindow {
 }
 
 /// What an origin answered for one window. A wrong-length answer is kept apart
-/// from a decline because the two paths judge it differently: the range pull
-/// degrades, and the origin-range wire reports [`CacheError::VerifyFailed`].
+/// from a decline because the two are judged differently: a decline is an
+/// origin fault ([`CacheError::OriginError`]), a wrong length cannot verify
+/// ([`CacheError::VerifyFailed`]).
 #[derive(Debug)]
 pub(crate) enum WindowFetch {
     /// The origin served the window at its exact length.
     Window(OriginWindow),
-    /// The origin declined the window (no `Range`, object absent or short).
+    /// The origin has no data object for the window.
     Declined { start: u64, end: u64 },
     /// The origin served `got` bytes for the `[start, end)` window.
     WrongLength { start: u64, end: u64, got: usize },
@@ -182,6 +184,9 @@ pub(crate) struct OriginRangeCursor {
     outboard: Bytes,
     /// Time budget for each window fetch; `None` is unbounded.
     budget: Option<OriginReadBudget>,
+    /// The origin's breaker and the retry policy each window fetch runs
+    /// under.
+    guard: ReadGuard,
     metrics: Option<Arc<CacheMetrics>>,
     spans: WindowSpans,
     /// The first window, fetched by [`Self::open`] and not yet handed out.
@@ -193,11 +198,11 @@ impl OriginRangeCursor {
     /// `outboard`, and fetch the first window. `Ok(None)` when this origin
     /// declines the first window, so the caller can advance the origin chain
     /// before it commits to this origin. Each window fetch runs under `budget`
-    /// ([`within_origin_timeout`]).
+    /// ([`within_origin_timeout`]), and retries a transient fault within it
+    /// under `guard` ([`ReadGuard::run`]).
     ///
     /// Meters every fetched window as `pull_through_bytes`. The outboard read
-    /// is metered where it happens, in
-    /// [`crate::CacheEngine::origin_fetch_outboard_bytes`].
+    /// is metered where it happens, in the engine's outboard fetch.
     ///
     /// # Errors
     ///
@@ -209,6 +214,7 @@ impl OriginRangeCursor {
         aligned: &AlignedRange,
         outboard: Bytes,
         budget: Option<OriginReadBudget>,
+        guard: ReadGuard,
         metrics: Option<Arc<CacheMetrics>>,
     ) -> CacheResult<Option<Self>> {
         let mut cursor = Self {
@@ -216,6 +222,7 @@ impl OriginRangeCursor {
             hash,
             outboard,
             budget,
+            guard,
             metrics,
             spans: WindowSpans::new(aligned),
             pending: None,
@@ -271,7 +278,8 @@ impl OriginRangeCursor {
             self.hash,
             "range window fetch",
             self.metrics.as_deref(),
-            self.origin.fetch_range_data(self.hash, req),
+            self.guard
+                .run(self.hash, || self.origin.fetch_range_data(self.hash, req)),
         )
         .await?
         .map_err(|e| CacheError::OriginError {
@@ -279,7 +287,7 @@ impl OriginRangeCursor {
             source: e.into_inner(),
         })? {
             OriginRangeFetch::Ranged { data } => data,
-            OriginRangeFetch::Unsupported | OriginRangeFetch::NotFound => {
+            OriginRangeFetch::NotFound => {
                 return Ok(Some(WindowFetch::Declined { start, end }));
             }
         };
@@ -570,8 +578,14 @@ pub struct OriginRangeWire {
     rx: mpsc::Receiver<Bytes>,
     fault: FaultSlot,
     ended: bool,
+    /// Called once with the terminal fault, before [`Self::next_chunk`]
+    /// yields it ([`Self::on_fault`]).
+    on_fault: Option<FaultHook>,
     _task: AbortOnDropHandle<()>,
 }
+
+/// What [`OriginRangeWire::on_fault`] runs with the wire's terminal fault.
+type FaultHook = Box<dyn FnOnce(&CacheError) + Send + Sync>;
 
 impl std::fmt::Debug for OriginRangeWire {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -699,8 +713,21 @@ impl OriginRangeWire {
             rx,
             fault,
             ended: false,
+            on_fault: None,
             _task: AbortOnDropHandle::new(task),
         })
+    }
+
+    /// Run `hook` once with the terminal fault the encode stopped on, just
+    /// before [`Self::next_chunk`] yields it. A wire that ends cleanly, or
+    /// that is dropped before its end, never runs it.
+    #[must_use]
+    pub(crate) fn on_fault(
+        mut self,
+        hook: impl FnOnce(&CacheError) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_fault = Some(Box::new(hook));
+        self
     }
 
     /// The next chunk of wire, in order. After the last chunk it yields one
@@ -714,11 +741,15 @@ impl OriginRangeWire {
             return Some(Ok(chunk));
         }
         self.ended = true;
-        self.fault
+        let fault = self
+            .fault
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .map(Err)
+            .take()?;
+        if let Some(hook) = self.on_fault.take() {
+            hook(&fault);
+        }
+        Some(Err(fault))
     }
 }
 

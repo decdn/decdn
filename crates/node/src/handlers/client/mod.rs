@@ -898,14 +898,9 @@ pub struct ClientHandlerDeps {
     pub attestations: Option<Arc<crate::attestations::Attestations>>,
     // Optional wiring — `None` unless the deployment enables the feature.
     /// Deadline for the node-to-node cache-miss pull, so a slow upstream
-    /// cannot pin the delivery path. `None` disables the node-to-node leg
-    /// only; a miss can still fill from the local origin via
-    /// [`Self::local_populate`].
+    /// cannot pin the delivery path. `None` disables the buffered
+    /// node-to-node leg.
     pub pull_through: Option<Duration>,
-    /// Deadline for filling a miss from this node's OWN configured fs/http/s3
-    /// origin, tried ahead of any node-to-node path and independent of
-    /// [`Self::pull_through`]. `None` skips the local-origin tier.
-    pub local_populate: Option<Duration>,
     /// Selects the credit-paced node-to-node pull leg, which draws upstream only
     /// what the downstream stream has paid for. `None` falls back to the
     /// buffered `populate` path when [`Self::pull_through`] is set.
@@ -1009,7 +1004,6 @@ impl ClientHandlerDeps {
             chain_freshness: None,
             attestations: None,
             pull_through: None,
-            local_populate: None,
             pull_through_origin: None,
             frame_target_bytes: decdn_common::config::DEFAULT_FRAME_TARGET_BYTES,
             idle_timeout: None,
@@ -1214,16 +1208,6 @@ pub struct ClientHandler {
     /// anti-proxy-abuse gate: a client without authority over a lane cannot make this
     /// node front upstream egress.
     pull_through: Option<Duration>,
-    /// Reactive LOCAL-origin pull-through deadline (#1116), set at construction
-    /// via [`ClientHandlerDeps`] whenever `[cache.origin]` is configured —
-    /// INDEPENDENT of `node_to_node_pull_through_enabled`. When `Some`, a cache
-    /// miss on a proven-authorized lane first tries to fill from the node's OWN
-    /// fs/http/s3 origin (`CacheEngine::populate_local`, which never touches the
-    /// paid `Peer` origin), so a cache-only operator can reactively serve its own
-    /// content and a local origin is preferred over the paid peer window path.
-    /// `None` disables local populate (miss ⇒ node→node path or a plain
-    /// `NotFound`).
-    local_populate: Option<Duration>,
     /// Window-paced node→node pull-through provider (#856), set at construction
     /// via [`ClientHandlerDeps`]. When `Some` (alongside `pull_through`), a cache
     /// miss for an offset-0 request that proves lane authority is served by
@@ -1394,7 +1378,6 @@ impl ClientHandler {
             lane_gauge_publish: std::sync::Mutex::new(()),
             capability_verify_cache: std::sync::Mutex::new(CapabilityVerifyCache::default()),
             pull_through: deps.pull_through,
-            local_populate: deps.local_populate,
             pull_through_origin: deps.pull_through_origin,
             frame_target_bytes: deps.frame_target_bytes,
             content_deny: deps.content_deny,

@@ -1144,29 +1144,23 @@ async fn throwaway_engine() -> Result<(CacheEngine, tempfile::TempDir)> {
     Ok((engine, dir))
 }
 
-/// Build a cache pre-seeded with every payload in `payloads`: a one-shard
-/// filesystem origin holds them, the cache pulls each into its local store, then
-/// the origin is dropped. A multi-blob sibling of `support::cache_with_blob`,
-/// used where a node must hold more than one blob.
+/// Build a cache (no origins) pre-seeded with every payload in `payloads` as
+/// whole blobs. A multi-blob sibling of `support::cache_with_blob`, used where
+/// a node must hold more than one blob.
 async fn cache_with_blobs(payloads: &[&[u8]]) -> Result<(CacheEngine, tempfile::TempDir)> {
-    let origin_dir = tempfile::tempdir()?;
-    for payload in payloads {
-        support::seed_origin_object(origin_dir.path(), payload)?;
-    }
     let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    let cache = CacheEngine::open(cache_dir.path(), vec![], 16).await?;
     for payload in payloads {
-        let _ = cache.get(support::register_payload(payload)).await?; // populate the local store
+        support::register_payload(payload);
+        cache.insert_blob(payload.to_vec()).await?;
     }
-    drop(origin_dir);
     Ok((cache, cache_dir))
 }
 
 /// Build a cache whose local store is EMPTY but whose filesystem origin holds
-/// `payload`, wired with an `Arc<CacheMetrics>` so a caller can assert
-/// `origin_fetches` — the counter that pins whether the node actually read its
-/// origin (`1`) or short-circuited (`0`). Both temp dirs are returned so the
+/// `payload` as `decdn origin import` publishes it, wired with an
+/// `Arc<CacheMetrics>` so a caller can assert `pull_through_bytes`, the origin
+/// egress the node spent. Both temp dirs are returned so the
 /// caller keeps the origin alive across a pull. Used by the #1117 chained-pull
 /// test: the upstream must REACTIVELY pull its own origin (authorized by the
 /// requester's ADR 005 binding) to serve, since nothing is pre-warmed.
@@ -1205,34 +1199,13 @@ async fn cache_with_fs_origin_only(
 /// in its own filesystem origin — so A can serve only by REACTIVELY pulling its
 /// origin, which A's `pull_authorized` gate allows solely because B now attaches
 /// an ADR 005 client identity binding (over B's OWN node id, signed with the
-/// lane's buyer key). B receiving the bytes, and A's origin fetching exactly
-/// once, proves the binding propagated across the hop and authorized the chained
-/// pull. Without the binding, A refuses with `NotFound`.
-///
-/// A's origin publishes no outboard, so A cannot serve the blob before its fill,
-/// and it answers B's voucher-less discovery open `NotFound`. A is the hash's
-/// assigned origin (B's directory lists it), so B keeps it as a cold
-/// pull-through target and opens it again with the pull-through flag.
+/// lane's buyer key). B receiving the bytes, and A reading the blob and its
+/// outboard from its origin once, proves the binding propagated across the hop
+/// and authorized the chained pull. Without the binding, A's admission refuses
+/// the stream.
 #[tokio::test(flavor = "multi_thread")]
-async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<()> {
-    pull_from_an_assigned_origin_that_needs_a_fill(None).await
-}
-
-/// An assigned origin's `NotFound` to a voucher-less discovery open means it
-/// needs a fill, not that the blob is absent: B does not negative-cache it, and
-/// its next open of A is the pull-through one, which A's origin fills.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_assigned_origins_discovery_not_found_is_a_cold_pull_through_target() -> Result<()> {
-    pull_from_an_assigned_origin_that_needs_a_fill(Some(support::capture_spans())).await
-}
-
-/// The body of [`node_origin_pull_chains_reactive_origin_via_client_binding`].
-/// With `spans`, it also checks B's opens of A: one voucher-less discovery
-/// open, then the pull-through open, and no negative-cache entry for the pair.
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
-async fn pull_from_an_assigned_origin_that_needs_a_fill(
-    spans: Option<support::SpanCapture>,
-) -> Result<()> {
+async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<()> {
     let payload = vec![0x9Eu8; PAYLOAD_LEN];
     let hash = support::register_payload(&payload);
 
@@ -1276,7 +1249,7 @@ async fn pull_from_an_assigned_origin_that_needs_a_fill(
         RATE,
         &domains,
         16,
-        |deps| deps.local_populate = Some(Duration::from_secs(20)),
+        |_| {},
     )?;
     let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task_a = spawn_a_server(ep_a.clone(), handler_a);
@@ -1304,10 +1277,9 @@ async fn pull_from_an_assigned_origin_that_needs_a_fill(
     )
     .await;
 
-    // Discover → open (A needs a fill) → pull-through open (with binding) → A
-    // reactively pulls its own origin
-    // → serve. A held nothing in-store, so a successful pull is proof of the
-    // chained reactive fill.
+    // Discover → open (with binding) → A serves from its own origin. A held
+    // nothing in-store, so a successful pull is proof of the chained reactive
+    // fill.
     let fetched = Origin::fetch(&origin, hash, u64::MAX)
         .await
         .map_err(|e| anyhow::anyhow!("node-origin chained fetch failed: {e}"))?;
@@ -1315,47 +1287,16 @@ async fn pull_from_an_assigned_origin_that_needs_a_fill(
         matches!(fetched, OriginFetch::AlreadyAdmitted),
         "node-origin did not admit the blob; the chained reactive pull did not fire"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "chained-pull bytes mismatch"
     );
     anyhow::ensure!(
-        cache_a_metrics.origin_fetches.get() == 1,
-        "upstream A must reactively pull its origin exactly once, got {}",
-        cache_a_metrics.origin_fetches.get()
+        cache_a_metrics.pull_through_bytes.get() == support::own_origin_egress(&payload)?,
+        "upstream A must read the blob and its outboard from its origin once, got {} bytes",
+        cache_a_metrics.pull_through_bytes.get()
     );
-    if let Some(spans) = spans {
-        anyhow::ensure!(
-            !origin.is_suppressed(a_id, hash),
-            "an assigned origin's discovery NotFound must not be negative-cached"
-        );
-        let a = a_id.to_string();
-        let discovery: Vec<_> = spans
-            .matching("discovery_open", "hash", &hash.to_string())
-            .into_iter()
-            .filter(|s| s.fields.get("peer") == Some(&a))
-            .collect();
-        anyhow::ensure!(
-            discovery.len() == 1
-                && discovery
-                    .first()
-                    .and_then(|s| s.fields.get("pull_through"))
-                    .map(String::as_str)
-                    == Some("false"),
-            "B asks A once without pull-through: {discovery:?}"
-        );
-        let pulls: Vec<_> = spans
-            .matching("open_progressive_pull", "hash", &hash.to_string())
-            .into_iter()
-            .filter(|s| s.fields.get("peer") == Some(&a))
-            .collect();
-        anyhow::ensure!(
-            !pulls.is_empty(),
-            "B's next open of A is the pull-through one: {pulls:?}"
-        );
-    }
-
     shutdown([task_a], [&ep_b, &ep_a]).await?;
     Ok(())
 }
@@ -1445,7 +1386,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
         matches!(fetched, OriginFetch::AlreadyAdmitted),
         "node-origin did not admit the blob; expected the pull to deliver it"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -1675,7 +1616,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         engine_b.has(hash).await?,
         "blob must be present after populate"
     );
-    let got = engine_b.get(hash).await?;
+    let got = support::fetch_blob(&engine_b, hash).await?;
     anyhow::ensure!(got.len() as u64 == total_bytes, "full blob length");
     anyhow::ensure!(got.as_ref() == payload.as_slice(), "content matches");
 
@@ -2422,7 +2363,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
         matches!(fetched, OriginFetch::AlreadyAdmitted),
         "expected the blob from the honest fallback candidate"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -2618,7 +2559,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
         matches!(fetched, OriginFetch::AlreadyAdmitted),
         "expected the blob from the honest fallback candidate"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -3452,7 +3393,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
         matches!(got, OriginFetch::AlreadyAdmitted),
         "the honest fallback held the blob; the walk must not miss"
     );
-    let delivered = engine.get(hash).await?;
+    let delivered = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         delivered.as_ref() == payload.as_slice(),
         "the fallback candidate's bytes must be the ones returned"
@@ -5366,7 +5307,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
         "the loop gave up before reaching the healthy candidate #3 — two silent \
          candidates consumed a budget the outer deadline had not allowed for"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "wrong bytes from candidate #3"
@@ -5481,7 +5422,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
         "a slow-but-healthy pull returned NotFound: the transfer was killed by a \
          whole-blob deadline it must not have (#1134)"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     let elapsed = started.elapsed();
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
@@ -5654,7 +5595,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         matches!(fetched, OriginFetch::AlreadyAdmitted),
         "expected the blob from the candidate that holds it"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "pulled bytes mismatch"
@@ -5692,7 +5633,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("second node-origin fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(refetched, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "the second fetch must still deliver the blob from A"
     );
     assert_counter(&b_metrics, "node_pull_refused_total", 1)?;
@@ -6364,7 +6305,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
         matches!(first_fetch, OriginFetch::AlreadyAdmitted),
         "first fetch returned NotFound"
     );
-    let first = engine.get(hash1).await?;
+    let first = support::fetch_blob(&engine, hash1).await?;
     anyhow::ensure!(
         first.as_ref() == payload1.as_slice(),
         "first pull bytes mismatch"
@@ -6384,7 +6325,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
         matches!(second_fetch, OriginFetch::AlreadyAdmitted),
         "second fetch returned NotFound — stale voucher rejected (the #852 bug)"
     );
-    let second = engine.get(hash2).await?;
+    let second = support::fetch_blob(&engine, hash2).await?;
     anyhow::ensure!(
         second.as_ref() == payload2.as_slice(),
         "second pull bytes mismatch"
@@ -6505,7 +6446,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
         matches!(fetched, OriginFetch::AlreadyAdmitted),
         "persist failure must not turn the pull into NotFound"
     );
-    let bytes = engine.get(hash).await?;
+    let bytes = support::fetch_blob(&engine, hash).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "delivered bytes mismatch"
@@ -10990,7 +10931,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
         recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
-    let got1 = engine.get(hash).await?;
+    let got1 = support::fetch_blob(&engine, hash).await?;
     let second = second.map_err(|e| anyhow::anyhow!("second concurrent fetch failed: {e}"))?;
     anyhow::ensure!(
         matches!(&second, OriginFetch::AlreadyAdmitted),
@@ -11003,7 +10944,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         counter_value(&b_metrics, "node_pull_stalled_total").unwrap_or(0),
         recorded.lock().map_or_else(|_| Vec::new(), |v| v.clone())
     );
-    let got2 = engine.get(hash2).await?;
+    let got2 = support::fetch_blob(&engine, hash2).await?;
     anyhow::ensure!(got1.as_ref() == payload.as_slice(), "blob 1 bytes mismatch");
     anyhow::ensure!(
         got2.as_ref() == payload2.as_slice(),
@@ -11125,7 +11066,7 @@ async fn a_second_fetch_inside_the_ttl_skips_discovery_entirely() -> Result<()> 
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
         matches!(first, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob"
     );
     anyhow::ensure!(
@@ -11139,7 +11080,7 @@ async fn a_second_fetch_inside_the_ttl_skips_discovery_entirely() -> Result<()> 
         .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
         matches!(second, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "second fetch must deliver the blob"
     );
     anyhow::ensure!(
@@ -11256,7 +11197,7 @@ async fn a_fetch_past_the_ttl_opens_again() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
         matches!(first, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob"
     );
     anyhow::ensure!(
@@ -11273,7 +11214,7 @@ async fn a_fetch_past_the_ttl_opens_again() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
         matches!(second, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "second fetch must deliver the blob"
     );
     anyhow::ensure!(
@@ -11649,7 +11590,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
         .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
         matches!(second, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "the second fetch must deliver the blob via the cold fallthrough"
     );
     // Three streams: fetch #1's discovery open (adopted, refused), fetch #2's
@@ -11806,7 +11747,7 @@ async fn a_candidate_cache_hit_still_honours_the_negative_cache() -> Result<()> 
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
         matches!(first, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob from A"
     );
     anyhow::ensure!(
@@ -11830,7 +11771,7 @@ async fn a_candidate_cache_hit_still_honours_the_negative_cache() -> Result<()> 
         .map_err(|e| anyhow::anyhow!("second fetch: {e}"))?;
     anyhow::ensure!(
         matches!(second, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "second fetch must still deliver the blob from A"
     );
     anyhow::ensure!(
@@ -12134,7 +12075,7 @@ async fn a_candidate_cache_hit_still_honours_the_wedged_provider_filter() -> Res
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
         matches!(first, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash2).await?.as_ref() == payload2.as_slice(),
+            && support::fetch_blob(&engine, hash2).await?.as_ref() == payload2.as_slice(),
         "fetch #1 must deliver hash2 from H"
     );
     anyhow::ensure!(
@@ -12477,7 +12418,7 @@ async fn a_candidate_cache_hit_drops_a_provider_no_longer_admitted() -> Result<(
         .map_err(|e| anyhow::anyhow!("first fetch: {e}"))?;
     anyhow::ensure!(
         matches!(first, OriginFetch::AlreadyAdmitted)
-            && engine.get(hash).await?.as_ref() == payload.as_slice(),
+            && support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "first fetch must deliver the blob from A"
     );
     anyhow::ensure!(
@@ -13226,10 +13167,8 @@ async fn a_pull_larger_than_the_working_deposit_tops_up_once_and_completes() -> 
         matches!(got, OriginFetch::AlreadyAdmitted),
         "a topped-up pull must deliver the blob, not NotFound"
     );
-    let bytes = fixture
-        .engine
-        .get(support::register_payload(payload.as_ref()))
-        .await?;
+    let bytes =
+        support::fetch_blob(&fixture.engine, support::register_payload(payload.as_ref())).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "the resumed pull delivered {} bytes, expected {}",
@@ -13338,10 +13277,8 @@ async fn a_slow_post_topup_delivery_scores_slow_not_instant() -> Result<()> {
         matches!(got, OriginFetch::AlreadyAdmitted),
         "a topped-up pull must deliver the blob, not NotFound"
     );
-    let bytes = fixture
-        .engine
-        .get(support::register_payload(payload.as_ref()))
-        .await?;
+    let bytes =
+        support::fetch_blob(&fixture.engine, support::register_payload(payload.as_ref())).await?;
     anyhow::ensure!(
         bytes.as_ref() == payload.as_slice(),
         "the resumed pull delivered {} bytes, expected {}",
@@ -13856,7 +13793,7 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_lanes() -> Result
         counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
         counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0)
     );
-    let bytes_a = fixture.engine.get(hash_a).await?;
+    let bytes_a = support::fetch_blob(&fixture.engine, hash_a).await?;
     let got_b = got_b.map_err(|e| anyhow::anyhow!("fetch B: {e}"))?;
     anyhow::ensure!(
         matches!(&got_b, OriginFetch::AlreadyAdmitted),
@@ -13868,7 +13805,7 @@ async fn concurrent_pulls_resume_at_their_own_frontier_not_the_lanes() -> Result
         counter_value(&fixture.metrics, "node_pull_stalled_total").unwrap_or(0),
         counter_value(&fixture.metrics, "node_pull_pool_open_pending_total").unwrap_or(0)
     );
-    let bytes_b = fixture.engine.get(hash_b).await?;
+    let bytes_b = support::fetch_blob(&fixture.engine, hash_b).await?;
     // EXACT bytes, which is the whole point: an overshot frontier assembles a blob
     // with a gap where the truncate could not rewind, and the engine's hash check
     // turns that into a NotFound (caught above) — never silently wrong bytes.
@@ -14181,7 +14118,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         "the attack quotes AT the ceiling; the gate must admit it, got {bought:?}"
     );
     anyhow::ensure!(
-        engine.get(hash).await?.as_ref() == payload.as_slice(),
+        support::fetch_blob(&engine, hash).await?.as_ref() == payload.as_slice(),
         "B's cache must hold the bought bytes"
     );
 
@@ -16620,10 +16557,10 @@ async fn a_refusal_at_admission_of_the_adopted_stream_is_backpressure() -> Resul
 }
 
 /// Spin up an assigned origin O for `payload`: its store starts empty and only
-/// its filesystem origin holds the blob, with a size proof and no outboard. So
-/// O answers a voucher-less discovery open `NotFound` and serves the blob only
-/// when an open asks it to pull through, which fills its store from its origin
-/// (#1116). Seeds S's lane on `ab_pool_id` keyed by `s_buyer_addr`.
+/// its filesystem origin holds the blob, its outboard and its size proof. So O
+/// answers a voucher-less discovery open from its origin's size proof and
+/// serves a paid open through its own-origin spine, which fills its store from
+/// its origin (#1116). Seeds S's lane on `ab_pool_id` keyed by `s_buyer_addr`.
 async fn spawn_fs_origin_node(
     payload: &[u8],
     ab_pool_id: B256,
@@ -16672,20 +16609,19 @@ async fn spawn_fs_origin_node(
         RATE,
         &domains,
         16,
-        |deps| deps.local_populate = Some(Duration::from_secs(20)),
+        |_| {},
     )?;
     let (ep, addr) = local_endpoint(sk, vec![ALPN_CLIENT.to_vec()]).await?;
     let task = spawn_a_server(ep.clone(), handler);
     Ok((id, addr, eth.address(), ep, task, cache_metrics))
 }
 
-/// The serve-miss pull leg reaches a directory origin that needs a fill (#1117
-/// on the ranged path): O answers S's discovery open `NotFound`, S keeps it as
-/// a cold pull-through target rather than negative-caching it, its handshake
-/// pulls through and proves the size, and the run plans every block on it. The
-/// leaf's paid delivery completes and O fills from its origin once.
+/// The serve-miss pull leg reaches a directory origin whose store is empty
+/// (#1117 on the ranged path): O answers S's voucher-less discovery open from
+/// its origin's size proof, S plans every block on it, the leaf's paid delivery
+/// completes, and O reads the blob and its outboard from its origin once.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_serve_miss_pulls_through_a_directory_origin_that_needs_a_fill() -> Result<()> {
+async fn a_serve_miss_pulls_from_a_directory_origin_with_an_empty_store() -> Result<()> {
     let spans = support::capture_spans();
     let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
     let hash = support::register_payload(&payload);
@@ -16729,20 +16665,20 @@ async fn a_serve_miss_pulls_through_a_directory_origin_that_needs_a_fill() -> Re
     .await?;
     anyhow::ensure!(
         outcome.completed && outcome.hash_ok && outcome.received == total_bytes,
-        "the leaf's paid delivery must complete through the cold origin"
+        "the leaf's paid delivery must complete through the directory origin"
     );
     anyhow::ensure!(
         cache_s.has(hash).await?,
         "S must promote the blob on a complete delivery"
     );
     anyhow::ensure!(
-        o_cache_metrics.origin_fetches.get() == 1,
-        "O must fill from its origin exactly once, got {}",
-        o_cache_metrics.origin_fetches.get()
+        o_cache_metrics.pull_through_bytes.get() == support::own_origin_egress(&payload)?,
+        "O must read the blob and its outboard from its origin once, got {} bytes",
+        o_cache_metrics.pull_through_bytes.get()
     );
     anyhow::ensure!(
         !origin_s.is_suppressed(o_id, hash),
-        "an assigned origin's discovery NotFound must not be negative-cached"
+        "a directory origin that serves the blob must not be negative-cached"
     );
     let o = o_id.to_string();
     let discovery = spans
@@ -16761,13 +16697,12 @@ async fn a_serve_miss_pulls_through_a_directory_origin_that_needs_a_fill() -> Re
     Ok(())
 }
 
-/// A holder that the walk drops does not hide the cold origins. The leaf L is
-/// itself a full holder and S's directory lists it beside the origin O, which
-/// needs a fill. S never pulls from its requester, so once L is gone no usable
-/// holder remains, and O joins as the cold pull-through target that serves the
-/// leaf.
+/// A holder that the walk drops does not hide the other origins. The leaf L is
+/// itself a full holder and S's directory lists it beside the origin O, whose
+/// store is empty. S never pulls from its requester, so it drops L, and O
+/// serves the leaf from its own origin.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_requester_holder_does_not_hide_the_cold_origin() -> Result<()> {
+async fn a_requester_holder_does_not_hide_the_directory_origin() -> Result<()> {
     let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 241) as u8).collect();
     let hash = support::register_payload(&payload);
     let total_bytes = u64::try_from(payload.len())?;
@@ -16817,12 +16752,12 @@ async fn a_requester_holder_does_not_hide_the_cold_origin() -> Result<()> {
     .await?;
     anyhow::ensure!(
         outcome.completed && outcome.hash_ok && outcome.received == total_bytes,
-        "the requester's delivery must complete through the cold origin"
+        "the requester's delivery must complete through the directory origin"
     );
     anyhow::ensure!(
-        o_cache_metrics.origin_fetches.get() == 1,
-        "O must fill from its origin exactly once, got {}",
-        o_cache_metrics.origin_fetches.get()
+        o_cache_metrics.pull_through_bytes.get() == support::own_origin_egress(&payload)?,
+        "O must read the blob and its outboard from its origin once, got {} bytes",
+        o_cache_metrics.pull_through_bytes.get()
     );
     shutdown([task_s, task_l, task_o], [&ep_s, &ep_l, &ep_o]).await?;
     Ok(())
@@ -16941,7 +16876,7 @@ async fn more_concurrent_misses_than_the_unadmitted_cap_share_one_upstream() -> 
         );
     }
     for (hash, payload) in hashes.iter().zip(&payloads) {
-        anyhow::ensure!(engine.get(*hash).await?.as_ref() == payload.as_slice());
+        anyhow::ensure!(support::fetch_blob(&engine, *hash).await?.as_ref() == payload.as_slice());
     }
     anyhow::ensure!(
         counter_value(

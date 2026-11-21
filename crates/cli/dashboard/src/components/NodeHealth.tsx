@@ -76,12 +76,12 @@ export function nodeTiles(
       {
         label: "Cache hit rate",
         value: metrics.hit_rate === null ? "—" : formatShare(metrics.hit_rate),
-        hint: "Hits over hits and misses since the node started",
+        hint: "Paid serves answered from held bytes, since the node started",
       },
       {
         label: "Serving",
         value: metrics.rates ? formatRate(metrics.rates.bytes) : "—",
-        hint: "Cache bytes returned per second since the scrape before",
+        hint: "Wire bytes served per second since the scrape before",
       },
       {
         label: "Unredeemed",

@@ -63,7 +63,7 @@ async fn concurrent_same_group_admits_are_idempotent() -> anyhow::Result<()> {
     b??;
 
     assert!(engine.present_ranges(hash).await?.is_complete());
-    let got = engine.get(hash).await?;
+    let got = engine.read_blob(hash).await?;
     assert_eq!(
         &got[..],
         &payload[..],

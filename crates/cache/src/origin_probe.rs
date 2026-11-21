@@ -1,15 +1,15 @@
-//! Live-origin probe memo (#1130 pt3): a bounded, TTL'd cache of
-//! `HEAD`/`HeadObject` existence answers so a per-request origin existence
-//! check does not hammer the backend.
+//! Live-origin presence memo (#1130 pt3): a bounded, TTL'd cache of origin
+//! existence answers, each read from an origin's `{H}.sizeproof`, so a
+//! per-request origin existence check does not hammer the backend.
 //!
 //! `rescan_origins` (#1130) builds the zero-I/O `origin_held` index from
 //! `enumerate()` ∪ pins, which for http/s3 covers pinned hashes ONLY (neither
 //! backend lists). A non-pinned bucket object is therefore invisible to the
 //! index. This memo backs the per-request fallback that consults the origin
-//! directly (`CacheEngine::origin_probe_presence`): it caches BOTH a positive answer
+//! directly (`CacheEngine::origin_presence`): it caches BOTH a positive answer
 //! (`Present(size)`) under a long positive TTL and a negative one (`Absent`)
 //! under a short negative TTL, so a flood of random-hash probes turns into at
-//! most one `HeadObject` per hash per TTL window rather than one per probe,
+//! most one origin read per hash per TTL window rather than one per probe,
 //! while a stale `Absent` cannot hide newly-available own content for more
 //! than the short negative window.
 //!
@@ -39,12 +39,12 @@ pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL: Duration =
 /// negative TTL because a client retrying one hash against a failing origin is
 /// the common shape, and this memo is keyed per hash: it collapses the repeats
 /// of a hash, not the namespace — during an outage, N distinct hashes still
-/// cost N live `HEAD`s per window. Shorter than the positive TTL because a
+/// cost N live reads per window. Shorter than the positive TTL because a
 /// memoised fault costs client-visible availability until it expires, so a
 /// recovered origin must be re-probed promptly.
 pub const DEFAULT_ORIGIN_PROBE_FAULT_TTL: Duration =
     Duration::from_secs(decdn_config_types::DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC);
-/// Default per-probe live-`HEAD` ceiling (`cache.origin_probe_timeout_ms`) — a
+/// Default per-probe live-read ceiling (`cache.origin_probe_timeout_ms`) — a
 /// slow origin must never stall the probe hot path.
 pub const DEFAULT_ORIGIN_PROBE_TIMEOUT: Duration =
     Duration::from_millis(decdn_config_types::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS);
@@ -60,11 +60,11 @@ pub enum Presence {
     /// The origin holds the blob; carries the total byte size for the probe's
     /// `total_bytes`.
     Present(u64),
-    /// No configured origin holds the blob (a `HEAD` 404, an unknown size,
-    /// or no origin — an authoritative "don't advertise").
+    /// No configured origin holds the blob (a `{H}.sizeproof` 404, or no
+    /// origin — an authoritative "don't advertise").
     Absent,
     /// The probe could not get an authoritative answer: a transport error or
-    /// a timeout (a `HEAD` overrun). Distinct from `Absent` on purpose — a
+    /// a timeout, or a size proof that does not verify. Distinct from `Absent` on purpose — a
     /// caller that would otherwise sign an authoritative `NotFound` must not
     /// do so on a fault, and a fault is worth memoising under its own TTL so
     /// a failing origin is not re-probed on every request for its namespace.
@@ -100,7 +100,7 @@ struct Entry {
     expires_at: Instant,
 }
 
-/// Live-origin probe policy: the three answer TTLs, the per-probe `HEAD`
+/// Live-origin probe policy: the three answer TTLs, the per-probe read
 /// ceiling, and the memo's capacity, resolved from the `cache.origin_probe_*`
 /// knobs.
 ///
@@ -118,7 +118,7 @@ pub struct OriginProbePolicy {
     /// TTL for a memoised `Fault` answer
     /// (`cache.origin_probe_fault_ttl_sec`).
     pub fault_ttl: Duration,
-    /// Per-probe ceiling on the live `HEAD`/`HeadObject`
+    /// Per-probe ceiling on the live origin walk
     /// (`cache.origin_probe_timeout_ms`).
     pub timeout: Duration,
     /// Max distinct hashes held in the memo
@@ -160,7 +160,7 @@ impl OriginProbeMemo {
         self.fault_ttl
     }
 
-    /// The per-probe live-`HEAD` ceiling this memo was configured with.
+    /// The per-probe live-walk ceiling this memo was configured with.
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }

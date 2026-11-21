@@ -93,10 +93,10 @@ The coverage bitmap holds at most `MAX_COVERAGE_BLOCKS` blocks (1,600 blocks, 10
 A discovery open does not set the flag. A paid leg sets it. Before admission, an open without the flag reads only this:
 
 - one store lookup;
-- for a blob that the node serves from its own origin, three origin reads that the node memoises per hash: a `HEAD` of the data object, the `{H}.sizeproof` object, and a `HEAD` of the `{H}.obao4` outboard;
+- for a blob that the node serves from its own origin, one read of the `{H}.sizeproof` object, which the node memoises per hash. The object states the size of the blob and proves it;
 - one signature.
 
-So repeats of a hash reach the origin at most once per memo TTL, and an unpaid open never costs origin egress in proportion to the blob. The node reads the outboard and the first range window only after admission at the first voucher. If the origin cannot serve the range, the node refuses the stream with a `StreamError` before any `ChunkData`. It then memoises the hash as having no outboard, and the next open of the hash degrades: `NotFound` without the flag, or the buffered origin fill with it. An origin without an outboard answers `NotFound` with an empty coverage.
+So repeats of a hash reach the origin at most once per memo TTL, and an unpaid open never costs origin egress in proportion to the blob. The node reads the outboard and the range windows only after admission at the first voucher. An origin publishes `{H}`, `{H}.obao4` and `{H}.sizeproof` for every blob that it holds ([ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard)). A missing or broken `{H}` or `{H}.obao4` is an origin fault. The node finds it after admission and refuses the stream with a `StreamError` before any `ChunkData`. The node memoises the fault, so the next open of the hash refuses at open. A blob without a `{H}.sizeproof` object has no proven size at the origin, so the node answers `NotFound` with an empty coverage.
 
 #### Deferred admission
 
@@ -298,7 +298,7 @@ The node limits inbound `cdn/client/v1` requests with two layered token buckets.
 
 Operators set the layers under `[serve.rate_limit]`. A rate of `0` turns a layer off.
 
-**Why the node limits unpaid requests.** A request costs the node work before any payment binds it. Most refusals after the node reads the request carry a signed `StreamResponse`. An origin-only node sends its backend a `HEAD` for an unseen hash before it checks a lane or a payment. An unseen pool or signer costs a chain read. Without a limit, a peer can spend the node's signing capacity, origin requests and RPC quota on requests that never pay.
+**Why the node limits unpaid requests.** A request costs the node work before any payment binds it. Most refusals after the node reads the request carry a signed `StreamResponse`. An origin-only node reads the `{H}.sizeproof` object of an unseen hash from its backend before it checks a lane or a payment. An unseen pool or signer costs a chain read. Without a limit, a peer can spend the node's signing capacity, origin requests and RPC quota on requests that never pay.
 
 **Why these defaults.** One request is one stream, and an honest client opens one stream per pull leg, with up to 100 at once on one connection ([§ Concurrent stream limits](#concurrent-stream-limits)). A discovery open is one stream too, so a fetch spends one request on each candidate before it pays. A node pulling on a cache miss shares one `NodeId` across all its pulls. `decdn-client` reads a `RATE_LIMITED` reset as back-off, not as a fault.
 

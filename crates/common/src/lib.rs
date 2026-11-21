@@ -4,7 +4,7 @@
 //! crate for the config schema, identity loading, and CLI argument structs
 //! they share. Wire formats and protocol-level types live in
 //! [`decdn_protocol`]; the config-vocabulary value types this schema is
-//! built from (`RetryPolicy`, `DecompressMode`, `OriginUrl`,
+//! built from (`RetryPolicy`, `OriginUrl`,
 //! `OriginKind`, `Hash`, `PinnedHashes`) live in the
 //! [`decdn_config_types`] leaf crate, so this crate (and the publisher
 //! CLI) never link the cache engine / iroh-blobs / AWS SDK. The

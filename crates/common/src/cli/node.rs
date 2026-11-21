@@ -134,10 +134,9 @@ pub enum NodeCommand {
     Drain(DrainArgs),
     /// Render a live (every `--interval-ms`) view of node activity by
     /// scraping the running node's `/metrics` HTTP endpoint (issue
-    /// #275). Shows active streams, cache hit rate, and cache bytes
-    /// returned — the operator-visible signal the issue calls "bytes
-    /// served" maps to `decdn_cache_bytes_returned_total` until the
-    /// network-side `cdn/client/v1` egress counter (#317) lands.
+    /// #275). Shows active streams, the serve-path cache hit rate
+    /// (`decdn_serve_cache_{hit,partial_hit,miss}_total`), and the wire
+    /// bytes served (`decdn_bytes_served_total`).
     Top(TopArgs),
     /// Register this node on-chain via `CapacityBond.registerNode` (ADR 019
     /// § Step 2.3). Loads the local iroh node key and Ethereum keystore,

@@ -27,24 +27,21 @@ use tokio::sync::{Notify, broadcast};
 
 use decdn_config_types::{CircuitBreakerPolicy, DeniedHashes, PinDiff, PinnedHashes, RetryPolicy};
 
-use crate::CHUNK_GROUP_BYTES;
 use crate::circuit_breaker::{
     Admission, Clock, OriginBreaker, OriginOutcome, SystemClock, TrialGuard,
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::fill_session::{FillClaim, FillRegistry, FillSession};
 use crate::metrics::CacheMetrics;
-use crate::origin::{Origin, OriginKind, OutboardFetch};
+use crate::origin::{Origin, OriginFetch, OriginKind, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
 use crate::origin_range::{
     MAX_CONCURRENT_RANGE_PULLS, OriginRangeCursor, OriginRangeWire, OriginReadBudget,
     RANGE_PULL_PERMIT_WARN_AFTER, within_origin_timeout,
 };
 use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
-use crate::range_pull::{AlignedRange, align_range, align_range_clamped};
-use crate::retry::{
-    TerminalFailure, classify_io_error, drain_to_bytes, run_with_retry_classified, should_buffer,
-};
+use crate::range_pull::{AlignedRange, align_range_clamped};
+use crate::retry::{ReadGuard, TerminalFailure, run_with_retry_classified};
 use crate::size_proofs::{SIZE_PROOF_ENTRIES, SizeProofMemo};
 use crate::{from_store_hash, to_store_hash};
 
@@ -122,6 +119,19 @@ struct RescanResolution {
     /// Faulted candidates that kept an entry from the previous index. Always
     /// `<= faults`, hence the same width.
     carried: u64,
+    /// Listed candidates that every origin answered with no `{H}.sizeproof`.
+    /// The listing proves the data object exists, so the publish is broken:
+    /// the object lacks the proof `decdn origin import` writes.
+    unpublished: u64,
+}
+
+/// One hash an origin rescan resolves.
+#[derive(Debug, Clone, Copy)]
+struct RescanCandidate {
+    hash: Hash,
+    /// Whether an origin's listing named the hash, as opposed to only the pin
+    /// set.
+    listed: bool,
 }
 
 /// One walk of the origin chain by [`CacheEngine::probe_origin_chain`].
@@ -138,6 +148,9 @@ struct ChainProbe {
     /// which a later origin's transient fault must not shadow), else the last —
     /// or the ceiling the walk overran. `None` for any other presence.
     cause: Option<String>,
+    /// For a `Present(size)`, the verified proof that the blob is `size`
+    /// bytes long. `None` for any other presence.
+    proof: Option<Bytes>,
 }
 
 /// The origin-held announce set plus what the rescan behind it could not
@@ -154,23 +167,23 @@ pub struct OriginHeldReport {
 }
 
 /// A live origin-existence answer (#1766), distinguishing a genuine negative
-/// from a backend fault. It is the target of the two-way collapse in
-/// `crate::origin_probe::Presence`: `Present`/`Absent` map straight across
-/// ([`CacheEngine::origin_probe_presence`]).
+/// from a backend fault ([`CacheEngine::origin_presence`]). It maps one to
+/// one onto the memoised `crate::origin_probe::Presence`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginPresence {
-    /// A configured origin holds the blob; carries the total byte size.
+    /// A configured origin holds the blob: its `{H}.sizeproof` proves the
+    /// total byte size it carries.
     Present(u64),
-    /// No configured origin holds the blob: a genuine `HEAD`/`HeadObject`
-    /// 404, or no origin is configured at all ([`CacheError::NoOrigin`] — a
-    /// node with nothing configured genuinely holds nothing; that is not a
-    /// transient condition).
+    /// No configured origin holds the blob: every origin answered that it
+    /// has no `{H}.sizeproof`, or no origin is configured at all (a node with
+    /// nothing configured genuinely holds nothing; that is not a transient
+    /// condition).
     Absent,
-    /// The probe could not get an authoritative answer: a transport error, or
-    /// the live `HEAD` overran `cache.origin_probe_timeout_ms`. Distinct from
-    /// `Absent` on purpose — a caller that would otherwise sign an
-    /// authoritative `NotFound` must not do so on a fault; see the
-    /// origin-only serve gate (`dispatch.rs`).
+    /// The walk could not get an authoritative answer: a transport error, a
+    /// `{H}.sizeproof` that does not verify, or the walk overran
+    /// `cache.origin_probe_timeout_ms`. Distinct from `Absent` on purpose — a
+    /// caller that would otherwise sign an authoritative `NotFound` must not
+    /// do so on a fault.
     Fault,
 }
 
@@ -186,9 +199,8 @@ impl From<Presence> for OriginPresence {
 
 /// Engine bundling a filesystem-backed iroh-blobs store with an optional
 /// origin backend. Lookups hit the store first; on miss and when an origin is
-/// configured, bytes are pulled and BLAKE3-verified. Insert-before-return is a
-/// property of the buffered path ([`Self::get`] / [`Self::populate`]), not of
-/// this type: [`Self::admit_bao`] commits only a verified sub-range.
+/// configured, bytes are pulled and BLAKE3-verified before they are stored or
+/// served. [`Self::admit_bao`] commits only a verified sub-range.
 #[derive(Debug, Clone)]
 pub struct CacheEngine {
     inner: Arc<Inner>,
@@ -198,25 +210,21 @@ pub struct CacheEngine {
 struct Inner {
     store: FsStore,
     /// Ordered list of origin backends consulted on cache misses
-    /// (#284). Empty vec => no pull-through configured; `pull_through`
+    /// (#284). Empty vec => no origin configured; `pull_through`
     /// short-circuits to `CacheError::NoOrigin`. A single-element vec
     /// is the single-origin case. Entries are tried in operator-supplied
     /// order; the next entry is consulted on `NotFound`, permanent error,
     /// or retry-budget exhaustion.
-    /// Deterministic per-origin failures (`HashMismatch`,
-    /// `BlobTooLarge`, and local-store errors classified as
-    /// `Store`) deliberately do not fall back — they indicate a
-    /// misbehaving backend or a degraded local store that must
-    /// surface, not be masked by trying a different mirror.
     origins: Vec<Arc<dyn Origin>>,
     /// Per-origin circuit-breakers (#963), parallel to `origins` by
-    /// index. `breakers[i]` fronts `origins[i]`'s pull-through retry
-    /// loop so a sustained outage on one backend fast-fails its misses
-    /// without burning retry/backoff, while the chain still advances to
-    /// the next backend. Always the same length as `origins` (built
-    /// together in `open_full`); an empty `origins` yields an empty
+    /// index. `breakers[i]` fronts every read of `origins[i]`: the
+    /// pull-through retry loop and each ranged-object read
+    /// ([`CacheEngine::read_guard`]). A sustained outage on one backend fast-fails
+    /// its reads without burning retry/backoff, while the chain still
+    /// advances to the next backend. Always the same length as `origins`
+    /// (built together in `open_full`); an empty `origins` yields an empty
     /// `breakers` and the `NoOrigin` short-circuit never reaches them.
-    breakers: Vec<OriginBreaker>,
+    breakers: Vec<Arc<OriginBreaker>>,
     max_blob_bytes: u64,
     /// Per-hash recency for eviction ordering: the instant of the last access,
     /// or the open-time seed.
@@ -311,20 +319,15 @@ struct Inner {
     /// collapses any number of triggers into a single rerun, which is all a
     /// rerun can be worth — the next pass re-derives everything from scratch.
     rescan_slot: AtomicU8,
-    /// Live-origin probe memo (#1130 pt3). The `origin_held` index only covers
-    /// fs enumeration ∪ pins — http/s3 do not list, so a non-pinned bucket
-    /// object is absent from it. [`CacheEngine::origin_probe_presence`] falls back to
-    /// a live `HEAD`/`HeadObject` for such hashes and memoises the answer here
-    /// (positive AND negative) under `cache.origin_probe_ttl_sec`, so a probe
-    /// flood costs at most one origin round-trip per hash per TTL window rather
-    /// than one per probe. Restart-configured; swapped in wholesale by
-    /// [`CacheEngine::set_origin_probe_config`] at bring-up.
+    /// Live-origin presence memo (#1130 pt3). The `origin_held` index only
+    /// covers fs enumeration ∪ pins — http/s3 do not list, so a non-pinned
+    /// bucket object is absent from it. [`CacheEngine::origin_presence`] reads
+    /// each origin's `{H}.sizeproof` for such hashes and memoises the answer
+    /// here (positive AND negative AND fault) under the `cache.origin_probe_*`
+    /// TTLs, so a probe flood costs at most one origin round-trip per hash per
+    /// TTL window rather than one per probe. Restart-configured; swapped in
+    /// wholesale by [`CacheEngine::set_origin_probe_config`] at bring-up.
     origin_probe_memo: Mutex<OriginProbeMemo>,
-    /// Memo of [`CacheEngine::origin_outboard_published`]: whether an origin
-    /// publishes a hash's `{H}.obao4` outboard, under the same TTLs as
-    /// `origin_probe_memo`. An origin whose ranges a serve finds unusable is
-    /// memoised as publishing none ([`CacheEngine::origin_range_serviceable`]).
-    outboard_probe_memo: Mutex<OriginProbeMemo>,
     /// Hashes this node refuses to serve, announce, or acquire because the
     /// operator's own `[content] denied_hashes` names them, and which a later
     /// config reload can UN-refuse (ADR 011 § Local Denylist). The governance
@@ -367,7 +370,7 @@ struct Inner {
     chain_denied: ArcSwap<HashSet<Hash>>,
     /// Hashes the operator has explicitly evicted via [`CacheEngine::evict`]
     /// (issue #279). Membership is honored by [`CacheEngine::has`] and
-    /// [`CacheEngine::get`] so an evicted blob is not served, even though
+    /// [`CacheEngine::populate`] so an evicted blob is not served, even though
     /// the underlying iroh-blobs store may still hold the bytes —
     /// `Blobs::delete` is `pub(crate)` in iroh-blobs and reserved for the
     /// GC task. [`CacheEngine::evict`] deletes the blob's protecting named
@@ -506,30 +509,23 @@ struct Inner {
     /// (#2065); each holds a permit for its whole span and `O(window + outboard)`
     /// bytes, so the bound caps their sum.
     own_origin_range_pulls: Arc<tokio::sync::Semaphore>,
-    /// Per configured origin (same index as `origins`): whether the origin has
-    /// served a clean first range window. Set on the first such window, by the
-    /// serviceability probe ([`CacheEngine::origin_range_serviceable`]) or a
-    /// draw, and never cleared, so the probe's range half reads nothing for a
-    /// confirmed origin. An origin that later stops serving ranges fails its
-    /// draw like any other mid-life origin fault.
-    origin_range_confirmed: Box<[AtomicBool]>,
     /// Origin `{H}.obao4` outboards already read, keyed by hash, tagged with
-    /// the serving origin, and bounded by bytes. The serviceability probe's
-    /// outboard half ([`CacheEngine::origin_fetch_outboard_bytes`]) and every
-    /// [`CacheEngine::origin_range_wire`] draw read it and fill it. Each
+    /// the serving origin, and bounded by bytes. Every
+    /// [`CacheEngine::origin_range_wire`] draw reads it and fills it. Each
     /// [`OriginRangeWire`] holds a handle and evicts the copy it used when the
     /// range fails bao verification.
     outboards: OutboardCache,
-    /// In-memory cache of the verified size proofs the store keeps under
-    /// named tags ([`CacheEngine::size_proof`]). Evicting a blob drops its
-    /// proof from both.
+    /// In-memory cache of the verified size proofs the engine keeps
+    /// ([`CacheEngine::size_proof`]), including the ones
+    /// [`CacheEngine::origin_presence`] read from an origin. The store keeps
+    /// the proof of a held blob under a named tag too. Evicting a blob drops
+    /// its proof from both.
     size_proofs: SizeProofMemo,
-    /// One async lock per hash whose `{H}.sizeproof` an origin read is
-    /// fetching ([`CacheEngine::size_proof`]), held as `Weak` like
-    /// `outboard_flights`.
-    size_proof_flights: Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>,
-    /// `(hash, size)` pairs no origin proved, and when a lookup found that.
-    size_proof_misses: Mutex<HashMap<(Hash, u64), Instant>>,
+    /// One async lock per hash whose origin presence a live walk is reading
+    /// ([`CacheEngine::origin_presence`]), held as `Weak` like
+    /// `outboard_flights`, so concurrent opens of a cold hash read the origin
+    /// once.
+    presence_flights: Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>,
     /// Whether the open-time recency seed walked the whole store, so the
     /// access times name every blob it holds. The orphan proof sweep runs only
     /// then ([`CacheEngine::sweep_orphan_size_proofs`]).
@@ -583,7 +579,7 @@ impl Inner {
     /// the old one, but the latch still bounds a pathological panic loop).
     ///
     /// Note the coalescing wait this guards (`notify.notified().await` in
-    /// [`CacheEngine::get`]) has no deadline of its own; callers impose
+    /// [`CacheEngine::populate`]) has no deadline of its own; callers impose
     /// their own (the node wraps `populate` in `tokio::time::timeout`).
     fn lock_inflight(&self) -> MutexGuard<'_, HashMap<Hash, Arc<Notify>>> {
         match self.inflight.lock() {
@@ -1472,7 +1468,7 @@ fn append_evicted_log(path: &Path, hash: Hash) -> std::io::Result<()> {
 enum GatedOutboard {
     /// The origin served an outboard of the exact length.
     Found(Bytes),
-    /// The origin has no outboard for the hash, or does not publish outboards.
+    /// The origin has no outboard for the hash.
     Declined,
     /// The origin served an outboard of the wrong length, which cannot verify.
     WrongLength,
@@ -1665,9 +1661,14 @@ impl CacheEngine {
         // output as the rest of the cache group (#963).
         let breakers = origins
             .iter()
-            .map(|_| OriginBreaker::new(circuit_breaker, Arc::clone(&clock), metrics.clone()))
+            .map(|_| {
+                Arc::new(OriginBreaker::new(
+                    circuit_breaker,
+                    Arc::clone(&clock),
+                    metrics.clone(),
+                ))
+            })
             .collect::<Vec<_>>();
-        let origin_range_confirmed = origins.iter().map(|_| AtomicBool::new(false)).collect();
 
         // `checked_sub` fails only within `COLD_SEED_AGE` of the monotonic
         // clock's origin (near boot). Seeding at `opened` then still sorts at or
@@ -1696,7 +1697,6 @@ impl CacheEngine {
                 origin_held: ArcSwap::from(Arc::new(OriginHeldIndex::default())),
                 rescan_slot: AtomicU8::new(RESCAN_IDLE),
                 origin_probe_memo: Mutex::new(OriginProbeMemo::default()),
-                outboard_probe_memo: Mutex::new(OriginProbeMemo::default()),
                 denied: ArcSwap::from(Arc::new(HashSet::new())),
                 chain_denied: ArcSwap::from(Arc::new(HashSet::new())),
                 evicted: MonotoneHashSet::new(evicted),
@@ -1723,11 +1723,9 @@ impl CacheEngine {
                 own_origin_range_pulls: Arc::new(tokio::sync::Semaphore::new(
                     MAX_CONCURRENT_RANGE_PULLS,
                 )),
-                origin_range_confirmed,
                 outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES),
                 size_proofs: SizeProofMemo::new(SIZE_PROOF_ENTRIES),
-                size_proof_flights: Mutex::new(HashMap::new()),
-                size_proof_misses: Mutex::new(HashMap::new()),
+                presence_flights: Mutex::new(HashMap::new()),
                 recency_seeded: AtomicBool::new(false),
                 outboard_flights: Mutex::new(HashMap::new()),
                 origin_read_head_start_ms: AtomicU64::new(0),
@@ -1934,16 +1932,16 @@ impl CacheEngine {
     /// `decdn_cache_origin_enumerate_failures_total` and rides the same
     /// snapshot.
     ///
-    /// Every adapter reserves [`Origin::size`]'s `Ok(None)` for an
+    /// Every adapter reserves [`Origin::fetch_size_proof`]'s `Ok(None)` for an
     /// authoritative absence (a genuine 404): an HTTP or S3 5xx/408/429
     /// surfaces as a transient fault and carries forward, a permission decline
     /// as a permanent one — so no outage is dropped here as an absence.
     ///
-    /// **Cost:** one origin probe per deduped candidate — every listed entry and
-    /// every pin, including the ones that resolve absent and never enter the
-    /// index. A local `metadata()` stat per fs entry, one HTTP `HEAD` / S3
-    /// `HeadObject` per remote one. Runs off the hot path at the configured
-    /// rescan cadence (startup / interval / reload), never per request.
+    /// **Cost:** one `{H}.sizeproof` read per deduped candidate — every listed
+    /// entry and every pin, including the ones that resolve absent and never
+    /// enter the index. Each object is a few KiB at most. Runs off the hot path
+    /// at the configured rescan cadence (startup / interval / reload), never
+    /// per request.
     ///
     /// One pass at a time, with any number of triggers arriving during a pass
     /// collapsing into a single rerun. A trigger that finds a pass in flight
@@ -2035,6 +2033,7 @@ impl CacheEngine {
             held,
             faults,
             carried,
+            unpublished,
         } = self.resolve_candidates(candidates).await;
 
         let count = held.len();
@@ -2043,6 +2042,21 @@ impl CacheEngine {
             probe_faults: faults,
             enumerate_failures,
         }));
+        self.report_rescan(count, faults, carried, enumerate_failures, unpublished);
+        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
+    }
+
+    /// Count and log what one rescan could not resolve: probe faults (of
+    /// which `carried` kept an older entry), failed listings, and listed
+    /// objects with no `{H}.sizeproof`. `count` is the size of the new index.
+    fn report_rescan(
+        &self,
+        count: usize,
+        faults: u64,
+        carried: u64,
+        enumerate_failures: u64,
+        unpublished: u64,
+    ) {
         if let Some(m) = &self.inner.metrics {
             if faults > 0 {
                 m.origin_probe_failures.inc_by(faults);
@@ -2050,6 +2064,16 @@ impl CacheEngine {
             if enumerate_failures > 0 {
                 m.origin_enumerate_failures.inc_by(enumerate_failures);
             }
+            if unpublished > 0 {
+                m.size_proof_origin_missing.inc_by(unpublished);
+            }
+        }
+        if unpublished > 0 {
+            tracing::warn!(
+                unpublished,
+                "rescan_origins: listed origin objects have no `{{H}}.sizeproof`, so the node \
+                 neither advertises nor serves them; run `decdn origin import` for each"
+            );
         }
         if faults > 0 {
             tracing::warn!(
@@ -2062,7 +2086,6 @@ impl CacheEngine {
                  resolves them"
             );
         }
-        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
     }
 
     /// The store upkeep each rescan runs first: lift the quarantines GC
@@ -2076,21 +2099,26 @@ impl CacheEngine {
     }
 
     /// Every hash [`Self::rescan_origins`] considers: each enumerable origin's
-    /// listing plus the operator pin set.
+    /// listing plus the operator pin set. Each hash says whether a listing
+    /// named it ([`RescanCandidate::listed`]).
     ///
     /// The pin set is snapshotted here rather than read inside the probe loop,
-    /// so its `ArcSwap` guard is not held across a `size()` await.
+    /// so its `ArcSwap` guard is not held across a probe await.
     ///
     /// Also returns how many origins failed to enumerate. Such an origin
     /// contributes nothing this pass — its hashes are never probed, so they
     /// carry no per-hash fault and simply leave the index. Only the operator
     /// pins naming them survive.
-    async fn rescan_candidates(&self) -> (Vec<Hash>, u64) {
-        let mut candidates: Vec<Hash> = Vec::new();
+    async fn rescan_candidates(&self) -> (Vec<RescanCandidate>, u64) {
+        let mut candidates: Vec<RescanCandidate> = Vec::new();
         let mut enumerate_failures = 0u64;
         for origin in &self.inner.origins {
             match origin.enumerate().await {
-                Ok(hashes) => candidates.extend(hashes),
+                Ok(hashes) => candidates.extend(
+                    hashes
+                        .into_iter()
+                        .map(|hash| RescanCandidate { hash, listed: true }),
+                ),
                 Err(err) => {
                     enumerate_failures = enumerate_failures.saturating_add(1);
                     tracing::warn!(
@@ -2103,24 +2131,32 @@ impl CacheEngine {
                 }
             }
         }
-        candidates.extend(self.inner.pinned.load().iter().copied());
+        candidates.extend(
+            self.inner
+                .pinned
+                .load()
+                .iter()
+                .map(|&hash| RescanCandidate {
+                    hash,
+                    listed: false,
+                }),
+        );
         (candidates, enumerate_failures)
     }
 
     /// Resolve each candidate against the origin chain for
     /// [`Self::rescan_origins`], deduping so a hash is probed once.
     ///
-    /// One local stat (fs) or one `HEAD` (pinned remote) per deduped candidate,
-    /// through [`Self::probe_origin_chain`] rather than
-    /// [`Self::origin_size`], which folds a transport error into "origin doesn't
-    /// have it".
+    /// One `{H}.sizeproof` read per deduped candidate, through
+    /// [`Self::probe_origin_chain`].
     ///
-    /// The probe memo is deliberately bypassed: an enumeration is as large as
-    /// the origin's listing, and the memo is a bounded map that evicts an
-    /// arbitrary live entry once full, so walking a rescan through it would push
-    /// out the serve path's warm answers. The store walk in the DHT seed does go
-    /// through the memo, because it asks the same question the serve gate asks
-    /// about the same hashes moments later.
+    /// The presence memo and the kept size-proof memo are deliberately
+    /// bypassed: an enumeration is as large as the origin's listing, and both
+    /// memos are bounded maps that evict a live entry once full, so walking a
+    /// rescan through them would push out the serve path's warm answers. The
+    /// store walk in the DHT seed does go through the presence memo, because it
+    /// asks the same question the serve gate asks about the same hashes
+    /// moments later.
     ///
     /// Each candidate is bounded by [`RESCAN_PROBE_TIMEOUT`], not by
     /// `cache.origin_probe_timeout_ms` — that knob exists to stop a slow origin
@@ -2128,7 +2164,7 @@ impl CacheEngine {
     /// critical path has no reason to be that impatient. A candidate that
     /// overruns is a fault like any other, so borrowing the tighter budget would
     /// turn a merely slow origin into an empty index on a cold boot.
-    async fn resolve_candidates(&self, candidates: Vec<Hash>) -> RescanResolution {
+    async fn resolve_candidates(&self, candidates: Vec<RescanCandidate>) -> RescanResolution {
         // `load_full` rather than holding the `ArcSwap` guard: the guard would
         // be held across every probe await below, which is the long-lived-guard
         // case arc-swap tells callers to avoid.
@@ -2140,7 +2176,8 @@ impl CacheEngine {
         // so keying off `held` re-probes those hashes once per duplicate and
         // counts one fault per probe.
         let mut seen: HashSet<Hash> = HashSet::new();
-        for hash in candidates {
+        // Listings come before pins, so a hash that is both is seen as listed.
+        for RescanCandidate { hash, listed } in candidates {
             if self.refuses(hash) || !seen.insert(hash) {
                 continue;
             }
@@ -2149,7 +2186,18 @@ impl CacheEngine {
                 OriginPresence::Present(size) => {
                     out.held.insert(hash, size);
                 }
-                OriginPresence::Absent => {}
+                // A pin can name a hash the origin does not hold. A listing
+                // proves the data object exists, so a listed hash with no size
+                // proof is a broken publish.
+                OriginPresence::Absent => {
+                    if listed {
+                        out.unpublished = out.unpublished.saturating_add(1);
+                        tracing::debug!(
+                            %hash,
+                            "rescan_origins: listed object has no `{{H}}.sizeproof`"
+                        );
+                    }
+                }
                 OriginPresence::Fault => {
                     out.faults = out.faults.saturating_add(1);
                     // Carry forward only what a later pass might resolve. A
@@ -2220,16 +2268,16 @@ impl CacheEngine {
     /// Walk the origin chain for `hash`, distinguishing a genuine negative from
     /// a backend fault, with no memo read or write.
     ///
-    /// Deliberately not routed through [`Self::origin_size`]: that helper's
-    /// per-origin error handling is swallow-and-advance, so other callers can
-    /// fall through a dead origin to a live one, and its terminal `Ok(None)`
-    /// folds a fault into a negative. A fault-aware caller needs the raw
-    /// per-origin outcomes instead.
+    /// Each origin is asked for its `{H}.sizeproof` object
+    /// ([`Origin::fetch_size_proof`]). The object states the blob's size
+    /// beside its proof ([`decdn_bao_range::parse_size_proof_object`]), and
+    /// the proof is verified against `hash` at that size.
     ///
-    /// - ANY origin answering `Ok(Some(size))` is `Present(size)` — the first
-    ///   such answer wins, same order as [`Self::origin_size`];
+    /// - ANY origin serving an object that verifies is `Present(size)` — the
+    ///   first such answer wins, in chain order;
     /// - failing that, ANY origin answering `Err(_)` (a transport error), or
-    ///   the whole walk overrunning `timeout`, is `Fault`;
+    ///   serving an object that does not parse or verify, or the whole walk
+    ///   overrunning `timeout`, is `Fault`;
     /// - only when every configured origin answered `Ok(None)` — or no origin
     ///   is configured at all, a node that genuinely holds nothing — is the
     ///   answer `Absent`. This is deliberately the lowest-precedence outcome:
@@ -2242,57 +2290,72 @@ impl CacheEngine {
     /// A `Fault` also says whether it is worth waiting out
     /// ([`ChainProbe::transient`]): `true` when at least one origin failed with
     /// a retry-eligible error, or the walk hit its ceiling. A `Fault` built only
-    /// from [`OriginPullError::Permanent`] — a symlink escape, a permission
-    /// denied, an HTTP 4xx — will still be there on the next pass and the one
-    /// after, so a caller that would otherwise hold state open on the strength
-    /// of "this might come back" must not. It also carries the walk's last
+    /// from [`OriginPullError::Permanent`] or a broken object — a symlink
+    /// escape, a permission denied, an HTTP 4xx, a proof that does not verify
+    /// — will still be there on the next pass and the one after, so a caller
+    /// that would otherwise hold state open on the strength of "this might
+    /// come back" must not. It also carries the walk's first operator-actionable
     /// per-origin error ([`ChainProbe::cause`]) for the caller's log.
     ///
-    /// **Never fetches the body** — existence and size only.
+    /// Reads no data object and no outboard.
     async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> ChainProbe {
         let walk = async {
             let mut cause = None;
             let mut kept_permanent_cause = false;
             let mut any_transient = false;
-            for origin in &self.inner.origins {
-                match origin.size(hash).await {
-                    Ok(Some(size)) => {
-                        return ChainProbe {
-                            presence: OriginPresence::Present(size),
-                            transient: false,
-                            cause: None,
-                        };
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            %hash,
-                            kind = ?origin.kind(),
-                            error = %format_args!("{e:#}"),
-                            transient = e.is_transient(),
-                            "origin-probe HEAD faulted; checking remaining origins",
-                        );
-                        // Keep the first non-transient cause: it is the
-                        // operator-actionable one, and a later origin's
-                        // transient fault must not shadow it.
-                        if !kept_permanent_cause {
-                            kept_permanent_cause = !e.is_transient();
-                            cause = Some(format!("{:?} origin: {e:#}", origin.kind()));
+            for (ix, origin) in self.inner.origins.iter().enumerate() {
+                let read = self
+                    .read_guard(ix)
+                    .run(hash, || origin.fetch_size_proof(hash))
+                    .await;
+                let (fault, transient) = match read {
+                    Ok(Some(object)) => match verified_size_proof(hash, &object) {
+                        Some((size, proof)) => {
+                            return ChainProbe {
+                                presence: OriginPresence::Present(size),
+                                transient: false,
+                                cause: None,
+                                proof: Some(proof),
+                            };
                         }
-                        any_transient |= e.is_transient();
-                    }
+                        None => (
+                            "its `{H}.sizeproof` does not verify against the hash; re-run \
+                             `decdn origin import` for the object"
+                                .to_owned(),
+                            false,
+                        ),
+                    },
+                    Ok(None) => continue,
+                    Err(e) => (format!("{e:#}"), e.is_transient()),
+                };
+                tracing::debug!(
+                    %hash,
+                    kind = ?origin.kind(),
+                    error = %fault,
+                    transient,
+                    "origin presence read faulted; checking remaining origins",
+                );
+                // Keep the first non-transient cause: it is the
+                // operator-actionable one, and a later origin's transient
+                // fault must not shadow it.
+                if !kept_permanent_cause {
+                    kept_permanent_cause = !transient;
+                    cause = Some(format!("{:?} origin: {fault}", origin.kind()));
                 }
+                any_transient |= transient;
             }
             match cause {
                 Some(cause) => ChainProbe {
                     presence: OriginPresence::Fault,
                     transient: any_transient,
                     cause: Some(cause),
+                    proof: None,
                 },
                 None => ChainProbe {
                     presence: OriginPresence::Absent,
                     transient: false,
                     cause: None,
+                    proof: None,
                 },
             }
         };
@@ -2304,38 +2367,45 @@ impl CacheEngine {
                 presence: OriginPresence::Fault,
                 transient: true,
                 cause: Some(format!("the origin chain walk overran {timeout:?}")),
+                proof: None,
             },
         }
     }
 
-    /// Live existence probe against the configured origins, distinguishing a
-    /// genuine negative from a backend fault (#1766). Callers must NOT treat a
-    /// fault as an authoritative absence (the origin-only serve gate).
+    /// Whether a configured origin holds `hash`, and its proven size,
+    /// distinguishing a genuine negative from a backend fault (#1766).
+    /// Callers must NOT treat a fault as an authoritative absence.
     ///
     /// The `origin_held` index covers fs enumeration ∪ pins only — http/s3 do
-    /// not list — so this is the fallback for a non-pinned bucket object.
+    /// not list — so this is the answer for a non-pinned bucket object.
     /// Callers consult [`Self::origin_held_size`] first (zero I/O) and fall
     /// back here on its miss.
     ///
-    /// A memo hit returns with no I/O. On a miss the origin chain is walked
-    /// under a `cache.origin_probe_timeout_ms` ceiling — deliberately not via
-    /// [`Self::origin_size`], whose per-origin error handling is
-    /// swallow-and-advance so other callers can fall through a dead origin to a
-    /// live one — and this layer decides what to remember:
+    /// The answer is the origin's `{H}.sizeproof` object, which states the
+    /// size beside its proof: the live walk reads at most one such object per
+    /// origin and nothing else — no data object, no outboard. A verified proof
+    /// is kept in the engine's size-proof memo, so [`Self::size_proof`] then
+    /// answers that size with no further origin read. A refused hash
+    /// ([`Self::refuses`]) is `Absent` with no read.
+    ///
+    /// A memo hit returns with no I/O. On a miss one live walk runs per hash
+    /// at a time — a concurrent caller waits for it and takes its memoised
+    /// answer — under a `cache.origin_probe_timeout_ms` ceiling, and this
+    /// layer decides what to remember:
     ///
     /// - `Present(size)` is memoised under the positive TTL;
-    /// - `Fault` is memoised under the fault TTL (#1789 item 6). The memo is
-    ///   keyed per hash, so this bounds repeat probes OF THE SAME HASH to one
-    ///   live `HEAD` per fault TTL — the common shape when a client retries a
-    ///   request against a failing origin. It does not bound namespace-wide
-    ///   load: during an outage, N distinct hashes still cost N live `HEAD`s
-    ///   per window. The TTL is graded against its neighbours and the config
-    ///   resolver enforces `negative <= fault <= positive`: patient enough that
-    ///   a retried hash is not re-probed as often as an absence, eager enough
-    ///   that a recovered origin is noticed soon — a memoised fault costs
-    ///   client-visible availability, since the origin-only serve gate answers
-    ///   `InternalError` and the open/DHT paths report this node holds nothing
-    ///   for as long as it stands.
+    /// - `Fault` — a transport error, an object that does not parse or
+    ///   verify, or the walk overrunning its ceiling — is memoised under the
+    ///   fault TTL (#1789 item 6). The memo is keyed per hash, so this bounds
+    ///   repeat reads OF THE SAME HASH to one live walk per fault TTL — the
+    ///   common shape when a client retries a request against a failing
+    ///   origin. It does not bound namespace-wide load: during an outage, N
+    ///   distinct hashes still cost N live walks per window. The TTL is graded
+    ///   against its neighbours and the config resolver enforces
+    ///   `negative <= fault <= positive`: patient enough that a retried hash
+    ///   is not re-read as often as an absence, eager enough that a recovered
+    ///   origin is noticed soon — a memoised fault costs client-visible
+    ///   availability for as long as it stands.
     /// - `Absent` — every configured origin answered `Ok(None)`, or none is
     ///   configured at all (a node with nothing configured genuinely holds
     ///   nothing, which is not transient) — is memoised under the short
@@ -2344,22 +2414,44 @@ impl CacheEngine {
     ///   `Err`, which reaches the `Fault` arm instead — so this arm never
     ///   caches a 5xx as an absence.
     ///
-    /// **Never fetches the body** — existence and size only.
-    pub async fn origin_probe_presence(&self, hash: Hash) -> OriginPresence {
+    /// A ranged read that faults after a `Present` answer (a missing or
+    /// broken `{H}.obao4` or `{H}`) replaces the memoised `Present` with
+    /// `Fault` ([`Self::origin_range_wire`]), so a broken publish costs one
+    /// refused stream per fault TTL, not one per open.
+    ///
+    /// Each origin's read runs under its circuit breaker and the retry
+    /// policy, inside the ceiling.
+    pub async fn origin_presence(&self, hash: Hash) -> OriginPresence {
+        self.origin_presence_with_proof(hash, false).await
+    }
+
+    /// [`Self::origin_presence`]. With `need_proof`, a memoised `Present`
+    /// whose proof the size-proof memo no longer keeps runs the live walk
+    /// again, so the caller finds the proof kept on return.
+    async fn origin_presence_with_proof(&self, hash: Hash, need_proof: bool) -> OriginPresence {
         if self.refuses(hash) {
             return OriginPresence::Absent;
         }
+        if let Some(presence) = self.memoised_presence(hash, need_proof) {
+            return presence;
+        }
+        // One live walk per hash: a concurrent caller waits here, then finds
+        // the walk's answer in the memo.
+        let flight = self.presence_flight(hash);
+        let _walking = flight.lock().await;
+        if let Some(presence) = self.memoised_presence(hash, need_proof) {
+            return presence;
+        }
         let now = Instant::now();
-        let timeout = {
-            let mut memo = self.probe_memo_lock();
-            if let Some(presence) = memo.get(hash, now) {
-                return presence.into();
-            }
-            memo.timeout()
-        };
-        // Live probe off the memo lock (never hold it across the await).
+        let timeout = self.probe_memo_lock().timeout();
+        // Live walk off the memo lock (never hold it across the await).
         let probe = self.probe_origin_chain(hash, timeout).await;
         let presence = probe.presence;
+        if let (OriginPresence::Present(size), Some(proof)) = (presence, probe.proof) {
+            // Into the memo before the presence answer, so a caller that sees
+            // `Present` finds the proof.
+            self.inner.size_proofs.insert(hash, size, proof, false);
+        }
         let memo_presence = match presence {
             OriginPresence::Present(size) => Presence::Present(size),
             OriginPresence::Absent => Presence::Absent,
@@ -2370,20 +2462,56 @@ impl CacheEngine {
             // fires at most once per hash per fault TTL — and it is the only
             // record that this node is about to refuse serves and answer opens
             // with "not held" for content it may well hold. It names the walk's
-            // last per-origin error, so a permanent fault (a symlink escape, a
-            // permission denied) shows at the default level; each per-origin
-            // error also logs at debug as the walk meets it.
+            // first operator-actionable per-origin error, so a permanent fault
+            // (a symlink escape, a permission denied, a broken size proof)
+            // shows at the default level; each per-origin error also logs at
+            // debug as the walk meets it.
             tracing::warn!(
                 %hash,
                 fault_ttl_secs = self.probe_memo_lock().fault_ttl().as_secs(),
                 transient = probe.transient,
                 cause = probe.cause.as_deref().unwrap_or("unknown"),
-                "origin probe faulted; memoising the fault — serves for this hash \
+                "origin presence read faulted; memoising the fault — serves for this hash \
                  answer InternalError and opens answer not-held until it expires"
             );
         }
         self.probe_memo_lock().insert(hash, memo_presence, now);
         presence
+    }
+
+    /// The memoised presence of `hash`, or `None` to run the live walk: no
+    /// live memo entry, or (with `need_proof`) a `Present` whose proof the
+    /// size-proof memo no longer keeps.
+    fn memoised_presence(&self, hash: Hash, need_proof: bool) -> Option<OriginPresence> {
+        let presence = self.probe_memo_lock().get(hash, Instant::now())?;
+        if need_proof
+            && let Presence::Present(size) = presence
+            && self
+                .inner
+                .size_proofs
+                .get(&hash)
+                .is_none_or(|kept| kept.size != size)
+        {
+            return None;
+        }
+        Some(presence.into())
+    }
+
+    /// The per-hash lock of the live presence walk
+    /// ([`Inner::presence_flights`]).
+    fn presence_flight(&self, hash: Hash) -> Arc<tokio::sync::Mutex<()>> {
+        let mut flights = self
+            .inner
+            .presence_flights
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(live) = flights.get(&hash).and_then(Weak::upgrade) {
+            return live;
+        }
+        flights.retain(|_, w| w.strong_count() > 0);
+        let flight = Arc::new(tokio::sync::Mutex::new(()));
+        flights.insert(hash, Arc::downgrade(&flight));
+        flight
     }
 
     /// Lock the origin-probe memo, recovering a poisoned mutex rather than
@@ -2403,99 +2531,6 @@ impl CacheEngine {
     /// so the value need not thread through every test constructor.
     pub fn set_origin_probe_config(&self, policy: OriginProbePolicy) {
         *self.probe_memo_lock() = OriginProbeMemo::new(policy);
-        *self.outboard_memo_lock() = OriginProbeMemo::new(policy);
-    }
-
-    /// Lock the outboard-presence memo, recovering a poisoned mutex as
-    /// [`Self::probe_memo_lock`] does.
-    fn outboard_memo_lock(&self) -> std::sync::MutexGuard<'_, OriginProbeMemo> {
-        self.inner
-            .outboard_probe_memo
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Whether an origin publishes the `{H}.obao4` outboard of `hash`, a
-    /// `total_bytes`-byte blob, learnt without reading it: a memoised answer,
-    /// a cached copy, or an [`Origin::has_outboard`] probe of each origin in
-    /// turn. The serve-miss path asks before it answers an open from its own
-    /// origin, so an open the payer has not taken reads no outboard and no
-    /// data. The outboard read and the range window run after admission
-    /// ([`Self::origin_range_serviceable`]).
-    ///
-    /// Answers memoise per hash under the origin-probe TTLs
-    /// ([`Self::set_origin_probe_config`]), so repeats of a hash reach the
-    /// origin once per TTL. A size claim past the blob cap answers `false`
-    /// with no read, as the outboard read does.
-    ///
-    /// # Errors
-    ///
-    /// [`CacheError::OriginError`] when no origin publishes the outboard and at
-    /// least one probe faulted or the walk overran the probe timeout, or such
-    /// a fault is memoised.
-    pub async fn origin_outboard_published(
-        &self,
-        hash: Hash,
-        total_bytes: u64,
-    ) -> CacheResult<bool> {
-        if total_bytes > self.inner.max_blob_bytes {
-            return Ok(false);
-        }
-        let fault = |cause: String| CacheError::OriginError {
-            hash,
-            source: anyhow::anyhow!(cause),
-        };
-        let now = Instant::now();
-        let timeout = {
-            let mut memo = self.outboard_memo_lock();
-            match memo.get(hash, now) {
-                Some(Presence::Present(_)) => return Ok(true),
-                Some(Presence::Absent) => return Ok(false),
-                Some(Presence::Fault) => {
-                    return Err(fault("an origin outboard probe faulted (memoised)".into()));
-                }
-                None => memo.timeout(),
-            }
-        };
-        // A cached copy answers with no origin read. The memo goes first: it
-        // holds a hash whose ranges a serve found unusable.
-        if self
-            .inner
-            .outboards
-            .get(hash, expected_outboard_len(total_bytes))
-            .is_some()
-        {
-            return Ok(true);
-        }
-        let walk = async {
-            let mut last_fault = None;
-            for origin in &self.inner.origins {
-                match origin.has_outboard(hash).await {
-                    Ok(true) => return Ok(true),
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::debug!(
-                            %hash,
-                            kind = ?origin.kind(),
-                            error = %format_args!("{e:#}"),
-                            "origin outboard probe faulted; checking remaining origins",
-                        );
-                        last_fault = Some(format!("{:?} origin: {e:#}", origin.kind()));
-                    }
-                }
-            }
-            last_fault.map_or(Ok(false), Err)
-        };
-        let answer = tokio::time::timeout(timeout, walk)
-            .await
-            .unwrap_or_else(|_| Err(format!("the outboard probe walk overran {timeout:?}")));
-        let presence = match &answer {
-            Ok(true) => Presence::Present(total_bytes),
-            Ok(false) => Presence::Absent,
-            Err(_) => Presence::Fault,
-        };
-        self.outboard_memo_lock().insert(hash, presence, now);
-        answer.map_err(fault)
     }
 
     /// Swap in the live *local* denied set from `[content] denied_hashes` (ADR
@@ -2857,8 +2892,8 @@ impl CacheEngine {
         Ok(aligned.chunk_ranges().clone() - present.chunk_ranges())
     }
 
-    /// Mark `hash` as evicted: subsequent [`Self::has`] / [`Self::get`] calls
-    /// behave as if the blob is absent (returning `false` / `NotFound`
+    /// Mark `hash` as evicted: subsequent [`Self::has`] / [`Self::populate`]
+    /// calls behave as if the blob is absent (returning `false` / `NotFound`
     /// respectively). The corresponding [`Self::access_times_snapshot`] entry
     /// is cleared so future LRU sweeps don't re-surface the hash.
     ///
@@ -3065,14 +3100,13 @@ impl CacheEngine {
     /// Delete every named tag pointing at `hash`, making the underlying
     /// bytes eligible for the iroh-blobs GC sweep.
     ///
-    /// Pull-through promotes each cached blob to a named tag
-    /// ([`iroh_blobs::api::tags::Tags::create`] on the streaming path,
-    /// `add_bytes` on the drain path); iroh-blobs GC protects any blob
+    /// Every fill promotes the blob it admits to a named tag
+    /// (`protect_partial`); iroh-blobs GC protects any blob
     /// reachable from a tag, so the bytes are never reclaimed while a tag
     /// survives. Tag names are opaque and store-assigned, so matches are
     /// found by enumerating tags and comparing hashes. A hash can carry more
     /// than one tag, so every match is removed (in practice the engine creates
-    /// one tag per cached hash — `get`/`populate` short-circuit on a hit and
+    /// one tag per cached hash — `protect_partial` memoises its tag and
     /// in-flight pulls coalesce (#305) — but the loop is robust to a future
     /// caller that tags the same hash twice). Returns the number of tags
     /// deleted.
@@ -3508,7 +3542,8 @@ impl CacheEngine {
             hash,
             "outboard fetch",
             self.inner.metrics.as_deref(),
-            origin.fetch_outboard(hash, outboard_max),
+            self.read_guard(origin_ix)
+                .run(hash, || origin.fetch_outboard(hash, outboard_max)),
         )
         .await
         .and_then(|r| {
@@ -3519,9 +3554,7 @@ impl CacheEngine {
         });
         let ob = match fetched {
             Ok(OutboardFetch::Found(ob)) => ob,
-            Ok(OutboardFetch::NotFound | OutboardFetch::Unsupported) => {
-                return Ok(GatedOutboard::Declined);
-            }
+            Ok(OutboardFetch::NotFound) => return Ok(GatedOutboard::Declined),
             Err(e) => {
                 tracing::warn!(
                     %hash,
@@ -3672,152 +3705,27 @@ impl CacheEngine {
             .clone()
     }
 
-    /// Fetch the blob by hash. Hits the local store on a cache hit; on a miss
-    /// pulls from the configured origin, BLAKE3-verifies, and inserts before
-    /// returning.
-    ///
-    /// Error variants callers commonly handle:
-    /// - [`CacheError::NoOrigin`] — miss with no origin configured.
-    /// - [`CacheError::NotFound`] — origin returned a definitive not-found
-    ///   (e.g. HTTP 404).
-    /// - [`CacheError::HashMismatch`] — origin returned bytes whose BLAKE3
-    ///   hash didn't match the request; bytes are dropped, not cached.
-    /// - [`CacheError::BlobTooLarge`] / [`CacheError::OriginError`] — size
-    ///   cap tripped in the engine or in the origin, respectively.
-    /// - [`CacheError::Store`] — local iroh-blobs store I/O failure.
-    pub async fn get(&self, hash: Hash) -> CacheResult<Bytes> {
-        if self.has(hash).await? {
-            self.observe_hit(hash);
-            let bytes = self.read_local(hash).await?;
-            if let Some(m) = &self.inner.metrics {
-                m.hits.inc();
-                m.bytes_returned
-                    .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-            }
-            return Ok(bytes);
-        }
-
-        // Logical-eviction guard (#279): once an operator has run
-        // `decdn node evict <hash>`, a subsequent `get` must not silently
-        // re-pull from the origin and undo the eviction. The eviction is
-        // sticky for the life of `<cache_dir>/evicted.log` — there is no
-        // "unevict" path; an operator who needs to re-cache a previously
-        // evicted hash hand-edits the log and restarts.
-        if self.refuses(hash) {
-            if let Some(m) = &self.inner.metrics {
-                m.misses.inc();
-            }
-            return Err(CacheError::NotFound { hash });
-        }
-
-        // Coalesce concurrent pull-through requests for the same hash (#305).
-        // A single lock acquisition atomically checks and inserts to avoid the
-        // race where multiple tasks see an empty map and all proceed to pull.
-        let bytes = loop {
-            let state = {
-                let mut guard = self.inner.lock_inflight();
-                if let Some(n) = guard.get(&hash) {
-                    Err(Arc::clone(n))
-                } else {
-                    let n = Arc::new(Notify::new());
-                    guard.insert(hash, Arc::clone(&n));
-                    Ok(n)
-                }
-            };
-
-            match state {
-                // Another task owns the pull — wait, then retry from the top.
-                Err(notify) => {
-                    notify.notified().await;
-                    if self.has(hash).await? {
-                        let bytes = self.read_local(hash).await?;
-                        // Waiter found the blob after the owner inserted it:
-                        // semantically a hit. `bytes_returned` is bumped
-                        // once after the loop for both arms; bump only
-                        // `hits` here.
-                        if let Some(m) = &self.inner.metrics {
-                            m.hits.inc();
-                        }
-                        break bytes;
-                    }
-                    // First attempt failed — loop back and either wait on a
-                    // new owner or become the owner ourselves.
-                }
-                // We are the owner — perform the pull. The guard's Drop impl
-                // removes the inflight entry and wakes waiters even if this
-                // task is cancelled mid-await, preventing the leak that would
-                // otherwise hang every future request for `hash`.
-                Ok(notify) => {
-                    let _guard = InflightGuard {
-                        hash,
-                        inner: &self.inner,
-                        notify: &notify,
-                    };
-                    break self.pull_through_bytes(hash).await?;
-                }
-            }
-        };
-        self.observe_hit(hash);
-        if let Some(m) = &self.inner.metrics {
-            m.bytes_returned
-                .inc_by(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        }
-        Ok(bytes)
-    }
-
     /// Ensure `hash` is present locally, pulling it through the origin chain on
-    /// a miss — like [`Self::get`] but WITHOUT returning the bytes or bumping
-    /// the `bytes_returned` / `hits` counters (which measure bytes served to a
-    /// `get` caller). Use this to fill the cache as a *side effect* — e.g. the
-    /// node-to-node cache-miss pull-through hook (#831) — so an internal fill is
-    /// not miscounted as client-facing egress and the whole blob is not
-    /// re-assembled into a buffer the caller would just drop. A hit is a no-op.
+    /// a miss. Only the node-to-node origin pulls a whole blob
+    /// ([`Origin::fetch`]): it admits the verified stream into the store
+    /// itself, so the blob never lands in RAM here (#1132). Every other origin
+    /// answers `NotFound`, so a chain of fs/http/s3 origins alone surfaces
+    /// [`CacheError::NotFound`]; those origins serve through
+    /// [`Self::origin_range_wire`]. A hit is a no-op.
     ///
-    /// That second guarantee is enforced, not merely intended: this path is
-    /// `FillMode::CommitOnly` all the way down, and neither commit arm can hand a
-    /// payload back under it — the streaming arm skips the `read_local`, the
-    /// buffered arm drops its drain buffer (#1132). Before that the blob *was*
-    /// read back and dropped, which is how the serve path's miss leg came to hold
-    /// ~708 MB for a 708 MB blob.
-    ///
-    /// Note the buffered arm's cost is bounded by
-    /// `cache.origin_retry.buffered_max_bytes` (4 MiB default) rather than by the
-    /// mode: an origin that advertises a `size_hint` at or under it is drained
-    /// before commit either way (a `None` hint always streams, and `0` disables
-    /// buffering). `CommitOnly` guarantees no blob is handed *back*, not that no
-    /// blob is ever briefly buffered.
-    ///
-    /// The origin-egress metric (`pull_through_bytes`) is still bumped by the
-    /// pull, which is correct — those bytes really did leave an origin.
+    /// Concurrent fills of one hash coalesce on a single owner (#305); each
+    /// origin runs under its own circuit breaker and retry budget, and the
+    /// chain advances on a miss, a permanent error or an exhausted budget.
     ///
     /// # Errors
     ///
-    /// Same set as [`Self::get`] (`NoOrigin` / `NotFound` / `HashMismatch` /
-    /// `BlobTooLarge` / `OriginError` / `Store`).
+    /// - [`CacheError::NoOrigin`] — miss with no origin configured.
+    /// - [`CacheError::NotFound`] — every origin answered not-found, or the
+    ///   hash is refused ([`Self::refuses`]).
+    /// - [`CacheError::OriginError`] — an origin failed, or every eligible
+    ///   origin's breaker is open.
+    /// - [`CacheError::Store`] — local iroh-blobs store I/O failure.
     pub async fn populate(&self, hash: Hash) -> CacheResult<()> {
-        self.populate_inner(hash, false).await
-    }
-
-    /// Like [`Self::populate`], but restricted to the node's OWN configured
-    /// origins (fs/http/s3): the `Peer` node→node origin is never consulted, so
-    /// this fronts no upstream USDC (#1116). The serve path uses it to
-    /// reactively fill from a local origin a blob a paying, lane-authorized
-    /// client asked for — independent of `node_to_node_pull_through_enabled` —
-    /// and to prefer a local origin over the paid peer window path. A hit is a
-    /// no-op; absence from every local origin surfaces `NotFound`, and a chain
-    /// with no non-`Peer` origin surfaces `NoOrigin`.
-    ///
-    /// # Errors
-    ///
-    /// Same set as [`Self::populate`].
-    pub async fn populate_local(&self, hash: Hash) -> CacheResult<()> {
-        self.populate_inner(hash, true).await
-    }
-
-    /// Shared body of [`Self::populate`] / [`Self::populate_local`]. `local_only`
-    /// threads through the coalescing loop into [`Self::pull_through`], where it
-    /// skips the `Peer` origin.
-    async fn populate_inner(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
         if self.has(hash).await? {
             // Recency only — a fill is not a hit sighting. The paired serve
             // emits the one `observe` through `observe_hit` (ADR 040).
@@ -3825,15 +3733,17 @@ impl CacheEngine {
             return Ok(());
         }
         // Logical-eviction guard (#279): never re-pull a deliberately evicted
-        // hash (mirrors `get`).
+        // hash. The eviction is sticky for the life of
+        // `<cache_dir>/evicted.log`.
         if self.refuses(hash) {
             if let Some(m) = &self.inner.metrics {
                 m.misses.inc();
             }
             return Err(CacheError::NotFound { hash });
         }
-        // Coalesce concurrent fills for the same hash (#305), mirroring `get`'s
-        // loop but bumping no `get`-caller metrics: `populate` fills as a side
+        // Coalesce concurrent fills for the same hash (#305). A single lock
+        // acquisition atomically checks and inserts, so tasks that all see an
+        // empty map cannot all proceed to pull. `populate` fills as a side
         // effect, so it counts neither a hit nor returned bytes.
         loop {
             let state = {
@@ -3862,10 +3772,7 @@ impl CacheEngine {
                         inner: &self.inner,
                         notify: &notify,
                     };
-                    // Fill-only: the payload is dropped, so the whole blob is
-                    // never read back out of the store (#1132). The wrapper
-                    // returns `()`, so there is nothing here to drop by accident.
-                    self.pull_through_fill(hash, local_only).await?;
+                    self.pull_through(hash).await?;
                     // ADR 040: consult the admission policy now that the fill
                     // succeeded and record the chosen segment. Under the default
                     // `AlwaysAdmit` the segment is `Main`, so `set_segment` is a
@@ -3888,9 +3795,9 @@ impl CacheEngine {
     }
 
     /// A permit from the own-origin draw pool ([`MAX_CONCURRENT_RANGE_PULLS`]).
-    /// A full pool bumps `range_pull_permit_waits` and waits rather than
-    /// degrading, because the degrade is a whole-blob origin pull — more egress,
-    /// not less. A wait past [`RANGE_PULL_PERMIT_WARN_AFTER`] logs one warning.
+    /// A full pool bumps `range_pull_permit_waits` and waits: the ranged draw
+    /// is the only way a node serves its own origin. A wait past
+    /// [`RANGE_PULL_PERMIT_WARN_AFTER`] logs one warning.
     async fn range_pull_permit(&self) -> CacheResult<tokio::sync::OwnedSemaphorePermit> {
         let pool = &self.inner.own_origin_range_pulls;
         if let Ok(permit) = Arc::clone(pool).try_acquire_owned() {
@@ -3922,16 +3829,12 @@ impl CacheEngine {
     /// cached copy of the exact length, or else the first origin's copy that
     /// passes the exact-length gate (`expected_outboard_len`, read with 64
     /// bytes of slack), which is then cached. `Ok(None)` when no origin serves
-    /// one (or none are configured) — the caller degrades exactly as with an
-    /// unsupported range. Each origin read runs under
+    /// one (or none are configured). Each origin read runs under
     /// [`Self::set_origin_read_budget`]'s budget. A per-origin decline, wrong
-    /// length, transport fault or timeout advances the chain.
+    /// length, transport fault or timeout advances the chain. A cached copy
+    /// answers without an origin read, and concurrent reads of one hash share
+    /// one origin read.
     ///
-    /// This is the outboard half of the own-origin serviceability probe
-    /// ([`Self::origin_range_serviceable`]), which the serve-miss path runs
-    /// after admission. Before it signs a `StreamResponse`, that path learns
-    /// only whether the outboard exists ([`Self::origin_outboard_published`]).
-    /// A cached copy answers without an origin read.
     /// The returned outboard is UNTRUSTED until it verifies against the root `H`
     /// (the range encode in [`Self::origin_range_wire`] is where that happens).
     ///
@@ -3939,6 +3842,10 @@ impl CacheEngine {
     ///
     /// [`CacheError::OriginError`] when no origin serves the outboard and at
     /// least one failed with a transport fault or a timeout (the last one).
+    ///
+    /// A test hook: a range draw reads the outboard through
+    /// [`Self::origin_range_wire`].
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn origin_fetch_outboard_bytes(
         &self,
         hash: Hash,
@@ -3953,9 +3860,10 @@ impl CacheEngine {
     /// [`Self::origin_fetch_outboard_bytes`], with the index of the origin whose
     /// copy it is — the cached entry's origin, or the origin that served it.
     ///
-    /// `total_bytes` is the origin's own size claim, so it bounds the outboard
-    /// read only after it passes the engine's blob cap: a claim past the cap
-    /// reads no outboard and answers `Ok(None)`.
+    /// `total_bytes` bounds the outboard read only after it passes the
+    /// engine's blob cap: a size past the cap reads no outboard and answers
+    /// `Ok(None)`.
+    #[cfg(any(test, feature = "test-util"))]
     async fn outboard_with_origin(
         &self,
         hash: Hash,
@@ -3982,12 +3890,8 @@ impl CacheEngine {
             return Ok(Some((cached.bytes, cached.origin_ix)));
         }
         // A genuine transport fault on an origin (as opposed to a clean
-        // `NotFound`/`Unsupported` decline) is remembered so it can be surfaced when
-        // NO origin serves the outboard. The serviceability caller latches this into
-        // `fault_seen` (#1129): an own-origin miss that fails because the operator's
-        // origin is degraded must terminate as `InternalError`, not a bare
-        // `NotFound`. A clean decline stays `Ok(None)` so the caller degrades
-        // silently (ADR 037 §"Fallback is always correct").
+        // `NotFound`) is remembered so it can be surfaced when NO origin serves
+        // the outboard (#1129): a degraded origin is not an absent one.
         let mut last_err: Option<CacheError> = None;
         for (ix, origin) in self.inner.origins.iter().enumerate() {
             match self
@@ -4001,7 +3905,7 @@ impl CacheEngine {
         }
         // No origin served the outboard. If any errored on the way, that transport
         // fault is the answer (degraded, not absent); otherwise it is a clean
-        // absence and the caller degrades to the buffered path.
+        // absence.
         match last_err {
             Some(e) => Err(e),
             None => Ok(None),
@@ -4028,96 +3932,70 @@ impl CacheEngine {
     /// [`crate::MAX_CONCURRENT_RANGE_PULLS`], so memory stays
     /// `O(window + outboard)` whatever the span (#2065).
     ///
-    /// A verify failure here is a HARD fault ([`CacheError::VerifyFailed`]), NOT a
-    /// degrade: by the time this runs the node has signed a
-    /// `StreamResponse` committing to serve under `H`, so a corrupt or
-    /// misconfigured OWN origin is a local-origin fault to surface, not upstream
-    /// corruption to route around (there is no upstream, and no fallback still
-    /// honours `H`). A fault after the wire has started ends it with a terminal
-    /// `Err` from [`OriginRangeWire::next_chunk`].
+    /// Every failure here is a HARD fault: the ranged draw is the only way a
+    /// node serves its own origin, and by the time this runs the node has
+    /// signed a `StreamResponse` committing to serve under `H`. A missing or
+    /// broken origin object is a local-origin fault to surface, not upstream
+    /// corruption to route around (there is no upstream). A fault after the
+    /// wire has started ends it with a terminal `Err` from
+    /// [`OriginRangeWire::next_chunk`].
     ///
     /// # Errors
     ///
     /// - [`CacheError::VerifyFailed`] — no origin opened the range, and an origin
     ///   served a wrong-length outboard or a wrong-length first window; neither
     ///   can verify against `H`.
-    /// - [`CacheError::OriginError`] — no origin opened the range, and at least
-    ///   one failed with a transport fault or a timeout (the last such fault).
-    ///
-    /// `Ok(None)` when every origin cleanly declines.
+    /// - [`CacheError::OriginError`] — no origin opened the range: at least one
+    ///   failed with a transport fault or a timeout (the last such fault), or
+    ///   every origin is missing the outboard or the data.
     pub async fn origin_range_wire(
         &self,
         hash: Hash,
         aligned: &AlignedRange,
-    ) -> CacheResult<Option<OriginRangeWire>> {
+    ) -> CacheResult<OriginRangeWire> {
         let permit = self.range_pull_permit().await?;
-        let Some(cursor) = self.open_range_cursor(hash, aligned, None).await? else {
-            return Ok(None);
+        let wire = match self.open_range_cursor(hash, aligned).await {
+            Ok(cursor) => {
+                OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone())
+            }
+            Err(e) => Err(e),
         };
-        OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone()).map(Some)
+        match wire {
+            Ok(wire) => {
+                let engine = self.clone();
+                Ok(wire.on_fault(move |fault| engine.memoise_range_fault(hash, fault)))
+            }
+            Err(e) => {
+                self.memoise_range_fault(hash, &e);
+                Err(e)
+            }
+        }
     }
 
-    /// The own-origin serviceability probe the serve-miss path runs once the
-    /// payer's first proof admits a stream it answered from its own origin:
-    /// whether an origin furnishes both the `{H}.obao4` outboard for `hash` (a
-    /// `total_bytes`-byte blob) and ranged reads of its data. `false` refuses
-    /// that stream before any chunk, and memoises the hash as publishing no
-    /// outboard ([`Self::origin_outboard_published`]), so the next open of the
-    /// hash takes the buffered whole-blob degrade before it answers
-    /// (ADR 037 §"Fallback is always correct"). An origin that served ranges
-    /// earlier and has stopped since fails its draw like any other mid-life
-    /// origin fault.
-    ///
-    /// The range half reads the first chunk group through the same origin
-    /// chain a draw walks, starting at the origin that served the outboard. It
-    /// reads nothing when that origin has already served a clean range window.
-    /// The 0-byte blob has no data to range, so its outboard alone answers.
-    ///
-    /// # Errors
-    ///
-    /// - [`CacheError::OriginError`] — no origin serves both halves, and at
-    ///   least one failed with a transport fault or a timeout.
-    /// - [`CacheError::VerifyFailed`] — no origin serves both halves, and an
-    ///   origin served a wrong-length outboard or first window, which cannot
-    ///   verify.
-    pub async fn origin_range_serviceable(
-        &self,
-        hash: Hash,
-        total_bytes: u64,
-    ) -> CacheResult<bool> {
-        let serviceable = self.range_serviceable(hash, total_bytes).await?;
-        if !serviceable {
-            // The next open of the hash takes the degrade before it answers.
-            self.outboard_memo_lock()
-                .insert(hash, Presence::Absent, Instant::now());
+    /// Remember a fault that a ranged read of `hash` found in the origin's
+    /// objects after a `Present` presence answer: a missing or broken
+    /// `{H}.obao4` or `{H}`, an origin that ignores `Range`, or a read that
+    /// failed past its retries. The presence memo then holds `Fault` for the
+    /// fault TTL ([`Self::origin_presence`]), so a later open refuses at open
+    /// and pulls through from a peer instead of answering `ok: true` and
+    /// refusing after the payer's first proof. A [`CacheError::Internal`] is
+    /// this process's fault, not the origin's, and changes nothing.
+    fn memoise_range_fault(&self, hash: Hash, fault: &CacheError) {
+        if !matches!(
+            fault,
+            CacheError::OriginError { .. } | CacheError::VerifyFailed { .. }
+        ) {
+            return;
         }
-        Ok(serviceable)
-    }
-
-    /// The body of [`Self::origin_range_serviceable`].
-    async fn range_serviceable(&self, hash: Hash, total_bytes: u64) -> CacheResult<bool> {
-        let Some((outboard, ix)) = self.outboard_with_origin(hash, total_bytes).await? else {
-            return Ok(false);
-        };
-        if total_bytes == 0 || self.range_confirmed(ix) {
-            return Ok(true);
-        }
-        let first_group =
-            align_range(0, CHUNK_GROUP_BYTES.min(total_bytes), total_bytes).map_err(|e| {
-                CacheError::Internal(anyhow::Error::from(e).context("range probe alignment"))
-            })?;
-        let opened = self
-            .open_range_cursor(hash, &first_group, Some((ix, outboard)))
-            .await?
-            .is_some();
-        if !opened {
-            tracing::debug!(
-                %hash,
-                "no own origin serves ranged reads of this blob; the miss degrades to a \
-                 whole-blob origin pull",
-            );
-        }
-        Ok(opened)
+        let mut memo = self.probe_memo_lock();
+        tracing::warn!(
+            %hash,
+            fault_ttl_secs = memo.fault_ttl().as_secs(),
+            error = %fault.display_chain(),
+            "origin range read faulted after a present size proof; memoising the fault — \
+             opens for this hash answer not-held until it expires"
+        );
+        memo.insert(hash, Presence::Fault, Instant::now());
     }
 
     /// The size proof that `hash` is `size` bytes long, or `None` when the
@@ -4130,19 +4008,19 @@ impl CacheEngine {
     /// 2. the proof it keeps in its store;
     /// 3. the last chunk group in its own store, for a complete blob or a
     ///    partial blob that holds its tail;
-    /// 4. the `{H}.sizeproof` object of each origin. An origin blob with no
-    ///    such object has no provable size here: `decdn origin import` writes
-    ///    it beside the outboard.
+    /// 4. the origins, through [`Self::origin_presence`]: its walk reads each
+    ///    origin's `{H}.sizeproof` once and keeps the verified proof in
+    ///    memory, so a lookup after a presence answer reads no origin. An
+    ///    origin blob with no such object has no provable size here:
+    ///    `decdn origin import` writes it beside the outboard.
     ///
     /// Every proof it finds is verified against `hash` and `size` before it
     /// is kept and returned. A proof that does not verify is skipped, so a
-    /// wrong `size` gives `None`. An origin fault gives `None` for that
-    /// origin.
+    /// wrong `size` gives `None`. An origin fault, memoised or live, gives
+    /// `None`.
     ///
-    /// Callers ask for a proof only after their gates passed (blacklist,
-    /// deny set, offset), so a proof is kept only for a request the node
-    /// answers. A proof of a blob the store holds and tracks is written to
-    /// the store too ([`Self::keep_size_proof`] says how).
+    /// A proof of a blob the store holds and tracks is written to the store
+    /// too ([`Self::keep_size_proof`] says how).
     pub async fn size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
         if let Some(kept) = self.inner.size_proofs.get(&hash) {
             if kept.size != size {
@@ -4328,166 +4206,54 @@ impl CacheEngine {
         decdn_bao_range::size_proof_from_tail_wire(*hash.as_bytes(), size, &wire).ok()
     }
 
-    /// Read the `{H}.sizeproof` object of each origin until one proves
-    /// `size`. One read runs per hash at a time: a concurrent lookup waits
-    /// and takes its proof from the memo. A lookup that finds none is
-    /// remembered for [`SIZE_PROOF_MISS_TTL`], so an open flood for a blob no
-    /// origin proves reads no origin again within that time.
+    /// The origin's proof that `hash` is `size` bytes long, through
+    /// [`Self::origin_presence`]: its walk keeps the verified proof, so this
+    /// reads no origin when a presence answer already stands with its proof.
+    /// `None` when no origin holds the blob at `size`, or the walk faulted.
     async fn origin_size_proof(&self, hash: Hash, size: u64) -> Option<Bytes> {
-        if self.inner.origins.is_empty() || self.size_proof_missed(hash, size) {
+        if self.inner.origins.is_empty() {
             return None;
         }
-        let flight = self.size_proof_flight(hash);
-        let _reading = flight.lock().await;
-        if let Some(kept) = self.inner.size_proofs.get(&hash) {
-            return (kept.size == size).then_some(kept.proof);
-        }
-        if self.size_proof_missed(hash, size) {
-            return None;
-        }
-        match self.read_origin_size_proofs(hash, size).await {
-            Ok(Some(proof)) => {
-                // Into the memo while the flight lock is held, so a waiting
-                // lookup finds it and reads no origin.
-                self.inner
-                    .size_proofs
-                    .insert(hash, size, proof.clone(), false);
-                Some(proof)
-            }
-            Ok(None) => {
-                self.note_size_proof_miss(hash, size);
+        match self.origin_presence_with_proof(hash, true).await {
+            OriginPresence::Present(proven) if proven == size => {}
+            OriginPresence::Present(_) | OriginPresence::Fault => return None,
+            OriginPresence::Absent => {
                 if let Some(m) = &self.inner.metrics {
                     m.size_proof_origin_missing.inc();
                 }
-                tracing::warn!(
+                tracing::debug!(
                     %hash,
                     size,
                     "no origin serves a `{{H}}.sizeproof` for this blob, so the node states \
-                     no size for it and does not serve it from its origin; run `decdn \
-                     origin import` for the object"
+                     no size for it and does not serve it from its origin"
                 );
-                None
-            }
-            // An outage is not an answer: no miss is remembered, so the next
-            // lookup asks again.
-            Err(()) => None,
-        }
-    }
-
-    /// Read each origin's `{H}.sizeproof` until one proves `size`. `Ok(None)`
-    /// when every origin answered and none proved it; `Err(())` when none
-    /// proved it and some origin failed to answer.
-    async fn read_origin_size_proofs(&self, hash: Hash, size: u64) -> Result<Option<Bytes>, ()> {
-        let root = *hash.as_bytes();
-        let mut answered = true;
-        for origin in &*self.inner.origins {
-            match origin.fetch_size_proof(hash).await {
-                Ok(Some(object)) => {
-                    // The object states its own size beside the proof.
-                    if let Some((stated, proof)) = decdn_bao_range::parse_size_proof_object(&object)
-                        && stated == size
-                        && decdn_bao_range::verify_size_proof(root, size, proof)
-                    {
-                        return Ok(Some(object.slice(8..)));
-                    }
-                    tracing::warn!(
-                        %hash,
-                        size,
-                        origin = ?origin.kind(),
-                        "the origin's size proof does not prove this size; re-run \
-                         `decdn origin import` for the object"
-                    );
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    answered = false;
-                    tracing::warn!(
-                        %hash,
-                        origin = ?origin.kind(),
-                        error = %e,
-                        "origin size proof read failed"
-                    );
-                }
+                return None;
             }
         }
-        if answered { Ok(None) } else { Err(()) }
-    }
-
-    /// The per-hash lock of the origin `.sizeproof` read.
-    fn size_proof_flight(&self, hash: Hash) -> Arc<tokio::sync::Mutex<()>> {
-        let mut flights = self
-            .inner
-            .size_proof_flights
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(live) = flights.get(&hash).and_then(Weak::upgrade) {
-            return live;
-        }
-        flights.retain(|_, w| w.strong_count() > 0);
-        let flight = Arc::new(tokio::sync::Mutex::new(()));
-        flights.insert(hash, Arc::downgrade(&flight));
-        flight
-    }
-
-    /// Whether a lookup of `(hash, size)` found no origin proof within the
-    /// last [`SIZE_PROOF_MISS_TTL`].
-    fn size_proof_missed(&self, hash: Hash, size: u64) -> bool {
         self.inner
-            .size_proof_misses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&(hash, size))
-            .is_some_and(|at| at.elapsed() < SIZE_PROOF_MISS_TTL)
-    }
-
-    /// Remember that no origin proves `(hash, size)`. The memo holds at most
-    /// [`SIZE_PROOF_MISS_ENTRIES`]; a full memo drops its expired entries,
-    /// then all of them.
-    fn note_size_proof_miss(&self, hash: Hash, size: u64) {
-        let mut misses = self
-            .inner
-            .size_proof_misses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if misses.len() >= SIZE_PROOF_MISS_ENTRIES {
-            misses.retain(|_, at| at.elapsed() < SIZE_PROOF_MISS_TTL);
-            if misses.len() >= SIZE_PROOF_MISS_ENTRIES {
-                misses.clear();
-            }
-        }
-        misses.insert((hash, size), Instant::now());
-    }
-
-    /// Whether the origin at `ix` has served a clean first range window.
-    fn range_confirmed(&self, ix: usize) -> bool {
-        self.inner
-            .origin_range_confirmed
-            .get(ix)
-            .is_some_and(|c| c.load(Ordering::Relaxed))
+            .size_proofs
+            .get(&hash)
+            .and_then(|kept| (kept.size == size).then_some(kept.proof))
     }
 
     /// Open a cursor on the first origin that serves both the outboard and a
-    /// first window of `aligned` of the right length. `preferred` (an origin
-    /// index and the outboard it served) goes first and reuses that copy; with
-    /// `None`, the origin whose outboard is cached goes first and reuses the
-    /// cached copy. Every other origin, in chain order, reads its own outboard
-    /// through the exact-length gate. A per-origin decline, transport fault,
-    /// wrong-length outboard or wrong-length first window advances the chain,
-    /// so a broken origin never shadows a healthy later one. The opened origin
-    /// is marked range-confirmed. Errors as [`Self::origin_range_wire`].
+    /// first window of `aligned` of the right length. The origin whose outboard
+    /// is cached goes first and reuses the cached copy. Every other origin, in
+    /// chain order, reads its own outboard through the exact-length gate. A
+    /// per-origin miss, transport fault, wrong-length outboard or wrong-length
+    /// first window advances the chain, so a broken origin never shadows a
+    /// healthy later one. Errors as [`Self::origin_range_wire`].
     async fn open_range_cursor(
         &self,
         hash: Hash,
         aligned: &AlignedRange,
-        preferred: Option<(usize, Bytes)>,
-    ) -> CacheResult<Option<OriginRangeCursor>> {
+    ) -> CacheResult<OriginRangeCursor> {
         let expected_len = expected_outboard_len(aligned.blob_size());
-        let cached = preferred.or_else(|| {
-            self.inner
-                .outboards
-                .get(hash, expected_len)
-                .map(|c| (c.origin_ix, c.bytes))
-        });
+        let cached = self
+            .inner
+            .outboards
+            .get(hash, expected_len)
+            .map(|c| (c.origin_ix, c.bytes));
         let first = cached.as_ref().map(|(ix, _)| *ix);
         let order = first
             .into_iter()
@@ -4520,6 +4286,7 @@ impl CacheEngine {
                 aligned,
                 outboard,
                 budget,
+                self.read_guard(ix),
                 self.inner.metrics.clone(),
             )
             .await;
@@ -4533,12 +4300,7 @@ impl CacheEngine {
                     );
                     wrong_length = true;
                 }
-                Ok(Some(cursor)) => {
-                    if let Some(confirmed) = self.inner.origin_range_confirmed.get(ix) {
-                        confirmed.store(true, Ordering::Relaxed);
-                    }
-                    return Ok(Some(cursor));
-                }
+                Ok(Some(cursor)) => return Ok(cursor),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(
@@ -4554,7 +4316,13 @@ impl CacheEngine {
         match (last_err, wrong_length) {
             (Some(e), _) => Err(e),
             (None, true) => Err(CacheError::VerifyFailed { expected: hash }),
-            (None, false) => Ok(None),
+            (None, false) => Err(CacheError::OriginError {
+                hash,
+                source: anyhow::anyhow!(
+                    "no configured origin serves both the `{{H}}.obao4` outboard and the data \
+                     of {hash}; run `decdn origin import` for the object"
+                ),
+            }),
         }
     }
 
@@ -4886,59 +4654,41 @@ impl CacheEngine {
         Ok(())
     }
 
-    /// Best-effort total byte size of `hash` from the configured origins, for
-    /// scoping a range pull ([`Self::origin_range_wire`] needs the exact blob
-    /// size to align + verify a sub-range against the root `H`, and the
-    /// `{H}.obao4` outboard alone doesn't pin the final chunk's length). Walks
-    /// the origin fallback chain ([`Origin::size`] — HTTP `HEAD` / S3
-    /// `HeadObject` / `fs` metadata) and returns the first known size; a
-    /// per-origin `Ok(None)` (no object / compressed / unsupported) or a
-    /// transport error advances the chain.
-    ///
-    /// Returns `Ok(None)` when every origin cleanly declines — the caller MUST
-    /// then degrade to a whole-blob [`Self::populate`] / [`Self::get`]. This is
-    /// a metadata probe only: it never fetches or caches bytes, so it carries no
-    /// logical-eviction guard (the caller's serve path and whole-blob fallback
-    /// both enforce it).
+    /// Import `bytes` into the store as one whole, tagged blob and return its
+    /// hash, as a completed fill leaves it: the blob is GC-protected, carries
+    /// an access time, and is announced on [`Self::subscribe_inserts`]. For
+    /// seeding a store in tests.
     ///
     /// # Errors
     ///
-    /// - [`CacheError::NoOrigin`] when no origin is configured, so the caller
-    ///   sees a coherent "can't range-pull" signal rather than a silent `None`.
-    /// - [`CacheError::OriginError`] when NO origin answers and at least one
-    ///   failed with a transport fault (the last such fault). A per-origin
-    ///   fault still advances the chain — a later origin's answer wins — but a
-    ///   probe that ends on faults reports a degraded node, not an empty one,
-    ///   so the serve path's #1129 latch can turn the terminal miss into
-    ///   `InternalError` instead of `NotFound`. Mirrors
-    ///   [`Self::origin_fetch_outboard_bytes`].
-    pub async fn origin_size(&self, hash: Hash) -> CacheResult<Option<u64>> {
-        if self.inner.origins.is_empty() {
-            return Err(CacheError::NoOrigin { hash });
-        }
-        let mut last_err: Option<CacheError> = None;
-        for origin in &self.inner.origins {
-            match origin.size(hash).await {
-                Ok(Some(size)) => return Ok(Some(size)),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(
-                        %hash,
-                        kind = ?origin.kind(),
-                        error = %format_args!("{e:#}"),
-                        "origin size probe failed; trying next origin",
-                    );
-                    last_err = Some(CacheError::OriginError {
-                        hash,
-                        source: e.into_inner(),
-                    });
-                }
-            }
-        }
-        match last_err {
-            Some(e) => Err(e),
-            None => Ok(None),
-        }
+    /// [`CacheError::Store`] when the store cannot import the bytes.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn insert_blob(&self, bytes: impl Into<Bytes>) -> CacheResult<Hash> {
+        let tag = self
+            .inner
+            .store
+            .blobs()
+            .add_bytes(bytes.into())
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        self.record_access(tag.hash);
+        let _ = self.inner.inserts_tx.send(tag.hash);
+        Ok(tag.hash)
+    }
+
+    /// Read the whole blob `hash` back out of the store. For tests.
+    ///
+    /// # Errors
+    ///
+    /// [`CacheError::Store`] when the store does not hold the whole blob.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn read_blob(&self, hash: Hash) -> CacheResult<Bytes> {
+        self.inner
+            .store
+            .blobs()
+            .get_bytes(hash)
+            .await
+            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
     }
 
     /// Flush ephemeral state to disk. The iroh-blobs store does its own
@@ -5140,11 +4890,11 @@ impl CacheEngine {
 
     /// Emit the hit signal for `hash`: bump its LRU recency AND forward one
     /// sighting to the shared frequency estimator (ADR 040 §Hit signal). This is
-    /// the one hit sighting a served or `get` request produces.
+    /// the one hit sighting a served request produces.
     ///
     /// Every client-facing serve chokepoint calls this exactly once per served
-    /// request — [`crate::CacheEngine::get`] on its own path, and the `node`
-    /// crate's `deliver` / `serve_leg` on the paid serve paths. The fill paths
+    /// request — the `node` crate's `deliver` / `serve_leg` on the paid serve
+    /// paths. The fill paths
     /// ([`Self::populate`], [`Self::admit_bao_stream`]) deliberately do NOT emit
     /// it; they only record recency, so a miss that fills and then serves counts
     /// as ONE sighting (the serve's), never two. This also
@@ -5310,15 +5060,6 @@ impl CacheEngine {
             .contains_key(&hash)
     }
 
-    async fn read_local(&self, hash: Hash) -> CacheResult<Bytes> {
-        self.inner
-            .store
-            .blobs()
-            .get_bytes(hash)
-            .await
-            .map_err(|e| CacheError::Store(anyhow::Error::from(e)))
-    }
-
     /// Read `[byte_offset, byte_offset + byte_len)` of `hash` from the local
     /// store ([ADR 038 §Serve side](https://github.com/decdn/decdn/blob/main/adr/038-bao-verified-range-streaming.md)).
     /// `byte_len == 0` reads to the blob end. Works against a **partial** blob
@@ -5329,8 +5070,7 @@ impl CacheEngine {
     ///
     /// Concatenates the exported range into a contiguous [`Bytes`]; for the
     /// streaming serve path the node drives iroh-blobs' `export_ranges`
-    /// directly. Provided here so the engine owns the local-read seam for both
-    /// whole-blob ([`Self::get`]) and range serves.
+    /// directly. Provided here so the engine owns the local-read seam.
     ///
     /// # Errors
     ///
@@ -5366,7 +5106,7 @@ impl CacheEngine {
                 // explicit failure: silently treating `None` as "ends at
                 // `byte_offset`" would return an empty range for a `byte_len ==
                 // 0` ("to end") read and mask the real cause. Surface it so the
-                // caller retries or falls back to a whole-blob serve.
+                // caller sees the real cause.
                 iroh_blobs::api::blobs::BlobStatus::Partial { size: None } => {
                     return Err(CacheError::Store(anyhow::anyhow!(
                         "export_range: store cannot report size for partial blob {hash}; \
@@ -5649,93 +5389,32 @@ impl CacheEngine {
         Ok(out)
     }
 
-    /// Whether the origin chain has any origin `pull_through` would actually try
-    /// for the given mode: any origin at all normally, or any non-`Peer` origin
-    /// under `local_only` (#1116).
-    fn has_eligible_origin(&self, local_only: bool) -> bool {
-        self.inner
-            .origins
-            .iter()
-            .any(|o| !local_only || o.kind() != OriginKind::Peer)
-    }
-
-    /// [`Self::pull_through`] for a caller that needs the bytes ([`Self::get`]).
-    ///
-    /// Exists so no caller has to name a [`FillMode`] or unwrap the `Option`: the
-    /// mode↔shape correspondence is resolved here, once. A `None` under
-    /// [`FillMode::ReturnBytes`] is a logic regression, not a runtime condition —
-    /// surface it as a `Store` fault, since the anti-panic policy rules out an
-    /// `expect` and a silent empty `Bytes` would be worse (the caller would serve
-    /// a zero-length blob).
-    async fn pull_through_bytes(&self, hash: Hash) -> CacheResult<Bytes> {
-        match self
-            .pull_through(hash, false, FillMode::ReturnBytes)
-            .await?
-        {
-            Some(bytes) => Ok(bytes),
-            None => Err(CacheError::Store(anyhow::anyhow!(
-                "pull_through returned no bytes for {hash} under FillMode::ReturnBytes"
-            ))),
-        }
-    }
-
-    /// [`Self::pull_through`] for a caller that only wants the blob present
-    /// ([`Self::populate`] / [`Self::populate_local`]).
-    ///
-    /// The `()` return is the point: under [`FillMode::CommitOnly`] there is no
-    /// payload to hand back, and a caller that cannot receive one cannot
-    /// accidentally keep a whole blob alive (#1132).
-    async fn pull_through_fill(&self, hash: Hash, local_only: bool) -> CacheResult<()> {
-        self.pull_through(hash, local_only, FillMode::CommitOnly)
-            .await
-            .map(drop)
-    }
-
-    /// Walk the origin chain to fill `hash`.
-    ///
-    /// The mode↔return-shape correspondence is exact in both directions:
-    /// [`FillMode::ReturnBytes`] always yields `Some` on success and
-    /// [`FillMode::CommitOnly`] always yields `None`. Prefer the
-    /// [`Self::pull_through_bytes`] / [`Self::pull_through_fill`] wrappers, which
-    /// are total and hide the `Option` entirely.
+    /// Walk the origin chain to fill `hash` ([`Self::populate`]).
     ///
     /// Runs inside an `origin_pull` span: one per chain walk, with the paid
-    /// node→node fallback's `node_pull` span nested inside when the walk reaches
+    /// node→node pull's `node_pull` span nested inside when the walk reaches
     /// the `Peer` origin.
-    #[allow(clippy::too_many_lines)]
-    // One linear chain walk; each outcome arm carries the rationale for its own fallback/return decision, and splitting the match out would separate those from the loop state (`last_err`, `any_not_found`, `any_short_circuit`) they exist to explain.
     #[tracing::instrument(
         name = "origin_pull",
         skip_all,
         fields(
             %hash,
-            local_only = local_only,
             outcome = tracing::field::Empty,
             error = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
         )
     )]
-    async fn pull_through(
-        &self,
-        hash: Hash,
-        local_only: bool,
-        mode: FillMode,
-    ) -> CacheResult<Option<Bytes>> {
-        let result: CacheResult<Option<Bytes>> = async {
-            // Every pull_through entry is a `get()` cache miss, regardless
-            // of how the pull resolves. Coalesced waiters that find a hit
-            // on retry never call `pull_through`, so they never reach this
-            // bump (their `hits` increment lives in the waiter branch of
-            // `get`).
+    async fn pull_through(&self, hash: Hash) -> CacheResult<()> {
+        let result: CacheResult<()> = async {
+            // Every pull_through entry is a cache miss, regardless of how the
+            // pull resolves. Coalesced waiters that find the blob on retry
+            // never call `pull_through`, so they never reach this bump.
             if let Some(m) = &self.inner.metrics {
                 m.misses.inc();
             }
-            // Reject pulls with no *eligible* origin early. With `local_only`
-            // (#1116) the `Peer` origin (the paid node→node fallback) is skipped, so
-            // a chain of nothing but `Peer` origins is a fast `NoOrigin`, like an
-            // empty chain — checked before the `origin_fetches` bump so that metric
-            // still counts only real local fetch attempts.
-            if !self.has_eligible_origin(local_only) {
+            // Reject pulls with no origin early, before the `origin_fetches`
+            // bump, so that metric counts only real fetch attempts.
+            if self.inner.origins.is_empty() {
                 return Err(CacheError::NoOrigin { hash });
             }
 
@@ -5753,22 +5432,12 @@ impl CacheEngine {
 
             // Fallback chain walk (#284). Each origin gets its own retry
             // budget; on retry-exhaustion / Permanent / NotFound we advance
-            // to the next entry. Deterministic per-origin failures
-            // (`HashMismatch`, `BlobTooLarge`, `Store`) intentionally do
-            // not fall back — they indicate a misbehaving backend that
-            // must surface, not be masked by trying a different one.
+            // to the next entry.
             let mut last_err: Option<OriginPullError> = None;
             let mut any_not_found = false;
             let mut any_short_circuit = false;
             let total = self.inner.origins.len();
             for (idx, origin) in self.inner.origins.iter().enumerate() {
-                // #1116: a `local_only` populate never touches the `Peer` origin
-                // (the paid node→node fallback), so an operator serving its OWN
-                // configured fs/http/s3 origin fronts no upstream USDC. Skipped
-                // before the breaker/retry machinery so it costs nothing.
-                if local_only && origin.kind() == OriginKind::Peer {
-                    continue;
-                }
                 let origin = Arc::clone(origin);
                 // Per-origin circuit-breaker (#963). An OPEN breaker
                 // short-circuits this origin *before* the retry/backoff
@@ -5779,7 +5448,7 @@ impl CacheEngine {
                 // the access non-panicking per the workspace anti-panic
                 // policy (a missing slot would be a construction bug, in
                 // which case we degrade to "no breaker" rather than panic).
-                let breaker = self.inner.breakers.get(idx);
+                let breaker = self.inner.breakers.get(idx).map(Arc::as_ref);
                 // Admit (or short-circuit) under the breaker. The `Proceed`
                 // arm carries a `TrialGuard` that owns any HALF-OPEN trial
                 // slot; it MUST stay alive across the `.await` below so that
@@ -5799,13 +5468,7 @@ impl CacheEngine {
 
                 let (outcome, terminal) =
                     run_with_retry_classified(policy, self.inner.metrics.as_ref(), hash, || {
-                        self.pull_through_attempt(
-                            Arc::clone(&origin),
-                            hash,
-                            max_blob_bytes,
-                            policy,
-                            mode,
-                        )
+                        origin.fetch(hash, max_blob_bytes)
                     })
                     .await;
                 // Commit the breaker outcome through the guard (defusing its
@@ -5819,41 +5482,22 @@ impl CacheEngine {
                 // NotFound advance as "primary failed" once any earlier
                 // origin had errored.
                 let advance_was_error = match outcome {
-                    Ok(PullThroughOutcome::Bytes(bytes)) => {
+                    Ok(OriginFetch::AlreadyAdmitted) => {
                         // Announce the successful commit to any DHT
                         // republish-scheduler subscribers (ADR 022 §STORE
                         // Flow). `broadcast::send` returns `Err(SendError)`
                         // only when there are no active subscribers, which
                         // is the normal state when no DHT republish task
-                        // exists — ignore. A local-store hit in `get` does
-                        // not emit: a hit changes nothing the republisher
-                        // advertises; commits and completed blocks do.
+                        // exists — ignore. A local-store hit does not emit:
+                        // a hit changes nothing the republisher advertises;
+                        // commits and completed blocks do.
                         let _ = self.inner.inserts_tx.send(hash);
-                        return Ok(Some(bytes));
+                        return Ok(());
                     }
-                    // Same successful commit, minus the read-back the caller did not
-                    // want (#1132) — so it must broadcast the insert identically.
-                    Ok(PullThroughOutcome::Committed) => {
-                        let _ = self.inner.inserts_tx.send(hash);
-                        return Ok(None);
-                    }
-                    Ok(PullThroughOutcome::NotFound) => {
+                    Ok(OriginFetch::NotFound) => {
                         any_not_found = true;
                         false
                     }
-                    Ok(PullThroughOutcome::BlobTooLarge) => {
-                        return Err(CacheError::BlobTooLarge {
-                            hash,
-                            limit_bytes: max_blob_bytes,
-                        });
-                    }
-                    Ok(PullThroughOutcome::HashMismatch { actual }) => {
-                        return Err(CacheError::HashMismatch {
-                            expected: hash,
-                            actual,
-                        });
-                    }
-                    Ok(PullThroughOutcome::Store(err)) => return Err(CacheError::Store(err)),
                     Err(e) => {
                         last_err = Some(e);
                         true
@@ -5903,27 +5547,23 @@ impl CacheEngine {
                 Err(CacheError::NotFound { hash })
             } else {
                 // Structurally unreachable: every iteration of the loop
-                // above takes exactly one match arm. The five non-`Err`
-                // arms all `return`; the `NotFound` arm sets
-                // `any_not_found`; the breaker short-circuit sets
-                // `any_short_circuit`; the `Err` arm sets `last_err`. To
-                // reach this branch the chain must be non-empty (`is_empty()`
-                // check at the top of `pull_through`) and have produced
-                // no `last_err`, no `any_not_found`, and no
-                // `any_short_circuit` — impossible under the current
-                // `PullThroughOutcome` taxonomy. Reaching it
-                // would mean a future variant was added without wiring
-                // the corresponding flag, and a debug-only assert would
-                // compile out in release builds. Emit an operator-visible
-                // log and fall through to a `NotFound` surface so the
-                // observable behaviour stays bounded (`unreachable!()`
-                // would also be correct but the workspace policy prefers
-                // a logged fallback over a release-panic in a hot path).
+                // above takes exactly one match arm. The `AlreadyAdmitted`
+                // arm returns; the `NotFound` arm sets `any_not_found`; the
+                // breaker short-circuit sets `any_short_circuit`; the `Err`
+                // arm sets `last_err`. To reach this branch the chain must be
+                // non-empty (`is_empty()` check at the top of `pull_through`)
+                // and have produced none of them — impossible under the
+                // current `OriginFetch` taxonomy. Reaching it would mean a
+                // future variant was added without wiring the corresponding
+                // flag. Emit an operator-visible log and fall through to a
+                // `NotFound` surface so the observable behaviour stays bounded
+                // (the workspace policy prefers a logged fallback over a
+                // release-panic in a hot path).
                 tracing::error!(
                     hash = %hash,
                     "internal invariant violated: non-empty origin chain produced \
                      neither a NotFound nor an Err — likely a missing flag on a new \
-                     PullThroughOutcome variant",
+                     OriginFetch variant",
                 );
                 Err(CacheError::NotFound { hash })
             }
@@ -5982,15 +5622,25 @@ impl CacheEngine {
         }
     }
 
+    /// The breaker and retry policy every read of the origin at `ix` runs
+    /// under ([`ReadGuard::run`]). An index past the chain reads with no
+    /// breaker (a construction bug, degraded rather than a panic).
+    fn read_guard(&self, ix: usize) -> ReadGuard {
+        ReadGuard::new(
+            self.inner.breakers.get(ix).cloned(),
+            self.inner.retry_policy,
+            self.inner.metrics.clone(),
+        )
+    }
+
     /// Commit a per-origin breaker the health verdict for a completed
     /// attempt (#963) by recording it through the admission's
     /// [`crate::circuit_breaker::TrialGuard`].
     ///
     /// A transient that exhausted the retry budget is `Unavailable`
-    /// (counts toward the trip threshold); everything else — bytes,
-    /// `NotFound`, permanent per-object errors (404/4xx/decode/cap), and
-    /// even a `Store`/`HashMismatch`/`BlobTooLarge` (the origin DID
-    /// respond) — is `Available` and resets the failure count.
+    /// (counts toward the trip threshold); everything else — a fill,
+    /// `NotFound`, permanent per-object errors (the origin DID respond) — is
+    /// `Available` and resets the failure count.
     ///
     /// Recording defuses the guard's cancellation-release path, so the
     /// HALF-OPEN trial slot it may own is resolved exactly once. A `None`
@@ -6038,365 +5688,6 @@ impl CacheEngine {
             "advancing to next origin in fallback chain (circuit-breaker open)",
         );
     }
-
-    /// A single end-to-end pull-through attempt: origin.fetch +
-    /// (buffer-then-commit | stream-and-commit) + hash verify + tag
-    /// promote. Body-phase errors classified as
-    /// [`OriginPullError::Transient`] re-enter the retry loop; the
-    /// non-[`OriginPullError`] outcomes (`Store` / `HashMismatch` /
-    /// `BlobTooLarge`) ride out through [`PullThroughOutcome`] because
-    /// they are deterministic and retry would not help.
-    ///
-    /// Why this method instead of inlining into `pull_through`: the
-    /// retry loop ([`run_with_retry_classified`]) needs a callable that
-    /// produces a fresh attempt on each invocation — the side-channel `Arc`s,
-    /// `TempTag`s, and origin futures all have to be re-created per
-    /// attempt and can't be reused across iterations.
-    ///
-    /// Under [`FillMode::CommitOnly`] (the `populate` fill path) this returns
-    /// [`PullThroughOutcome::Committed`] rather than a payload — the streaming arm
-    /// by skipping its `read_local`, the buffered arm by dropping its drain
-    /// buffer. See that variant's docs (#1132).
-    #[allow(clippy::too_many_lines)] // Linear per-attempt flow; the failure-classification arms each need their own context comment, and splitting them across functions would obscure the sequence more than the length.
-    async fn pull_through_attempt(
-        &self,
-        origin: Arc<dyn Origin>,
-        hash: Hash,
-        max_blob_bytes: u64,
-        policy: RetryPolicy,
-        mode: FillMode,
-    ) -> Result<PullThroughOutcome, OriginPullError> {
-        // The origin handle is now plumbed in by the caller
-        // (`pull_through`'s fallback-chain loop, #284) so this method
-        // is agnostic to chain position and works identically for the
-        // singular-origin (chain length 1) and multi-origin paths.
-        let fetch = origin.fetch(hash, max_blob_bytes).await?;
-        let (stream, size_hint) = match fetch {
-            crate::origin::OriginFetch::NotFound => return Ok(PullThroughOutcome::NotFound),
-            crate::origin::OriginFetch::AlreadyAdmitted => {
-                // The origin admitted + verified the blob into the store itself
-                // (node-to-node pull, #1682). Skip the drain / import_and_verify_stream
-                // and reuse the same post-commit tail the streamed path runs.
-                return match mode {
-                    FillMode::CommitOnly => Ok(PullThroughOutcome::Committed),
-                    FillMode::ReturnBytes => match self.read_local(hash).await {
-                        Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
-                        Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
-                        Err(other) => Ok(PullThroughOutcome::Store(
-                            anyhow::Error::from(other).context(
-                                "read_local returned unexpected variant after AlreadyAdmitted",
-                            ),
-                        )),
-                    },
-                };
-            }
-            crate::origin::OriginFetch::Found { stream, size_hint } => (stream, size_hint),
-        };
-
-        // Pre-stream cap: if the adapter advertised a length, reject
-        // before reading the first byte. The post-stream cap below is
-        // load-bearing too — origins can lie or omit the hint. This
-        // is a deterministic operator-visible cap breach; surface as
-        // `BlobTooLarge` directly without burning retry budget.
-        if let Some(advertised) = size_hint
-            && advertised > max_blob_bytes
-        {
-            return Ok(PullThroughOutcome::BlobTooLarge);
-        }
-
-        if should_buffer(size_hint, policy.buffered_max_bytes) {
-            let drain_cap = policy.buffered_max_bytes.min(max_blob_bytes);
-            let bytes = match drain_to_bytes(stream, drain_cap, self.inner.metrics.as_ref()).await {
-                Ok(b) => b,
-                // Cap-breach: surface as `BlobTooLarge` directly (typed
-                // outcome). Routing through `classify_io_error` would
-                // collapse it to a generic `OriginError` and operators
-                // alerting on the typed `BlobTooLarge` metric would
-                // lose visibility.
-                Err(e) if is_blob_too_large_marker(&e) => {
-                    return Ok(PullThroughOutcome::BlobTooLarge);
-                }
-                Err(e) => return Err(classify_io_error(e)),
-            };
-            return self.commit_buffered_bytes(hash, bytes, mode).await;
-        }
-
-        // Streaming path: drive the origin stream into the store, verify the
-        // hash, and promote — shared verbatim with the node-driven tee sink
-        // (#856) via `import_and_verify_stream`. On a committed blob the engine's
-        // existing `get()` callers (admin RPC, metrics tests) want the full
-        // payload as `Bytes`, so re-read it from the local store (one mmap'd read
-        // with `fs-store`, no extra origin egress).
-        match self
-            .import_and_verify_stream(hash, stream, max_blob_bytes)
-            .await?
-        {
-            // The fill-only caller (`populate` / `populate_local`) drops the bytes,
-            // so reading them back would re-materialise the whole blob for nothing
-            // — the exact allocation the streaming import above just avoided
-            // (#1132). Skip it.
-            StreamCommitOutcome::Committed if mode == FillMode::CommitOnly => {
-                Ok(PullThroughOutcome::Committed)
-            }
-            StreamCommitOutcome::Committed => match self.read_local(hash).await {
-                Ok(bytes) => Ok(PullThroughOutcome::Bytes(bytes)),
-                Err(CacheError::Store(err)) => Ok(PullThroughOutcome::Store(err)),
-                Err(other) => {
-                    // `read_local` only surfaces `Store`; any other variant is a
-                    // logic regression. Map to `Store` so the outer
-                    // `pull_through` still surfaces a coherent error; the inner
-                    // anyhow chain preserves the cause.
-                    Ok(PullThroughOutcome::Store(
-                        anyhow::Error::from(other).context(
-                            "read_local returned unexpected variant after successful commit",
-                        ),
-                    ))
-                }
-            },
-            StreamCommitOutcome::HashMismatch { actual } => {
-                Ok(PullThroughOutcome::HashMismatch { actual })
-            }
-            StreamCommitOutcome::BlobTooLarge => Ok(PullThroughOutcome::BlobTooLarge),
-            StreamCommitOutcome::Store(err) => Ok(PullThroughOutcome::Store(err)),
-        }
-    }
-
-    /// Drive a chunk stream into the iroh-blobs store, capturing mid-stream
-    /// errors via the side channel, verify the committed hash against `hash`,
-    /// and on match promote the temp tag to a named tag. This is the
-    /// commit-and-verify tail of the origin pull-through
-    /// ([`Self::pull_through_attempt`]); `stream` is an `Origin::fetch` stream.
-    /// It does NOT broadcast the insert or read the bytes back; the caller owns
-    /// those (the pull-through re-reads for its `Bytes` return).
-    ///
-    /// `count_and_cap_stream` enforces `max_blob_bytes` and bumps the
-    /// origin-egress metric per chunk, so the pulled bytes are metered as the
-    /// upstream egress they genuinely are (those bytes left an origin) without
-    /// touching the `get`-caller hit/returned counters.
-    async fn import_and_verify_stream<S>(
-        &self,
-        hash: Hash,
-        stream: S,
-        max_blob_bytes: u64,
-    ) -> Result<StreamCommitOutcome, OriginPullError>
-    where
-        S: futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
-    {
-        // `iroh-blobs::add_stream` swallows the upstream `io::Error` (it
-        // `?`-propagates inside an async block whose error is discarded), so
-        // without this side-channel capture the engine sees only "unexpected end
-        // of stream" and operators lose the actionable upstream message. Failed
-        // attempts strand a partial `TempTag` worth of bytes; iroh-blobs GC
-        // reclaims them at `cache.gc_interval_sec` cadence.
-        let captured_err: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
-        let counted = count_and_cap_stream(
-            stream,
-            max_blob_bytes,
-            self.inner.metrics.clone(),
-            captured_err.clone(),
-        );
-        let progress = self.inner.store.blobs().add_stream(counted).await;
-        let temp_tag_result = progress.temp_tag().await;
-
-        // Side-channel-recorded error wins over both the iroh-blobs Err arm AND a
-        // "successful" partial import, because the latter's hash is
-        // deterministically wrong and we'd rather surface the real cause than a
-        // confusing `HashMismatch`. Drop the temp tag (regardless of inner
-        // Ok/Err) so iroh-blobs GC reclaims the partial bytes.
-        let captured = captured_err
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(upstream) = captured {
-            drop(temp_tag_result);
-            // Cap-breach mid-stream: typed `BlobTooLargeMarker` is the documented
-            // escape hatch — surface as the typed `BlobTooLarge` outcome rather
-            // than routing through `classify_io_error` which would collapse it to
-            // a generic `OriginError`.
-            if is_blob_too_large_marker(&upstream) {
-                return Ok(StreamCommitOutcome::BlobTooLarge);
-            }
-            // Otherwise classify via the shared body-phase classifier: typed
-            // `OriginError::*` inners surface as Permanent (decompression
-            // failures, etc.); `io::ErrorKind`-Transient kinds (ConnectionReset,
-            // TimedOut, …) surface as Transient and re-enter the retry loop.
-            return Err(classify_io_error(upstream));
-        }
-
-        let temp_tag = match temp_tag_result {
-            Ok(tt) => tt,
-            Err(err) => {
-                // No upstream-captured error: the failure is on iroh-blobs' side
-                // (disk write, actor crash, serialization-task panic, etc.).
-                // Surface as `Store` so operators routing on origin-vs-store
-                // don't misclassify a local store problem as a remote origin one.
-                return Ok(StreamCommitOutcome::Store(
-                    anyhow::Error::from(err)
-                        .context("iroh-blobs add_stream failed during pull-through"),
-                ));
-            }
-        };
-
-        let actual = temp_tag.hash();
-        if actual != hash {
-            // Drop the temp tag without promotion → the wrong-hash bytes are
-            // never tagged, so they are GC-eligible inside iroh-blobs and the
-            // next sweep reclaims them. Deterministic protocol violation: a clean
-            // stream that hashed wrong is not a transport failure — retry won't
-            // help.
-            //
-            // We deliberately do NOT logically evict `actual`. The persisted
-            // evicted set is reserved for operator DMCA/corruption takedowns
-            // (#279); reusing it here would durably censor `actual` — and since
-            // content is BLAKE3-addressed, bytes whose hash is `actual` *are* the
-            // authorized content for `actual`. A malicious upstream that answers
-            // a pull for `hash` with a victim blob's bytes could otherwise make
-            // us permanently blacklist that legitimate blob (#853). The requested
-            // hash `hash` is correctly never committed.
-            drop(temp_tag);
-            return Ok(StreamCommitOutcome::HashMismatch { actual });
-        }
-
-        // Promote the temp tag to a named tag — same effect as
-        // `add_bytes(...).await`, which goes through `with_tag()` (iroh-blobs
-        // `blobs.rs:624-632`). The name is opaque; the store auto-assigns it.
-        // Tag-create failure is store-side, not origin-side: surface as `Store`
-        // so retry-class taxonomy doesn't pick it up.
-        let haf = temp_tag.hash_and_format();
-        // A pull that started before a quarantine must not protect the corrupt
-        // entry the quarantine released to GC. The import landed on that entry,
-        // so nothing verified is lost.
-        if self.is_quarantined(hash) {
-            drop(temp_tag);
-            return Ok(StreamCommitOutcome::Committed);
-        }
-        if let Err(err) = self.inner.store.tags().create(haf).await {
-            return Ok(StreamCommitOutcome::Store(anyhow::Error::from(err)));
-        }
-        drop(temp_tag);
-        Ok(StreamCommitOutcome::Committed)
-    }
-
-    /// Commit a fully-buffered payload from the drain path. Drains do
-    /// not go through `count_and_cap_stream` (their cap was already
-    /// enforced inline), so this just hands the buffered `Bytes` to
-    /// iroh-blobs and verifies the resulting hash. Splitting the
-    /// commit out of `pull_through_attempt` keeps the two body-phase
-    /// paths (drain vs. streaming) symmetric: each is followed by the
-    /// same commit-and-verify sequence.
-    async fn commit_buffered_bytes(
-        &self,
-        hash: Hash,
-        bytes: Bytes,
-        mode: FillMode,
-    ) -> Result<PullThroughOutcome, OriginPullError> {
-        // iroh-blobs `add_bytes` returns `Ok(NamedTag)` directly,
-        // skipping the `TempTag` intermediary used by `add_stream`.
-        // The named tag protects the blob from GC and is the same
-        // shape the streaming path produces after `tags().create()`.
-        let tag = match self.inner.store.blobs().add_bytes(bytes.clone()).await {
-            Ok(t) => t,
-            Err(err) => {
-                return Ok(PullThroughOutcome::Store(
-                    anyhow::Error::from(err)
-                        .context("iroh-blobs add_bytes failed during pull-through"),
-                ));
-            }
-        };
-        let actual = tag.hash;
-        if actual != hash {
-            // Unlike the streaming path (which drops an unpromoted `TempTag`),
-            // `add_bytes` already created a *persistent named tag* protecting
-            // these wrong-hash bytes from GC. Delete it so the bytes become
-            // GC-eligible — matching the streaming path's drop semantics and
-            // avoiding the unbounded-disk-growth leak (#837). Best-effort: a
-            // delete failure only delays reclaim, so it is logged, not
-            // propagated over the `HashMismatch` we owe the caller.
-            //
-            // As on the streaming path we do NOT logically evict `actual`:
-            // the persisted evicted set is for deliberate takedowns only, and
-            // logically evicting a content-addressed hash here is the
-            // durable-censorship vector in #853.
-            if let Err(err) = self.inner.store.tags().delete(tag.name).await {
-                if let Some(m) = &self.inner.metrics {
-                    m.tag_drop_failures.inc();
-                }
-                tracing::warn!(
-                    expected = %hash,
-                    %actual,
-                    error = %err,
-                    "hash-mismatch tag delete failed (drain path); wrong-hash bytes stay GC-protected (not auto-retried)",
-                );
-            }
-            return Ok(PullThroughOutcome::HashMismatch { actual });
-        }
-        match mode {
-            FillMode::ReturnBytes => Ok(PullThroughOutcome::Bytes(bytes)),
-            // The drain already holds these bytes, so unlike the streaming path
-            // there is nothing to *avoid* re-reading here — dropping them is not a
-            // memory win. It is a CONTRACT win: it makes "CommitOnly ⟺ None" true
-            // in both directions, so the wrappers are total and a reader of
-            // `FillMode::CommitOnly` can trust it end to end rather than
-            // discovering this arm as an exception.
-            FillMode::CommitOnly => {
-                drop(bytes);
-                Ok(PullThroughOutcome::Committed)
-            }
-        }
-    }
-}
-
-/// Whether a pull-through hands the committed blob back to its caller.
-///
-/// Replaces a `want_bytes: bool` that sat directly beside `local_only: bool` in
-/// `pull_through`'s argument list — two adjacent booleans the compiler would let
-/// you swap silently, in a chain where getting it wrong either reinstates the
-/// #1132 whole-blob read-back or stops `get` consulting peer origins. The
-/// `local_only` half would at least be caught — `populate_local_skips_peer_origin_and_fills_from_local`
-/// asserts `peer_fetches == 0`. The read-back half is the silent one, and is what
-/// the enum is really buying.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum FillMode {
-    /// [`CacheEngine::get`] — the caller needs the payload. The streaming arm
-    /// reads the committed blob back out of the store to produce it; the buffered
-    /// arm already holds it and returns its drain buffer.
-    ReturnBytes,
-    /// [`CacheEngine::populate`] — the caller drops the payload, so it is never
-    /// read back (#1132). Serving a 708 MB blob would otherwise cost that much
-    /// again on the miss leg for a buffer nobody looks at.
-    CommitOnly,
-}
-
-/// Per-attempt outcomes that ride out of the retry loop without
-/// classification: each is a deterministic, non-retry-class result
-/// the engine maps directly to a `CacheError` variant.
-#[derive(Debug)]
-enum PullThroughOutcome {
-    Bytes(Bytes),
-    /// The blob committed to the local store, but the caller asked not to have it
-    /// read back ([`FillMode::CommitOnly`] — the fill-only path, #1132). Carrying no
-    /// payload is the entire point: re-reading a 708 MB blob to hand it to
-    /// [`CacheEngine::populate`], which drops it, was a whole-blob allocation on
-    /// the serve path's miss leg.
-    Committed,
-    NotFound,
-    BlobTooLarge,
-    HashMismatch {
-        actual: Hash,
-    },
-    Store(anyhow::Error),
-}
-
-/// Outcome of [`CacheEngine::import_and_verify_stream`] — the commit-and-verify
-/// tail of the origin pull-through. Mirrors [`PullThroughOutcome`] minus the
-/// `Bytes`/`NotFound` arms: a stream import either commits, hashes wrong,
-/// overruns the cap, or hits a store fault.
-#[derive(Debug)]
-enum StreamCommitOutcome {
-    Committed,
-    BlobTooLarge,
-    HashMismatch { actual: Hash },
-    Store(anyhow::Error),
 }
 
 /// Bound on the store's `import_bao` local update queue for
@@ -6434,17 +5725,6 @@ fn classify_admit_decode_error(hash: Hash, e: std::io::Error) -> CacheError {
         CacheError::Feed(anyhow::Error::from(e).context("admit_bao_stream: decode/feed failed"))
     }
 }
-/// True when the body-phase `io::Error` wraps a typed
-/// [`BlobTooLargeMarker`] — meaning the cap (engine-level
-/// `count_and_cap_stream`, adapter-level HTTP chunk cap, or the
-/// drain-path running total) tripped. Lets the engine surface
-/// `CacheError::BlobTooLarge` directly instead of routing through
-/// [`classify_io_error`] which would collapse the typed marker into a
-/// generic `OriginError`.
-fn is_blob_too_large_marker(e: &std::io::Error) -> bool {
-    e.get_ref()
-        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<BlobTooLargeMarker>)
-}
 
 /// Exact byte length a correct pre-order bao outboard for a `blob_size`-byte
 /// blob has, under iroh-blobs' canonical `IROH_BLOCK_SIZE` (#823). Used to
@@ -6454,112 +5734,6 @@ fn is_blob_too_large_marker(e: &std::io::Error) -> bool {
 /// exceeds `u64` (it cannot for any real blob).
 pub(crate) fn expected_outboard_len(blob_size: u64) -> u64 {
     bao_tree::BaoTree::new(blob_size, crate::range_pull::IROH_BLOCK_SIZE).outboard_size()
-}
-
-pub(crate) use crate::origin::BlobTooLargeMarker;
-
-/// Adapter that bumps the `pull_through_bytes` metric per chunk,
-/// captures any upstream error into `captured_err`, and *terminates
-/// the stream cleanly* (yields `None`, never `Err`) on cap breach
-/// or upstream error.
-///
-/// The engine pipes the returned stream directly into
-/// [`iroh_blobs::api::blobs::Blobs::add_stream`], so the I/O bound
-/// becomes the chunk size from the origin (typically a few KiB to a
-/// few MiB depending on the backend) — a 10 GB blob never pins
-/// 10 GB of process RSS (issue #271).
-///
-/// **Why `None`-on-error rather than `Err`:** iroh-blobs'
-/// `add_stream` send loop propagates a yielded `Err` via `?`,
-/// dropping the bidi-channel sender. Its server-side companion
-/// actor then waits forever for `Done` before yielding any
-/// progress item, hanging the whole import. Yielding `None` lets
-/// `add_stream` send the `Done` marker so the import commits
-/// (under whatever hash the partial bytes produce); the engine
-/// reads `captured_err` to surface the *real* failure instead of
-/// the misleading `HashMismatch` the partial-import would
-/// otherwise produce. The partial blob is left as an unprotected
-/// `TempTag` and reclaimed by iroh-blobs' GC.
-///
-/// **Wrapping the inner stream in `Option`** ensures polling
-/// returns `None` once we've terminated. Polling a stream after
-/// a terminal error is undefined; without the sentinel, a
-/// consumer that resumes polling could re-enter the adapter and
-/// re-poll an already-errored upstream.
-///
-/// The `Send + Sync + 'static` bound on the returned stream is fixed
-/// by `add_stream`'s signature.
-fn count_and_cap_stream<S>(
-    stream: S,
-    max_bytes: u64,
-    metrics: Option<Arc<CacheMetrics>>,
-    captured_err: Arc<Mutex<Option<std::io::Error>>>,
-) -> impl futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + 'static
-where
-    S: futures_util::Stream<Item = std::io::Result<Bytes>> + Send + Sync + Unpin + 'static,
-{
-    use futures_util::StreamExt;
-    futures_util::stream::unfold(
-        (Some(stream), 0u64, metrics, captured_err),
-        move |(maybe_s, total, metrics, captured)| async move {
-            let mut s = maybe_s?;
-            let next = s.next().await?;
-            match next {
-                Err(e) => {
-                    // Move the real error into the side channel
-                    // (preserves any typed inner like
-                    // `io::Error::other(OriginError::*)` that
-                    // `HttpOrigin` packs in) and *terminate the
-                    // stream cleanly* by returning `None` on the
-                    // next poll. We deliberately do **not** yield
-                    // the error to iroh-blobs' `add_stream`: when
-                    // we yield `Err` from the source stream,
-                    // `add_stream`'s send loop returns early via
-                    // `?`, dropping the bidi-channel sender — but
-                    // its companion server-side actor then waits
-                    // forever for `Done` before yielding any
-                    // progress item, hanging the whole import.
-                    // Yielding `None` instead lets `add_stream`
-                    // send the `Done` marker, the import commits
-                    // with whatever bytes were already received
-                    // (under a wrong hash), and the engine reads
-                    // `captured_err` to surface the *real* failure
-                    // instead of the misleading `HashMismatch` the
-                    // partial-import would otherwise produce. The
-                    // partial blob is left as an unprotected
-                    // `TempTag` and reclaimed by iroh-blobs' GC.
-                    *captured.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
-                    None
-                }
-                Ok(chunk) => {
-                    // Bill the chunk before the cap check: the
-                    // origin already sent us the bytes, so the
-                    // operator-visible egress meter must count them
-                    // (matches the pre-streaming "every byte fetched
-                    // is paid" intent at engine.rs:952-960). A
-                    // chunk that lands the running total past
-                    // `max_bytes` is still counted in
-                    // `pull_through_bytes` even though we then
-                    // abort the import.
-                    if let Some(m) = metrics.as_ref() {
-                        m.pull_through_bytes
-                            .inc_by(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-                    }
-                    let new_total = total.saturating_add(chunk.len() as u64);
-                    if new_total > max_bytes {
-                        // Pack a typed `BlobTooLargeMarker` into the
-                        // io::Error so the engine surfaces
-                        // `CacheError::BlobTooLarge` (recovered via
-                        // `io::Error::get_ref` downcast).
-                        let err = std::io::Error::other(BlobTooLargeMarker { max_bytes });
-                        *captured.lock().unwrap_or_else(PoisonError::into_inner) = Some(err);
-                        return None;
-                    }
-                    Some((Ok(chunk), (Some(s), new_total, metrics, captured)))
-                }
-            }
-        },
-    )
 }
 
 /// Record the end of an `origin_pull` span once. A
@@ -6588,12 +5762,14 @@ fn record_origin_pull<T>(span: &tracing::Span, result: &CacheResult<T>) {
 /// keeps no content from GC.
 const SIZE_PROOF_TAG_PREFIX: &str = "decdn-sizeproof-";
 
-/// How long a lookup that found no origin `{H}.sizeproof` is remembered, so a
-/// open flood for an unprovable blob reads no origin again in that time.
-const SIZE_PROOF_MISS_TTL: Duration = Duration::from_secs(5);
-
-/// Most `(hash, size)` misses the engine remembers.
-const SIZE_PROOF_MISS_ENTRIES: usize = 4096;
+/// The size and proof a `{H}.sizeproof` object holds, when the proof verifies
+/// against `hash` at the size the object states. `None` for an object that
+/// does not parse or does not verify.
+fn verified_size_proof(hash: Hash, object: &Bytes) -> Option<(u64, Bytes)> {
+    let (size, proof) = decdn_bao_range::parse_size_proof_object(object)?;
+    decdn_bao_range::verify_size_proof(*hash.as_bytes(), size, proof)
+        .then(|| (size, object.slice_ref(proof)))
+}
 
 /// The blob hash a size proof tag names, from its 64 hex characters.
 fn size_proof_tag_hash(name: &[u8]) -> Option<Hash> {

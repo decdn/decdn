@@ -1,5 +1,4 @@
 use super::*;
-use std::assert_matches;
 
 const ROOT: &str = "cause-root-7f3a";
 const OUTER: &str = "ctx-outer-7f3a";
@@ -66,36 +65,4 @@ fn logged_chain_names_each_cause_once() {
             assert_eq!(shown.matches(OUTER).count(), 1, "{shown}");
         }
     }
-}
-
-fn decompression_fault() -> CacheError {
-    let typed = OriginError::DecompressionFailed {
-        encoding: SupportedEncoding::Gzip,
-        source: std::io::Error::other(ROOT),
-    };
-    CacheError::OriginError {
-        hash: Hash::from_bytes([0; 32]),
-        source: anyhow::Error::from(typed).context(OUTER),
-    }
-}
-
-#[test]
-fn logged_decompression_failure_names_the_decoder_error_once() {
-    for shown in logged(decompression_fault()) {
-        assert_eq!(shown.matches(ROOT).count(), 1, "{shown}");
-        assert!(shown.contains("failed to decompress gzip"), "{shown}");
-    }
-}
-
-#[test]
-fn origin_error_kind_finds_the_typed_cause_under_context() {
-    let e = decompression_fault();
-    assert_matches!(
-        e.origin_error_kind(),
-        Some(OriginError::DecompressionFailed {
-            encoding: SupportedEncoding::Gzip,
-            ..
-        }),
-        "{e:?}"
-    );
 }

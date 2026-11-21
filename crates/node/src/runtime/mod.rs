@@ -1250,24 +1250,6 @@ async fn build_chain_and_handlers(
     let bind_domain =
         decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
 
-    // Reactive LOCAL-origin pull-through (#1116). Arm a local-only populate on the
-    // serve-miss path whenever the operator configured any origin (`[cache.origin]`),
-    // INDEPENDENT of `node_to_node_pull_through_enabled`: a cache-only operator must
-    // be able to reactively serve content it holds in its OWN fs/http/s3 origin, and
-    // — with node→node on — that local origin is preferred over the paid peer window
-    // path. The handler still gates it on proven lane authority
-    // (`pull_authorized`), so it fronts no free egress, and `populate_local` never
-    // consults the paid `Peer` node→node origin. The node→node
-    // window/buffered/governor/gate paths below stay flag-gated.
-    //
-    // A single local origin-chain walk (fs/http/s3), NOT a provider fan-out — so
-    // budget it at the per-attempt `node_pull_timeout_sec`, not `outer_pull_deadline`
-    // (which budgets the sequential node→node pull). Using the outer deadline would
-    // let a wedged local origin block many times longer (>7× at defaults) before
-    // falling through to the node→node paths.
-    let local_populate = (!cfg.cache.origins.is_empty())
-        .then(|| Duration::from_secs(cfg.cache.node_pull_timeout_sec));
-
     // Node→node pull-through deps (#831/#856/#821), all gated on
     // `node_to_node_pull_through_enabled`. Computed as `Option`s here so the handler's
     // wiring is one construction-time literal; the gates (and their nesting) are
@@ -1445,7 +1427,6 @@ async fn build_chain_and_handlers(
         chain_freshness: Some(chain_freshness.clone()),
         attestations: Some(Arc::clone(&attestations)),
         pull_through,
-        local_populate,
         pull_through_origin,
         frame_target_bytes: cfg.payment.frame_target_bytes,
         idle_timeout: None,
@@ -3368,12 +3349,10 @@ async fn build_cache(
     let mut origins: Vec<Arc<dyn Origin>> = Vec::with_capacity(cfg.cache.origins.len());
     for (idx, resolved) in cfg.cache.origins.iter().enumerate() {
         let backend: Arc<dyn Origin> = match resolved {
-            ResolvedOrigin::Http { url, decompress } => Arc::new(
-                HttpOrigin::new_with_user_agent(url.clone(), &cfg.cache.user_agent)
-                    .with_context(|| {
-                        format!("failed to build HTTP origin client for cache.origins[{idx}]")
-                    })?
-                    .with_decompress_mode(*decompress),
+            ResolvedOrigin::Http { url } => Arc::new(
+                HttpOrigin::new_with_user_agent(url.clone(), &cfg.cache.user_agent).with_context(
+                    || format!("failed to build HTTP origin client for cache.origins[{idx}]"),
+                )?,
             ),
             ResolvedOrigin::Fs { path } => {
                 Arc::new(FilesystemOrigin::new(path.clone()).await.with_context(|| {
@@ -3389,8 +3368,7 @@ async fn build_cache(
                     .await
                     .with_context(|| {
                         format!("failed to construct S3 origin client for cache.origins[{idx}]")
-                    })?
-                    .with_decompress_mode(s3_cfg.decompress),
+                    })?,
             ),
         };
         origins.push(backend);

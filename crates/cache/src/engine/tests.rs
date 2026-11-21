@@ -7,21 +7,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::origin::{Origin, OriginFetch, OriginKind};
 use std::assert_matches;
 
-/// A trivial in-memory origin for tests. Stores exactly one blob.
+/// An origin that holds nothing, standing in for a configured HTTP origin.
 #[derive(Debug)]
-struct StubOrigin {
-    data: Bytes,
-    hash: Hash,
-}
-
-impl StubOrigin {
-    fn new(payload: &[u8]) -> Self {
-        Self {
-            hash: Hash::new(payload),
-            data: Bytes::from(payload.to_vec()),
-        }
-    }
-}
+struct StubOrigin;
 
 impl Origin for StubOrigin {
     fn kind(&self) -> OriginKind {
@@ -32,430 +20,100 @@ impl Origin for StubOrigin {
         // `Origin::kind` is a tag, not a behavioural switch.
         OriginKind::Http
     }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
-    {
-        let result = if hash == self.hash {
-            Ok(OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(OriginFetch::NotFound)
-        };
-        Box::pin(async move { result })
-    }
 }
 
-/// A stub origin that also answers [`Origin::size`] and
-/// [`Origin::fetch_outboard`], for outboard-fetch tests. The
-/// outboard answer is configurable so a test can exercise the
-/// `NotFound`/`Unsupported` degrade.
-#[derive(Debug)]
-struct OutboardStubOrigin {
-    data: Bytes,
-    hash: Hash,
-    outboard: Option<Bytes>,
-}
-
-impl OutboardStubOrigin {
-    fn new(payload: &[u8], outboard: Option<Bytes>) -> Self {
-        Self {
-            hash: Hash::new(payload),
-            data: Bytes::from(payload.to_vec()),
-            outboard,
-        }
-    }
-}
-
-impl Origin for OutboardStubOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
-    {
-        let result = if hash == self.hash {
-            Ok(OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(OriginFetch::NotFound)
-        };
-        Box::pin(async move { result })
-    }
-
-    fn size(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
-        let matches = hash == self.hash;
-        let len = u64::try_from(self.data.len()).unwrap_or(u64::MAX);
-        Box::pin(async move { Ok(matches.then_some(len)) })
-    }
-
-    fn fetch_outboard(
-        &self,
-        hash: Hash,
-        _outboard_max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, crate::OriginPullError>> + Send + '_>>
-    {
-        let result = if hash == self.hash {
-            match &self.outboard {
-                Some(ob) => OutboardFetch::Found(ob.clone()),
-                None => OutboardFetch::NotFound,
-            }
-        } else {
-            OutboardFetch::NotFound
-        };
-        Box::pin(async move { Ok(result) })
-    }
-}
-
-/// Serves several blobs from one origin so a single engine can hold
-/// multiple distinct hashes (a second `CacheEngine::open` on the same
-/// dir would deadlock on iroh-blobs' single-writer file lock).
-#[derive(Debug)]
-struct MultiStubOrigin {
+/// A whole-blob origin shaped like the node-to-node origin: `fetch` admits
+/// its blob into the engine's store itself and answers `AlreadyAdmitted`, so
+/// `populate` runs its real fill path. `engine` is set once the engine that
+/// owns this origin is open. Counts the fetches; an optional delay keeps a
+/// fetch in flight while other callers arrive.
+#[derive(Debug, Default)]
+struct AdmittingOrigin {
+    engine: std::sync::OnceLock<CacheEngine>,
     blobs: std::collections::HashMap<Hash, Bytes>,
-}
-
-impl MultiStubOrigin {
-    fn new(payloads: &[&[u8]]) -> Self {
-        let blobs = payloads
-            .iter()
-            .map(|p| (Hash::new(p), Bytes::from(p.to_vec())))
-            .collect();
-        Self { blobs }
-    }
-}
-
-impl Origin for MultiStubOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
-    {
-        let result = self
-            .blobs
-            .get(&hash)
-            .map_or(Ok(OriginFetch::NotFound), |b| {
-                Ok(OriginFetch::found_one_shot(b.clone()))
-            });
-        Box::pin(async move { result })
-    }
-}
-
-/// Origin that answers `size()` (a `HEAD`/`HeadObject` stand-in) for one
-/// hash and COUNTS the calls, so a test can prove `origin_probe_presence`
-/// memoises rather than re-probing the backend on every probe. An optional
-/// delay exercises the per-probe timeout.
-#[derive(Debug)]
-struct CountingSizeOrigin {
-    hash: Hash,
-    size: u64,
-    calls: Arc<AtomicUsize>,
+    fetches: AtomicUsize,
     delay: Option<Duration>,
 }
 
-impl CountingSizeOrigin {
-    fn new(hash: Hash, size: u64) -> (Self, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let origin = Self {
-            hash,
-            size,
-            calls: Arc::clone(&calls),
-            delay: None,
-        };
-        (origin, calls)
+impl AdmittingOrigin {
+    fn new(payloads: &[&[u8]]) -> Self {
+        Self {
+            blobs: payloads
+                .iter()
+                .map(|p| (Hash::new(p), Bytes::from(p.to_vec())))
+                .collect(),
+            ..Self::default()
+        }
     }
 
-    fn slow(hash: Hash, size: u64, delay: Duration) -> (Self, Arc<AtomicUsize>) {
-        let (mut origin, calls) = Self::new(hash, size);
-        origin.delay = Some(delay);
-        (origin, calls)
+    fn slow(payloads: &[&[u8]], delay: Duration) -> Self {
+        Self {
+            delay: Some(delay),
+            ..Self::new(payloads)
+        }
+    }
+
+    fn fetches(&self) -> usize {
+        self.fetches.load(Ordering::SeqCst)
     }
 }
 
-impl Origin for CountingSizeOrigin {
+impl Origin for AdmittingOrigin {
     fn kind(&self) -> OriginKind {
-        OriginKind::Http
+        OriginKind::Peer
     }
 
     fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
-    {
-        // Never exercised by the probe path (existence + size only).
-        Box::pin(async { Ok(OriginFetch::NotFound) })
-    }
-
-    fn size(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
-        let matches = hash == self.hash;
-        let size = self.size;
-        let calls = Arc::clone(&self.calls);
-        let delay = self.delay;
-        Box::pin(async move {
-            // Count the *attempt* before any await, so a probe that the
-            // caller times out still registers as a backend hit.
-            calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(d) = delay {
-                tokio::time::sleep(d).await;
-            }
-            Ok(matches.then_some(size))
-        })
-    }
-}
-
-/// Origin whose `size()` (a `HEAD`/`HeadObject` stand-in) always fails
-/// with a transport error, and COUNTS the calls — the `Fault`-arm
-/// counterpart to [`CountingSizeOrigin`].
-#[derive(Debug)]
-struct FailingSizeOrigin {
-    calls: Arc<AtomicUsize>,
-}
-
-impl FailingSizeOrigin {
-    fn new() -> (Self, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        (
-            Self {
-                calls: Arc::clone(&calls),
-            },
-            calls,
-        )
-    }
-}
-
-impl Origin for FailingSizeOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        _hash: Hash,
         _max_bytes: u64,
     ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
     {
-        Box::pin(async { Ok(OriginFetch::NotFound) })
-    }
-
-    fn size(
-        &self,
-        _hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
-        let calls = Arc::clone(&self.calls);
         Box::pin(async move {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Err(crate::OriginPullError::Transient(anyhow::anyhow!(
-                "synthetic HEAD outage (connection refused)"
-            )))
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
+            let (Some(engine), Some(blob)) = (self.engine.get(), self.blobs.get(&hash)) else {
+                return Ok(OriginFetch::NotFound);
+            };
+            engine
+                .insert_blob(blob.clone())
+                .await
+                .map_err(|e| crate::OriginPullError::Permanent(anyhow::Error::from(e)))?;
+            Ok(OriginFetch::AlreadyAdmitted)
         })
     }
 }
 
-/// A per-origin transport error on the live `HEAD` — not just a timeout —
-/// is `Fault`, never `Absent` (#1766 follow-up): `origin_probe_presence`
-/// walks the origin chain itself rather than going through
-/// [`CacheEngine::origin_size`], whose swallow-and-advance per-origin
-/// error handling would otherwise launder a connection-refused/5xx/DNS
-/// outage into a false `Ok(None)`. Also confirms the fault is never
-/// memoised: a second probe re-walks the chain (call count 1 -> 2).
-#[tokio::test]
-async fn origin_probe_presence_transport_error_is_fault_not_absent() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let hash = Hash::new(b"faulting origin probe");
-    let (origin, calls) = FailingSizeOrigin::new();
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    assert_eq!(
-        engine.origin_probe_presence(hash).await,
-        OriginPresence::Fault,
-        "a per-origin transport error must be Fault, not Absent",
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend HEAD attempt");
-    assert_eq!(
-        engine.origin_probe_presence(hash).await,
-        OriginPresence::Fault,
-        "a fault is memoised under the fault TTL (#1789 item 6)",
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "the second probe served the cached fault rather than re-walking \
-         the origin chain — a steady state re-probes once per fault TTL, \
-         not once per request",
-    );
-    Ok(())
+/// Open an engine in `dir` over the one origin `origin`, and point `origin`
+/// at it.
+async fn admitting_engine(
+    dir: &Path,
+    origin: &Arc<AdmittingOrigin>,
+) -> anyhow::Result<CacheEngine> {
+    admitting_engine_with_metrics(dir, origin, None).await
 }
 
-/// A present remote object is discovered by a live `HEAD` and the answer is
-/// memoised: a second probe for the same hash issues NO further backend call.
-#[tokio::test]
-async fn origin_probe_presence_hits_origin_then_memoises_positive() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let hash = Hash::new(b"remote object");
-    let (origin, calls) = CountingSizeOrigin::new(hash, 4096);
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    assert_eq!(
-        engine.origin_probe_presence(hash).await,
-        OriginPresence::Present(4096),
-        "live HEAD finds it"
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "one backend HEAD");
-    assert_eq!(
-        engine.origin_probe_presence(hash).await,
-        OriginPresence::Present(4096),
-        "served from memo"
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "memo hit issues no second HEAD"
-    );
-    Ok(())
-}
-
-/// A 404 is memoised too — the whole point of the negative cache is that a
-/// random-hash probe flood does not re-`HeadObject` the origin every time.
-#[tokio::test]
-async fn origin_probe_presence_memoises_absent() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let present = Hash::new(b"present");
-    let absent = Hash::new(b"absent");
-    let (origin, calls) = CountingSizeOrigin::new(present, 100);
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    assert_eq!(
-        engine.origin_probe_presence(absent).await,
-        OriginPresence::Absent,
-        "not in origin"
-    );
-    assert_eq!(
-        engine.origin_probe_presence(absent).await,
-        OriginPresence::Absent,
-        "still absent"
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "negative answer is cached");
-    Ok(())
-}
-
-/// A refused (denied/blacklisted/evicted) hash is never advertised, and the
-/// guard short-circuits BEFORE any backend probe.
-#[tokio::test]
-async fn origin_probe_presence_refused_never_probes() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let hash = Hash::new(b"denied object");
-    let (origin, calls) = CountingSizeOrigin::new(hash, 100);
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-    engine.set_chain_denied_one(hash, true);
-
-    assert_eq!(
-        engine.origin_probe_presence(hash).await,
-        OriginPresence::Absent,
-        "refused stays hidden"
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "no HEAD for a refused hash"
-    );
-    Ok(())
-}
-
-/// `origin_probe_presence` distinguishes `Present`/`Absent`/`Fault`
-/// (#1766): a hash the origin holds is `Present(size)`, a hash it does not
-/// is `Absent`, and a `HEAD` slower than the probe ceiling is `Fault` —
-/// NOT `Absent`, so a caller can never sign an authoritative `NotFound`
-/// off a backend blip.
-#[tokio::test]
-async fn origin_probe_presence_distinguishes_present_absent_and_fault() -> anyhow::Result<()> {
-    // `Present`/`Absent` against a fast origin.
-    let tmp = tempfile::tempdir()?;
-    let present = Hash::new(b"present for presence");
-    let absent = Hash::new(b"absent for presence");
-    let (present_origin, _present_calls) = CountingSizeOrigin::new(present, 777);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(present_origin) as Arc<dyn Origin>],
+/// [`admitting_engine`] with a metrics handle.
+async fn admitting_engine_with_metrics(
+    dir: &Path,
+    origin: &Arc<AdmittingOrigin>,
+    metrics: Option<Arc<CacheMetrics>>,
+) -> anyhow::Result<CacheEngine> {
+    let engine = CacheEngine::open_full(
+        dir,
+        vec![Arc::clone(origin) as Arc<dyn Origin>],
         10,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        metrics,
+        Duration::ZERO,
     )
     .await?;
-    assert_eq!(
-        engine.origin_probe_presence(present).await,
-        OriginPresence::Present(777),
-        "a live HEAD hit is Present, not folded away",
-    );
-    assert_eq!(
-        engine.origin_probe_presence(absent).await,
-        OriginPresence::Absent,
-        "a genuine miss is Absent",
-    );
-
-    // `Fault` against a separate engine whose only origin overruns the
-    // probe ceiling (a shared origin would delay the Present/Absent
-    // probes above too, since `CountingSizeOrigin`'s delay is unconditional).
-    let tmp2 = tempfile::tempdir()?;
-    let slow = Hash::new(b"slow for presence");
-    let (slow_origin, slow_calls) = CountingSizeOrigin::slow(slow, 100, Duration::from_millis(400));
-    let fault_engine = CacheEngine::open(
-        tmp2.path(),
-        vec![Arc::new(slow_origin) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    // Tight timeout so the 400 ms origin overruns it.
-    fault_engine.set_origin_probe_config(OriginProbePolicy {
-        positive_ttl: Duration::from_secs(15),
-        negative_ttl: Duration::from_secs(2),
-        fault_ttl: Duration::from_secs(5),
-        timeout: Duration::from_millis(20),
-        capacity: 16,
-    });
-    assert_eq!(
-        fault_engine.origin_probe_presence(slow).await,
-        OriginPresence::Fault,
-        "a HEAD slower than the ceiling is Fault, not Absent",
-    );
-    assert_eq!(
-        slow_calls.load(Ordering::SeqCst),
-        1,
-        "one backend attempt for the first faulting probe",
-    );
-    assert_eq!(
-        fault_engine.origin_probe_presence(slow).await,
-        OriginPresence::Fault,
-        "a memoised fault still answers Fault",
-    );
-    assert_eq!(
-        slow_calls.load(Ordering::SeqCst),
-        1,
-        "the second probe served the cached fault instead of re-hitting \
-         the backend (#1789 item 6)",
-    );
-    Ok(())
+    let _ = origin.engine.set(engine.clone());
+    Ok(engine)
 }
 
 /// `total_bytes` must sum the on-disk footprint — it is the eviction
@@ -464,16 +122,10 @@ async fn origin_probe_presence_distinguishes_present_absent_and_fault() -> anyho
 async fn total_bytes_sums_populated_blobs() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"total-bytes payload";
-    let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
 
     anyhow::ensure!(engine.total_bytes().await? == 0, "empty cache is 0 bytes");
-    let _ = engine.get(hash).await?;
+    let hash = engine.insert_blob(payload.to_vec()).await?;
 
     let total = engine.total_bytes().await?;
     anyhow::ensure!(
@@ -496,14 +148,8 @@ async fn total_bytes_sums_populated_blobs() -> anyhow::Result<()> {
 async fn release_for_eviction_does_not_write_the_evicted_log() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"soft evict payload";
-    let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let _ = engine.get(hash).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
+    let hash = engine.insert_blob(payload.to_vec()).await?;
 
     engine.release_for_eviction(hash).await?;
 
@@ -534,14 +180,14 @@ async fn rescan_origins_indexes_fs_and_present_pins() -> anyhow::Result<()> {
     use crate::origin::FilesystemOrigin;
 
     async fn seed(base: &Path, payload: Vec<u8>) -> anyhow::Result<(Hash, u64)> {
-        let hash = Hash::new(&payload);
-        let hex = hash.to_hex();
-        let shard = hex.get(..2).unwrap_or("");
-        let dir = base.join(shard);
+        let len = u64::try_from(payload.len())?;
+        let eo = decdn_bao_range::encode_outboard(payload.as_slice(), len)?;
+        let dir = base.join(eo.shard());
         tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::write(dir.join(hex.as_str()), &payload).await?;
-        let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-        Ok((hash, len))
+        tokio::fs::write(dir.join(&eo.hash_hex), &payload).await?;
+        tokio::fs::write(dir.join(eo.obao4_name()), &eo.outboard).await?;
+        tokio::fs::write(dir.join(eo.size_proof_name()), eo.size_proof_object()).await?;
+        Ok((Hash::new(&payload), len))
     }
 
     let origin_dir = tempfile::tempdir()?;
@@ -607,28 +253,36 @@ async fn rescan_origins_indexes_fs_and_present_pins() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Origin that enumerates a fixed set and whose `size()` can be switched
-/// from answering to faulting, standing in for a `HeadObject` throttle
-/// window that opens between two rescans.
+/// A blob of `len` bytes derived from `seed`, and its `{H}.sizeproof` object.
+fn held_blob(seed: &[u8], len: usize) -> anyhow::Result<(Hash, Bytes)> {
+    let data: Vec<u8> = seed.iter().copied().cycle().take(len).collect();
+    let size = u64::try_from(len)?;
+    let object = decdn_bao_range::encode_outboard(data.as_slice(), size)?.size_proof_object();
+    Ok((Hash::new(&data), Bytes::from(object)))
+}
+
+/// Origin that enumerates a fixed set and whose `{H}.sizeproof` reads can
+/// be switched from answering to faulting, standing in for a throttle window
+/// that opens between two rescans.
 #[derive(Debug)]
 struct ThrottlableOrigin {
-    held: Vec<(Hash, u64)>,
+    held: Vec<(Hash, Bytes)>,
     faulting: Arc<AtomicBool>,
     /// The fault is `Permanent` rather than `Transient` — a revoked ACL or a
     /// symlink escape, which no later rescan resolves.
     permanent: Arc<AtomicBool>,
     enumerate_fails: Arc<AtomicBool>,
-    /// The origin still *lists* `held` but no longer serves it, so `size`
-    /// answers an authoritative `Ok(None)`.
+    /// The origin still *lists* `held` but no longer serves it, so the size
+    /// proof read answers an authoritative `Ok(None)`.
     holds: Arc<AtomicBool>,
-    /// Milliseconds each `size` takes, so a test can keep a pass in flight
-    /// while other triggers arrive.
+    /// Milliseconds each size proof read takes, so a test can keep a pass in
+    /// flight while other triggers arrive.
     slow_ms: Arc<AtomicU64>,
     size_calls: Arc<AtomicUsize>,
 }
 
 impl ThrottlableOrigin {
-    fn new(held: Vec<(Hash, u64)>) -> (Self, ThrottleControls) {
+    fn new(held: Vec<(Hash, Bytes)>) -> (Self, ThrottleControls) {
         let controls = ThrottleControls {
             faulting: Arc::new(AtomicBool::new(false)),
             permanent: Arc::new(AtomicBool::new(false)),
@@ -667,19 +321,10 @@ impl Origin for ThrottlableOrigin {
         OriginKind::S3
     }
 
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
-    {
-        Box::pin(async { Ok(OriginFetch::NotFound) })
-    }
-
-    fn size(
+    fn fetch_size_proof(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, crate::OriginPullError>> + Send + '_>>
     {
         Box::pin(async move {
             self.size_calls.fetch_add(1, Ordering::SeqCst);
@@ -690,11 +335,11 @@ impl Origin for ThrottlableOrigin {
             if self.faulting.load(Ordering::SeqCst) {
                 return Err(if self.permanent.load(Ordering::SeqCst) {
                     crate::OriginPullError::Permanent(anyhow::anyhow!(
-                        "synthetic HeadObject access denied"
+                        "synthetic size proof read: access denied"
                     ))
                 } else {
                     crate::OriginPullError::Transient(anyhow::anyhow!(
-                        "synthetic HeadObject throttle (503 SlowDown)"
+                        "synthetic size proof read: 503 SlowDown"
                     ))
                 });
             }
@@ -705,7 +350,7 @@ impl Origin for ThrottlableOrigin {
                 .held
                 .iter()
                 .find(|(h, _)| *h == hash)
-                .map(|(_, len)| *len))
+                .map(|(_, object)| object.clone()))
         })
     }
 
@@ -731,9 +376,10 @@ impl Origin for ThrottlableOrigin {
 /// announce coverage — with every downstream signal reporting success.
 #[tokio::test]
 async fn rescan_origins_carries_a_faulted_probe_forward() -> anyhow::Result<()> {
-    let indexed = Hash::new(b"throttle-indexed");
-    let fresh = Hash::new(b"throttle-fresh");
-    let (origin, controls) = ThrottlableOrigin::new(vec![(indexed, 5000), (fresh, 9000)]);
+    let indexed_blob = held_blob(b"throttle-indexed", 5000)?;
+    let fresh_blob = held_blob(b"throttle-fresh", 9000)?;
+    let (indexed, fresh) = (indexed_blob.0, fresh_blob.0);
+    let (origin, controls) = ThrottlableOrigin::new(vec![indexed_blob, fresh_blob]);
     let origin = Arc::new(origin) as Arc<dyn Origin>;
 
     let tmp = tempfile::tempdir()?;
@@ -745,7 +391,9 @@ async fn rescan_origins_carries_a_faulted_probe_forward() -> anyhow::Result<()> 
         // `fresh` is also pinned, so it reaches the probe loop twice — once
         // from the listing and once from the pin set. It must be probed once.
         crate::PinnedHashes::new([from_store_hash(fresh)].into_iter().collect()),
-        crate::RetryPolicy::default(),
+        // No retry, so one probe is one origin read and the count below
+        // measures the per-candidate dedupe.
+        crate::RetryPolicy::disabled(),
         CircuitBreakerPolicy::default(),
         Some(Arc::clone(&cm)),
         Duration::ZERO,
@@ -837,8 +485,9 @@ async fn rescan_origins_carries_a_faulted_probe_forward() -> anyhow::Result<()> 
 /// carries an entry forward — an authoritative `Ok(None)` drops it.
 #[tokio::test]
 async fn rescan_origins_evicts_a_hash_the_origin_no_longer_holds() -> anyhow::Result<()> {
-    let goes_away = Hash::new(b"origin-drops-it");
-    let (origin, controls) = ThrottlableOrigin::new(vec![(goes_away, 4242)]);
+    let blob = held_blob(b"origin-drops-it", 4242)?;
+    let goes_away = blob.0;
+    let (origin, controls) = ThrottlableOrigin::new(vec![blob]);
     let origin = Arc::new(origin) as Arc<dyn Origin>;
 
     let tmp = tempfile::tempdir()?;
@@ -850,8 +499,8 @@ async fn rescan_origins_evicts_a_hash_the_origin_no_longer_holds() -> anyhow::Re
         "the healthy rescan must index it",
     );
 
-    // The origin still lists it but no longer holds it: `size` answers
-    // `Ok(None)`, which is authoritative, not a fault.
+    // The origin still lists it but no longer holds it: the size proof read
+    // answers `Ok(None)`, which is authoritative, not a fault.
     controls.holds.store(false, Ordering::SeqCst);
     engine.rescan_origins().await;
 
@@ -875,8 +524,9 @@ async fn rescan_origins_evicts_a_hash_the_origin_no_longer_holds() -> anyhow::Re
 /// obsolete passes back to back, against an origin already struggling.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_rescans_collapse_into_one_rerun() -> anyhow::Result<()> {
-    let listed = Hash::new(b"rescan-single-flight");
-    let (origin, controls) = ThrottlableOrigin::new(vec![(listed, 11)]);
+    let blob = held_blob(b"rescan-single-flight", 11)?;
+    let listed = blob.0;
+    let (origin, controls) = ThrottlableOrigin::new(vec![blob]);
     let origin = Arc::new(origin) as Arc<dyn Origin>;
 
     let tmp = tempfile::tempdir()?;
@@ -927,8 +577,9 @@ async fn concurrent_rescans_collapse_into_one_rerun() -> anyhow::Result<()> {
 /// intervened — advertising content the serve path refuses, indefinitely.
 #[tokio::test]
 async fn rescan_origins_does_not_carry_a_permanent_fault() -> anyhow::Result<()> {
-    let revoked = Hash::new(b"origin-acl-revoked");
-    let (origin, controls) = ThrottlableOrigin::new(vec![(revoked, 777)]);
+    let blob = held_blob(b"origin-acl-revoked", 777)?;
+    let revoked = blob.0;
+    let (origin, controls) = ThrottlableOrigin::new(vec![blob]);
     let origin = Arc::new(origin) as Arc<dyn Origin>;
 
     let tmp = tempfile::tempdir()?;
@@ -977,8 +628,9 @@ async fn rescan_origins_does_not_carry_a_permanent_fault() -> anyhow::Result<()>
 /// healthy.
 #[tokio::test]
 async fn rescan_origins_reports_an_origin_it_could_not_list() -> anyhow::Result<()> {
-    let listed = Hash::new(b"listing-outage");
-    let (origin, controls) = ThrottlableOrigin::new(vec![(listed, 1234)]);
+    let blob = held_blob(b"listing-outage", 1234)?;
+    let listed = blob.0;
+    let (origin, controls) = ThrottlableOrigin::new(vec![blob]);
     let origin = Arc::new(origin) as Arc<dyn Origin>;
 
     let tmp = tempfile::tempdir()?;
@@ -1036,11 +688,11 @@ async fn release_for_eviction_refuses_pinned_hash() -> anyhow::Result<()> {
     let hash = Hash::new(payload);
     let engine = CacheEngine::open(
         tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+        vec![Arc::new(StubOrigin) as Arc<dyn Origin>],
         10,
     )
     .await?;
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
 
     engine.set_pinned(&PinnedHashes::new(
         [from_store_hash(hash)].into_iter().collect(),
@@ -1067,11 +719,11 @@ async fn release_for_eviction_reclaims_a_deny_listed_pinned_hash() -> anyhow::Re
     let hash = Hash::new(payload);
     let engine = CacheEngine::open(
         tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+        vec![Arc::new(StubOrigin) as Arc<dyn Origin>],
         10,
     )
     .await?;
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
     engine.set_pinned(&PinnedHashes::new(
         [from_store_hash(hash)].into_iter().collect(),
     ));
@@ -1101,27 +753,21 @@ async fn release_for_eviction_reclaims_a_deny_listed_pinned_hash() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn get_cache_hit_records_access_time() -> anyhow::Result<()> {
+async fn populate_hit_records_access_time() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello cache hit";
-    let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
+    let hash = engine.insert_blob(payload.to_vec()).await?;
 
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    // Prime the cache via pull-through.
-    let _ = engine.get(hash).await?;
-
-    // Clear the access time so the next get proves a cache-hit path.
+    // Clear the access time so the next populate proves a cache-hit path.
     engine.inner.access_times.clear();
 
-    // Read again — this time it's a local hit.
-    let _ = engine.get(hash).await?;
+    // Populate again — this time it's a local hit.
+    engine.populate(hash).await?;
 
     anyhow::ensure!(
         engine.last_accessed(hash).is_some(),
-        "expected Some(Instant) after cache-hit get"
+        "expected Some(Instant) after a cache-hit populate"
     );
     Ok(())
 }
@@ -1131,68 +777,15 @@ async fn pull_through_records_access_time() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello pull-through";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
+    let engine = admitting_engine(tmp.path(), &origin).await?;
 
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+    engine.populate(hash).await?;
 
-    // First get triggers pull-through.
-    let _ = engine.get(hash).await?;
-
+    anyhow::ensure!(origin.fetches() == 1, "the miss pulls through");
     anyhow::ensure!(
         engine.last_accessed(hash).is_some(),
-        "expected Some(Instant) after pull-through get"
-    );
-    Ok(())
-}
-
-/// The `FillMode` ↔ return-shape correspondence, asserted where the private
-/// types are visible — the integration tests in `tests/pull_through.rs`
-/// cannot see `PullThroughOutcome`, so they can only observe that the fill
-/// happened, not which arm produced it.
-///
-/// This is the property the enum exists to carry, and it must hold in BOTH
-/// directions: `ReturnBytes` always yields `Some`, `CommitOnly` always yields
-/// `None`. Before `FillMode` the second half was false on the buffered arm,
-/// which handed its drain buffer back regardless — an exception that made the
-/// wrappers partial and the mode untrustworthy to read.
-///
-/// Deliberately run through the BUFFERED arm: `StubOrigin` advertises a size
-/// hint well under `buffered_max_bytes`, so `should_buffer` routes here. The
-/// streaming arm never had the defect.
-#[tokio::test]
-async fn fill_mode_determines_the_return_shape_in_both_directions() -> anyhow::Result<()> {
-    let payload = b"drained, not streamed";
-    let hash = Hash::new(payload);
-
-    let tmp_fill = tempfile::tempdir()?;
-    let engine = CacheEngine::open(
-        tmp_fill.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let committed = engine
-        .pull_through(hash, false, FillMode::CommitOnly)
-        .await?;
-    anyhow::ensure!(
-        committed.is_none(),
-        "CommitOnly must yield no payload, got {committed:?}"
-    );
-
-    let tmp_bytes = tempfile::tempdir()?;
-    let engine = CacheEngine::open(
-        tmp_bytes.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
-    let returned = engine
-        .pull_through(hash, false, FillMode::ReturnBytes)
-        .await?;
-    anyhow::ensure!(
-        returned.as_deref() == Some(payload.as_slice()),
-        "ReturnBytes must yield the payload, got {returned:?}"
+        "expected Some(Instant) after a pull-through populate"
     );
     Ok(())
 }
@@ -1202,17 +795,15 @@ async fn subscribe_inserts_emits_on_pull_through_success() -> anyhow::Result<()>
     let tmp = tempfile::tempdir()?;
     let payload = b"hello dht hook";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
-
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
+    let engine = admitting_engine(tmp.path(), &origin).await?;
     let mut rx = engine.subscribe_inserts();
 
     // Successful pull-through must announce the hash to the
     // subscriber. The DHT republish scheduler (#320)
     // consumes this stream to drive `Store` fan-out to the K+3
     // closest peers.
-    let _ = engine.get(hash).await?;
+    engine.populate(hash).await?;
     let announced = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
         .await
         .map_err(|_| anyhow::anyhow!("timed out waiting for subscribe_inserts emit"))?
@@ -1226,29 +817,28 @@ async fn subscribe_inserts_emits_on_pull_through_success() -> anyhow::Result<()>
 
 #[tokio::test]
 async fn subscribe_inserts_does_not_emit_on_cache_hit() -> anyhow::Result<()> {
-    // A `get` that hits the local store (no pull-through, no new
+    // A `populate` that hits the local store (no pull-through, no new
     // commit) must NOT emit on the channel — only fresh commits
     // do, because the consumer's job is to schedule a NEW publish
     // cycle for newly-cached blobs.
     let tmp = tempfile::tempdir()?;
     let payload = b"hello cached-hit";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
+    let engine = admitting_engine(tmp.path(), &origin).await?;
 
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    // First get: pull-through, should emit. Drain that emission so
-    // the channel is empty before the second get.
+    // First populate: pull-through, should emit. Drain every emission so
+    // the channel is empty before the second populate.
     let mut rx = engine.subscribe_inserts();
-    let _ = engine.get(hash).await?;
+    engine.populate(hash).await?;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
         .await
         .map_err(|_| anyhow::anyhow!("first pull-through emission missing"))?
         .map_err(|e| anyhow::anyhow!("recv first: {e}"))?;
+    while rx.try_recv().is_ok() {}
 
-    // Second get: cache hit. No emission expected.
-    let _ = engine.get(hash).await?;
+    // Second populate: cache hit. No emission expected.
+    engine.populate(hash).await?;
     let r = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
     anyhow::ensure!(
         r.is_err(),
@@ -1258,26 +848,24 @@ async fn subscribe_inserts_does_not_emit_on_cache_hit() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn second_get_updates_access_time() -> anyhow::Result<()> {
+async fn second_populate_updates_access_time() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello update";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
-
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
+    let engine = admitting_engine(tmp.path(), &origin).await?;
 
     // First access (pull-through).
-    let _ = engine.get(hash).await?;
+    engine.populate(hash).await?;
     let first = engine
         .last_accessed(hash)
-        .ok_or_else(|| anyhow::anyhow!("expected Some after first get"))?;
+        .ok_or_else(|| anyhow::anyhow!("expected Some after first populate"))?;
 
     // Burn a tiny bit of real wall-clock time so Instant::now() advances.
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     // Second access (cache hit).
-    let _ = engine.get(hash).await?;
+    engine.populate(hash).await?;
     let second = engine
         .last_accessed(hash)
         .ok_or_else(|| anyhow::anyhow!("expected Some after second get"))?;
@@ -1308,7 +896,7 @@ async fn observe_hit_forwards_to_frequency_estimator() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello frequency";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
 
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
@@ -1316,7 +904,8 @@ async fn observe_hit_forwards_to_frequency_estimator() -> anyhow::Result<()> {
     let counter = Arc::new(Counter::default());
     engine.set_frequency_estimator(counter.clone());
 
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
+    engine.observe_hit(hash);
 
     anyhow::ensure!(counter.estimate(hash) >= 1, "observe should fire on access");
     Ok(())
@@ -1336,12 +925,8 @@ async fn serve_hit_signal_fires_once_per_serve_and_promotes_a_hot_resident_blob(
     let tmp = tempfile::tempdir()?;
     let payload = b"hot resident blob";
     let hash = Hash::new(payload);
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
+    let engine = admitting_engine(tmp.path(), &origin).await?;
 
     let promotion_threshold = 3u32;
     let freq: Arc<dyn FrequencyEstimator> = Arc::new(TinyLfuEstimator::new(4096));
@@ -1354,7 +939,7 @@ async fn serve_hit_signal_fires_once_per_serve_and_promotes_a_hot_resident_blob(
     // Fill as a miss. The fill path reads the estimate for admission (0 ->
     // Probation) but must NOT emit the hit signal, so estimate stays 0 — this
     // is what keeps a fill-and-serve miss at one sighting, not two.
-    engine.populate_local(hash).await?;
+    engine.populate(hash).await?;
     anyhow::ensure!(
         freq.estimate(hash) == 0,
         "the fill alone must not observe (no double-count with the serve)"
@@ -1385,7 +970,7 @@ async fn default_admission_is_main_segment() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello admission";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
 
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
@@ -1406,12 +991,12 @@ async fn access_times_snapshot_contains_accessed_hash() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello snapshot";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
 
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
 
     let snap = engine.access_times_snapshot();
     anyhow::ensure!(
@@ -1636,16 +1221,11 @@ async fn iter_hashes_returns_empty_on_empty_store() -> anyhow::Result<()> {
 async fn iter_hashes_returns_all_committed_blobs() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payloads: &[&[u8]] = &[b"iter-a", b"iter-b", b"iter-c"];
-    let origin = MultiStubOrigin::new(payloads);
-
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
 
     let mut expected: HashSet<Hash> = HashSet::new();
     for p in payloads {
-        let h = Hash::new(*p);
-        let _ = engine.get(h).await?;
-        expected.insert(h);
+        expected.insert(engine.insert_blob(p.to_vec()).await?);
     }
 
     // Use a HashSet for the comparison — iroh-blobs `list()` order is
@@ -1659,14 +1239,11 @@ async fn iter_hashes_returns_all_committed_blobs() -> anyhow::Result<()> {
 async fn iter_hashes_excludes_evicted_blobs() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payloads: &[&[u8]] = &[b"evict-a", b"evict-b", b"evict-c", b"evict-d"];
-    let origin = MultiStubOrigin::new(payloads);
+    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
 
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    let hashes: Vec<Hash> = payloads.iter().map(|p| Hash::new(*p)).collect();
-    for h in &hashes {
-        let _ = engine.get(*h).await?;
+    let mut hashes: Vec<Hash> = Vec::new();
+    for p in payloads {
+        hashes.push(engine.insert_blob(p.to_vec()).await?);
     }
 
     // Evict half — odd indices.
@@ -1703,15 +1280,10 @@ async fn iter_hashes_includes_pinned_blobs() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload_pinned: &[u8] = b"pin-a";
     let payload_plain: &[u8] = b"pin-b";
-    let origin = MultiStubOrigin::new(&[payload_pinned, payload_plain]);
+    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
 
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    let h_pinned = Hash::new(payload_pinned);
-    let h_plain = Hash::new(payload_plain);
-    let _ = engine.get(h_pinned).await?;
-    let _ = engine.get(h_plain).await?;
+    let h_pinned = engine.insert_blob(payload_pinned.to_vec()).await?;
+    let h_plain = engine.insert_blob(payload_plain.to_vec()).await?;
 
     let s = [from_store_hash(h_pinned)].into_iter().collect();
     let diff = engine.set_pinned(&PinnedHashes::new(s));
@@ -1732,80 +1304,23 @@ async fn iter_hashes_includes_pinned_blobs() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An origin that sleeps before returning, counting how many times
-/// `fetch` was invoked. Used to verify coalescing of concurrent pulls.
-#[derive(Debug)]
-struct SlowCountingOrigin {
-    data: Bytes,
-    hash: Hash,
-    fetch_count: AtomicUsize,
-    delay: std::time::Duration,
-}
-
-impl SlowCountingOrigin {
-    fn new(payload: &[u8], delay: std::time::Duration) -> Self {
-        Self {
-            hash: Hash::new(payload),
-            data: Bytes::from(payload.to_vec()),
-            fetch_count: AtomicUsize::new(0),
-            delay,
-        }
-    }
-}
-
-impl Origin for SlowCountingOrigin {
-    fn kind(&self) -> OriginKind {
-        OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
-    {
-        self.fetch_count.fetch_add(1, Ordering::SeqCst);
-        let result = if hash == self.hash {
-            Ok(OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(OriginFetch::NotFound)
-        };
-        let delay = self.delay;
-        Box::pin(async move {
-            tokio::time::sleep(delay).await;
-            result
-        })
-    }
-}
-
 #[tokio::test]
-async fn concurrent_gets_coalesce_into_single_origin_fetch() -> anyhow::Result<()> {
+async fn concurrent_populates_coalesce_into_single_origin_fetch() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"coalesce me";
     let hash = Hash::new(payload);
-    let origin = Arc::new(SlowCountingOrigin::new(
-        payload,
+    let origin = Arc::new(AdmittingOrigin::slow(
+        &[payload],
         std::time::Duration::from_millis(50),
     ));
-
     let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin.clone() as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
+    let engine = admitting_engine_with_metrics(tmp.path(), &origin, Some(Arc::clone(&cm))).await?;
 
-    // Spawn several concurrent gets for the same hash.
+    // Spawn several concurrent populates for the same hash.
     let mut handles = Vec::new();
     for _ in 0..5 {
         let e = engine.clone();
-        handles.push(tokio::spawn(async move { e.get(hash).await }));
+        handles.push(tokio::spawn(async move { e.populate(hash).await }));
     }
 
     // Await all — they should all succeed.
@@ -1817,31 +1332,15 @@ async fn concurrent_gets_coalesce_into_single_origin_fetch() -> anyhow::Result<(
     }
 
     // The origin should have been called at most once (coalesced).
-    let count = origin.fetch_count.load(Ordering::SeqCst);
+    let count = origin.fetches();
     anyhow::ensure!(count == 1, "expected exactly 1 origin fetch, got {count}");
 
-    // Counter accounting under coalescing (#418): exactly one task
-    // becomes the owner and counts as a miss; the other four are
-    // waiter-retry hits. A regression that moved the waiter-hit
-    // bump out of `engine.rs::get`'s waiter branch would silently
-    // mis-classify every coalesced workload as a miss-storm.
+    // Counter accounting under coalescing (#418): exactly one task becomes
+    // the owner and counts as a miss; the waiters find the blob present.
     anyhow::ensure!(
         cm.misses.get() == 1,
         "owner pulls once → exactly 1 miss, got {}",
         cm.misses.get()
-    );
-    anyhow::ensure!(
-        cm.hits.get() == 4,
-        "4 waiters retry into a hit, got {} hits",
-        cm.hits.get()
-    );
-    anyhow::ensure!(
-        cm.pull_through_bytes.get() == payload.len() as u64,
-        "single origin fetch → pull_through_bytes == payload.len()"
-    );
-    anyhow::ensure!(
-        cm.bytes_returned.get() == (payload.len() as u64) * 5,
-        "all 5 callers got the bytes back, so bytes_returned == 5 * payload.len()"
     );
     Ok(())
 }
@@ -1851,12 +1350,10 @@ async fn inflight_map_is_empty_after_pull_completes() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"cleanup check";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
+    let engine = admitting_engine(tmp.path(), &origin).await?;
 
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    let _ = engine.get(hash).await?;
+    engine.populate(hash).await?;
 
     let inflight_len = inflight_len(&engine);
     anyhow::ensure!(
@@ -1867,7 +1364,7 @@ async fn inflight_map_is_empty_after_pull_completes() -> anyhow::Result<()> {
 }
 
 /// Cancelling the owner mid-pull must not leave the inflight entry
-/// orphaned — otherwise every subsequent `get()` for the same hash hangs
+/// orphaned — otherwise every subsequent `populate()` for the same hash hangs
 /// on a `Notify` that never fires. The `InflightGuard`'s `Drop` impl
 /// wakes waiters and clears the entry even on cancellation.
 #[tokio::test]
@@ -1875,15 +1372,20 @@ async fn cancelled_owner_does_not_orphan_inflight_entry() -> anyhow::Result<()> 
     let tmp = tempfile::tempdir()?;
     let payload = b"cancel test";
     let hash = Hash::new(payload);
-    let origin = SlowCountingOrigin::new(payload, std::time::Duration::from_secs(10));
-
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
+    let origin = Arc::new(AdmittingOrigin::slow(
+        &[payload],
+        std::time::Duration::from_secs(10),
+    ));
+    let engine = admitting_engine(tmp.path(), &origin).await?;
 
     // Spawn the owner with a tiny timeout so it gets cancelled mid-pull.
     let owner_engine = engine.clone();
     let owner = tokio::spawn(async move {
-        tokio::time::timeout(std::time::Duration::from_millis(50), owner_engine.get(hash)).await
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            owner_engine.populate(hash),
+        )
+        .await
     });
     // Wait for the owner task to finish (timeout fires → future dropped).
     let _ = owner.await?;
@@ -1929,82 +1431,14 @@ fn inflight_len(engine: &CacheEngine) -> usize {
         .len()
 }
 
-/// The load-bearing half of #1517: a poisoned coalescing mutex must not
-/// cost origin egress. Before the fix both `get` call sites discarded the
-/// `PoisonError` and fell through to a *direct* pull, and std poison is
-/// sticky for the process lifetime — so one panic permanently turned every
-/// concurrent request for a missing blob into its own origin fetch. On a
-/// metered `http`/`s3` origin that is an unbounded egress multiplier; on
-/// the `Peer` origin reached via `populate` it is a USDC double-spend.
-///
-/// `fetch_count == 1` under a poisoned mutex is the whole assertion.
-#[tokio::test]
-async fn poisoned_inflight_mutex_still_coalesces_and_is_counted() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"coalesce under poison";
-    let hash = Hash::new(payload);
-    let origin = Arc::new(SlowCountingOrigin::new(
-        payload,
-        std::time::Duration::from_millis(50),
-    ));
-
-    let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin.clone() as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
-
-    poison_inflight(&engine);
-
-    let mut handles = Vec::new();
-    for _ in 0..5 {
-        let e = engine.clone();
-        handles.push(tokio::spawn(async move { e.get(hash).await }));
-    }
-    for handle in handles {
-        let result = handle
-            .await
-            .map_err(|e| anyhow::anyhow!("task join: {e}"))?;
-        anyhow::ensure!(result.is_ok(), "expected Ok, got {result:?}");
-    }
-
-    let count = origin.fetch_count.load(Ordering::SeqCst);
-    anyhow::ensure!(
-        count == 1,
-        "coalescing must survive poison — expected exactly 1 origin fetch, got {count}"
-    );
-    // Exactly one: `lock_inflight` clears the poison, so a single
-    // panic is a single bump no matter how many locks follow it.
-    // Asserting the exact value is what pins that — `> 0` would pass
-    // just as happily if the clear were dropped and the counter
-    // climbed with request volume.
-    let bumps = cm.inflight_mutex_poisoned.get();
-    anyhow::ensure!(
-        bumps == 1,
-        "one poisoning must count exactly once, got {bumps}"
-    );
-    anyhow::ensure!(
-        inflight_len(&engine) == 0,
-        "the owner's guard must still clear its entry under poison"
-    );
-    Ok(())
-}
-
 /// Two separate poisonings count twice while the log stays latched at one.
 ///
 /// Two poisonings, not one, is the whole point: because `lock_inflight`
 /// clears the poison, a single panic yields a single bump, so only a
 /// *second* panic can show the counter advancing past the latch. This is
 /// also the test that pins "counts poisonings, not locks-since-a-poisoning"
-/// — drop the `clear_poison` and the first `get` alone drives the counter
-/// to 2, which the exact-value assertions below reject.
+/// — drop the `clear_poison` and the first `populate` alone drives the
+/// counter to 2, which the exact-value assertions below reject.
 ///
 /// The latch itself is asserted through the private `AtomicBool` rather
 /// than by capturing log output: no crate in the workspace carries a
@@ -2017,20 +1451,9 @@ async fn separate_poisonings_each_count_while_the_log_latches() -> anyhow::Resul
     let tmp = tempfile::tempdir()?;
     let payload = b"latch check";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
-
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
     let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
+    let engine = admitting_engine_with_metrics(tmp.path(), &origin, Some(Arc::clone(&cm))).await?;
 
     poison_inflight(&engine);
 
@@ -2042,7 +1465,7 @@ async fn separate_poisonings_each_count_while_the_log_latches() -> anyhow::Resul
     // One miss takes the lock twice (claim the entry, then release it in
     // `InflightGuard::drop`) but sees the poison only on the first, since
     // that lock clears it.
-    let _ = engine.get(hash).await?;
+    engine.populate(hash).await?;
     let after_first = cm.inflight_mutex_poisoned.get();
     anyhow::ensure!(
         after_first == 1,
@@ -2053,9 +1476,9 @@ async fn separate_poisonings_each_count_while_the_log_latches() -> anyhow::Resul
         "the first poisoned lock must latch the log"
     );
 
-    // A second, independent panic. A second `get` would add nothing on its
-    // own — it is a cache hit and returns above the coalescing loop without
-    // locking at all — so poison directly and take one more lock.
+    // A second, independent panic. A second `populate` would add nothing on
+    // its own — it is a cache hit and returns above the coalescing loop
+    // without locking at all — so poison directly and take one more lock.
     poison_inflight(&engine);
     drop(engine.inner.lock_inflight());
     let after_second = cm.inflight_mutex_poisoned.get();
@@ -2071,39 +1494,24 @@ async fn separate_poisonings_each_count_while_the_log_latches() -> anyhow::Resul
     Ok(())
 }
 
-/// `populate_inner`'s coalescing loop is a near-verbatim *copy* of `get`'s,
-/// not a shared helper, and the poison handling #1517 requires lives in each
-/// copy separately, so each copy can regress on its own. Covering `get`
-/// therefore does not cover this, and a mutation that reverts only
-/// `populate_inner` survives a `get`-only suite.
+/// The load-bearing half of #1517: a poisoned coalescing mutex must not
+/// cost upstream egress. `populate` walks the `Peer` origin, so a lost claim
+/// here is the duplicate *paid* upstream pull — the USDC double-spend #1517
+/// names — and std poison is sticky for the process lifetime unless
+/// `lock_inflight` clears it.
 ///
-/// This is also the copy that matters most: `populate` (unlike
-/// `populate_local`) walks the `Peer` origin, so a lost claim here is the
-/// duplicate *paid* upstream pull — the USDC double-spend #1517 names.
-/// `get`, by contrast, has no production caller in the daemon; the serve
-/// path fills via `populate`/`populate_local`.
+/// One origin fetch under a poisoned mutex is the whole assertion.
 #[tokio::test]
 async fn poisoned_populate_still_coalesces_into_one_fill() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"populate under poison";
     let hash = Hash::new(payload);
-    let origin = Arc::new(SlowCountingOrigin::new(
-        payload,
+    let origin = Arc::new(AdmittingOrigin::slow(
+        &[payload],
         std::time::Duration::from_millis(50),
     ));
-
     let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![origin.clone() as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
+    let engine = admitting_engine_with_metrics(tmp.path(), &origin, Some(Arc::clone(&cm))).await?;
 
     poison_inflight(&engine);
 
@@ -2119,11 +1527,13 @@ async fn poisoned_populate_still_coalesces_into_one_fill() -> anyhow::Result<()>
         anyhow::ensure!(result.is_ok(), "expected Ok, got {result:?}");
     }
 
-    let count = origin.fetch_count.load(Ordering::SeqCst);
+    let count = origin.fetches();
     anyhow::ensure!(
         count == 1,
         "populate must coalesce under poison — expected 1 origin fetch, got {count}"
     );
+    // Exactly one: `lock_inflight` clears the poison, so a single panic is a
+    // single bump no matter how many locks follow it.
     let bumps = cm.inflight_mutex_poisoned.get();
     anyhow::ensure!(bumps == 1, "one poisoning, one bump; got {bumps}");
     anyhow::ensure!(inflight_len(&engine) == 0, "the claim must be released");
@@ -2145,33 +1555,31 @@ async fn poisoned_mutex_does_not_orphan_inflight_entry() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"poisoned cancel";
     let hash = Hash::new(payload);
-    let origin_handle = Arc::new(SlowCountingOrigin::new(
-        payload,
+    let origin_handle = Arc::new(AdmittingOrigin::slow(
+        &[payload],
         std::time::Duration::from_secs(10),
     ));
-
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![origin_handle.clone() as Arc<dyn Origin>],
-        10,
-    )
-    .await?;
+    let engine = admitting_engine(tmp.path(), &origin_handle).await?;
 
     poison_inflight(&engine);
 
     let owner_engine = engine.clone();
     let owner = tokio::spawn(async move {
-        tokio::time::timeout(std::time::Duration::from_millis(50), owner_engine.get(hash)).await
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            owner_engine.populate(hash),
+        )
+        .await
     });
     let _ = owner.await?;
 
     // Prove the owner actually claimed the entry before asserting it was
     // released. Without this the test passes vacuously whenever the 50 ms
-    // timeout lands before the pull starts — `get` does `refuses()` and
-    // `has()` (fs store I/O) first — and an empty map then proves nothing,
-    // even under a leaking drop impl (#1517). A loaded CI box makes that a
-    // silent false pass rather than a visible flake.
-    let claimed = origin_handle.fetch_count.load(Ordering::SeqCst);
+    // timeout lands before the pull starts — `populate` does `has()` (fs
+    // store I/O) and `refuses()` first — and an empty map then proves
+    // nothing, even under a leaking drop impl (#1517). A loaded CI box makes
+    // that a silent false pass rather than a visible flake.
+    let claimed = origin_handle.fetches();
     anyhow::ensure!(
         claimed == 1,
         "owner must have reached the pull (and so held the entry), got {claimed} fetches"
@@ -2180,7 +1588,7 @@ async fn poisoned_mutex_does_not_orphan_inflight_entry() -> anyhow::Result<()> {
     // An empty map is the assertion proper, and it reads through
     // `into_inner` so poison cannot fake it. Under a leaking drop impl (#1517)
     // the entry survives here and `len == 1`. There is deliberately no
-    // "now issue another get and time it" probe: this origin sleeps for ten
+    // "now issue another populate and time it" probe: this origin sleeps for ten
     // seconds by design, so any such timeout would measure the stub rather
     // than the orphaned `Notify`.
     let len = inflight_len(&engine);
@@ -2355,14 +1763,14 @@ async fn evict_blocks_subsequent_serve() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"evict me";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
 
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
 
     // Prime the cache so we evict a real, served blob — covers the
     // hot path the operator would actually be evicting.
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
     anyhow::ensure!(
         engine.has(hash).await?,
         "expected blob present before evict"
@@ -2375,7 +1783,7 @@ async fn evict_blocks_subsequent_serve() -> anyhow::Result<()> {
         !engine.has(hash).await?,
         "has() should report absent after evict"
     );
-    match engine.get(hash).await {
+    match engine.populate(hash).await {
         Err(CacheError::NotFound { .. }) => Ok(()),
         other => Err(anyhow::anyhow!(
             "expected NotFound after evict, got {other:?}"
@@ -2397,9 +1805,9 @@ async fn evict_persists_across_open() -> anyhow::Result<()> {
 
     // First open: prime + evict.
     {
-        let origin = Arc::new(StubOrigin::new(payload));
+        let origin = Arc::new(StubOrigin);
         let engine = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 10).await?;
-        let _ = engine.get(hash).await?;
+        let _ = engine.insert_blob(payload.to_vec()).await?;
         engine.evict(hash).await?;
         engine.shutdown().await?;
     }
@@ -2421,10 +1829,9 @@ async fn evict_persists_across_open() -> anyhow::Result<()> {
 /// Commit every payload into a cache at `dir`, then shut the engine down so
 /// the next `open` sees them as blobs already on disk.
 async fn commit_then_close(dir: &Path, payloads: &[&[u8]]) -> anyhow::Result<()> {
-    let origin = Arc::new(MultiStubOrigin::new(payloads)) as Arc<dyn Origin>;
-    let engine = CacheEngine::open(dir, vec![origin], 10).await?;
+    let engine = CacheEngine::open(dir, vec![], 10).await?;
     for payload in payloads {
-        let _ = engine.get(Hash::new(payload)).await?;
+        let _ = engine.insert_blob(payload.to_vec()).await?;
     }
     engine.shutdown().await?;
     Ok(())
@@ -2469,11 +1876,9 @@ async fn an_evicted_pre_open_blob_is_not_seeded() -> anyhow::Result<()> {
     let evicted = Hash::new(evicted_payload);
     let kept = Hash::new(kept_payload);
     {
-        let origin =
-            Arc::new(MultiStubOrigin::new(&[evicted_payload, kept_payload])) as Arc<dyn Origin>;
-        let engine = CacheEngine::open(tmp.path(), vec![origin], 10).await?;
-        let _ = engine.get(evicted).await?;
-        let _ = engine.get(kept).await?;
+        let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
+        let _ = engine.insert_blob(evicted_payload.to_vec()).await?;
+        let _ = engine.insert_blob(kept_payload.to_vec()).await?;
         engine.evict(evicted).await?;
         engine.shutdown().await?;
     }
@@ -2723,7 +2128,7 @@ async fn evict_unknown_hash_is_a_no_op() -> anyhow::Result<()> {
 async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"a served blob";
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
     let hash = Hash::new(payload);
@@ -2734,7 +2139,7 @@ async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> 
         "an absent hash is unavailable and not evicted"
     );
 
-    engine.populate(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
     anyhow::ensure!(
         engine.serve_audit(hash).await?
             == ServeAudit::Serveable {
@@ -2760,11 +2165,11 @@ async fn serve_audit_reports_presence_size_and_eviction() -> anyhow::Result<()> 
 async fn serve_audit_withholds_the_size_of_a_denied_blob() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"denied but on disk";
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
     let hash = Hash::new(payload);
-    engine.populate(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
 
     engine.set_chain_denied_one(hash, true);
     let audit = engine.serve_audit(hash).await?;
@@ -2785,11 +2190,8 @@ async fn serve_audit_withholds_the_size_of_a_denied_blob() -> anyhow::Result<()>
 #[tokio::test]
 async fn serve_audit_reports_a_zero_length_blob_as_serveable() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
-    let origin = StubOrigin::new(b"");
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-    let hash = Hash::new(b"");
-    engine.populate(hash).await?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
+    let hash = engine.insert_blob(Vec::new()).await?;
 
     let audit = engine.serve_audit(hash).await?;
     anyhow::ensure!(
@@ -3017,11 +2419,11 @@ async fn inspect_after_get_reports_size_and_served() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"inspect me";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
 
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
 
     let preview = engine.inspect(hash).await?;
     anyhow::ensure!(
@@ -3051,11 +2453,11 @@ async fn inspect_after_evict_keeps_size_but_flips_served() -> anyhow::Result<()>
     let tmp = tempfile::tempdir()?;
     let payload = b"evicted blob";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
 
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
     engine.evict(hash).await?;
 
     let preview = engine.inspect(hash).await?;
@@ -3110,7 +2512,7 @@ async fn inspect_reports_pinned_flag() -> anyhow::Result<()> {
 #[tokio::test]
 async fn inspect_reports_origin_kinds_when_origin_configured() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
-    let origin = StubOrigin::new(b"egress-cost preview");
+    let origin = StubOrigin;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
     let preview = engine.inspect(Hash::new(b"never-fetched")).await?;
@@ -3136,152 +2538,30 @@ async fn inspect_reports_no_origin_kinds_when_cache_only() -> anyhow::Result<()>
 }
 
 // -------------------------------------------------------------------
-// Cache hit/miss + bytes counters (#418)
+// Cache miss counters (#418)
 // -------------------------------------------------------------------
 
 #[tokio::test]
-async fn hits_plus_misses_equals_total_gets() -> anyhow::Result<()> {
+async fn populate_fill_counts_one_miss() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
-    let payload = b"hello invariant";
+    let payload = b"populate counts one miss per fill";
     let hash = Hash::new(payload);
-    let unknown = Hash::new(b"never present");
-    let origin = StubOrigin::new(payload);
+    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
     let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
-
-    // 1 miss (pull-through), 2 hits, 1 miss (origin NotFound), 1 miss (evicted).
-    let _ = engine.get(hash).await?; // miss
-    let _ = engine.get(hash).await?; // hit
-    let _ = engine.get(hash).await?; // hit
-    let _ = engine.get(unknown).await; // miss (origin NotFound)
-    engine.evict(hash).await?;
-    let _ = engine.get(hash).await; // miss (evicted)
-
-    anyhow::ensure!(cm.hits.get() == 2, "hits = {}", cm.hits.get());
-    anyhow::ensure!(cm.misses.get() == 3, "misses = {}", cm.misses.get());
-    anyhow::ensure!(
-        cm.hits.get() + cm.misses.get() == 5,
-        "across cache-domain outcomes (no store-I/O errors), every get bumps exactly one of hits/misses"
-    );
-    // Only the priming Found bumped pull_through_bytes; the unknown
-    // get took the origin-NotFound branch which returns before the
-    // bump. Pin both, so a stray bump in either error path fails
-    // the test.
-    anyhow::ensure!(
-        cm.pull_through_bytes.get() == payload.len() as u64,
-        "pull_through_bytes = {}, expected {}",
-        cm.pull_through_bytes.get(),
-        payload.len()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn pull_through_success_bumps_bytes_returned() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"hello pull-through bytes returned";
-    let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
-    let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
-
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(
-        cm.bytes_returned.get() == bytes.len() as u64,
-        "bytes_returned should match payload length after a successful pull-through"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn pull_through_bumps_pull_through_bytes() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"hello pull-through bytes";
-    let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
-    let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
-
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(cm.misses.get() == 1, "first get is a miss");
-    anyhow::ensure!(cm.hits.get() == 0, "no hits on first get");
-    anyhow::ensure!(
-        cm.pull_through_bytes.get() == bytes.len() as u64,
-        "pull_through_bytes should equal payload length on a Found origin"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn populate_fills_without_bumping_bytes_returned() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"populate must not count as bytes returned";
-    let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
-    let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
+    let engine = admitting_engine_with_metrics(tmp.path(), &origin, Some(Arc::clone(&cm))).await?;
 
     engine.populate(hash).await?;
     anyhow::ensure!(engine.has(hash).await?, "populate must fill the store");
-    // Origin egress IS counted (the bytes really left an origin)...
-    anyhow::ensure!(
-        cm.pull_through_bytes.get() == payload.len() as u64,
-        "populate must still bump origin-egress pull_through_bytes"
-    );
-    // ...but it is NOT a `get` caller, so no served-bytes / hit accounting.
-    anyhow::ensure!(
-        cm.bytes_returned.get() == 0,
-        "populate must NOT bump bytes_returned (#831: internal fill, not client egress)"
-    );
-    anyhow::ensure!(cm.hits.get() == 0, "populate must not count a hit");
+    anyhow::ensure!(cm.misses.get() == 1, "the fill is one miss");
+    anyhow::ensure!(cm.origin_fetches.get() == 1, "the fill is one origin fetch");
 
     // A populate on an already-present hash is a no-op (no second pull).
     engine.populate(hash).await?;
     anyhow::ensure!(
-        cm.pull_through_bytes.get() == payload.len() as u64,
+        origin.fetches() == 1,
         "a populate for an already-present blob must not re-pull"
     );
-    anyhow::ensure!(cm.bytes_returned.get() == 0, "still no bytes_returned");
+    anyhow::ensure!(cm.misses.get() == 1, "a hit is no miss");
     Ok(())
 }
 
@@ -3302,22 +2582,20 @@ async fn no_origin_increments_misses_only() -> anyhow::Result<()> {
     .await?;
 
     let hash = Hash::new(b"missing payload");
-    let Err(err) = engine.get(hash).await else {
+    let Err(err) = engine.populate(hash).await else {
         anyhow::bail!("expected NoOrigin, got Ok");
     };
     anyhow::ensure!(
         matches!(err, CacheError::NoOrigin { .. }),
         "expected NoOrigin"
     );
-    anyhow::ensure!(cm.misses.get() == 1, "exactly one miss for a NoOrigin get");
-    anyhow::ensure!(cm.hits.get() == 0, "no hits");
     anyhow::ensure!(
-        cm.pull_through_bytes.get() == 0,
-        "no origin bytes since origin not configured"
+        cm.misses.get() == 1,
+        "exactly one miss for a NoOrigin populate"
     );
     anyhow::ensure!(
-        cm.bytes_returned.get() == 0,
-        "no bytes returned on error path"
+        cm.origin_fetches.get() == 0,
+        "no origin fetch since no origin is configured"
     );
     Ok(())
 }
@@ -3327,7 +2605,7 @@ async fn evicted_hash_increments_misses() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello evicted miss";
     let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
+    let origin = StubOrigin;
     let cm = Arc::new(CacheMetrics::default());
     let engine = CacheEngine::open_full(
         tmp.path(),
@@ -3341,21 +2619,21 @@ async fn evicted_hash_increments_misses() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Prime then evict so the next get hits the evicted branch in get().
-    let _ = engine.get(hash).await?;
+    // Prime then evict so the next populate hits the evicted branch.
+    let _ = engine.insert_blob(payload.to_vec()).await?;
     engine.evict(hash).await?;
     let misses_before = cm.misses.get();
 
-    let Err(err) = engine.get(hash).await else {
+    let Err(err) = engine.populate(hash).await else {
         anyhow::bail!("expected NotFound, got Ok");
     };
     anyhow::ensure!(
         matches!(err, CacheError::NotFound { .. }),
-        "evicted get must surface NotFound"
+        "evicted populate must surface NotFound"
     );
     anyhow::ensure!(
         cm.misses.get() == misses_before + 1,
-        "misses should bump by exactly 1 on an evicted-hash get"
+        "misses should bump by exactly 1 on an evicted-hash populate"
     );
     Ok(())
 }
@@ -3484,11 +2762,11 @@ async fn operator_evict_wins_over_an_in_use_hold() -> anyhow::Result<()> {
     let hash = Hash::new(payload);
     let engine = CacheEngine::open(
         tmp.path(),
-        vec![Arc::new(StubOrigin::new(payload)) as Arc<dyn Origin>],
+        vec![Arc::new(StubOrigin) as Arc<dyn Origin>],
         10,
     )
     .await?;
-    let _ = engine.get(hash).await?;
+    let _ = engine.insert_blob(payload.to_vec()).await?;
     let hold = engine.hold_in_use(hash);
     anyhow::ensure!(engine.has(hash).await?, "held before evict");
 
@@ -3499,43 +2777,6 @@ async fn operator_evict_wins_over_an_in_use_hold() -> anyhow::Result<()> {
     );
     drop(hold);
     anyhow::ensure!(!engine.is_in_use(hash));
-    Ok(())
-}
-
-#[tokio::test]
-async fn hit_increments_hits_and_bytes_returned() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"hello hit metrics";
-    let hash = Hash::new(payload);
-    let origin = StubOrigin::new(payload);
-    let cm = Arc::new(CacheMetrics::default());
-    let engine = CacheEngine::open_full(
-        tmp.path(),
-        vec![Arc::new(origin) as Arc<dyn Origin>],
-        10,
-        crate::PinnedHashes::empty(),
-        crate::RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cm)),
-        Duration::ZERO,
-    )
-    .await?;
-
-    // First get is a pull-through (miss); prime the cache.
-    let _ = engine.get(hash).await?;
-    let hits_before = cm.hits.get();
-    let bytes_before = cm.bytes_returned.get();
-
-    // Second get must be a local hit.
-    let bytes = engine.get(hash).await?;
-    anyhow::ensure!(
-        cm.hits.get() == hits_before + 1,
-        "hits should increment by 1 on a cache hit"
-    );
-    anyhow::ensure!(
-        cm.bytes_returned.get() == bytes_before + bytes.len() as u64,
-        "bytes_returned should increase by bytes.len() on a cache hit"
-    );
     Ok(())
 }
 
@@ -3554,20 +2795,20 @@ fn local_outboard_pull_test_blob() -> Vec<u8> {
 /// exercised without an HTTP/S3/fs backend. `data`/`outboard`/`size` are held
 /// independently so a test can serve bytes that do NOT hash to `hash` (a
 /// corrupt / misconfigured OWN origin, the local-origin-fault case).
-/// `support_range == false` models an origin with no `206`/outboard support,
-/// i.e. the [`crate::OriginRangeFetch::Unsupported`] degrade. `max_req`
-/// records the largest data span any single range fetch asked for.
+/// `support_range == false` models an origin that does not honor `Range`,
+/// which an adapter reports as a permanent fault. `max_req` records the
+/// largest data span any single range fetch asked for.
 #[derive(Debug)]
 struct RangeStubOrigin {
     hash: Hash,
     data: Bytes,
     outboard: Option<Bytes>,
-    size: u64,
     support_range: bool,
     max_req: AtomicU64,
     /// Windows starting at or past this offset come back one byte short.
     short_from: u64,
-    /// Windows starting at or past this offset are declined.
+    /// Windows starting at or past this offset answer that the data object
+    /// is missing.
     decline_from: u64,
     /// Windows starting at or past this offset fail with a transport error.
     fail_from: u64,
@@ -3578,18 +2819,18 @@ struct RangeStubOrigin {
     gate: Arc<tokio::sync::Semaphore>,
     /// When true, [`Origin::fetch_outboard`] returns a transport
     /// [`OriginPullError`] instead of a clean decline — the degraded-origin
-    /// case the serviceability probe must surface as a fault (#1129), not as a
-    /// clean `Ok(None)` absence.
+    /// case a read must surface as a fault (#1129), not as a clean absence.
     fault_outboard: bool,
     /// Calls to [`Origin::fetch_outboard`] so far.
     outboard_fetches: AtomicUsize,
-    /// Calls to [`Origin::has_outboard`] so far.
-    outboard_heads: AtomicUsize,
     /// When true, [`Origin::fetch_outboard`] waits on `gate`.
     gate_outboard: bool,
     /// Calls to [`Origin::fetch_range_data`] so far, shared so a test can
     /// read it after the engine takes the origin.
     range_fetches: Arc<AtomicUsize>,
+    /// The `{H}.sizeproof` object [`Origin::fetch_size_proof`] serves for
+    /// `hash`; `None` answers no object.
+    size_proof: Option<Bytes>,
 }
 
 impl RangeStubOrigin {
@@ -3599,7 +2840,6 @@ impl RangeStubOrigin {
             hash,
             data: Bytes::from(payload.to_vec()),
             outboard: Some(outboard),
-            size: u64::try_from(payload.len()).unwrap_or(u64::MAX),
             support_range: true,
             max_req: AtomicU64::new(0),
             short_from: u64::MAX,
@@ -3610,20 +2850,19 @@ impl RangeStubOrigin {
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
             fault_outboard: false,
             outboard_fetches: AtomicUsize::new(0),
-            outboard_heads: AtomicUsize::new(0),
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
+            size_proof: None,
         }
     }
 
-    /// An origin that knows `hash`'s size but FAULTS its outboard fetch with a
-    /// transport error — a degraded own origin, distinct from a clean absence.
-    fn outboard_faulting(hash: Hash, size: u64) -> Self {
+    /// An origin that FAULTS its outboard fetch of `hash` with a transport
+    /// error — a degraded own origin, distinct from a clean absence.
+    fn outboard_faulting(hash: Hash) -> Self {
         Self {
             hash,
             data: Bytes::new(),
             outboard: None,
-            size,
             support_range: false,
             max_req: AtomicU64::new(0),
             short_from: u64::MAX,
@@ -3634,9 +2873,9 @@ impl RangeStubOrigin {
             gate: Arc::new(tokio::sync::Semaphore::new(0)),
             fault_outboard: true,
             outboard_fetches: AtomicUsize::new(0),
-            outboard_heads: AtomicUsize::new(0),
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
+            size_proof: None,
         }
     }
 }
@@ -3646,42 +2885,17 @@ impl Origin for RangeStubOrigin {
         OriginKind::Http
     }
 
-    fn fetch(
+    fn fetch_size_proof(
         &self,
         hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, crate::OriginPullError>> + Send + '_>>
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, crate::OriginPullError>> + Send + '_>>
     {
-        let result = if hash == self.hash {
-            Ok(OriginFetch::found_one_shot(self.data.clone()))
+        let object = if hash == self.hash {
+            self.size_proof.clone()
         } else {
-            Ok(OriginFetch::NotFound)
+            None
         };
-        Box::pin(async move { result })
-    }
-
-    fn size(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, crate::OriginPullError>> + Send + '_>>
-    {
-        let out = (hash == self.hash).then_some(self.size);
-        Box::pin(async move { Ok(out) })
-    }
-
-    fn has_outboard(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, crate::OriginPullError>> + Send + '_>> {
-        self.outboard_heads.fetch_add(1, Ordering::SeqCst);
-        let answer = if self.fault_outboard && hash == self.hash {
-            Err(crate::OriginPullError::Transient(anyhow::anyhow!(
-                "stub outboard transport fault"
-            )))
-        } else {
-            Ok(self.outboard.is_some() && hash == self.hash)
-        };
-        Box::pin(async move { answer })
+        Box::pin(async move { Ok(object) })
     }
 
     fn fetch_outboard(
@@ -3735,10 +2949,17 @@ impl Origin for RangeStubOrigin {
                 )))
             });
         }
+        if !self.support_range {
+            return Box::pin(async {
+                Err(crate::OriginPullError::Permanent(anyhow::anyhow!(
+                    "stub origin does not honor Range"
+                )))
+            });
+        }
         let gated = req.fetch_start >= self.gate_from;
         let result = if req.fetch_start >= self.decline_from {
-            crate::OriginRangeFetch::Unsupported
-        } else if hash == self.hash && self.support_range {
+            crate::OriginRangeFetch::NotFound
+        } else if hash == self.hash {
             let s = usize::try_from(req.fetch_start).unwrap_or(usize::MAX);
             let mut e = usize::try_from(req.fetch_end).unwrap_or(usize::MAX);
             if req.fetch_start >= self.short_from {
@@ -3751,7 +2972,7 @@ impl Origin for RangeStubOrigin {
                 None => crate::OriginRangeFetch::NotFound,
             }
         } else {
-            crate::OriginRangeFetch::Unsupported
+            crate::OriginRangeFetch::NotFound
         };
         Box::pin(async move {
             if gated {
@@ -3810,178 +3031,52 @@ async fn stub_engine(
     Ok((engine, tmp))
 }
 
-/// The serviceability probe confirms an origin that serves the outboard and
-/// ranges with one chunk-group read, then answers the next probe from the
-/// latch without a read.
+/// A first origin that does not honor `Range` does not shadow a second
+/// origin that serves both halves; a draw opens on the second.
 #[tokio::test]
-async fn origin_range_serviceable_probes_one_group_then_latches() -> anyhow::Result<()> {
-    let (data, hash, origin, _) = multi_window_stub();
-    let total = u64::try_from(data.len())?;
-    let fetches = Arc::clone(&origin.range_fetches);
-    let (engine, _tmp) = stub_engine(vec![origin]).await?;
-    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
-    anyhow::ensure!(
-        fetches.load(Ordering::SeqCst) == 1,
-        "the first probe reads one window"
-    );
-    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
-    anyhow::ensure!(
-        fetches.load(Ordering::SeqCst) == 1,
-        "a confirmed origin is not probed again"
-    );
-    Ok(())
-}
-
-/// The outboard-presence probe reads no outboard: it asks each origin once,
-/// and answers the next ask from its memo with no origin call.
-#[tokio::test]
-async fn origin_outboard_published_heads_once_and_reads_no_outboard() -> anyhow::Result<()> {
-    let (data, hash, origin, _) = multi_window_stub();
-    let total = u64::try_from(data.len())?;
-    let origin = Arc::new(origin);
-    let tmp = tempfile::tempdir()?;
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 64).await?;
-    anyhow::ensure!(engine.origin_outboard_published(hash, total).await?);
-    anyhow::ensure!(engine.origin_outboard_published(hash, total).await?);
-    anyhow::ensure!(
-        origin.outboard_heads.load(Ordering::SeqCst) == 1,
-        "one probe, then the memo"
-    );
-    anyhow::ensure!(
-        origin.outboard_fetches.load(Ordering::SeqCst) == 0,
-        "no outboard is read"
-    );
-    anyhow::ensure!(
-        origin.range_fetches.load(Ordering::SeqCst) == 0,
-        "no data window is read"
-    );
-    Ok(())
-}
-
-/// A faulting outboard probe is an error, not an absence.
-#[tokio::test]
-async fn origin_outboard_published_faults_on_a_faulting_origin() -> anyhow::Result<()> {
-    let hash = Hash::from([7u8; 32]);
-    let (engine, _tmp) = stub_engine(vec![RangeStubOrigin::outboard_faulting(hash, 4096)]).await?;
-    let probed = engine.origin_outboard_published(hash, 4096).await;
-    anyhow::ensure!(
-        matches!(probed, Err(CacheError::OriginError { .. })),
-        "a fault must surface, got {probed:?}"
-    );
-    Ok(())
-}
-
-/// A range a serve finds unusable memoises the hash as publishing no
-/// outboard, so the next open degrades before it answers.
-#[tokio::test]
-async fn an_unusable_range_memoises_the_outboard_as_absent() -> anyhow::Result<()> {
-    let (data, hash, mut origin, _) = multi_window_stub();
-    let total = u64::try_from(data.len())?;
-    origin.support_range = false;
-    let (engine, _tmp) = stub_engine(vec![origin]).await?;
-    anyhow::ensure!(engine.origin_outboard_published(hash, total).await?);
-    anyhow::ensure!(!engine.origin_range_serviceable(hash, total).await?);
-    anyhow::ensure!(
-        !engine.origin_outboard_published(hash, total).await?,
-        "the next open sees no usable outboard"
-    );
-    Ok(())
-}
-
-/// An origin that publishes the outboard but declines ranges is not
-/// serviceable, so the caller refuses the admitted stream before any chunk.
-#[tokio::test]
-async fn origin_range_serviceable_is_false_without_range_support() -> anyhow::Result<()> {
-    let (data, hash, mut origin, _) = multi_window_stub();
-    let total = u64::try_from(data.len())?;
-    origin.support_range = false;
-    let (engine, _tmp) = stub_engine(vec![origin]).await?;
-    anyhow::ensure!(!engine.origin_range_serviceable(hash, total).await?);
-    Ok(())
-}
-
-/// A wrong-length first window cannot verify: the probe reports it as a hard
-/// fault, not as serviceable.
-#[tokio::test]
-async fn origin_range_serviceable_faults_on_a_short_first_window() -> anyhow::Result<()> {
-    let (data, hash, mut origin, _) = multi_window_stub();
-    let total = u64::try_from(data.len())?;
-    origin.short_from = 0;
-    let (engine, _tmp) = stub_engine(vec![origin]).await?;
-    let probed = engine.origin_range_serviceable(hash, total).await;
-    anyhow::ensure!(
-        matches!(probed, Err(CacheError::VerifyFailed { .. })),
-        "a short first window must fault, got {probed:?}"
-    );
-    Ok(())
-}
-
-/// A blob of one chunk group has an empty outboard, which the outboard cache
-/// never holds. The latch still keys on the origin that served it, so the
-/// second probe reads no range.
-#[tokio::test]
-async fn origin_range_serviceable_latches_a_small_blob() -> anyhow::Result<()> {
-    use bao_tree::io::outboard::PreOrderMemOutboard;
-
-    let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-    let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
-    anyhow::ensure!(ob.data.is_empty(), "one chunk group has an empty outboard");
-    let hash = Hash::from(*ob.root.as_bytes());
-    let origin = RangeStubOrigin::serving(hash, &data, Bytes::from(ob.data));
-    let fetches = Arc::clone(&origin.range_fetches);
-    let (engine, _tmp) = stub_engine(vec![origin]).await?;
-    let total = u64::try_from(data.len())?;
-    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
-    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
-    anyhow::ensure!(
-        fetches.load(Ordering::SeqCst) == 1,
-        "a confirmed origin is probed once, got {}",
-        fetches.load(Ordering::SeqCst)
-    );
-    Ok(())
-}
-
-/// A first origin that publishes the outboard but declines ranges does not
-/// shadow a second origin that serves both; the probe confirms the second.
-#[tokio::test]
-async fn origin_range_serviceable_walks_past_a_range_declining_origin() -> anyhow::Result<()> {
-    let (data, hash, mut declining, _) = multi_window_stub();
-    let total = u64::try_from(data.len())?;
+async fn a_draw_walks_past_a_range_declining_origin() -> anyhow::Result<()> {
+    let (_, hash, mut declining, aligned) = multi_window_stub();
     declining.support_range = false;
     let (_, _, serving, _) = multi_window_stub();
-    let declined = Arc::clone(&declining.range_fetches);
     let served = Arc::clone(&serving.range_fetches);
     let (engine, _tmp) = stub_engine(vec![declining, serving]).await?;
-    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
+    let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
-        served.load(Ordering::SeqCst) == 1,
-        "the second origin serves the probe"
+        fault.is_none(),
+        "the serving origin's wire is whole: {fault:?}"
     );
-    let before = declined.load(Ordering::SeqCst);
-    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
     anyhow::ensure!(
-        declined.load(Ordering::SeqCst) == before && served.load(Ordering::SeqCst) == 1,
-        "a second probe reads no range from either origin"
+        served.load(Ordering::SeqCst) > 0,
+        "the second origin serves the draw"
+    );
+    Ok(())
+}
+
+/// An origin that does not honor `Range` is a fault for the draw, never a
+/// degrade.
+#[tokio::test]
+async fn a_draw_without_range_support_is_an_origin_error() -> anyhow::Result<()> {
+    let (_, hash, mut origin, aligned) = multi_window_stub();
+    origin.support_range = false;
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    let opened = engine.origin_range_wire(hash, &aligned).await;
+    anyhow::ensure!(
+        matches!(opened, Err(CacheError::OriginError { .. })),
+        "got {opened:?}"
     );
     Ok(())
 }
 
 /// A first origin that serves a wrong-length first window does not shadow a
-/// healthy second origin: the probe confirms the second, and a draw opens
-/// on it and completes.
+/// healthy second origin: a draw opens on the second and completes.
 #[tokio::test]
 async fn a_short_first_window_advances_to_a_healthy_origin() -> anyhow::Result<()> {
-    let (data, hash, mut short, aligned) = multi_window_stub();
-    let total = u64::try_from(data.len())?;
+    let (_, hash, mut short, aligned) = multi_window_stub();
     short.short_from = 0;
     let (_, _, healthy, _) = multi_window_stub();
     let (engine, _tmp) = stub_engine(vec![short, healthy]).await?;
-    anyhow::ensure!(engine.origin_range_serviceable(hash, total).await?);
-    let wire = engine
-        .origin_range_wire(hash, &aligned)
-        .await?
-        .expect("opens on the healthy origin");
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         fault.is_none(),
@@ -4001,10 +3096,7 @@ async fn a_permit_wait_past_the_warning_keeps_waiting() -> anyhow::Result<()> {
     let (engine, _tmp) = stub_engine(vec![origin]).await?;
     let mut wires = Vec::new();
     for _ in 0..crate::MAX_CONCURRENT_RANGE_PULLS {
-        let mut wire = engine
-            .origin_range_wire(hash, &aligned)
-            .await?
-            .expect("opens");
+        let mut wire = engine.origin_range_wire(hash, &aligned).await?;
         anyhow::ensure!(matches!(wire.next_chunk().await, Some(Ok(_))));
         wires.push(wire);
     }
@@ -4019,11 +3111,8 @@ async fn a_permit_wait_past_the_warning_keeps_waiting() -> anyhow::Result<()> {
     );
     tokio::time::resume();
     drop(wires.pop());
-    let opened = tokio::time::timeout(Duration::from_secs(10), waiting).await??;
-    anyhow::ensure!(
-        opened.is_some(),
-        "the waiting draw opens once a permit frees"
-    );
+    // The waiting draw opens once a permit frees.
+    let _opened = tokio::time::timeout(Duration::from_secs(10), waiting).await??;
     Ok(())
 }
 
@@ -4034,10 +3123,7 @@ async fn origin_range_wire_mid_stream_decline_is_origin_error() -> anyhow::Resul
     let (_, hash, mut origin, aligned) = multi_window_stub();
     origin.decline_from = crate::RANGE_PULL_WINDOW_BYTES;
     let (engine, _tmp) = stub_engine(vec![origin]).await?;
-    let wire = engine
-        .origin_range_wire(hash, &aligned)
-        .await?
-        .expect("opens");
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         matches!(fault, Some(CacheError::OriginError { .. })),
@@ -4052,10 +3138,7 @@ async fn origin_range_wire_mid_stream_transport_fault_is_origin_error() -> anyho
     let (_, hash, mut origin, aligned) = multi_window_stub();
     origin.fail_from = crate::RANGE_PULL_WINDOW_BYTES;
     let (engine, _tmp) = stub_engine(vec![origin]).await?;
-    let wire = engine
-        .origin_range_wire(hash, &aligned)
-        .await?
-        .expect("opens");
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         matches!(fault, Some(CacheError::OriginError { .. })),
@@ -4080,8 +3163,7 @@ async fn origin_range_wire_panicking_encode_ends_on_an_internal_fault() -> anyho
             engine.origin_range_wire(hash, &aligned),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("a panicked encode must release its permit"))??
-        .expect("opens");
+        .map_err(|_| anyhow::anyhow!("a panicked encode must release its permit"))??;
         let (_, fault) = drain_wire(wire).await;
         let Some(CacheError::Internal(source)) = &fault else {
             anyhow::bail!("a panicked encode must end on an Internal fault, got {fault:?}");
@@ -4121,10 +3203,7 @@ async fn origin_range_wire_releases_its_permit_on_drop() -> anyhow::Result<()> {
 
     let mut wires = Vec::new();
     for _ in 0..crate::MAX_CONCURRENT_RANGE_PULLS {
-        let mut wire = engine
-            .origin_range_wire(hash, &aligned)
-            .await?
-            .expect("opens");
+        let mut wire = engine.origin_range_wire(hash, &aligned).await?;
         anyhow::ensure!(matches!(wire.next_chunk().await, Some(Ok(_))));
         wires.push(wire);
     }
@@ -4143,15 +3222,12 @@ async fn origin_range_wire_releases_its_permit_on_drop() -> anyhow::Result<()> {
         cm.range_pull_permit_waits.get()
     );
     drop(wires);
-    let reopened = tokio::time::timeout(
+    // Dropped wires must release their permits.
+    let _reopened = tokio::time::timeout(
         Duration::from_secs(10),
         engine.origin_range_wire(hash, &aligned),
     )
     .await??;
-    anyhow::ensure!(
-        reopened.is_some(),
-        "dropped wires must release their permits"
-    );
     Ok(())
 }
 
@@ -4166,10 +3242,7 @@ async fn dropping_a_wire_parked_in_an_origin_fetch_frees_its_permit() -> anyhow:
     origin.gate_from = crate::RANGE_PULL_WINDOW_BYTES;
     let (engine, _tmp) = stub_engine(vec![origin]).await?;
     let pool = Arc::clone(&engine.inner.own_origin_range_pulls);
-    let mut wire = engine
-        .origin_range_wire(hash, &aligned)
-        .await?
-        .expect("opens");
+    let mut wire = engine.origin_range_wire(hash, &aligned).await?;
     // Drain the first window until the encode parks on the gated second fetch.
     while tokio::time::timeout(Duration::from_millis(200), wire.next_chunk())
         .await
@@ -4202,10 +3275,7 @@ async fn origin_range_wire_empty_blob_ends_cleanly() -> anyhow::Result<()> {
     let origin = RangeStubOrigin::serving(hash, &[], outboard.clone());
     let (engine, _tmp) = stub_engine(vec![origin]).await?;
     let aligned = crate::range_pull::align_range(0, 0, 0)?;
-    let wire = engine
-        .origin_range_wire(hash, &aligned)
-        .await?
-        .expect("opens");
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (wire, fault) = drain_wire(wire).await;
     anyhow::ensure!(fault.is_none(), "the empty blob must not fault: {fault:?}");
     let reference = encode_verified_range(root, &aligned, &[], outboard)?;
@@ -4220,12 +3290,9 @@ async fn origin_range_wire_falls_back_to_a_serving_origin() -> anyhow::Result<()
     let (data, hash, serving, aligned) = multi_window_stub();
     let (_, _, mut declining, _) = multi_window_stub();
     declining.support_range = false;
-    let faulting = RangeStubOrigin::outboard_faulting(hash, aligned.blob_size());
+    let faulting = RangeStubOrigin::outboard_faulting(hash);
     let (engine, _tmp) = stub_engine(vec![faulting, declining, serving]).await?;
-    let wire = engine
-        .origin_range_wire(hash, &aligned)
-        .await?
-        .expect("opens");
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (wire, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         fault.is_none(),
@@ -4246,7 +3313,7 @@ async fn origin_range_wire_falls_back_to_a_serving_origin() -> anyhow::Result<()
 #[tokio::test]
 async fn origin_range_wire_reports_a_transport_fault_when_no_origin_serves() -> anyhow::Result<()> {
     let (_, hash, _, aligned) = multi_window_stub();
-    let faulting = RangeStubOrigin::outboard_faulting(hash, aligned.blob_size());
+    let faulting = RangeStubOrigin::outboard_faulting(hash);
     let (engine, _tmp) = stub_engine(vec![faulting]).await?;
     let err = engine
         .origin_range_wire(hash, &aligned)
@@ -4279,9 +3346,7 @@ async fn origin_range_wire_streams_admittable_wire_in_windows() -> anyhow::Resul
     // Start mid-blob so the range is not window-aligned to the blob start.
     let aligned = crate::range_pull::align_range(3 * crate::CHUNK_GROUP_BYTES, 0, total)
         .map_err(|e| anyhow::anyhow!("align: {e}"))?;
-    let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-        anyhow::bail!("expected Some(wire) — the origin serves the range + outboard");
-    };
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (wire, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         fault.is_none(),
@@ -4345,9 +3410,7 @@ async fn origin_range_wire_hard_faults_on_mismatch() -> anyhow::Result<()> {
 
     let aligned =
         crate::range_pull::align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
-    let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-        anyhow::bail!("expected Some(wire) — the first window serves");
-    };
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         matches!(fault, Some(CacheError::VerifyFailed { expected }) if expected == hash),
@@ -4374,9 +3437,7 @@ async fn origin_range_wire_hard_faults_on_short_later_window() -> anyhow::Result
     let tmp = tempfile::tempdir()?;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
-    let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-        anyhow::bail!("expected Some(wire) — the first window serves");
-    };
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         matches!(fault, Some(CacheError::VerifyFailed { expected }) if expected == hash),
@@ -4448,7 +3509,7 @@ async fn origin_range_wire_hard_faults_on_wrong_length_outboard() -> anyhow::Res
             .origin_fetch_outboard_bytes(hash, total)
             .await?
             .is_none(),
-        "the serviceability probe declines a wrong-length outboard"
+        "an outboard read declines a wrong-length outboard"
     );
     Ok(())
 }
@@ -4495,9 +3556,7 @@ async fn origin_range_wire_reads_the_outboard_once_per_hash() -> anyhow::Result<
             .is_some()
     );
     for _ in 0..3 {
-        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-            anyhow::bail!("expected Some(wire)");
-        };
+        let wire = engine.origin_range_wire(hash, &aligned).await?;
         let (_, fault) = drain_wire(wire).await;
         anyhow::ensure!(fault.is_none(), "a genuine origin ends cleanly: {fault:?}");
     }
@@ -4571,9 +3630,7 @@ async fn pull_through_bytes_counts_the_outboard_once() -> anyhow::Result<()> {
     );
     let draws = 2u64;
     for _ in 0..draws {
-        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-            anyhow::bail!("expected Some(wire)");
-        };
+        let wire = engine.origin_range_wire(hash, &aligned).await?;
         let (_, fault) = drain_wire(wire).await;
         anyhow::ensure!(fault.is_none(), "clean drain: {fault:?}");
     }
@@ -4602,9 +3659,7 @@ async fn a_verify_fault_evicts_the_cached_outboard() -> anyhow::Result<()> {
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 64).await?;
     for round in 1..=2 {
-        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-            anyhow::bail!("expected Some(wire) — the first window serves");
-        };
+        let wire = engine.origin_range_wire(hash, &aligned).await?;
         let (_, fault) = drain_wire(wire).await;
         anyhow::ensure!(
             matches!(fault, Some(CacheError::VerifyFailed { .. })),
@@ -4662,9 +3717,7 @@ async fn a_stuck_first_window_advances_the_chain() -> anyhow::Result<()> {
     stuck.gate_from = 0;
     let (engine, _tmp) = stub_engine(vec![stuck, serving]).await?;
     engine.set_origin_read_budget(Duration::from_millis(50), u64::MAX);
-    let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-        anyhow::bail!("expected Some(wire) from the second origin");
-    };
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
         fault.is_none(),
@@ -4695,9 +3748,7 @@ async fn an_origin_without_data_does_not_lend_its_outboard() -> anyhow::Result<(
             .is_some()
     );
     for _ in 0..2 {
-        let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-            anyhow::bail!("expected Some(wire) from the second origin");
-        };
+        let wire = engine.origin_range_wire(hash, &aligned).await?;
         let (_, fault) = drain_wire(wire).await;
         anyhow::ensure!(
             fault.is_none(),
@@ -4720,9 +3771,7 @@ async fn a_stuck_window_fetch_times_out() -> anyhow::Result<()> {
     origin.gate_from = crate::RANGE_PULL_WINDOW_BYTES;
     let (engine, _tmp) = stub_engine(vec![origin]).await?;
     engine.set_origin_read_budget(Duration::from_millis(50), u64::MAX);
-    let Some(wire) = engine.origin_range_wire(hash, &aligned).await? else {
-        anyhow::bail!("expected Some(wire) — the first window serves");
-    };
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
     let (_, fault) = tokio::time::timeout(Duration::from_secs(10), drain_wire(wire)).await?;
     anyhow::ensure!(
         matches!(&fault, Some(CacheError::OriginError { source, .. })
@@ -4732,26 +3781,93 @@ async fn a_stuck_window_fetch_times_out() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An origin with no range support degrades to `Ok(None)` — the caller then
-/// falls through to a whole-blob path.
+/// An origin missing the outboard is an origin fault for the draw: the
+/// ranged draw is the only way the node serves its own origin, so there is
+/// nothing to degrade to.
 #[tokio::test]
-async fn origin_range_wire_none_when_unsupported() -> anyhow::Result<()> {
+async fn origin_range_wire_faults_when_no_origin_has_the_outboard() -> anyhow::Result<()> {
     let data = local_outboard_pull_test_blob();
     let hash = Hash::new(&data);
     let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
     let mut origin = RangeStubOrigin::serving(hash, &data, Bytes::new());
     origin.outboard = None;
-    origin.support_range = false;
     let tmp = tempfile::tempdir()?;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 64).await?;
 
     let aligned =
         crate::range_pull::align_range(0, 0, total).map_err(|e| anyhow::anyhow!("align: {e}"))?;
+    let opened = engine.origin_range_wire(hash, &aligned).await;
     anyhow::ensure!(
-        engine.origin_range_wire(hash, &aligned).await?.is_none(),
-        "an unsupported origin must degrade origin_range_wire to Ok(None)"
+        matches!(&opened, Err(CacheError::OriginError { source, .. })
+            if format!("{source:#}").contains("decdn origin import")),
+        "a missing outboard must be an OriginError, got {opened:?}"
     );
+    Ok(())
+}
+
+/// An origin missing the data object (the outboard present) is an origin
+/// fault for the draw, never a degrade.
+#[tokio::test]
+async fn origin_range_wire_faults_when_no_origin_has_the_data() -> anyhow::Result<()> {
+    let (_, hash, mut origin, aligned) = multi_window_stub();
+    origin.decline_from = 0;
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    let opened = engine.origin_range_wire(hash, &aligned).await;
+    anyhow::ensure!(
+        matches!(opened, Err(CacheError::OriginError { .. })),
+        "a missing data object must be an OriginError, got {opened:?}"
+    );
+    Ok(())
+}
+
+/// The `{H}.sizeproof` object `decdn origin import` writes for `data`.
+fn size_proof_object_of(data: &[u8]) -> anyhow::Result<Bytes> {
+    let size = u64::try_from(data.len())?;
+    Ok(Bytes::from(
+        decdn_bao_range::encode_outboard(data, size)?.size_proof_object(),
+    ))
+}
+
+/// A range read that finds a missing outboard after a present size proof
+/// memoises an origin fault, so the next open refuses at open instead of
+/// answering present and refusing after the first proof.
+#[tokio::test]
+async fn a_range_open_fault_memoises_an_origin_fault() -> anyhow::Result<()> {
+    let (data, hash, mut origin, aligned) = multi_window_stub();
+    origin.outboard = None;
+    origin.size_proof = Some(size_proof_object_of(&data)?);
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    let size = u64::try_from(data.len())?;
+    anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Present(size));
+    anyhow::ensure!(engine.origin_range_wire(hash, &aligned).await.is_err());
+    anyhow::ensure!(
+        engine.origin_presence(hash).await == OriginPresence::Fault,
+        "the range fault replaces the memoised presence"
+    );
+    Ok(())
+}
+
+/// A data object that goes missing mid-stream memoises an origin fault too.
+#[tokio::test]
+async fn a_mid_stream_range_fault_memoises_an_origin_fault() -> anyhow::Result<()> {
+    let (data, hash, mut origin, aligned) = multi_window_stub();
+    origin.decline_from = crate::RANGE_PULL_WINDOW_BYTES;
+    origin.size_proof = Some(size_proof_object_of(&data)?);
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    let size = u64::try_from(data.len())?;
+    anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Present(size));
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
+    anyhow::ensure!(
+        engine.origin_presence(hash).await == OriginPresence::Present(size),
+        "the open served its first window"
+    );
+    let (_, fault) = drain_wire(wire).await;
+    anyhow::ensure!(
+        matches!(fault, Some(CacheError::OriginError { .. })),
+        "{fault:?}"
+    );
+    anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Fault);
     Ok(())
 }
 
@@ -4776,7 +3892,8 @@ async fn origin_fetch_outboard_bytes_found_and_absent() -> anyhow::Result<()> {
         "a publishing origin must return its outboard bytes"
     );
 
-    let bare = OutboardStubOrigin::new(&data, None);
+    let mut bare = RangeStubOrigin::serving(hash, &data, Bytes::new());
+    bare.outboard = None;
     let tmp2 = tempfile::tempdir()?;
     let engine2 =
         CacheEngine::open(tmp2.path(), vec![Arc::new(bare) as Arc<dyn Origin>], 64).await?;
@@ -4800,7 +3917,7 @@ async fn origin_fetch_outboard_bytes_surfaces_a_transport_fault() -> anyhow::Res
     let hash = Hash::new(&data);
     let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
 
-    let faulting = RangeStubOrigin::outboard_faulting(hash, total);
+    let faulting = RangeStubOrigin::outboard_faulting(hash);
     let tmp = tempfile::tempdir()?;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::new(faulting) as Arc<dyn Origin>], 64).await?;
@@ -6072,14 +5189,14 @@ async fn already_admitted_short_circuits_and_serves_from_store() -> anyhow::Resu
         .set(engine.clone())
         .map_err(|_| anyhow::anyhow!("engine cell already set"))?;
 
-    // populate (CommitOnly) → blob present without re-ingest.
+    // populate → blob present without re-ingest.
     engine.populate(hash).await?;
     anyhow::ensure!(
         engine.has(hash).await?,
         "blob must be present after AlreadyAdmitted populate"
     );
-    // get (ReturnBytes) → bytes read back from the store equal the content.
-    let got = engine.get(hash).await?;
+    // The bytes read back from the store equal the content.
+    let got = engine.read_blob(hash).await?;
     anyhow::ensure!(
         got.as_ref() == plaintext.as_slice(),
         "served bytes must equal the blob"
@@ -6364,7 +5481,7 @@ async fn a_cut_short_export_is_not_a_short_file() -> anyhow::Result<()> {
 /// operator can act on (#2801 item 3): a non-transient cause survives a later
 /// origin's transient fault instead of being shadowed by it, a lone transient
 /// fault names itself, and the walk ceiling names the timeout. The
-/// `origin_probe_presence` warn prints this string, so `cause: None` on a
+/// `origin_presence` warn prints this string, so `cause: None` on a
 /// fault would print `cause="unknown"` and lose the signal.
 #[tokio::test]
 async fn probe_origin_chain_cause_prefers_the_permanent_error() -> anyhow::Result<()> {
@@ -6414,7 +5531,7 @@ async fn probe_origin_chain_cause_prefers_the_permanent_error() -> anyhow::Resul
     );
 
     // The walk ceiling is a cause of its own.
-    let (slow, controls) = ThrottlableOrigin::new(vec![(hash, 7)]);
+    let (slow, controls) = ThrottlableOrigin::new(vec![]);
     controls.slow_ms.store(5_000, Ordering::SeqCst);
     let (engine, _tmp) = engine_with(vec![Arc::new(slow) as Arc<dyn Origin>]).await?;
     let probe = engine

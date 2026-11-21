@@ -113,19 +113,13 @@ impl BlobSource for BackendSource {
                 );
             }
             // Stream + verify + encode the range out of our own origin. A fault
-            // found up front (a wrong-length outboard or first window, a transport
-            // fault, a read past its time budget) surfaces here via `?`; a clean
-            // decline (no origin serves the outboard or the range) is `None`.
-            let Some(wire) = self
+            // found up front (a missing or wrong-length outboard or first window,
+            // a transport fault, a read past its time budget) surfaces here via
+            // `?`.
+            let wire = self
                 .engine
                 .origin_range_wire(Hash::from(hash), &range)
-                .await?
-            else {
-                anyhow::bail!(
-                    "no configured origin serves the outboard or the range for {}",
-                    Hash::from(hash)
-                );
-            };
+                .await?;
             let header = UpstreamPullHeader {
                 total_bytes: self.total_bytes,
                 // The engine proved this size from the node's own origin

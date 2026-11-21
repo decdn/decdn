@@ -1359,15 +1359,13 @@ pub struct DecdnMetrics {
     /// `decdn_node_pull_through_timeouts_total` (#831): cache-miss pull-through
     /// attempts the delivery handler abandoned at its deadline. Distinguishes a
     /// slow/wedged upstream from a genuine miss (both otherwise return
-    /// `NotFound`). Covers BOTH reactive fill tiers — node→node (#831) and the
-    /// local-origin populate (#1116) — so it is not solely a node→node-health
-    /// signal; a cache-only operator's own wedged origin bumps it too.
+    /// `NotFound`) on the buffered node→node pull.
     pub node_pull_through_timeouts: Counter,
     /// `decdn_node_pull_through_errors_total` (#831): cache-engine errors (not
     /// clean misses) hit while filling a miss on the delivery path — a real
     /// store/pull fault, surfaced as `NotFound` to the client but logged + bumped
-    /// here so it isn't silent. Covers BOTH reactive fill tiers: node→node (#831)
-    /// and the local-origin populate (#1116).
+    /// here so it isn't silent. Covers the node→node pull (#831) and a fault
+    /// of the own-origin `{H}.sizeproof` read.
     pub node_pull_through_errors: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// credit-paced serve loop paused the upstream pull because the pull
@@ -1424,17 +1422,13 @@ pub struct DecdnMetrics {
     /// because the `OpenMetrics` encoder appends it.
     pub node_pull_through_upstream_verify_failed: Counter,
     /// `decdn_local_outboard_serves_total` (#1130): times the node served a
-    /// whole-blob cache miss by streaming straight from its own configured
-    /// origin (http/s3/fs) into the paying client while filling
-    /// the local cache store beside it — the stream-while-store path, entered only when
-    /// the origin publishes a `{H}.obao4` pre-order outboard alongside the
-    /// object. Incremented once per entry into `serve_via_backend_origin`,
-    /// before any admission guard, so it also counts requests this tier later
-    /// rejects (deposit/leech/size) — it marks which SERVE TIER fired, not
-    /// whether the fill ultimately succeeded. A miss that instead falls back to
-    /// the buffered `populate_local` path (no outboard, or this tier declined)
-    /// never bumps this counter, which is what lets a test or dashboard tell
-    /// the two fill strategies apart deterministically instead of by timing.
+    /// cache miss by streaming straight from its own configured origin
+    /// (http/s3/fs) into the paying client while filling the local cache store
+    /// beside it — the stream-while-store path, entered when the origin
+    /// publishes a `{H}.sizeproof` that verifies. Incremented once per entry
+    /// into `serve_via_backend_origin`, before any admission guard, so it also
+    /// counts requests this tier later rejects (deposit/leech/size) — it marks
+    /// which SERVE TIER fired, not whether the fill ultimately succeeded.
     pub local_outboard_serves: Counter,
     /// `decdn_serve_cache_hit_total`: paid serves the blob-availability gate
     /// classified as servable from a COMPLETE locally-held blob, before any fill
@@ -1447,15 +1441,9 @@ pub struct DecdnMetrics {
     /// node shedding hard would otherwise report a hit rate that collapses
     /// exactly when an operator most needs to read it.
     ///
-    /// This is the serve-path twin of `decdn_cache_hits_total`, and the two are
-    /// not interchangeable: the cache-crate counter meters
-    /// `CacheEngine::get()`, the whole-blob buffered read, which the paid serve
-    /// path never calls — it streams through `export_bao_range_stream` instead.
-    /// A node that serves only paying clients therefore holds
-    /// `decdn_cache_hits_total` at zero however full its store is. Its partner
-    /// `decdn_cache_misses_total` is NOT confined to `get` — the fill tiers bump
-    /// it too — so that pair reads as a populated, permanently-0% ratio rather
-    /// than as an empty one, which is why the serve path needs its own family.
+    /// This family is the node's cache hit rate: the cache engine serves every
+    /// blob by range through `export_bao_range_stream` and keeps no hit counter
+    /// of its own, so the serve path classifies availability here.
     ///
     /// Sibling of `serve_cache_partial_hit` and `serve_cache_miss`. At most one
     /// of the three is bumped per request, and two requests that reach
@@ -3025,8 +3013,7 @@ recorders! {
 
     /// The node entered `serve_via_backend_origin` — the stream-while-store
     /// serve tier fired for this request (#1130). Counted at entry, before any
-    /// admission guard; distinguishes this tier from the buffered
-    /// `populate_local` fallback regardless of this request's eventual outcome.
+    /// admission guard, regardless of this request's eventual outcome.
     local_outboard_serve => local_outboard_serves.inc();
 
     /// The blob-availability gate classified a paid serve as servable from a

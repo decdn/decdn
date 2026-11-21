@@ -2311,14 +2311,11 @@ fn warn_on_duplicate_origins(
 fn resolve_origin(cfg: &types::OriginConfig) -> anyhow::Result<crate::config::ResolvedOrigin> {
     use crate::config::ResolvedOrigin;
     match cfg {
-        types::OriginConfig::Http { url, decompress } => {
+        types::OriginConfig::Http { url } => {
             anyhow::ensure!(!url.is_empty(), "cache.origin.url must not be empty");
             let parsed =
                 decdn_config_types::parse_origin_url(url).context("invalid cache.origin.url")?;
-            Ok(ResolvedOrigin::Http {
-                url: parsed,
-                decompress: decompress.unwrap_or_default(),
-            })
+            Ok(ResolvedOrigin::Http { url: parsed })
         }
         types::OriginConfig::Fs { path } => {
             let expanded = expand_tilde(path);
@@ -2375,7 +2372,6 @@ fn resolve_s3_origin(
         path_style,
         prefix,
         credentials,
-        decompress,
     } = cfg;
 
     validate_s3_bucket_name(&bucket).context("invalid cache.origin.bucket")?;
@@ -2464,7 +2460,6 @@ fn resolve_s3_origin(
         path_style: path_style.unwrap_or(false),
         prefix,
         credentials,
-        decompress: decompress.unwrap_or_default(),
     })
 }
 
@@ -2558,22 +2553,11 @@ fn validate_user_agent(s: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Hard ceiling on `cache.origin_retry.buffered_max_bytes` (#519).
-/// 64 MiB is well above the 4 MiB default but small enough that an
-/// accidental "set to 4 GiB" gets caught at config-load time. The
-/// streaming abort+restart path covers blobs of any size without
-/// raising this knob; lifting the ceiling would let an operator
-/// silently amplify per-fetch RSS into territory that doesn't
-/// actually buy them anything.
-pub const MAX_BUFFERED_MAX_BYTES: u64 = 64 << 20;
-
-/// Resolve the origin retry policy (#285, extended in #519). Absent =>
-/// defaults via `RetryPolicy::default()`. Present partial sections
-/// fill missing fields from the same defaults (handled by
-/// `#[serde(default)]` on `RetryPolicy` itself). This function
-/// enforces the cross-field invariants the type can't express:
-/// monotone schedule, finite jitter in `[0, 1]`, and a sane ceiling
-/// on the body-phase buffer budget.
+/// Resolve the origin retry policy (#285). Absent => defaults via
+/// `RetryPolicy::default()`. Present partial sections fill missing fields
+/// from the same defaults (handled by `#[serde(default)]` on `RetryPolicy`
+/// itself). This function enforces the cross-field invariants the type
+/// can't express: monotone schedule and finite jitter in `[0, 1]`.
 pub fn resolve_origin_retry(
     file: Option<&decdn_config_types::RetryPolicy>,
 ) -> anyhow::Result<decdn_config_types::RetryPolicy> {
@@ -2589,15 +2573,6 @@ pub fn resolve_origin_retry(
         p.jitter_ratio.is_finite() && (0.0..=1.0).contains(&p.jitter_ratio),
         "cache.origin_retry: jitter_ratio={} must be a finite number in 0.0..=1.0",
         p.jitter_ratio,
-    );
-    anyhow::ensure!(
-        p.buffered_max_bytes <= MAX_BUFFERED_MAX_BYTES,
-        "cache.origin_retry: buffered_max_bytes ({}) exceeds the hard ceiling of {} bytes \
-         (#519). The streaming abort+restart path covers blobs of any size without raising \
-         this knob; if mid-stream retries on large blobs is the goal, leave \
-         buffered_max_bytes at the default and rely on the streaming path",
-        p.buffered_max_bytes,
-        MAX_BUFFERED_MAX_BYTES,
     );
     Ok(p)
 }

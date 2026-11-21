@@ -19,8 +19,8 @@ pub(crate) struct LiveInfo {
 }
 
 /// Extract the `decdn_cache_bytes` gauge value from Prometheus text. Matches
-/// only the exact series name (so `decdn_cache_bytes_total` and
-/// `decdn_cache_bytes_returned_total` are skipped), tolerates a `{...}`
+/// only the exact series name (so a series that shares the prefix, such as
+/// `decdn_cache_bytes_total`, is skipped), tolerates a `{...}`
 /// label block, and takes the first whitespace-separated token after the
 /// name/labels as the value (so a trailing sample timestamp is ignored).
 pub(crate) fn parse_cache_bytes(metrics_body: &str) -> Option<u64> {

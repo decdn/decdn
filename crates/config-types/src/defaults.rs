@@ -15,7 +15,7 @@ pub const DEFAULT_USER_AGENT: &str = concat!("decdn-node/", env!("CARGO_PKG_VERS
 
 /// Default TTL in seconds for a memoised live-origin probe answer
 /// (#1130 pt3). Long enough that a burst of requests for the same object
-/// costs one `HEAD`/`HeadObject`, short enough to track an origin
+/// costs one `{H}.sizeproof` read, short enough to track an origin
 /// deletion within seconds. Canonical u64 form shared by
 /// `decdn-common` (config default) and `decdn-cache` (wrapped as a
 /// `Duration`).
@@ -39,7 +39,7 @@ pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
 pub const DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC: u64 = 5;
 
 /// Default per-request ceiling in milliseconds on the live-origin
-/// `HEAD`/`HeadObject` (#1130 pt3). A slow origin must not stall the
+/// `{H}.sizeproof` read (#1130 pt3). A slow origin must not stall the
 /// serve hot path; on overrun the node does not advertise the blob and
 /// memoises the fault.
 pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;

@@ -202,7 +202,7 @@ async fn poll_node_fast(
                 .map(|(prev, at)| SnapshotDelta::between(prev, &snapshot, now - *at));
             last = Some((snapshot.clone(), now));
             NodeMetrics {
-                hit_rate: hit_rate(snapshot.cache_hits, snapshot.cache_misses),
+                hit_rate: hit_rate(snapshot.serve_cache_hits, snapshot.serve_cache_misses),
                 snapshot,
                 rates,
             }

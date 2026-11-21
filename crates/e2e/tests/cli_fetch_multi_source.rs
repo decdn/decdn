@@ -14,8 +14,8 @@
 //! served by one while the other sat idle.
 //!
 //! Two independently-bonded nodes ("holder A" and "holder B") are launched,
-//! each pre-warmed with the SAME blob (so they share a hash and are both
-//! admissible sources). The client never pins `--node-id`, so `decdn get`
+//! each seeded with the SAME blob on its own origin (so they share a hash and
+//! are both admissible sources: each serves it from its origin). The client never pins `--node-id`, so `decdn get`
 //! auto-discovers both via the on-chain `CapacityBond` registry, opens the
 //! blob on each with no voucher, and runs the acquire loop
 //! (`decdn_client::acquire`, through the `Downloader` face in
@@ -106,8 +106,8 @@ async fn run() -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
 
-    // BOTH nodes are pre-warmed with the SAME blob bytes, so they share a hash
-    // and are both admissible sources: the acquire loop stripes across two
+    // BOTH nodes are seeded with the SAME blob bytes on their own origins, so
+    // they share a hash and are both admissible sources: the acquire loop stripes across two
     // distinct-operator holders of the exact hash requested.
     let blob = make_blob();
     let blob_hash = Hash::new(&blob);

@@ -444,7 +444,7 @@ fn observability_restart_required_changes(
 // ----- pinned_hashes ------------------------------------------------------
 
 /// Reloadable `cache.pinned_hashes`. The rest of `cache.*`
-/// (`cache_dir`, sizes, origin, `decompress`) is not hot-reloadable.
+/// (`cache_dir`, sizes, origin) is not hot-reloadable.
 struct PinnedHashesSection {
     /// Optional handle to the live cache engine. `None` in unit tests
     /// that exercise reload semantics without a real engine; populated
@@ -1299,7 +1299,7 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         .as_ref()
         .is_some_and(cache_has_restart_required_field)
     {
-        warn_ignored("cache.* (cache_dir, sizes, origin, decompress)");
+        warn_ignored("cache.* (cache_dir, sizes, origin)");
     }
     if file.payment.is_some() {
         // The whole `[payment]` section is restart-required. `rate_per_mb` is
