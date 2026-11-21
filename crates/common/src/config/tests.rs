@@ -2925,6 +2925,38 @@ fn fs_origin_rejects_unknown_field_typo() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An origin serves raw bytes and the node decompresses nothing, so
+/// `decompress` is an unknown field on every origin kind.
+#[test]
+fn removed_origin_decompress_is_rejected() -> anyhow::Result<()> {
+    for origin in [
+        "kind = \"http\"\nurl = \"https://origin.example/\"\n",
+        "kind = \"fs\"\npath = \"/var/decdn\"\n",
+        "kind = \"s3\"\nbucket = \"decdn-blobs\"\nregion = \"us-east-1\"\n",
+    ] {
+        assert_origin_toml_rejects(
+            &format!("{origin}decompress = \"auto\"\n"),
+            &["unknown field", "decompress"],
+        )?;
+    }
+    Ok(())
+}
+
+/// No whole-blob origin tier buffers a blob, so `buffered_max_bytes` is an
+/// unknown field of `cache.origin_retry`.
+#[test]
+fn removed_buffered_max_bytes_is_rejected() -> anyhow::Result<()> {
+    let err = toml::from_str::<decdn_config_types::RetryPolicy>("buffered_max_bytes = 1048576\n")
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
+    let msg = format!("{err}");
+    anyhow::ensure!(
+        msg.contains("unknown field") && msg.contains("buffered_max_bytes"),
+        "got: {msg}"
+    );
+    Ok(())
+}
+
 /// Helper: assert that a TOML deserialization fails with a
 /// message containing every required fragment. Used by the
 /// missing-required-field and unknown-tag-value tests.

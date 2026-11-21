@@ -335,11 +335,11 @@ impl Origin for ThrottlableOrigin {
             if self.faulting.load(Ordering::SeqCst) {
                 return Err(if self.permanent.load(Ordering::SeqCst) {
                     crate::OriginPullError::Permanent(anyhow::anyhow!(
-                        "synthetic HeadObject access denied"
+                        "synthetic size proof read: access denied"
                     ))
                 } else {
                     crate::OriginPullError::Transient(anyhow::anyhow!(
-                        "synthetic HeadObject throttle (503 SlowDown)"
+                        "synthetic size proof read: 503 SlowDown"
                     ))
                 });
             }
@@ -391,7 +391,9 @@ async fn rescan_origins_carries_a_faulted_probe_forward() -> anyhow::Result<()> 
         // `fresh` is also pinned, so it reaches the probe loop twice — once
         // from the listing and once from the pin set. It must be probed once.
         crate::PinnedHashes::new([from_store_hash(fresh)].into_iter().collect()),
-        crate::RetryPolicy::default(),
+        // No retry, so one probe is one origin read and the count below
+        // measures the per-candidate dedupe.
+        crate::RetryPolicy::disabled(),
         CircuitBreakerPolicy::default(),
         Some(Arc::clone(&cm)),
         Duration::ZERO,
@@ -2826,6 +2828,9 @@ struct RangeStubOrigin {
     /// Calls to [`Origin::fetch_range_data`] so far, shared so a test can
     /// read it after the engine takes the origin.
     range_fetches: Arc<AtomicUsize>,
+    /// The `{H}.sizeproof` object [`Origin::fetch_size_proof`] serves for
+    /// `hash`; `None` answers no object.
+    size_proof: Option<Bytes>,
 }
 
 impl RangeStubOrigin {
@@ -2847,6 +2852,7 @@ impl RangeStubOrigin {
             outboard_fetches: AtomicUsize::new(0),
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
+            size_proof: None,
         }
     }
 
@@ -2869,6 +2875,7 @@ impl RangeStubOrigin {
             outboard_fetches: AtomicUsize::new(0),
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
+            size_proof: None,
         }
     }
 }
@@ -2876,6 +2883,19 @@ impl RangeStubOrigin {
 impl Origin for RangeStubOrigin {
     fn kind(&self) -> OriginKind {
         OriginKind::Http
+    }
+
+    fn fetch_size_proof(
+        &self,
+        hash: Hash,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, crate::OriginPullError>> + Send + '_>>
+    {
+        let object = if hash == self.hash {
+            self.size_proof.clone()
+        } else {
+            None
+        };
+        Box::pin(async move { Ok(object) })
     }
 
     fn fetch_outboard(
@@ -3798,6 +3818,56 @@ async fn origin_range_wire_faults_when_no_origin_has_the_data() -> anyhow::Resul
         matches!(opened, Err(CacheError::OriginError { .. })),
         "a missing data object must be an OriginError, got {opened:?}"
     );
+    Ok(())
+}
+
+/// The `{H}.sizeproof` object `decdn origin import` writes for `data`.
+fn size_proof_object_of(data: &[u8]) -> anyhow::Result<Bytes> {
+    let size = u64::try_from(data.len())?;
+    Ok(Bytes::from(
+        decdn_bao_range::encode_outboard(data, size)?.size_proof_object(),
+    ))
+}
+
+/// A range read that finds a missing outboard after a present size proof
+/// memoises an origin fault, so the next open refuses at open instead of
+/// answering present and refusing after the first proof.
+#[tokio::test]
+async fn a_range_open_fault_memoises_an_origin_fault() -> anyhow::Result<()> {
+    let (data, hash, mut origin, aligned) = multi_window_stub();
+    origin.outboard = None;
+    origin.size_proof = Some(size_proof_object_of(&data)?);
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    let size = u64::try_from(data.len())?;
+    anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Present(size));
+    anyhow::ensure!(engine.origin_range_wire(hash, &aligned).await.is_err());
+    anyhow::ensure!(
+        engine.origin_presence(hash).await == OriginPresence::Fault,
+        "the range fault replaces the memoised presence"
+    );
+    Ok(())
+}
+
+/// A data object that goes missing mid-stream memoises an origin fault too.
+#[tokio::test]
+async fn a_mid_stream_range_fault_memoises_an_origin_fault() -> anyhow::Result<()> {
+    let (data, hash, mut origin, aligned) = multi_window_stub();
+    origin.decline_from = crate::RANGE_PULL_WINDOW_BYTES;
+    origin.size_proof = Some(size_proof_object_of(&data)?);
+    let (engine, _tmp) = stub_engine(vec![origin]).await?;
+    let size = u64::try_from(data.len())?;
+    anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Present(size));
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
+    anyhow::ensure!(
+        engine.origin_presence(hash).await == OriginPresence::Present(size),
+        "the open served its first window"
+    );
+    let (_, fault) = drain_wire(wire).await;
+    anyhow::ensure!(
+        matches!(fault, Some(CacheError::OriginError { .. })),
+        "{fault:?}"
+    );
+    anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Fault);
     Ok(())
 }
 

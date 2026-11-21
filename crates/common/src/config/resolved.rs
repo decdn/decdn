@@ -291,7 +291,7 @@ pub struct ResolvedCache {
     pub fs_rescan_interval_sec: u64,
     /// TTL in seconds for a memoised positive live-origin probe answer (#1130
     /// pt3). Default [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`]. Backs the
-    /// per-request `HEAD`/`HeadObject` fallback that discovers non-pinned http/s3
+    /// per-request `{H}.sizeproof` read that discovers non-pinned http/s3
     /// objects the enumeration index cannot see.
     pub origin_probe_ttl_sec: u64,
     /// Default [`crate::config::DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC`]. The
@@ -303,7 +303,8 @@ pub struct ResolvedCache {
     /// hash that faulted is not re-probed, and is capped by
     /// `origin_probe_ttl_sec` so a recovered origin is noticed soon.
     pub origin_probe_fault_ttl_sec: u64,
-    /// Per-request live-`HEAD` ceiling in milliseconds (#1130 pt3). Default
+    /// Per-request ceiling in milliseconds on the live `{H}.sizeproof` read
+    /// (#1130 pt3). Default
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
     /// off the serve hot path.
     pub origin_probe_timeout_ms: u64,

@@ -157,7 +157,11 @@ impl std::fmt::Debug for OutboardFetch {
 /// [`OriginPullError::Permanent`] for failures that won't be cured by
 /// retrying (HTTP 4xx other than 404, an object over its cap or shorter
 /// than the requested span, permission denied). A missing object is *not* an
-/// error — each read answers its own `NotFound`.
+/// error — each read answers its own `NotFound`. The HTTP adapter also reads
+/// a 403 on the outboard and data reads as a missing object, because an
+/// origin in front of a bucket without list permission answers 403 for a
+/// missing key. On the `{H}.sizeproof` read, which is the presence answer, a
+/// 403 is a permanent fault.
 pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// Pull the whole blob `hash` into the store. Only the node-to-node origin
     /// pulls a whole blob: it admits the verified stream itself and answers

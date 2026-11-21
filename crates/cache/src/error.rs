@@ -170,7 +170,8 @@ pub enum OriginPullError {
     Transient(anyhow::Error),
 
     /// A failure that won't be cured by retrying: HTTP 4xx (other than 404,
-    /// which each read answers as a missing object), an object over its cap
+    /// which each read answers as a missing object, and a 403 on the HTTP
+    /// outboard and data reads, read the same way), an object over its cap
     /// or shorter than the requested span, or a symlink escape, a dangling
     /// symlink or a permission denied on the filesystem origin.
     #[error(transparent)]

@@ -189,9 +189,10 @@ pub struct CacheMetrics {
     pub tag_drop_failures: Counter,
 
     /// Origin size probes that faulted during an origin rescan — a transport
-    /// error from one or more configured origins with none of them confirming
-    /// the object, or the probe walk overrunning its ceiling — rather than
-    /// answering "held" or "not held".
+    /// error or a `{H}.sizeproof` that does not verify from one or more
+    /// configured origins with none of them confirming the object, or the
+    /// probe walk overrunning its ceiling — rather than answering "held" or
+    /// "not held".
     ///
     /// Operator-actionable: a rescan resolves each candidate against the origin
     /// to decide what this node advertises, so a throttled origin read window
@@ -347,7 +348,8 @@ pub struct CacheMetrics {
     /// size for such a blob and does not serve it from its origin. A nonzero
     /// rate for content the origin holds means its objects lack the proof
     /// `decdn origin import` writes. Each lookup counts, including one the
-    /// presence memo answers.
+    /// presence memo answers, and so does each listed object an origin
+    /// rescan finds with no size proof.
     ///
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_size_proof_origin_missing_total`.

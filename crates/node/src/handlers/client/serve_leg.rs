@@ -274,8 +274,10 @@ impl ClientHandler {
     /// the leg sent any `ChunkData`. A fill fault there (a missing or broken
     /// origin object, an upstream that failed) is a refusal: the node writes
     /// a `StreamError` for [`ServeRejectReason::InternalError`] and the
-    /// requester asks another node (ADR 005 § Deferred admission). A client
-    /// that left, or a fault after the first frame, passes through unchanged.
+    /// requester asks another node (ADR 005 § Deferred admission). A fault
+    /// the peer caused ([`super::wire::is_peer_attributable`]: a client that
+    /// left, a payment fault) or a fault after the first frame passes
+    /// through unchanged.
     async fn refuse_fill_fault(
         &self,
         send: &mut SendStream,

@@ -229,12 +229,27 @@ fn classify_reqwest_error(e: reqwest::Error) -> OriginPullError {
 
 /// Status-code classification per RFC 9110 + operational practice:
 /// 5xx, 408 (Request Timeout), and 429 (Too Many Requests) are retriable;
-/// every other 4xx is permanent. `404` and `403` are intercepted earlier as
-/// a missing object; this helper assumes the caller already excluded them.
+/// every other 4xx is permanent. `404` and `403` are intercepted earlier
+/// ([`HttpOrigin::missing_or_fault`]); this helper assumes the caller already
+/// excluded them.
 fn is_transient_status(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+/// How [`HttpOrigin::missing_or_fault`] reads a `403`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Forbidden {
+    /// A missing object. An origin in front of a bucket without list
+    /// permission answers 403 for a missing key. The outboard and data
+    /// reads run only after a presence answer, so a missing object there is
+    /// a fault either way.
+    Missing,
+    /// A fault. The `{H}.sizeproof` read is the presence answer, and an
+    /// absence there is memoised and signed, so a refusal must not read as
+    /// one.
+    Fault,
 }
 
 impl Origin for HttpOrigin {
@@ -275,10 +290,15 @@ impl Origin for HttpOrigin {
     ) -> Pin<Box<dyn Future<Output = Result<OutboardFetch, OriginPullError>> + Send + '_>> {
         Box::pin(async move {
             let url = self.url_for(&format!("{}{OBAO4_SUFFIX}", hash.to_hex()), hash)?;
-            Ok(match self.get_bounded(&url, outboard_max_bytes).await? {
-                Some(bytes) => OutboardFetch::Found(bytes),
-                None => OutboardFetch::NotFound,
-            })
+            Ok(
+                match self
+                    .get_bounded(&url, outboard_max_bytes, Forbidden::Missing)
+                    .await?
+                {
+                    Some(bytes) => OutboardFetch::Found(bytes),
+                    None => OutboardFetch::NotFound,
+                },
+            )
         })
     }
 
@@ -292,7 +312,9 @@ impl Origin for HttpOrigin {
                 hash,
             )?;
             let max = decdn_bao_range::MAX_SIZE_PROOF_OBJECT_BYTES as u64;
-            self.get_bounded(&url, max).await
+            // A 403 here is a fault, not an absence: the size proof is the
+            // presence answer, and an absence is memoised and signed as one.
+            self.get_bounded(&url, max, Forbidden::Fault).await
         })
     }
 }
@@ -335,23 +357,34 @@ impl HttpOrigin {
     }
 
     /// Classify a non-success `status` the origin answered to `what` on
-    /// `url_log`. `Ok(())` means the object is missing: a 404, or a 403,
-    /// which an origin in front of a bucket answers for a missing key. A
-    /// retriable status (5xx/408/429 per [`is_transient_status`]) is an
-    /// [`OriginPullError::Transient`]. A redirect (disabled per #579) and
+    /// `url_log`. `Ok(())` means the object is missing: a 404, or a 403 under
+    /// [`Forbidden::Missing`], which an origin in front of a bucket answers
+    /// for a missing key. A retriable status (5xx/408/429 per
+    /// [`is_transient_status`]) is an [`OriginPullError::Transient`]. A
+    /// redirect (disabled per #579), a 403 under [`Forbidden::Fault`] and
     /// every other status are an [`OriginPullError::Permanent`].
     fn missing_or_fault(
         &self,
         status: StatusCode,
         url_log: &str,
         what: &str,
+        forbidden: Forbidden,
     ) -> Result<(), OriginPullError> {
         if status == StatusCode::NOT_FOUND {
             return Ok(());
         }
         if status == StatusCode::FORBIDDEN {
-            self.log_forbidden(url_log);
-            return Ok(());
+            return match forbidden {
+                Forbidden::Missing => {
+                    self.log_forbidden(url_log);
+                    Ok(())
+                }
+                Forbidden::Fault => Err(OriginPullError::Permanent(anyhow::anyhow!(
+                    "origin {what} {url_log} answered {status}; the node cannot tell a \
+                     missing object from a refused one, so check the origin's permissions \
+                     (an origin must answer 404 for a key it does not hold)"
+                ))),
+            };
         }
         if status.is_redirection() {
             return Err(OriginPullError::Permanent(anyhow::anyhow!(
@@ -368,14 +401,16 @@ impl HttpOrigin {
     }
 
     /// GET `url` and buffer the whole body, capped at `max_bytes`. `Ok(None)`
-    /// when the object is missing ([`Self::missing_or_fault`]). A body over the
-    /// cap is malformed or foreign (for example a chunk-level outboard from
-    /// another tool) and is an [`OriginPullError::Permanent`]. A transport
-    /// fault on the send or the body read is an [`OriginPullError`] too.
+    /// when the object is missing ([`Self::missing_or_fault`] under
+    /// `forbidden`). A body over the cap is malformed or foreign (for example
+    /// a chunk-level outboard from another tool) and is an
+    /// [`OriginPullError::Permanent`]. A transport fault on the send or the
+    /// body read is an [`OriginPullError`] too.
     async fn get_bounded(
         &self,
         url: &reqwest::Url,
         max_bytes: u64,
+        forbidden: Forbidden,
     ) -> Result<Option<Bytes>, OriginPullError> {
         let url_log = redact_for_log(url);
         let resp = self
@@ -383,7 +418,7 @@ impl HttpOrigin {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            self.missing_or_fault(status, &url_log, "GET")?;
+            self.missing_or_fault(status, &url_log, "GET", forbidden)?;
             return Ok(None);
         }
         let oversize = || {
@@ -427,7 +462,7 @@ impl HttpOrigin {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            self.missing_or_fault(status, &url_log, "GET (range)")?;
+            self.missing_or_fault(status, &url_log, "GET (range)", Forbidden::Missing)?;
             return Ok(None);
         }
         // Only `206 Partial Content` is an honored range. A `200` means the

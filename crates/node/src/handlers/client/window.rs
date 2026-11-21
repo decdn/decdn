@@ -900,6 +900,17 @@ impl ClientHandler {
             })
             .await;
         }
+        // A fill fault before the first chunk is an own-origin fault: count
+        // it as the open-time origin faults are counted. The engine memoises
+        // it, so the next open of the hash refuses at open.
+        if matches!(
+            serve_result,
+            Ok(super::outcome::ServeEnd::Refused(
+                ServeRejectReason::InternalError
+            ))
+        ) {
+            self.metrics.node_pull_through_error();
+        }
         serve_result
     }
 

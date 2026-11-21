@@ -285,7 +285,9 @@ async fn ranged_paid_pull(
                 }
             }
             ClientMessage::StreamEnd => break,
-            ClientMessage::StreamError(e) => anyhow::bail!("stream error mid-delivery: {e:?}"),
+            ClientMessage::StreamError(e) => {
+                anyhow::bail!("stream error after {cumulative} bytes: {e:?}")
+            }
             other => anyhow::bail!("unexpected message mid-delivery: {other:?}"),
         }
     }
@@ -1810,6 +1812,9 @@ enum BrokenObject {
     NoRangeSupport,
     /// A ranged data GET answers `500`.
     RangeOutage,
+    /// `{H}` answers `404`: the origin publishes the size proof and the
+    /// outboard but not the data.
+    MissingData,
 }
 
 /// Mount the origin for `case`: the size proof, the outboard and the data
@@ -1830,7 +1835,7 @@ async fn mount_broken_origin(
                 .get(..outboard.len().saturating_sub(7))
                 .unwrap_or_default(),
         ),
-        BrokenObject::NoRangeSupport | BrokenObject::RangeOutage => {
+        BrokenObject::NoRangeSupport | BrokenObject::RangeOutage | BrokenObject::MissingData => {
             ResponseTemplate::new(200).set_body_bytes(outboard.to_vec())
         }
     };
@@ -1842,6 +1847,7 @@ async fn mount_broken_origin(
     let data_response = match case {
         BrokenObject::NoRangeSupport => ResponseTemplate::new(200).set_body_bytes(blob.to_vec()),
         BrokenObject::RangeOutage => ResponseTemplate::new(500),
+        BrokenObject::MissingData => ResponseTemplate::new(404),
         BrokenObject::MissingOutboard
         | BrokenObject::OutboardOutage
         | BrokenObject::TruncatedOutboard => {
@@ -1914,10 +1920,17 @@ async fn broken_origin_object_faults_before_any_chunk(case: BrokenObject) -> any
     let Err(err) = pulled else {
         anyhow::bail!("{case:?}: a broken origin must not deliver the blob");
     };
-    // The open answered `ok: true` from the size proof; the stream then ended.
+    // The open answered `ok: true` from the size proof; the stream then ended
+    // with a `StreamError` for `InternalError` (wire `Declined`) before any
+    // `ChunkData`.
     anyhow::ensure!(
         !err.to_string().contains("delivery refused"),
         "{case:?}: the open answers from the size proof, got: {err:#}"
+    );
+    anyhow::ensure!(
+        err.to_string().contains("stream error after 0 bytes")
+            && err.to_string().contains("Declined"),
+        "{case:?}: a StreamError(Declined) before any ChunkData, got: {err:#}"
     );
 
     anyhow::ensure!(
@@ -1950,6 +1963,162 @@ async fn broken_origin_object_faults_before_any_chunk(case: BrokenObject) -> any
         counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
         "{case:?}: the node refuses the stream with a StreamError before any ChunkData"
     );
+    anyhow::ensure!(
+        counter_value(&metrics, "node_pull_through_errors_total")? == 1,
+        "{case:?}: the fault counts as an own-origin pull-through error"
+    );
+
+    // The engine memoised the fault, so the next open refuses at open with no
+    // origin read, instead of answering `ok: true` and refusing after the
+    // payer's first proof.
+    let origin_reads = count_requests(&server, |r| r.method.as_str() == "GET").await?;
+    let again = tokio::time::timeout(
+        Duration::from_secs(20),
+        ranged_paid_pull(
+            &client_ep,
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            client_node_id,
+            &client_eth,
+            pool_id,
+            server_eth.address(),
+            hash,
+            0,
+            0,
+            RATE_PER_MB,
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{case:?}: the second open must end, not hang"))?;
+    let Err(again) = again else {
+        anyhow::bail!("{case:?}: a memoised fault must not deliver the blob");
+    };
+    anyhow::ensure!(
+        again.to_string().contains("delivery refused"),
+        "{case:?}: the next open refuses at open, got: {again:#}"
+    );
+    anyhow::ensure!(
+        count_requests(&server, |r| r.method.as_str() == "GET").await? == origin_reads,
+        "{case:?}: the memoised fault reads no origin object"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
+/// A data object that stops serving after the stream has sent bytes is a
+/// fault mid-stream, not a refusal: the node already sent `ChunkData`, so it
+/// cannot answer with a refusal class. The stream ends without hanging, the
+/// node keeps only the verified prefix, the refusal counter stays at zero,
+/// and the engine memoises the fault so the next open refuses at open.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one linear integration-test scenario
+async fn a_data_object_that_fails_mid_stream_ends_the_stream() -> anyhow::Result<()> {
+    // A little over one range window, so the pull draws a second window after
+    // the first has streamed.
+    let window = usize::try_from(decdn_cache::RANGE_PULL_WINDOW_BYTES)?;
+    let blob: Vec<u8> = (0..window + 200 * 1024)
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect();
+    let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
+    let hash = Hash::from_bytes(*ob.root.as_bytes());
+    let hex = hash.to_hex();
+
+    let server = MockServer::start().await;
+    mount_size_proof(&server, &hex, &blob).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}.obao4")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ob.data.clone()))
+        .mount(&server)
+        .await;
+    // The first window serves; every later window answers 404.
+    let origin_bytes = blob.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/{hex}")))
+        .respond_with(move |req: &Request| {
+            let span = req
+                .headers
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_byte_range);
+            match span {
+                Some((0, end)) => usize::try_from(end)
+                    .ok()
+                    .and_then(|end| origin_bytes.get(..=end))
+                    .map_or_else(
+                        || ResponseTemplate::new(416),
+                        |body| ResponseTemplate::new(206).set_body_bytes(body.to_vec()),
+                    ),
+                _ => ResponseTemplate::new(404),
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let pool_id = B256::repeat_byte(0x6C);
+    let client_eth = Arc::new(PrivateKeySigner::random());
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = Arc::new(PrivateKeySigner::random());
+    let (handler, cache, metrics, _cache_tmp) = handler_over_http_origin(
+        &server.uri(),
+        pool_id,
+        client_eth.address(),
+        &server_eth,
+        server_id,
+        Some(Duration::from_secs(15)),
+    )
+    .await?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+
+    let client_sk = fresh_key();
+    let client_node_id = B256::from(*client_sk.public().as_bytes());
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let pull = || {
+        ranged_paid_pull(
+            &client_ep,
+            EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            client_node_id,
+            &client_eth,
+            pool_id,
+            server_eth.address(),
+            hash,
+            0,
+            0,
+            RATE_PER_MB,
+        )
+    };
+    let pulled = tokio::time::timeout(Duration::from_secs(30), pull())
+        .await
+        .map_err(|_| anyhow::anyhow!("a mid-stream fault must end the stream, not hang"))?;
+    let Err(err) = pulled else {
+        anyhow::bail!("a data object that stops serving must not deliver the blob");
+    };
+    anyhow::ensure!(
+        !err.to_string().contains("delivery refused")
+            && !err.to_string().contains("stream error after 0 bytes"),
+        "the stream answered ok and sent bytes before it failed, got: {err:#}"
+    );
+    anyhow::ensure!(
+        counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 0,
+        "a fault after the first ChunkData is not a refusal"
+    );
+    anyhow::ensure!(
+        !cache.has(hash).await?,
+        "the node never holds a blob it could not fill"
+    );
+    anyhow::ensure!(
+        cache.present_ranges(hash).await?.held_bytes() > 0,
+        "the node keeps the verified prefix it streamed"
+    );
+
+    let again = tokio::time::timeout(Duration::from_secs(20), pull())
+        .await
+        .map_err(|_| anyhow::anyhow!("the second open must end, not hang"))?;
+    anyhow::ensure!(
+        again.is_err_and(|e| e.to_string().contains("delivery refused")),
+        "the memoised fault refuses the next open at open"
+    );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -1973,6 +2142,11 @@ async fn truncated_outboard_faults_before_any_chunk() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn no_range_origin_faults_before_any_chunk() -> anyhow::Result<()> {
     broken_origin_object_faults_before_any_chunk(BrokenObject::NoRangeSupport).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_data_object_faults_before_any_chunk() -> anyhow::Result<()> {
+    broken_origin_object_faults_before_any_chunk(BrokenObject::MissingData).await
 }
 
 #[tokio::test(flavor = "multi_thread")]

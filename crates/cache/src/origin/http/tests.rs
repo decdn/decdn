@@ -273,8 +273,10 @@ async fn fetch_outboard_oversize_is_a_permanent_fault() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A published `{hex}.sizeproof` is read verbatim; a `404` or a `403` is no
-/// proof (`None`), a `503` a transient fault.
+/// A published `{hex}.sizeproof` is read verbatim; a `404` is no proof
+/// (`None`), a `403` a permanent fault and a `503` a transient one. The size
+/// proof is the presence answer, so a refused read must never read as an
+/// absence.
 #[tokio::test]
 async fn fetch_size_proof_classifies_its_status() -> anyhow::Result<()> {
     let server = MockServer::start().await;
@@ -293,18 +295,28 @@ async fn fetch_size_proof_classifies_its_status() -> anyhow::Result<()> {
         "a 200 must return the object"
     );
 
-    for status in [404u16, 403] {
-        let hash = Hash::new(format!("http-size-proof-{status}").as_bytes());
-        mount_get(
-            &server,
-            format!("{}.sizeproof", hash.to_hex()),
-            ResponseTemplate::new(status),
-        )
-        .await;
-        anyhow::ensure!(
-            origin.fetch_size_proof(hash).await?.is_none(),
-            "{status} must be no proof"
-        );
+    let missing = Hash::new(b"http-size-proof-404");
+    mount_get(
+        &server,
+        format!("{}.sizeproof", missing.to_hex()),
+        ResponseTemplate::new(404),
+    )
+    .await;
+    anyhow::ensure!(
+        origin.fetch_size_proof(missing).await?.is_none(),
+        "a 404 must be no proof"
+    );
+
+    let refused = Hash::new(b"http-size-proof-403");
+    mount_get(
+        &server,
+        format!("{}.sizeproof", refused.to_hex()),
+        ResponseTemplate::new(403),
+    )
+    .await;
+    match origin.fetch_size_proof(refused).await {
+        Err(err) => anyhow::ensure!(!err.is_transient(), "a 403 is permanent: {err}"),
+        Ok(got) => anyhow::bail!("a 403 must fault, got Ok({got:?})"),
     }
 
     let outage = Hash::new(b"http-size-proof-503");
@@ -378,5 +390,186 @@ async fn new_with_user_agent_accepts_custom_value() -> anyhow::Result<()> {
 fn new_outside_a_runtime_is_an_error() -> anyhow::Result<()> {
     let url = parse_origin_url("https://origin.example/")?;
     anyhow::ensure!(HttpOrigin::new(url).is_err(), "built outside a runtime");
+    Ok(())
+}
+
+/// Resolve `received_requests()` or fail: `None` means wiremock recording is
+/// off, and then an empty list proves nothing about the SSRF defence.
+async fn received(server: &MockServer) -> anyhow::Result<Vec<wiremock::Request>> {
+    server
+        .received_requests()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("wiremock recording is disabled"))
+}
+
+/// A redirect is a permanent fault on every read, and the client never
+/// contacts its target (#579): a compromised origin could point a 3xx at
+/// cloud metadata or an internal service, and the request itself is the SSRF
+/// primitive. One request reaches the source, so the test cannot pass on a
+/// client that failed before it sent anything.
+#[tokio::test]
+async fn redirects_are_refused_without_contacting_the_target() -> anyhow::Result<()> {
+    for status in [301u16, 302, 307] {
+        let hash = Hash::new(format!("http-redirect-{status}").as_bytes());
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 1024]))
+            .mount(&target)
+            .await;
+        let source = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Location", format!("{}/elsewhere", target.uri()).as_str()),
+            )
+            .mount(&source)
+            .await;
+        let origin = HttpOrigin::parse(&source.uri())?;
+
+        let proof = origin.fetch_size_proof(hash).await;
+        let outboard = origin.fetch_outboard(hash, 1 << 20).await;
+        let range = origin.fetch_range_data(hash, FIRST_KIB).await;
+        for (read, err) in [
+            ("size proof", proof.err()),
+            ("outboard", outboard.err()),
+            ("range", range.err()),
+        ] {
+            let Some(err) = err else {
+                anyhow::bail!("a {status} on the {read} read must fault");
+            };
+            anyhow::ensure!(!err.is_transient(), "a {status} is permanent: {err}");
+            anyhow::ensure!(
+                format!("{err:#}").contains("redirects are disabled"),
+                "the {read} fault must name the redirect: {err:#}"
+            );
+        }
+        anyhow::ensure!(
+            received(&target).await?.is_empty(),
+            "a {status} target must not be contacted"
+        );
+        anyhow::ensure!(
+            received(&source).await?.len() == 3,
+            "each read sends exactly one request to the source"
+        );
+    }
+    Ok(())
+}
+
+/// A redirect to an internal address faults at the status check: the only
+/// request that leaves the client goes to the source.
+#[tokio::test]
+async fn a_redirect_to_an_internal_address_is_refused() -> anyhow::Result<()> {
+    let hash = Hash::new(b"http-redirect-internal");
+    let source = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("Location", format!("http://127.0.0.1:1/{}", hash.to_hex())),
+        )
+        .mount(&source)
+        .await;
+    let origin = HttpOrigin::parse(&source.uri())?
+        .with_timeouts(Duration::from_secs(10), Duration::from_secs(5));
+
+    match origin.fetch_size_proof(hash).await {
+        Err(err) => anyhow::ensure!(!err.is_transient(), "a redirect is permanent: {err}"),
+        Ok(got) => anyhow::bail!("a redirect must fault, got Ok({got:?})"),
+    }
+    anyhow::ensure!(
+        received(&source).await?.len() == 1,
+        "exactly one request reaches the source; redirects may be followed"
+    );
+    Ok(())
+}
+
+/// Bind an ephemeral port, accept one connection and never write to it, so
+/// the TCP handshake completes but no status line arrives.
+async fn spawn_silent_server() -> anyhow::Result<std::net::SocketAddr> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = listener.accept().await {
+            let _sock = sock;
+            std::future::pending::<()>().await;
+        }
+    });
+    Ok(addr)
+}
+
+/// Bind an ephemeral port, answer one request with headers and a short first
+/// chunk, then hang, so the next body read stalls.
+async fn spawn_stall_after_partial_body_server() -> anyhow::Result<std::net::SocketAddr> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    let seen = buf.get(..n).unwrap_or(&[]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let resp = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nABCD\r\n";
+        let _ = sock.write_all(resp).await;
+        let _sock = sock;
+        std::future::pending::<()>().await;
+    });
+    Ok(addr)
+}
+
+/// An origin that accepts the connection and never answers is a transient
+/// fault once the headers timeout fires, so a stalled `{H}.sizeproof` read
+/// faults rather than hangs the open.
+#[tokio::test]
+async fn response_headers_timeout_fires_on_a_silent_origin() -> anyhow::Result<()> {
+    let addr = spawn_silent_server().await?;
+    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
+        .with_timeouts(Duration::from_millis(200), Duration::from_secs(30));
+
+    match origin.fetch_size_proof(Hash::new(b"http-silent")).await {
+        Err(err) => {
+            anyhow::ensure!(err.is_transient(), "a headers timeout is transient: {err}");
+            anyhow::ensure!(
+                format!("{err:#}").contains("headers timed out"),
+                "the fault must name the headers timeout: {err:#}"
+            );
+        }
+        Ok(got) => anyhow::bail!("a silent origin must fault, got Ok({got:?})"),
+    }
+    Ok(())
+}
+
+/// An origin that stalls mid-body is a transient fault once the chunk-idle
+/// timeout fires, so a stalled outboard read faults rather than hangs the
+/// serve leg.
+#[tokio::test]
+async fn chunk_idle_timeout_fires_when_the_origin_stalls_mid_body() -> anyhow::Result<()> {
+    let addr = spawn_stall_after_partial_body_server().await?;
+    let origin = HttpOrigin::parse(&format!("http://{addr}/"))?
+        .with_timeouts(Duration::from_secs(30), Duration::from_millis(200));
+
+    match origin
+        .fetch_outboard(Hash::new(b"http-stall"), 1 << 20)
+        .await
+    {
+        Err(err) => {
+            anyhow::ensure!(err.is_transient(), "a stalled body is transient: {err}");
+            anyhow::ensure!(
+                format!("{err:#}").contains("body read stalled"),
+                "the fault must name the stall: {err:#}"
+            );
+        }
+        Ok(got) => anyhow::bail!("a stalled origin must fault, got Ok({got:?})"),
+    }
     Ok(())
 }

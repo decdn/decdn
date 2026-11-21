@@ -407,9 +407,9 @@ impl NodeFixture {
     /// from the node's own origin. Returns once the store holds every blob.
     ///
     /// A journey that models content the operator already holds in its store
-    /// (an eviction, a cache hit) warms first. The warm opens its own pool, so
-    /// it moves the node's serve, lane and byte counters: take any baseline
-    /// after it.
+    /// (an eviction, a cache hit) warms first. The warm opens one pool per
+    /// hash, so it moves the node's serve, lane and byte counters: take any
+    /// baseline after it.
     pub async fn warm(&self, chain: &ChainFixture, hashes: &[Hash]) -> anyhow::Result<()> {
         let client = crate::client::ClientFixture::new(chain).await?;
         let admin = self.admin_client()?;

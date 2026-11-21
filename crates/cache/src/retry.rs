@@ -1,4 +1,7 @@
-//! Origin pull-through retry policy with exponential backoff and jitter (#285).
+//! Origin retry policy with exponential backoff and jitter (#285).
+//!
+//! `ReadGuard` runs each read of an origin's ranged objects under the
+//! origin's circuit breaker and this retry loop.
 //!
 //! Wraps a single pull-through attempt in a bounded retry loop. The adapter
 //! (or the engine's per-attempt closure) classifies each failure as
@@ -39,6 +42,7 @@ use std::time::Duration;
 use decdn_config_types::RetryPolicy;
 use iroh_blobs::Hash;
 
+use crate::circuit_breaker::{Admission, OriginBreaker, OriginOutcome};
 use crate::error::OriginPullError;
 use crate::metrics::CacheMetrics;
 
@@ -151,6 +155,80 @@ where
                 tokio::time::sleep(sleep).await;
                 attempt = attempt.saturating_add(1);
             }
+        }
+    }
+}
+
+/// What every read of one origin's ranged objects runs under: that origin's
+/// circuit breaker (#963) and the retry policy (`cache.origin_retry`). The
+/// `{H}.sizeproof`, `{H}.obao4` and range window reads all go through
+/// [`Self::run`], so one transport blip does not refuse a paid stream, and
+/// a down origin trips its breaker and stops costing backoff.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadGuard {
+    /// The origin's breaker; `None` reads with no breaker.
+    breaker: Option<Arc<OriginBreaker>>,
+    policy: RetryPolicy,
+    metrics: Option<Arc<CacheMetrics>>,
+}
+
+impl ReadGuard {
+    /// A guard over `breaker` under `policy`, metered to `metrics`.
+    pub(crate) const fn new(
+        breaker: Option<Arc<OriginBreaker>>,
+        policy: RetryPolicy,
+        metrics: Option<Arc<CacheMetrics>>,
+    ) -> Self {
+        Self {
+            breaker,
+            policy,
+            metrics,
+        }
+    }
+
+    /// A guard with no breaker and no retry: each read runs once.
+    #[cfg(test)]
+    pub(crate) const fn none() -> Self {
+        Self::new(None, RetryPolicy::disabled(), None)
+    }
+
+    /// Run `read` for `hash` under the breaker and the retry policy.
+    ///
+    /// An open breaker answers an [`OriginPullError::Transient`] at once,
+    /// with no read and no backoff. A transient fault is retried with
+    /// backoff ([`run_with_retry_classified`]). One that exhausts the budget
+    /// stays [`OriginPullError::Transient`], so a caller that waits out a
+    /// transient fault (the presence memo, the rescan carry-forward) still
+    /// can, and it counts toward the breaker's trip threshold. A permanent
+    /// fault returns at once and counts as a reachable origin.
+    pub(crate) async fn run<T, F, Fut>(&self, hash: Hash, read: F) -> Result<T, OriginPullError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, OriginPullError>>,
+    {
+        let guard = match self.breaker.as_deref().map(OriginBreaker::acquire) {
+            Some(Admission::ShortCircuit) => {
+                return Err(OriginPullError::Transient(anyhow::anyhow!(
+                    "the origin's circuit breaker is open after repeated failures; the node \
+                     reads it again after the cooldown (cache.circuit_breaker)"
+                )));
+            }
+            Some(Admission::Proceed(_state, guard)) => Some(guard),
+            None => None,
+        };
+        let (outcome, terminal) =
+            run_with_retry_classified(self.policy, self.metrics.as_ref(), hash, read).await;
+        if let Some(guard) = guard {
+            guard.record(match terminal {
+                Some(TerminalFailure::TransientExhausted) => OriginOutcome::Unavailable,
+                Some(TerminalFailure::Permanent) | None => OriginOutcome::Available,
+            });
+        }
+        match (outcome, terminal) {
+            (Err(e), Some(TerminalFailure::TransientExhausted)) => {
+                Err(OriginPullError::Transient(e.into_inner()))
+            }
+            (outcome, _) => outcome,
         }
     }
 }

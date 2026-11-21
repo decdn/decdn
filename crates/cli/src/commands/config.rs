@@ -1083,10 +1083,10 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # [cache]
 # gc_interval_sec = 300                    # iroh-blobs GC sweep cadence; 0 disables (#518). NOTE: the eviction driver only drops GC protection, so with 0 it can never reclaim disk and cache_size_mb is unenforceable (#1173)
 # fs_rescan_interval_sec = 60              # re-walk the fs origin + re-check pins into the origin-held index, so a file dropped into the origin becomes open-answerable and DHT-announced within one interval (#1130); 0 disables the timer (startup and `decdn node reload` still rescan)
-# origin_probe_ttl_sec = 15                # TTL for a memoised positive live-origin probe answer — a hash absent from the fs/pins index falls back to a HEAD/HeadObject against the http/s3 origin, a present answer cached this long (#1130 pt3)
+# origin_probe_ttl_sec = 15                # TTL for a memoised positive live-origin probe answer — a hash absent from the fs/pins index falls back to a {H}.sizeproof read against the http/s3 origin, a present answer cached this long (#1130 pt3)
 # origin_probe_negative_ttl_sec = 2        # TTL for a memoised negative (absent) live-origin probe answer; short on purpose so a stale absent cannot hide newly-available own content for long (#1130 pt3)
 # origin_probe_fault_ttl_sec = 5           # TTL for a memoised fault (backend outage) live-origin probe answer; the memo is per hash, so this collapses one hash's repeats rather than a namespace's load. Must satisfy origin_probe_negative_ttl_sec <= this <= origin_probe_ttl_sec: patient enough to beat the negative TTL on a retried hash, eager enough that a recovered origin stops refusing clients soon (#1130 pt3, #1789 item 6)
-# origin_probe_timeout_ms = 2000           # per-request ceiling on the live-origin HEAD/HeadObject; on timeout the node does not advertise the blob and memoises the fault for one fault TTL (#1130 pt3)
+# origin_probe_timeout_ms = 2000           # per-request ceiling on the live-origin {H}.sizeproof read; on timeout the node does not advertise the blob and memoises the fault for one fault TTL (#1130 pt3)
 # origin_probe_memo_capacity = 4096        # max distinct hashes held in the live-origin probe memo; bounds memo memory under a random-hash request flood (#1130 pt3)
 # eviction_high_water_pct = 90             # LRU driver evicts above this % of cache_size_mb (#1173); bounds [60,95]
 # eviction_target_pct = 80                 # LRU driver evicts down to this % (#1173); bounds [40,90], must be <= high_water-5

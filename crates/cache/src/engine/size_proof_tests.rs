@@ -17,6 +17,8 @@ enum ProofAnswer {
     Down,
     /// This `{H}.sizeproof` object.
     Object(Bytes),
+    /// A transport fault on the first `n` reads, then this object.
+    DownThen(usize, Bytes),
 }
 
 /// An origin that answers every `{H}.sizeproof` read with `answer`, after
@@ -51,8 +53,12 @@ impl Origin for ProofReads {
         &self,
         _hash: Hash,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        let answer = self.answer.clone();
+        let read = self.reads.fetch_add(1, Ordering::SeqCst);
+        let answer = match self.answer.clone() {
+            ProofAnswer::DownThen(n, _) if read < n => ProofAnswer::Down,
+            ProofAnswer::DownThen(_, object) => ProofAnswer::Object(object),
+            other => other,
+        };
         let delay = self.delay;
         Box::pin(async move {
             if !delay.is_zero() {
@@ -63,7 +69,7 @@ impl Origin for ProofReads {
                 ProofAnswer::Down => {
                     Err(OriginPullError::Transient(anyhow::anyhow!("origin down")))
                 }
-                ProofAnswer::Object(object) => Ok(Some(object)),
+                ProofAnswer::Object(object) | ProofAnswer::DownThen(_, object) => Ok(Some(object)),
             }
         })
     }
@@ -149,15 +155,51 @@ async fn no_size_proof_is_absent_and_memoised() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An adapter error is a `Fault`, memoised under the fault TTL.
+/// An adapter error is a `Fault` once the retry budget is spent, memoised
+/// under the fault TTL.
 #[tokio::test]
 async fn an_adapter_error_is_a_fault() -> anyhow::Result<()> {
     let hash = Hash::new(b"outage");
     let origin = ProofReads::new(ProofAnswer::Down);
     let (engine, _tmp) = engine_over(Arc::clone(&origin)).await?;
     anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Fault);
+    let walked = origin.reads();
+    let budget = usize::try_from(RetryPolicy::default().max_retries)?;
+    anyhow::ensure!(
+        walked == budget + 1,
+        "a transient read is retried: {walked}"
+    );
     anyhow::ensure!(engine.size_proof(hash, 9000).await.is_none());
-    anyhow::ensure!(origin.reads() == 1, "the fault is memoised");
+    anyhow::ensure!(origin.reads() == walked, "the fault is memoised");
+    Ok(())
+}
+
+/// A transient fault that clears within the retry budget is no fault: the
+/// read is retried and the proof answers presence.
+#[tokio::test]
+async fn a_transient_size_proof_fault_is_retried() -> anyhow::Result<()> {
+    let data = blob();
+    let size = u64::try_from(data.len())?;
+    let hash = Hash::new(&data);
+    let origin = ProofReads::new(ProofAnswer::DownThen(1, size_proof_object(&data)?));
+    let (engine, _tmp) = engine_over(Arc::clone(&origin)).await?;
+    anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Present(size));
+    anyhow::ensure!(origin.reads() == 2, "one retry: {}", origin.reads());
+    Ok(())
+}
+
+/// A fault that outlasts the retry budget stays transient, so the rescan
+/// carries the hash forward rather than drop it.
+#[tokio::test]
+async fn an_exhausted_retry_budget_is_a_transient_fault() -> anyhow::Result<()> {
+    let hash = Hash::new(b"long-outage");
+    let origin = ProofReads::new(ProofAnswer::Down);
+    let (engine, _tmp) = engine_over(Arc::clone(&origin)).await?;
+    let probe = engine
+        .probe_origin_chain(hash, Duration::from_secs(30))
+        .await;
+    anyhow::ensure!(probe.presence == OriginPresence::Fault, "{probe:?}");
+    anyhow::ensure!(probe.transient, "an outage stays transient: {probe:?}");
     Ok(())
 }
 
@@ -613,5 +655,32 @@ async fn evicting_the_empty_blob_keeps_other_proofs() -> anyhow::Result<()> {
         proof_tags(&engine, hash).await? == [Hash::EMPTY],
         "the proof of another blob survives"
     );
+    Ok(())
+}
+
+/// A rescan that lists an object with no `{H}.sizeproof` does not advertise
+/// it, and counts it: the listing proves the data exists, so the publish is
+/// broken, not absent.
+#[tokio::test]
+async fn a_listed_object_without_a_size_proof_is_counted() -> anyhow::Result<()> {
+    let data = blob();
+    let (hash, _dir, origin) = seeded_fs_origin(&data, false).await?;
+    let tmp = tempfile::tempdir()?;
+    let metrics = Arc::new(CacheMetrics::default());
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        vec![origin],
+        64,
+        PinnedHashes::empty(),
+        RetryPolicy::default(),
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&metrics)),
+        Duration::ZERO,
+    )
+    .await?;
+    engine.rescan_origins().await;
+    anyhow::ensure!(engine.origin_held_size(hash).is_none());
+    anyhow::ensure!(metrics.size_proof_origin_missing.get() == 1);
+    anyhow::ensure!(engine.origin_held_snapshot().probe_faults == 0);
     Ok(())
 }

@@ -34,6 +34,7 @@ use crate::error::{CacheError, CacheResult};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
 use crate::outboard_cache::OutboardCache;
+use crate::retry::ReadGuard;
 
 /// The time budget for one origin read of the range-pull path — an outboard
 /// fetch or one data window. A read of `len` bytes gets
@@ -183,6 +184,9 @@ pub(crate) struct OriginRangeCursor {
     outboard: Bytes,
     /// Time budget for each window fetch; `None` is unbounded.
     budget: Option<OriginReadBudget>,
+    /// The origin's breaker and the retry policy each window fetch runs
+    /// under.
+    guard: ReadGuard,
     metrics: Option<Arc<CacheMetrics>>,
     spans: WindowSpans,
     /// The first window, fetched by [`Self::open`] and not yet handed out.
@@ -194,7 +198,8 @@ impl OriginRangeCursor {
     /// `outboard`, and fetch the first window. `Ok(None)` when this origin
     /// declines the first window, so the caller can advance the origin chain
     /// before it commits to this origin. Each window fetch runs under `budget`
-    /// ([`within_origin_timeout`]).
+    /// ([`within_origin_timeout`]), and retries a transient fault within it
+    /// under `guard` ([`ReadGuard::run`]).
     ///
     /// Meters every fetched window as `pull_through_bytes`. The outboard read
     /// is metered where it happens, in the engine's outboard fetch.
@@ -209,6 +214,7 @@ impl OriginRangeCursor {
         aligned: &AlignedRange,
         outboard: Bytes,
         budget: Option<OriginReadBudget>,
+        guard: ReadGuard,
         metrics: Option<Arc<CacheMetrics>>,
     ) -> CacheResult<Option<Self>> {
         let mut cursor = Self {
@@ -216,6 +222,7 @@ impl OriginRangeCursor {
             hash,
             outboard,
             budget,
+            guard,
             metrics,
             spans: WindowSpans::new(aligned),
             pending: None,
@@ -271,7 +278,8 @@ impl OriginRangeCursor {
             self.hash,
             "range window fetch",
             self.metrics.as_deref(),
-            self.origin.fetch_range_data(self.hash, req),
+            self.guard
+                .run(self.hash, || self.origin.fetch_range_data(self.hash, req)),
         )
         .await?
         .map_err(|e| CacheError::OriginError {
@@ -570,8 +578,14 @@ pub struct OriginRangeWire {
     rx: mpsc::Receiver<Bytes>,
     fault: FaultSlot,
     ended: bool,
+    /// Called once with the terminal fault, before [`Self::next_chunk`]
+    /// yields it ([`Self::on_fault`]).
+    on_fault: Option<FaultHook>,
     _task: AbortOnDropHandle<()>,
 }
+
+/// What [`OriginRangeWire::on_fault`] runs with the wire's terminal fault.
+type FaultHook = Box<dyn FnOnce(&CacheError) + Send + Sync>;
 
 impl std::fmt::Debug for OriginRangeWire {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -699,8 +713,21 @@ impl OriginRangeWire {
             rx,
             fault,
             ended: false,
+            on_fault: None,
             _task: AbortOnDropHandle::new(task),
         })
+    }
+
+    /// Run `hook` once with the terminal fault the encode stopped on, just
+    /// before [`Self::next_chunk`] yields it. A wire that ends cleanly, or
+    /// that is dropped before its end, never runs it.
+    #[must_use]
+    pub(crate) fn on_fault(
+        mut self,
+        hook: impl FnOnce(&CacheError) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_fault = Some(Box::new(hook));
+        self
     }
 
     /// The next chunk of wire, in order. After the last chunk it yields one
@@ -714,11 +741,15 @@ impl OriginRangeWire {
             return Some(Ok(chunk));
         }
         self.ended = true;
-        self.fault
+        let fault = self
+            .fault
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .map(Err)
+            .take()?;
+        if let Some(hook) = self.on_fault.take() {
+            hook(&fault);
+        }
+        Some(Err(fault))
     }
 }
 

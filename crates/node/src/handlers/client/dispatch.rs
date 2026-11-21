@@ -647,8 +647,9 @@ impl ClientHandler {
         // configured at all) is a real foreign-content answer, declined under
         // its own reason so the operator's metrics separate policy declines
         // from real cache misses. `Fault` (a transport error, a timed-out
-        // read or a proof that does not verify) is NOT an absence, so it refuses for `InternalError`,
-        // matching the store-fault handling on the `has()` path below. Both
+        // read or a proof that does not verify) is NOT an absence, so it
+        // refuses for `InternalError`, matching the store-fault handling on
+        // the `has()` path below. Both
         // sign `Declined`: this node will not serve the hash during this fetch.
         if !self.relay_foreign_namespaces {
             match self.cache.origin_presence(hash).await {
@@ -800,7 +801,7 @@ impl ClientHandler {
             //
             // Before the response is signed, the node reads one object per
             // hash, memoised for the probe TTL: the origin's `{H}.sizeproof`
-            // (ADR 005 § Bounded byte ranges). It states the size and proves
+            // (ADR 005 § Pull-through). It states the size and proves
             // it, and the engine keeps the proof for the response. The outboard
             // and the range windows are read only after admission, in
             // `serve_via_backend_origin`. The origin publishes `{H}`,
@@ -819,6 +820,12 @@ impl ClientHandler {
                 decdn_cache::OriginPresence::Present(total)
                     if self.cache.size_proof(hash, total).await.is_none() =>
                 {
+                    tracing::warn!(
+                        %hash,
+                        total,
+                        "the origin presence memo says present but no size proof of that \
+                         size can be read back; treating it as an origin fault"
+                    );
                     self.metrics.node_pull_through_error();
                     fault_seen = true;
                 }

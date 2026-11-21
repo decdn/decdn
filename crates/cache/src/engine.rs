@@ -41,7 +41,7 @@ use crate::origin_range::{
 };
 use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
 use crate::range_pull::{AlignedRange, align_range_clamped};
-use crate::retry::{TerminalFailure, run_with_retry_classified};
+use crate::retry::{ReadGuard, TerminalFailure, run_with_retry_classified};
 use crate::size_proofs::{SIZE_PROOF_ENTRIES, SizeProofMemo};
 use crate::{from_store_hash, to_store_hash};
 
@@ -119,6 +119,19 @@ struct RescanResolution {
     /// Faulted candidates that kept an entry from the previous index. Always
     /// `<= faults`, hence the same width.
     carried: u64,
+    /// Listed candidates that every origin answered with no `{H}.sizeproof`.
+    /// The listing proves the data object exists, so the publish is broken:
+    /// the object lacks the proof `decdn origin import` writes.
+    unpublished: u64,
+}
+
+/// One hash an origin rescan resolves.
+#[derive(Debug, Clone, Copy)]
+struct RescanCandidate {
+    hash: Hash,
+    /// Whether an origin's listing named the hash, as opposed to only the pin
+    /// set.
+    listed: bool,
 }
 
 /// One walk of the origin chain by [`CacheEngine::probe_origin_chain`].
@@ -204,13 +217,14 @@ struct Inner {
     /// or retry-budget exhaustion.
     origins: Vec<Arc<dyn Origin>>,
     /// Per-origin circuit-breakers (#963), parallel to `origins` by
-    /// index. `breakers[i]` fronts `origins[i]`'s pull-through retry
-    /// loop so a sustained outage on one backend fast-fails its misses
-    /// without burning retry/backoff, while the chain still advances to
-    /// the next backend. Always the same length as `origins` (built
-    /// together in `open_full`); an empty `origins` yields an empty
+    /// index. `breakers[i]` fronts every read of `origins[i]`: the
+    /// pull-through retry loop and each ranged-object read
+    /// ([`CacheEngine::read_guard`]). A sustained outage on one backend fast-fails
+    /// its reads without burning retry/backoff, while the chain still
+    /// advances to the next backend. Always the same length as `origins`
+    /// (built together in `open_full`); an empty `origins` yields an empty
     /// `breakers` and the `NoOrigin` short-circuit never reaches them.
-    breakers: Vec<OriginBreaker>,
+    breakers: Vec<Arc<OriginBreaker>>,
     max_blob_bytes: u64,
     /// Per-hash recency for eviction ordering: the instant of the last access,
     /// or the open-time seed.
@@ -1647,7 +1661,13 @@ impl CacheEngine {
         // output as the rest of the cache group (#963).
         let breakers = origins
             .iter()
-            .map(|_| OriginBreaker::new(circuit_breaker, Arc::clone(&clock), metrics.clone()))
+            .map(|_| {
+                Arc::new(OriginBreaker::new(
+                    circuit_breaker,
+                    Arc::clone(&clock),
+                    metrics.clone(),
+                ))
+            })
             .collect::<Vec<_>>();
 
         // `checked_sub` fails only within `COLD_SEED_AGE` of the monotonic
@@ -2013,6 +2033,7 @@ impl CacheEngine {
             held,
             faults,
             carried,
+            unpublished,
         } = self.resolve_candidates(candidates).await;
 
         let count = held.len();
@@ -2021,6 +2042,21 @@ impl CacheEngine {
             probe_faults: faults,
             enumerate_failures,
         }));
+        self.report_rescan(count, faults, carried, enumerate_failures, unpublished);
+        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
+    }
+
+    /// Count and log what one rescan could not resolve: probe faults (of
+    /// which `carried` kept an older entry), failed listings, and listed
+    /// objects with no `{H}.sizeproof`. `count` is the size of the new index.
+    fn report_rescan(
+        &self,
+        count: usize,
+        faults: u64,
+        carried: u64,
+        enumerate_failures: u64,
+        unpublished: u64,
+    ) {
         if let Some(m) = &self.inner.metrics {
             if faults > 0 {
                 m.origin_probe_failures.inc_by(faults);
@@ -2028,6 +2064,16 @@ impl CacheEngine {
             if enumerate_failures > 0 {
                 m.origin_enumerate_failures.inc_by(enumerate_failures);
             }
+            if unpublished > 0 {
+                m.size_proof_origin_missing.inc_by(unpublished);
+            }
+        }
+        if unpublished > 0 {
+            tracing::warn!(
+                unpublished,
+                "rescan_origins: listed origin objects have no `{{H}}.sizeproof`, so the node \
+                 neither advertises nor serves them; run `decdn origin import` for each"
+            );
         }
         if faults > 0 {
             tracing::warn!(
@@ -2040,7 +2086,6 @@ impl CacheEngine {
                  resolves them"
             );
         }
-        tracing::debug!(count, "rescan_origins: refreshed origin-held index");
     }
 
     /// The store upkeep each rescan runs first: lift the quarantines GC
@@ -2054,7 +2099,8 @@ impl CacheEngine {
     }
 
     /// Every hash [`Self::rescan_origins`] considers: each enumerable origin's
-    /// listing plus the operator pin set.
+    /// listing plus the operator pin set. Each hash says whether a listing
+    /// named it ([`RescanCandidate::listed`]).
     ///
     /// The pin set is snapshotted here rather than read inside the probe loop,
     /// so its `ArcSwap` guard is not held across a probe await.
@@ -2063,12 +2109,16 @@ impl CacheEngine {
     /// contributes nothing this pass — its hashes are never probed, so they
     /// carry no per-hash fault and simply leave the index. Only the operator
     /// pins naming them survive.
-    async fn rescan_candidates(&self) -> (Vec<Hash>, u64) {
-        let mut candidates: Vec<Hash> = Vec::new();
+    async fn rescan_candidates(&self) -> (Vec<RescanCandidate>, u64) {
+        let mut candidates: Vec<RescanCandidate> = Vec::new();
         let mut enumerate_failures = 0u64;
         for origin in &self.inner.origins {
             match origin.enumerate().await {
-                Ok(hashes) => candidates.extend(hashes),
+                Ok(hashes) => candidates.extend(
+                    hashes
+                        .into_iter()
+                        .map(|hash| RescanCandidate { hash, listed: true }),
+                ),
                 Err(err) => {
                     enumerate_failures = enumerate_failures.saturating_add(1);
                     tracing::warn!(
@@ -2081,7 +2131,16 @@ impl CacheEngine {
                 }
             }
         }
-        candidates.extend(self.inner.pinned.load().iter().copied());
+        candidates.extend(
+            self.inner
+                .pinned
+                .load()
+                .iter()
+                .map(|&hash| RescanCandidate {
+                    hash,
+                    listed: false,
+                }),
+        );
         (candidates, enumerate_failures)
     }
 
@@ -2105,7 +2164,7 @@ impl CacheEngine {
     /// critical path has no reason to be that impatient. A candidate that
     /// overruns is a fault like any other, so borrowing the tighter budget would
     /// turn a merely slow origin into an empty index on a cold boot.
-    async fn resolve_candidates(&self, candidates: Vec<Hash>) -> RescanResolution {
+    async fn resolve_candidates(&self, candidates: Vec<RescanCandidate>) -> RescanResolution {
         // `load_full` rather than holding the `ArcSwap` guard: the guard would
         // be held across every probe await below, which is the long-lived-guard
         // case arc-swap tells callers to avoid.
@@ -2117,7 +2176,8 @@ impl CacheEngine {
         // so keying off `held` re-probes those hashes once per duplicate and
         // counts one fault per probe.
         let mut seen: HashSet<Hash> = HashSet::new();
-        for hash in candidates {
+        // Listings come before pins, so a hash that is both is seen as listed.
+        for RescanCandidate { hash, listed } in candidates {
             if self.refuses(hash) || !seen.insert(hash) {
                 continue;
             }
@@ -2126,7 +2186,18 @@ impl CacheEngine {
                 OriginPresence::Present(size) => {
                     out.held.insert(hash, size);
                 }
-                OriginPresence::Absent => {}
+                // A pin can name a hash the origin does not hold. A listing
+                // proves the data object exists, so a listed hash with no size
+                // proof is a broken publish.
+                OriginPresence::Absent => {
+                    if listed {
+                        out.unpublished = out.unpublished.saturating_add(1);
+                        tracing::debug!(
+                            %hash,
+                            "rescan_origins: listed object has no `{{H}}.sizeproof`"
+                        );
+                    }
+                }
                 OriginPresence::Fault => {
                     out.faults = out.faults.saturating_add(1);
                     // Carry forward only what a later pass might resolve. A
@@ -2232,8 +2303,12 @@ impl CacheEngine {
             let mut cause = None;
             let mut kept_permanent_cause = false;
             let mut any_transient = false;
-            for origin in &self.inner.origins {
-                let (fault, transient) = match origin.fetch_size_proof(hash).await {
+            for (ix, origin) in self.inner.origins.iter().enumerate() {
+                let read = self
+                    .read_guard(ix)
+                    .run(hash, || origin.fetch_size_proof(hash))
+                    .await;
+                let (fault, transient) = match read {
                     Ok(Some(object)) => match verified_size_proof(hash, &object) {
                         Some((size, proof)) => {
                             return ChainProbe {
@@ -2338,6 +2413,14 @@ impl CacheEngine {
     ///   absence (a genuine 404) — an outage or a permission decline is an
     ///   `Err`, which reaches the `Fault` arm instead — so this arm never
     ///   caches a 5xx as an absence.
+    ///
+    /// A ranged read that faults after a `Present` answer (a missing or
+    /// broken `{H}.obao4` or `{H}`) replaces the memoised `Present` with
+    /// `Fault` ([`Self::origin_range_wire`]), so a broken publish costs one
+    /// refused stream per fault TTL, not one per open.
+    ///
+    /// Each origin's read runs under its circuit breaker and the retry
+    /// policy, inside the ceiling.
     pub async fn origin_presence(&self, hash: Hash) -> OriginPresence {
         self.origin_presence_with_proof(hash, false).await
     }
@@ -3017,14 +3100,13 @@ impl CacheEngine {
     /// Delete every named tag pointing at `hash`, making the underlying
     /// bytes eligible for the iroh-blobs GC sweep.
     ///
-    /// Pull-through promotes each cached blob to a named tag
-    /// ([`iroh_blobs::api::tags::Tags::create`] on the streaming path,
-    /// `add_bytes` on the drain path); iroh-blobs GC protects any blob
+    /// Every fill promotes the blob it admits to a named tag
+    /// (`protect_partial`); iroh-blobs GC protects any blob
     /// reachable from a tag, so the bytes are never reclaimed while a tag
     /// survives. Tag names are opaque and store-assigned, so matches are
     /// found by enumerating tags and comparing hashes. A hash can carry more
     /// than one tag, so every match is removed (in practice the engine creates
-    /// one tag per cached hash — `get`/`populate` short-circuit on a hit and
+    /// one tag per cached hash — `protect_partial` memoises its tag and
     /// in-flight pulls coalesce (#305) — but the loop is robust to a future
     /// caller that tags the same hash twice). Returns the number of tags
     /// deleted.
@@ -3460,7 +3542,8 @@ impl CacheEngine {
             hash,
             "outboard fetch",
             self.inner.metrics.as_deref(),
-            origin.fetch_outboard(hash, outboard_max),
+            self.read_guard(origin_ix)
+                .run(hash, || origin.fetch_outboard(hash, outboard_max)),
         )
         .await
         .and_then(|r| {
@@ -3759,6 +3842,10 @@ impl CacheEngine {
     ///
     /// [`CacheError::OriginError`] when no origin serves the outboard and at
     /// least one failed with a transport fault or a timeout (the last one).
+    ///
+    /// A test hook: a range draw reads the outboard through
+    /// [`Self::origin_range_wire`].
+    #[cfg(any(test, feature = "test-util"))]
     pub async fn origin_fetch_outboard_bytes(
         &self,
         hash: Hash,
@@ -3773,9 +3860,10 @@ impl CacheEngine {
     /// [`Self::origin_fetch_outboard_bytes`], with the index of the origin whose
     /// copy it is — the cached entry's origin, or the origin that served it.
     ///
-    /// `total_bytes` is the origin's own size claim, so it bounds the outboard
-    /// read only after it passes the engine's blob cap: a claim past the cap
-    /// reads no outboard and answers `Ok(None)`.
+    /// `total_bytes` bounds the outboard read only after it passes the
+    /// engine's blob cap: a size past the cap reads no outboard and answers
+    /// `Ok(None)`.
+    #[cfg(any(test, feature = "test-util"))]
     async fn outboard_with_origin(
         &self,
         hash: Hash,
@@ -3866,8 +3954,48 @@ impl CacheEngine {
         aligned: &AlignedRange,
     ) -> CacheResult<OriginRangeWire> {
         let permit = self.range_pull_permit().await?;
-        let cursor = self.open_range_cursor(hash, aligned).await?;
-        OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone())
+        let wire = match self.open_range_cursor(hash, aligned).await {
+            Ok(cursor) => {
+                OriginRangeWire::spawn(cursor, aligned, permit, self.inner.outboards.clone())
+            }
+            Err(e) => Err(e),
+        };
+        match wire {
+            Ok(wire) => {
+                let engine = self.clone();
+                Ok(wire.on_fault(move |fault| engine.memoise_range_fault(hash, fault)))
+            }
+            Err(e) => {
+                self.memoise_range_fault(hash, &e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Remember a fault that a ranged read of `hash` found in the origin's
+    /// objects after a `Present` presence answer: a missing or broken
+    /// `{H}.obao4` or `{H}`, an origin that ignores `Range`, or a read that
+    /// failed past its retries. The presence memo then holds `Fault` for the
+    /// fault TTL ([`Self::origin_presence`]), so a later open refuses at open
+    /// and pulls through from a peer instead of answering `ok: true` and
+    /// refusing after the payer's first proof. A [`CacheError::Internal`] is
+    /// this process's fault, not the origin's, and changes nothing.
+    fn memoise_range_fault(&self, hash: Hash, fault: &CacheError) {
+        if !matches!(
+            fault,
+            CacheError::OriginError { .. } | CacheError::VerifyFailed { .. }
+        ) {
+            return;
+        }
+        let mut memo = self.probe_memo_lock();
+        tracing::warn!(
+            %hash,
+            fault_ttl_secs = memo.fault_ttl().as_secs(),
+            error = %fault.display_chain(),
+            "origin range read faulted after a present size proof; memoising the fault — \
+             opens for this hash answer not-held until it expires"
+        );
+        memo.insert(hash, Presence::Fault, Instant::now());
     }
 
     /// The size proof that `hash` is `size` bytes long, or `None` when the
@@ -4158,6 +4286,7 @@ impl CacheEngine {
                 aligned,
                 outboard,
                 budget,
+                self.read_guard(ix),
                 self.inner.metrics.clone(),
             )
             .await;
@@ -4977,7 +5106,7 @@ impl CacheEngine {
                 // explicit failure: silently treating `None` as "ends at
                 // `byte_offset`" would return an empty range for a `byte_len ==
                 // 0` ("to end") read and mask the real cause. Surface it so the
-                // caller retries or falls back to a whole-blob serve.
+                // caller sees the real cause.
                 iroh_blobs::api::blobs::BlobStatus::Partial { size: None } => {
                     return Err(CacheError::Store(anyhow::anyhow!(
                         "export_range: store cannot report size for partial blob {hash}; \
@@ -5319,7 +5448,7 @@ impl CacheEngine {
                 // the access non-panicking per the workspace anti-panic
                 // policy (a missing slot would be a construction bug, in
                 // which case we degrade to "no breaker" rather than panic).
-                let breaker = self.inner.breakers.get(idx);
+                let breaker = self.inner.breakers.get(idx).map(Arc::as_ref);
                 // Admit (or short-circuit) under the breaker. The `Proceed`
                 // arm carries a `TrialGuard` that owns any HALF-OPEN trial
                 // slot; it MUST stay alive across the `.await` below so that
@@ -5491,6 +5620,17 @@ impl CacheEngine {
                 "advancing to next origin in fallback chain (NotFound)",
             );
         }
+    }
+
+    /// The breaker and retry policy every read of the origin at `ix` runs
+    /// under ([`ReadGuard::run`]). An index past the chain reads with no
+    /// breaker (a construction bug, degraded rather than a panic).
+    fn read_guard(&self, ix: usize) -> ReadGuard {
+        ReadGuard::new(
+            self.inner.breakers.get(ix).cloned(),
+            self.inner.retry_policy,
+            self.inner.metrics.clone(),
+        )
     }
 
     /// Commit a per-origin breaker the health verdict for a completed

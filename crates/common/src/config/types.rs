@@ -425,8 +425,10 @@ pub struct CacheConfig {
     /// "entry was ignored" surprise hours later when the operator
     /// discovers the blob got evicted anyway.
     pub pinned_hashes: Option<Vec<String>>,
-    /// Origin pull-through retry policy (#285). Controls exponential
-    /// backoff for transient origin errors. Absent => defaults from
+    /// Origin retry policy (#285). Controls exponential backoff for
+    /// transient origin errors on every origin read: the `{H}.sizeproof`,
+    /// `{H}.obao4` and range-window reads, each retried on its own.
+    /// Absent => defaults from
     /// [`decdn_config_types::RetryPolicy::default`] (3 retries, 100ms
     /// initial backoff doubling to 10s cap, 10% jitter).
     /// `max_retries = 0` opts out and makes one attempt with no retry.
@@ -436,11 +438,11 @@ pub struct CacheConfig {
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
     /// the fields filled from defaults.
     pub origin_retry: Option<decdn_config_types::RetryPolicy>,
-    /// Per-origin circuit-breaker policy (#963). Fronts each origin's
-    /// pull-through retry loop: after `failure_threshold` consecutive
-    /// origin-unavailable failures (transient errors that exhausted the
-    /// retry budget — NOT 404s or other permanent per-object errors) the
-    /// breaker trips OPEN and fast-fails every miss for `cooldown_ms`
+    /// Per-origin circuit-breaker policy (#963). Fronts every read of each
+    /// origin: after `failure_threshold` consecutive origin-unavailable
+    /// failures (transient errors that exhausted the retry budget — NOT
+    /// 404s or other permanent per-object errors) the breaker trips OPEN
+    /// and fast-fails every read of that origin for `cooldown_ms`
     /// without incurring any retry/backoff, then admits
     /// `half_open_max_calls` trial pulls to probe recovery. Absent =>
     /// defaults from [`decdn_config_types::CircuitBreakerPolicy::default`]
@@ -481,11 +483,11 @@ pub struct CacheConfig {
     /// TTL, in seconds, for a memoised positive live-origin probe answer (#1130
     /// pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A
     /// request for a hash absent from the `fs`-enumeration ∪ pins index falls
-    /// back to a live `HEAD`/`HeadObject` against the http/s3 origin; a
+    /// back to a live `{H}.sizeproof` read against the http/s3 origin; a
     /// present-with-size answer is cached for this long so a non-pinned bucket
     /// object is discoverable without an origin round-trip on every request.
-    /// Shorter TTLs track origin deletions faster at the cost of more `HEAD`
-    /// traffic. See `origin_probe_negative_ttl_sec` for the absent-answer TTL.
+    /// Shorter TTLs track origin deletions faster at the cost of more
+    /// `{H}.sizeproof` reads. See `origin_probe_negative_ttl_sec` for the absent-answer TTL.
     pub origin_probe_ttl_sec: Option<u64>,
     /// TTL, in seconds, for a memoised negative (absent) live-origin probe
     /// answer (#1130 pt3). Absent =>
@@ -504,7 +506,7 @@ pub struct CacheConfig {
     /// origin_probe_fault_ttl_sec <= origin_probe_ttl_sec`.
     pub origin_probe_fault_ttl_sec: Option<u64>,
     /// Per-request ceiling, in milliseconds, on the live-origin
-    /// `HEAD`/`HeadObject` (#1130 pt3). Absent =>
+    /// `{H}.sizeproof` read (#1130 pt3). Absent =>
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`] (2000). A slow origin
     /// must never stall the serve hot path; on timeout the node does not
     /// advertise the blob and memoises the fault for one fault TTL.
