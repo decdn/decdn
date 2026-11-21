@@ -526,8 +526,8 @@ struct Inner {
     /// proof from both.
     size_proofs: SizeProofMemo,
     /// One async lock per hash whose `{H}.sizeproof` an origin read is
-    /// fetching ([`CacheEngine::size_proof`]). An entry lives while a fetch
-    /// holds or waits on its lock.
+    /// fetching ([`CacheEngine::size_proof`]). The lock lives while a fetch
+    /// holds or waits on it.
     size_proof_flights: Flights<Hash, tokio::sync::Mutex<()>>,
     /// `(hash, size)` pairs no origin proved, and when a lookup found that.
     size_proof_misses: Mutex<HashMap<(Hash, u64), Instant>>,
@@ -537,8 +537,8 @@ struct Inner {
     recency_seeded: AtomicBool,
     /// One async lock per hash whose outboard an origin read is fetching, so
     /// concurrent cold misses of one hash wait for the first read and reuse its
-    /// cached copy instead of each downloading it. An entry lives while a
-    /// fetch holds or waits on its lock.
+    /// cached copy instead of each downloading it. The lock lives while a
+    /// fetch holds or waits on it.
     outboard_flights: Flights<Hash, tokio::sync::Mutex<()>>,
     /// Head start, in milliseconds, of the time budget for one origin read of
     /// the range-pull path. `0` means no budget. Set once at bring-up by

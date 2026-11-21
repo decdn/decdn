@@ -4,9 +4,9 @@
 //! [`Flights::get`] of a key makes a fresh `V`, and every later `get` while a
 //! holder keeps that `Arc` returns the same value. The map holds only a `Weak`,
 //! so an entry dies with its last holder, and the next `get` of that key makes
-//! a fresh value. The usual `V` is a lock that serializes the fills of one key,
-//! so concurrent misses of the key wait for one fill instead of each running
-//! their own.
+//! a fresh value. The usual `V` is a lock that serializes the fills of one key:
+//! when each caller re-checks its cache under the lock, concurrent misses of
+//! the key wait for one fill instead of each running their own.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -18,11 +18,12 @@ pub const PRUNE_FLOOR: usize = 16;
 
 /// One shared value per key, held while someone holds it.
 ///
-/// Dead entries stay in the map until a prune. A `get` that inserts prunes
-/// first when the map has reached its prune size, then sets the next prune
-/// size to twice the live entries (at least [`PRUNE_FLOOR`]). Pruning so
-/// costs amortized O(1) per insert, and the map stays within about twice
-/// the live entries plus [`PRUNE_FLOOR`].
+/// A dead entry stays in the map until a prune, or until a `get` of its key
+/// replaces it. A `get` that inserts prunes first when the map has reached
+/// its prune size, then sets the next prune size to twice the live entries
+/// (at least [`PRUNE_FLOOR`]). Pruning so costs amortized O(1) per insert,
+/// and the map holds at most about twice the most live entries it has held,
+/// or [`PRUNE_FLOOR`] when that is more.
 pub struct Flights<K, V> {
     inner: Mutex<FlightMap<K, V>>,
 }
@@ -55,7 +56,7 @@ impl<K, V> fmt::Debug for Flights<K, V> {
 }
 
 impl<K, V> Flights<K, V> {
-    /// The entries in the map, dead ones not yet pruned included.
+    /// How many entries the map holds, dead ones not yet pruned included.
     pub fn len(&self) -> usize {
         self.lock().map.len()
     }
@@ -90,7 +91,8 @@ impl<K: Eq + Hash, V> Flights<K, V> {
         flight
     }
 
-    /// How many holders keep the value of `key`: `0` when it has none.
+    /// How many `Arc`s of the value of `key` exist now: `0` when the key has
+    /// no entry or its entry is dead.
     pub fn holders(&self, key: &K) -> usize {
         self.lock().map.get(key).map_or(0, Weak::strong_count)
     }

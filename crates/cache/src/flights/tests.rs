@@ -5,8 +5,9 @@ use super::{Flights, PRUNE_FLOOR};
 
 type LockFlights = Flights<u64, tokio::sync::Mutex<()>>;
 
-/// The prunes `get(key)` ran and the dead and live entries they scanned,
-/// told from the map size before and after it.
+/// The prunes `get(key)` ran and the entries they scanned, told from the map
+/// size before and after it. A prune that drops no entry leaves no trace, so
+/// both counts are lower bounds.
 #[derive(Default)]
 struct PruneLog {
     prunes: usize,
@@ -14,8 +15,8 @@ struct PruneLog {
 }
 
 impl PruneLog {
-    /// `get` of a key the map holds no live entry for, logging a prune when
-    /// the map did not grow by that one entry.
+    /// `get` of a key the map holds no entry for, logging a prune when the
+    /// map did not grow by that one entry.
     fn get<V: Default>(&mut self, flights: &Flights<u64, V>, key: u64) -> Arc<V> {
         let before = flights.len();
         let flight = flights.get(key);
@@ -64,7 +65,7 @@ fn pruning_is_amortized() {
     let n = usize::try_from(N).unwrap();
 
     // Dead keys only: the map stays within the floor, and each insert pays
-    // for at most one scanned entry.
+    // for at most one scanned entry on average.
     let flights = LockFlights::default();
     let mut log = PruneLog::default();
     for key in 0..N {
