@@ -1592,7 +1592,9 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_withdrawn_total`.
     pub serve_stream_rejected_withdrawn: Counter,
     /// `serve_stream` requests refused because the blob is absent and
-    /// pull-through was unavailable or failed to fill it. Visible name:
+    /// pull-through was unavailable or failed to fill it. A miss on a request
+    /// with no lane in the pool counts here too: the node does not pull for it.
+    /// Visible name:
     /// `decdn_serve_stream_rejected_cache_miss_total`.
     pub serve_stream_rejected_cache_miss: Counter,
     /// `serve_stream` requests refused because their `payment_pool` names a
@@ -1605,16 +1607,18 @@ pub struct DecdnMetrics {
     /// `Declined`, not a signed absence. Visible name:
     /// `decdn_serve_stream_rejected_internal_error_total`.
     pub serve_stream_rejected_internal_error: Counter,
-    /// `serve_stream` requests refused on an unknown / never-opened lane
-    /// (#848). Wire-indistinguishable from `cache_miss`/`owner_mismatch` (all
-    /// signed as `NotFound` to avoid leaking lane existence), so this
-    /// server-side counter is the only place the distinction lives — a rising
-    /// value isolates an unknown-lane abuse campaign. Visible name:
+    /// `serve_stream` requests refused on an unknown / never-opened lane, for a
+    /// blob the node holds or a fill lands. A request with no lane for an absent
+    /// blob counts on `cache_miss`. Wire-indistinguishable from
+    /// `cache_miss`/`owner_mismatch` (all signed as `NotFound` to avoid leaking
+    /// lane existence), so this server-side counter is the only place the
+    /// distinction lives. Visible name:
     /// `decdn_serve_stream_rejected_unknown_lane_total`.
     pub serve_stream_rejected_unknown_lane: Counter,
     /// `serve_stream` requests refused because they carry no verified client
     /// binding, so they cannot name a lane (#327). A binding for a signer with no
-    /// lane counts as `unknown_lane`. Visible name:
+    /// lane counts as `unknown_lane` when the node holds the blob, and as
+    /// `cache_miss` when it does not. Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
     pub serve_stream_rejected_owner_mismatch: Counter,
     /// `serve_stream` requests reset because the client binding failed to
@@ -1631,13 +1635,13 @@ pub struct DecdnMetrics {
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting pool's remaining deposit could not cover what the node
     /// would front at its rate. (The refusal itself is signed — as an `ok: false`
-    /// response; what is never signed is an `ok: true`.) **Two** guards bump
-    /// this, and both ask whether the pool's `remaining − M` covers one chunk
-    /// (capped by the request's aligned span): the pull-through tiers' guard
-    /// (#856, #1519), which runs before any tier fronts origin egress or upstream
-    /// USDC, and the **direct-serve** guard (#1516). It does not distinguish them,
-    /// so a spike cannot be attributed to a guard from this series alone — the log
-    /// line at the refusal site is what says which.
+    /// response; what is never signed is an `ok: true`.) **Four** gates bump
+    /// this, and each asks whether the pool's `remaining − M` covers the
+    /// request's aligned span, capped at one chunk: the pre-fill gate before any
+    /// fill tier, the pull-through tier's gate before it fronts origin egress or
+    /// upstream USDC, the direct-serve admission gate, and the post-fill gate on
+    /// the landed blob's size. Neither this series nor the shared log line names
+    /// the gate.
     /// Signed as `Unfunded`: every guard runs past the lane-ownership proof, so
     /// its audience is the proven requester (ADR 005 §Open-time refusal classes).
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
@@ -1785,15 +1789,18 @@ pub struct DecdnMetrics {
     /// an operator sees the staleness refusals. Visible name:
     /// `decdn_serve_stream_rejected_chain_stale_total`.
     pub serve_stream_rejected_chain_stale: Counter,
-    /// An ALREADY-RUNNING delivery cut off at an MB boundary because a takedown
-    /// landed after the stream opened (ADR 011 §On Blacklist Event). Visible
-    /// name: `decdn_serve_stream_terminated_takedown_total`.
+    /// An ALREADY-RUNNING delivery reset before its next frame because the blob
+    /// or the pool's funder became refused after the stream opened (ADR 011 §On
+    /// Blacklist Event): the blob is on the local denylist or the governance
+    /// blacklist, or the node evicted or quarantined it, or the funder is on an
+    /// origin blacklist. Visible name:
+    /// `decdn_serve_stream_terminated_takedown_total`.
     ///
     /// Distinct from the `rejected_*` family above, which counts refusals at
-    /// stream open. This one is the operator's evidence that the compliance
-    /// window was honored for traffic already in flight — the case that would
-    /// otherwise keep a multi-GB blob flowing for minutes after the order took
-    /// effect, which is the slashable one.
+    /// stream open. During a takedown, this one is the operator's evidence that
+    /// the compliance window held for traffic already in flight — the case that
+    /// would otherwise keep a multi-GB blob flowing for minutes after the order
+    /// took effect, which is the slashable one.
     pub serve_stream_terminated_takedown: Counter,
     /// `decdn_serve_stream_rejected_load_shed_hit_total`: cache-hit serves shed
     /// under node overload (egress saturation).
