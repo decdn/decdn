@@ -142,9 +142,10 @@ struct StreamLabels {
     direction: StreamDirection,
 }
 
-/// Why capability intake dropped an owner-signed capability, as the `reason`
-/// label on `decdn_capability_intake_dropped_total`. A dropped capability
-/// registers no lane, so the client hears the same unknown-lane refusal as an
+/// Why capability intake dropped an owner-signed capability or failed to
+/// register its lane, as the `reason` label on
+/// `decdn_capability_intake_dropped_total`. A dropped capability registers no
+/// lane, so the client hears the same unknown-lane refusal as an
 /// ordinary miss; each drop site also logs its cause, and this label is the
 /// operator's only aggregate view of it. The derive renders variants in
 /// `snake_case`.
@@ -173,22 +174,27 @@ pub enum CapabilityIntakeDropReason {
     MalformedSignature,
     /// The owner signature recovers to an address other than the pool owner.
     /// Usually a client that still signs for an owner the pool has transferred
-    /// away from. The one drop the node logs at `warn`.
+    /// away from. One of the two drops the node logs at `warn`.
     WrongOwner,
     /// The owner signature recovers to no address, for example a high-`s`
     /// signature outside the contract's verifiable set.
     InvalidSignature,
+    /// The owner signature verifies, but the node's lane store refuses to
+    /// record the lane, so no lane registers. The other drop the node logs at
+    /// `warn`. A rising value points at the node's lane store, not the client.
+    StoreFailed,
 }
 
 impl CapabilityIntakeDropReason {
     /// Every variant. [`Metrics::new`] materializes one child per entry, so
     /// each `reason` series exports at zero from startup.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::ExpiryZero,
         Self::NotEoaSignature,
         Self::MalformedSignature,
         Self::WrongOwner,
         Self::InvalidSignature,
+        Self::StoreFailed,
     ];
 }
 
@@ -1683,7 +1689,7 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_capability_expired_total`.
     pub serve_stream_rejected_capability_expired: Counter,
     /// `decdn_capability_intake_dropped_total{reason}`: owner-signed
-    /// capabilities that intake dropped before it registered a lane. The
+    /// capabilities that intake dropped or failed to register as a lane. The
     /// client then hears an unknown-lane refusal, the same as an ordinary miss,
     /// so this counter is the operator's only aggregate view of intake drops.
     /// See [`CapabilityIntakeDropReason`] for each value. Every child exports at
