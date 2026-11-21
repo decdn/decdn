@@ -1133,16 +1133,16 @@ const INTAKE_DROP_LABELS: [&str; 6] = [
     "store_failed",
 ];
 
-/// Assert that `decdn_capability_intake_dropped_total` reads one on `label`
-/// and zero on every other `reason`.
-fn assert_intake_dropped_only(metrics: &Metrics, label: &str) {
+/// Assert that `decdn_capability_intake_dropped_total` reads one on `dropped`
+/// and zero on every other `reason`, or zero on every `reason` for `None`.
+fn assert_intake_dropped(metrics: &Metrics, dropped: Option<&str>) {
     let text = metrics.encode().expect("metrics encode");
-    for other in INTAKE_DROP_LABELS {
-        let want = u64::from(other == label);
-        let line = format!("decdn_capability_intake_dropped_total{{reason=\"{other}\"}} {want}");
+    for label in INTAKE_DROP_LABELS {
+        let want = u64::from(dropped == Some(label));
+        let line = format!("decdn_capability_intake_dropped_total{{reason=\"{label}\"}} {want}");
         assert!(
             text.lines().any(|l| l == line),
-            "after a {label} drop, expected `{line}`:\n{text}"
+            "after drop {dropped:?}, expected `{line}`:\n{text}"
         );
     }
 }
@@ -1204,7 +1204,7 @@ async fn assert_intake_drop(
         matches!(store.get(lane_key), Ok(None)),
         "a {label} drop never reaches the lane store"
     );
-    assert_intake_dropped_only(&metrics, label);
+    assert_intake_dropped(&metrics, Some(label));
 }
 
 #[tokio::test]
@@ -1311,7 +1311,7 @@ async fn intake_counts_a_lane_store_failure() {
         }),
         "a lane the store refuses never enters the live map"
     );
-    assert_intake_dropped_only(&metrics, "store_failed");
+    assert_intake_dropped(&metrics, Some("store_failed"));
 }
 
 /// A signature with `r = s = 0` parses but recovers to no address.
@@ -1560,6 +1560,7 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
         Some(genuine_sig),
         "the genuine owner_sig rides the lane record after the repeated intake"
     );
+    assert_intake_dropped(&metrics, None);
 
     // A tampered re-send: the SAME capability payload signed by a
     // different key — a well-formed signature that is a distinct cache
