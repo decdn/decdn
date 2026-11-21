@@ -49,6 +49,7 @@ pub mod engine;
 pub mod error;
 pub mod eviction_driver;
 pub mod fill_session;
+pub mod flights;
 pub mod metrics;
 pub mod origin;
 pub mod origin_probe;
@@ -85,6 +86,7 @@ pub use fill_session::{
     HashOutboard, ObserverLease, SessionOutboardReader, ended_at_held_bytes_cap, is_unlanded,
     unlanded,
 };
+pub use flights::Flights;
 /// The blob-store hash: `decdn_cache::Hash` is `iroh_blobs::Hash`, the BLAKE3
 /// digest the iroh-blobs store keys on. The *config-vocabulary* hash that crosses
 /// operator-facing config/admin surfaces is the distinct
