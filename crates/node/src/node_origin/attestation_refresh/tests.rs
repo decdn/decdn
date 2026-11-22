@@ -36,6 +36,13 @@ impl Origin for Holds {
         Box::pin(async move { Ok(held.then_some(1_024)) })
     }
 
+    fn enumerate(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, OriginPullError>> + Send + '_>> {
+        let held = self.0;
+        Box::pin(async move { Ok(vec![held]) })
+    }
+
     fn kind(&self) -> OriginKind {
         OriginKind::Filesystem
     }
@@ -108,12 +115,20 @@ async fn a_refresh_with_no_source_retries_later() {
     );
 }
 
-#[tokio::test]
-async fn an_expired_attestation_with_no_fresher_one_is_dropped() {
-    let hash = [5; 32];
-    let (r, _dir) = refresher(Some(seated()), Vec::new()).await;
-    // Kept while live, then left to expire.
-    let short = crate::dht::attestation::sign_attestation(
+/// The value of `decdn_attestation_expired_total`.
+fn expired_count(metrics: &Metrics) -> usize {
+    let text = metrics.encode().unwrap();
+    text.lines()
+        .filter_map(|l| l.strip_prefix("decdn_attestation_expired_total "))
+        .map(|v| v.parse().unwrap())
+        .next()
+        .unwrap()
+}
+
+/// A minimum-lifetime attestation for `hash` that expires two seconds from
+/// now.
+fn expiring_soon(hash: [u8; 32]) -> decdn_protocol::OriginAttestation {
+    crate::dht::attestation::sign_attestation(
         &*ORIGIN,
         &crate::dht::attestation::test_support::domain(),
         hash,
@@ -121,12 +136,45 @@ async fn an_expired_attestation_with_no_fresher_one_is_dropped() {
         now_us() - HOUR_US + 2_000_000,
         MIN_ATTESTATION_TTL_SEC,
     )
-    .unwrap();
-    assert!(r.attestations.keep(hash, short));
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_expired_attestation_of_a_blob_the_node_lacks_is_dropped() {
+    let hash = [5; 32];
+    let (r, _dir) = refresher(Some(seated()), Vec::new()).await;
+    // Kept while live, then left to expire.
+    assert!(r.attestations.keep(hash, expiring_soon(hash)));
     tokio::time::sleep(Duration::from_secs(3)).await;
     r.refresh_due().await;
     assert_eq!(r.attestations.held(&hash), None);
     assert_eq!(r.attestations.live(&hash), None);
+    assert_eq!(expired_count(&r.metrics), 1);
+}
+
+/// The node keeps the expired attestation of a blob it still holds, serves
+/// nothing under it, and keeps retrying, so the hash serves again once an
+/// origin returns. The lapse counts once.
+#[tokio::test]
+async fn an_expired_attestation_of_a_held_blob_stays_due_for_refresh() {
+    let hash = [5; 32];
+    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(hash)));
+    let (r, _dir) = refresher(None, vec![backend]).await;
+    r.cache.rescan_origins().await;
+    assert!(r.cache.origin_held_size(Hash::from_bytes(hash)).is_some());
+    let short = expiring_soon(hash);
+    assert!(r.attestations.keep(hash, short.clone()));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    r.refresh_due().await;
+    assert_eq!(r.attestations.held(&hash), Some(short));
+    assert_eq!(r.attestations.live(&hash), None);
+    let retry = now_us() + REFRESH_RETRY_US;
+    assert_eq!(r.attestations.refresh_due(retry).len(), 1, "retried later");
+    assert_eq!(
+        r.attestations.refresh_failed(hash, retry),
+        RefreshFailed::Lapsed { first: false }
+    );
+    assert_eq!(expired_count(&r.metrics), 1);
 }
 
 #[tokio::test]

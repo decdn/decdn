@@ -467,14 +467,19 @@ impl ClientHandler {
         // branch (attach: the owner fills; own/mixed: `target` is set by step 3 or 6b).
         // It states `total_bytes` by its proof, known from the peek or the
         // header handshake.
-        let (resp, resp_ext) = self
+        let super::wire::Served::Signed(resp, resp_ext) = self
             .sign_served(
                 req,
                 rate_per_mb,
                 total_bytes,
                 super::fill::full_coverage(total_bytes),
             )
-            .await?;
+            .await?
+        else {
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::Unattested, rate_per_mb)
+                .await;
+        };
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         first_byte.mark_responded();
@@ -729,14 +734,19 @@ impl ClientHandler {
 
         // (4) Sign + send the response up front: it states `total_bytes` by
         // its proof, a size the caller already proved for the origin object.
-        let (resp, resp_ext) = self
+        let super::wire::Served::Signed(resp, resp_ext) = self
             .sign_served(
                 req,
                 rate_per_mb,
                 total_bytes,
                 super::fill::full_coverage(total_bytes),
             )
-            .await?;
+            .await?
+        else {
+            return self
+                .respond_error(&mut send, req, ServeRejectReason::Unattested, rate_per_mb)
+                .await;
+        };
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         first_byte.mark_responded();

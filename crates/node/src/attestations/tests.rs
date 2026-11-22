@@ -163,14 +163,124 @@ fn refresh_is_due_between_half_life_and_three_quarters() {
 }
 
 #[test]
-fn a_deferred_refresh_waits_for_its_retry() {
+fn a_failed_refresh_waits_for_its_retry() {
     let store = Attestations::in_memory(verifier(), None);
     let now = now_us();
     assert!(store.keep([4; 32], attest_at([4; 32], now)));
     let late = now + u64::from(DEFAULT_ATTESTATION_TTL_SEC) * 1_000_000 * 3 / 4;
-    store.defer_refresh([4; 32], late);
+    assert_eq!(store.refresh_failed([4; 32], late), RefreshFailed::Live);
     assert!(store.refresh_due(late).is_empty());
     assert_eq!(store.refresh_due(late + REFRESH_RETRY_US).len(), 1);
+}
+
+/// An expired attestation stays held and due for refresh. Only the first
+/// failed refresh past its expiry reports it as newly lapsed.
+#[test]
+fn a_lapsed_attestation_stays_held_and_reports_its_lapse_once() {
+    let store = Attestations::in_memory(verifier(), None);
+    let now = now_us();
+    let att = attest_at([4; 32], now);
+    assert!(store.keep([4; 32], att.clone()));
+    let expired = att.expires_at_us() + 1;
+    assert_eq!(
+        store.refresh_failed([4; 32], expired),
+        RefreshFailed::Lapsed { first: true }
+    );
+    let retry = expired + REFRESH_RETRY_US;
+    assert_eq!(store.refresh_due(retry).len(), 1, "still due");
+    assert_eq!(
+        store.refresh_failed([4; 32], retry),
+        RefreshFailed::Lapsed { first: false }
+    );
+    assert_eq!(store.held(&[4; 32]), Some(att));
+    assert_eq!(store.refresh_failed([5; 32], retry), RefreshFailed::Gone);
+}
+
+/// `forget_lapsed` removes only an expired entry, so a fresh attestation kept
+/// while a refresh ran survives that refresh's failure.
+#[test]
+fn forget_lapsed_keeps_a_live_entry() {
+    let store = Attestations::in_memory(verifier(), None);
+    let now = now_us();
+    let att = attest_at([4; 32], now);
+    assert!(store.keep([4; 32], att.clone()));
+    assert!(!store.forget_lapsed(&[4; 32], now));
+    assert_eq!(store.held(&[4; 32]), Some(att.clone()));
+    assert!(store.forget_lapsed(&[4; 32], att.expires_at_us() + 1));
+    assert_eq!(store.held(&[4; 32]), None);
+    assert!(!store.forget_lapsed(&[4; 32], att.expires_at_us() + 1));
+}
+
+/// Due refreshes list the live attestations first, the soonest to expire
+/// first, then the expired ones.
+#[test]
+fn refresh_due_lists_live_attestations_before_lapsed_ones() {
+    let store = Attestations::in_memory(verifier(), None);
+    let now = now_us();
+    let soon = sign_attestation(
+        &*ORIGIN,
+        &domain(),
+        [1; 32],
+        NAMESPACE,
+        now,
+        MIN_ATTESTATION_TTL_SEC,
+    )
+    .unwrap();
+    let later = attest_at([2; 32], now);
+    let later_still = attest_at([3; 32], now + 1_000_000);
+    for (hash, att) in [([3; 32], &later_still), ([1; 32], &soon), ([2; 32], &later)] {
+        assert!(store.keep(hash, att.clone()));
+    }
+    // Past `soon`'s expiry, and past the others' three quarters.
+    let at = later.timestamp_us + u64::from(later.ttl_sec) * 1_000_000 * 7 / 8;
+    assert!(at >= soon.expires_at_us());
+    let order: Vec<_> = store.refresh_due(at).into_iter().map(|d| d.hash).collect();
+    assert_eq!(order, vec![[2; 32], [3; 32], [1; 32]]);
+}
+
+/// Concurrent offers for one hash leave the one that expires last held, in
+/// memory and on disk.
+#[test]
+fn concurrent_keeps_hold_the_attestation_that_expires_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Attestations::open(verifier(), dir.path(), None));
+    let now = now_us();
+    let offers: Vec<_> = (0..16u64)
+        .map(|i| attest_at([6; 32], now - HOUR_US + i * 1_000_000))
+        .collect();
+    let newest = offers.last().unwrap().clone();
+    std::thread::scope(|scope| {
+        for offer in offers.iter().rev() {
+            let store = Arc::clone(&store);
+            scope.spawn(move || assert!(store.keep([6; 32], offer.clone())));
+        }
+    });
+    assert_eq!(store.held(&[6; 32]), Some(newest.clone()));
+    drop(store);
+    let reopened = Attestations::open(verifier(), dir.path(), None);
+    assert_eq!(reopened.held(&[6; 32]), Some(newest));
+}
+
+/// A file whose recorded signer is not the one its signature recovers to is
+/// skipped at load.
+#[test]
+fn a_file_with_a_forged_signer_is_skipped_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let att = attest([3; 32]);
+    let forged = Held {
+        hash: [3; 32],
+        attestation: att,
+        signer: PrivateKeySigner::random().address(),
+    };
+    let files = dir.path().join(ATTESTATIONS_DIR);
+    std::fs::create_dir_all(&files).unwrap();
+    std::fs::write(
+        files.join(file_name(&[3; 32])),
+        postcard::to_allocvec(&forged).unwrap(),
+    )
+    .unwrap();
+    let store = Attestations::open(verifier(), dir.path(), None);
+    assert_eq!(store.held(&[3; 32]), None);
 }
 
 #[test]

@@ -2249,6 +2249,25 @@ impl ClientHandler {
         reset_stream(send, recv, APP_ERR_NO_ERROR);
     }
 
+    /// Cut off an in-flight delivery of a hash the node no longer holds a live
+    /// origin attestation for, by resetting both directions (ADR 005 § Serving
+    /// rule).
+    ///
+    /// The same reset as [`Self::terminate_for_takedown`], for the same
+    /// reasons: no mid-stream `StreamError` fits, and [`APP_ERR_NO_ERROR`]
+    /// keeps the client from scoring the node as faulty for a lapse it did not
+    /// cause. A client that re-requests the hash gets the signed `Declined`
+    /// refusal from the open-time gate. The caller returns
+    /// `Stopped { Unattested }`, which the dispatch sink counts on
+    /// `decdn_serve_stream_terminated_unattested_total`.
+    pub(super) fn terminate_unattested(send: &mut SendStream, recv: &mut RecvStream, hash: Hash) {
+        tracing::info!(
+            %hash,
+            "terminating an in-flight delivery: the node no longer holds a live origin attestation for the hash"
+        );
+        reset_stream(send, recv, APP_ERR_NO_ERROR);
+    }
+
     /// Apply one lane-lifecycle `delta` to the live-lane count and publish the
     /// resulting `decdn_lanes_open` gauge.
     ///

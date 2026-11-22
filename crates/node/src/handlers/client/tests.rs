@@ -275,12 +275,22 @@ async fn handler_for_tests_with_floor(
     metrics: &Arc<Metrics>,
     pool_min_remaining_deposit: U256,
 ) -> (Arc<ClientHandler>, tempfile::TempDir) {
+    handler_for_tests_with(metrics, pool_min_remaining_deposit, None).await
+}
+
+/// [`handler_for_tests_with_floor`] with an origin attestation store wired, as
+/// a node with a DHT runs.
+async fn handler_for_tests_with(
+    metrics: &Arc<Metrics>,
+    pool_min_remaining_deposit: U256,
+    attestations: Option<Arc<crate::attestations::Attestations>>,
+) -> (Arc<ClientHandler>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let cache = CacheEngine::open(dir.path(), Vec::new(), 16)
         .await
         .expect("cache");
     let domain = alloy::sol_types::eip712_domain! { name: "t", version: "1", };
-    let deps = ClientHandlerDeps::new(
+    let mut deps = ClientHandlerDeps::new(
         iroh::SecretKey::generate().public(),
         Arc::clone(metrics),
         Arc::new(ConnectionLimiter::new(
@@ -307,8 +317,18 @@ async fn handler_for_tests_with_floor(
         pool_min_remaining_deposit,
         always_admit_shed(),
     );
+    deps.attestations = attestations;
     let handler = ClientHandler::new(deps).expect("handler");
     (Arc::new(handler), dir)
+}
+
+/// The signed pair of a [`wire::Served`], or an error for an `Unattested`
+/// refusal.
+fn signed(served: wire::Served) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
+    match served {
+        wire::Served::Signed(resp, ext) => Ok((resp, ext)),
+        wire::Served::Unattested => anyhow::bail!("refused: no live attestation"),
+    }
 }
 
 /// The load-shed controller sheds a cache-miss once the node is at its
@@ -2041,9 +2061,11 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
         byte_len: 0,
         timestamp_us: an_hour_ago,
     };
-    let (resp, _ext) = handler
-        .sign_served(&req, 1, 1024, decdn_protocol::Coverage::full(1))
-        .await?;
+    let (resp, _ext) = signed(
+        handler
+            .sign_served(&req, 1, 1024, decdn_protocol::Coverage::full(1))
+            .await?,
+    )?;
     assert_eq!(resp.body.timestamp_us, an_hour_ago);
     let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
     let recovered = StreamSlashData::from_response_body(&resp.body)
@@ -2075,9 +2097,11 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
     };
 
     let full = || decdn_protocol::Coverage::full(decdn_protocol::num_blocks(size));
-    let (resp, ext) = handler
-        .sign_served(&req(*hash.as_bytes()), 1, size, full())
-        .await?;
+    let (resp, ext) = signed(
+        handler
+            .sign_served(&req(*hash.as_bytes()), 1, size, full())
+            .await?,
+    )?;
     assert!(resp.body.ok);
     assert_eq!(ext.validate(resp.body.ok), Ok(()));
     assert_eq!(ext.coverage, full(), "the coverage rides as given");
@@ -2104,6 +2128,59 @@ async fn sign_response_carries_the_size_proof_and_signs_no_unproven_size() -> an
             .await
             .is_err()
     );
+    Ok(())
+}
+
+/// Every served answer carries the live origin attestation the node holds for
+/// the hash. With none held, for instance once it expired after the
+/// open-time gate, the node signs no served answer and refuses
+/// `Unattested`. The empty blob needs none.
+#[tokio::test]
+async fn sign_served_carries_the_live_attestation_or_refuses_unattested() -> anyhow::Result<()> {
+    use crate::dht::attestation::test_support::{attest, verifier};
+
+    let metrics = Arc::new(Metrics::new());
+    let store = Arc::new(crate::attestations::Attestations::in_memory(
+        verifier(),
+        None,
+    ));
+    let (handler, _dir) =
+        handler_for_tests_with(&metrics, U256::ZERO, Some(Arc::clone(&store))).await;
+    let data = vec![7u8; 1024];
+    let proof = decdn_bao_range::encode_outboard(data.as_slice(), 1024)?.size_proof;
+    let hash = Hash::new(&data);
+    assert!(handler.cache.keep_size_proof(hash, 1024, &proof).await);
+    let req = |hash: [u8; 32]| decdn_protocol::client::StreamRequest {
+        hash,
+        namespace_id: [0; 32],
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
+        pool_id: [0; 32],
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: crate::handlers::timestamp_skew::now_us(),
+    };
+    let one = || decdn_protocol::Coverage::full(1);
+
+    assert!(matches!(
+        handler
+            .sign_served(&req(*hash.as_bytes()), 1, 1024, one())
+            .await?,
+        wire::Served::Unattested
+    ));
+    assert!(!handler.attested_now(hash));
+
+    let attestation = attest(*hash.as_bytes());
+    assert!(store.keep(*hash.as_bytes(), attestation.clone()));
+    let (resp, ext) = signed(
+        handler
+            .sign_served(&req(*hash.as_bytes()), 1, 1024, one())
+            .await?,
+    )?;
+    assert!(resp.body.ok);
+    assert_eq!(ext.origin_attestation, Some(attestation));
+    assert!(handler.attested_now(hash));
+
+    assert!(handler.attested_now(Hash::EMPTY));
     Ok(())
 }
 

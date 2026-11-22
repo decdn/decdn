@@ -108,6 +108,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_midstream_signer_cap_exhausted_total",
     "decdn_serve_stream_midstream_blob_too_large_total",
     "decdn_serve_stream_terminated_takedown_total",
+    "decdn_serve_stream_terminated_unattested_total",
     "decdn_serve_stream_voucher_rejected_total",
     "decdn_serve_stream_proof_budget_exhausted_total",
     "decdn_serve_stream_client_declined_total",
@@ -1796,9 +1797,10 @@ pub struct DecdnMetrics {
     /// Attestation refreshes that found nothing fresher; the node retries
     /// later. Visible name: `decdn_attestation_refresh_failed_total`.
     pub attestation_refresh_failed: Counter,
-    /// Held origin attestations dropped because they expired with no fresher
-    /// one found: the node stops serving and publishing the hash. Visible
-    /// name: `decdn_attestation_expired_total`.
+    /// Held origin attestations that expired with no fresher one found,
+    /// counted once per expiry: the node stops serving and publishing the
+    /// hash. It keeps retrying while it holds the blob. Visible name:
+    /// `decdn_attestation_expired_total`.
     pub attestation_expired: Counter,
     /// A serve refused because the node has been unable to reach the chain for
     /// longer than `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving
@@ -1820,6 +1822,15 @@ pub struct DecdnMetrics {
     /// otherwise keep a multi-GB blob flowing for minutes after the order took
     /// effect, which is the slashable one.
     pub serve_stream_terminated_takedown: Counter,
+    /// An already-running delivery cut off at a frame boundary because the
+    /// node no longer holds a live origin attestation for the hash: it expired
+    /// with no fresher one kept, or its signer lost its seat or landed on the
+    /// origin deny-set (ADR 005 § Serving rule). Visible name:
+    /// `decdn_serve_stream_terminated_unattested_total`.
+    ///
+    /// The in-flight sibling of [`Self::serve_stream_rejected_unattested`],
+    /// which counts the refusals at stream open.
+    pub serve_stream_terminated_unattested: Counter,
     /// `decdn_serve_stream_rejected_load_shed_hit_total`: cache-hit serves shed
     /// under node overload (egress saturation).
     pub serve_stream_rejected_load_shed_hit: Counter,
@@ -2967,7 +2978,7 @@ recorders! {
     /// Record an attestation refresh that found nothing fresher.
     attestation_refresh_failed => attestation_refresh_failed.inc();
 
-    /// Record a held attestation dropped on expiry.
+    /// Record a held attestation that expired with no fresher one found.
     attestation_expired => attestation_expired.inc();
 
     /// Record a `serve_stream` request refused because the node's chain reads
@@ -2978,6 +2989,10 @@ recorders! {
     /// Record an in-flight delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
     serve_stream_terminated_takedown => serve_stream_terminated_takedown.inc();
+
+    /// Record an in-flight delivery cut off at a frame boundary because the
+    /// node no longer holds a live origin attestation for the hash.
+    serve_stream_terminated_unattested => serve_stream_terminated_unattested.inc();
 
     /// Record a `serve_stream` cache-hit request refused by the load-shed policy
     /// (egress saturation).

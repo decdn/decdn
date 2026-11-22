@@ -13,17 +13,22 @@
 //! - **Refresh.** From half its lifetime on, plus a per-hash jitter, a held
 //!   attestation is due for refresh ([`Attestations::refresh_due`]). The
 //!   refresh task replaces it with a fresher one from the DHT or from a seated
-//!   origin (`crate::node_origin::attestation_refresh`).
+//!   origin (`crate::node_origin::attestation_refresh`). An attestation that
+//!   expired stays held, unserved, and due for refresh while the node holds
+//!   the blob, so the hash serves again once its origins return.
 //!
 //! The store keeps one attestation per hash: the valid one that expires last.
-//! Held attestations persist under `<data_dir>/attestations/`, one file per
-//! hash, so a restarted node serves and republishes what it holds without
-//! pulling it again. A file that does not decode is skipped at load.
+//! It decides and replaces under one lock, so a concurrent offer of an older
+//! attestation never displaces a newer one. Held attestations persist under
+//! `<data_dir>/attestations/`, one file per hash, so a restarted node serves
+//! and republishes what it holds without pulling it again. A file that does
+//! not decode, or whose signer does not recover from its signature, is skipped
+//! at load.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
@@ -57,6 +62,44 @@ struct Held {
     signer: Address,
 }
 
+/// A held attestation with its refresh state. The refresh state lives in
+/// memory only: a restarted node tries each due hash once at once.
+#[derive(Debug, Clone)]
+struct Entry {
+    held: Held,
+    /// When a refresh that failed may run again.
+    retry_at: Option<u64>,
+    /// Whether a failed refresh already found this attestation expired.
+    lapsed: bool,
+}
+
+impl Entry {
+    const fn new(held: Held) -> Self {
+        Self {
+            held,
+            retry_at: None,
+            lapsed: false,
+        }
+    }
+}
+
+/// What a failed refresh left held for its hash
+/// ([`Attestations::refresh_failed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFailed {
+    /// The held attestation is still live. Its refresh retries later.
+    Live,
+    /// The held attestation expired. The node does not serve the hash, and the
+    /// refresh retries later. `first` is set on the first failed refresh that
+    /// found it expired.
+    Lapsed {
+        /// The first failed refresh since the attestation expired.
+        first: bool,
+    },
+    /// The node holds no attestation for the hash any more.
+    Gone,
+}
+
 /// A held attestation whose refresh is due.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshDue {
@@ -70,10 +113,10 @@ pub struct RefreshDue {
 #[derive(Debug)]
 pub struct Attestations {
     verifier: AttestationVerifier,
-    held: RwLock<HashMap<[u8; 32], Held>>,
-    /// When a refresh that failed may run again, per hash. Memory only: a
-    /// restarted node tries each due hash once at once.
-    retry_at: RwLock<HashMap<[u8; 32], u64>>,
+    held: RwLock<HashMap<[u8; 32], Entry>>,
+    /// Serializes the file writes, so the file of a hash always ends at the
+    /// entry held in memory ([`Attestations::sync_file`]).
+    persist: Mutex<()>,
     /// Seeds the per-hash refresh jitter. Random per process, so holders of
     /// one hash spread their refreshes over the jitter window.
     jitter: std::collections::hash_map::RandomState,
@@ -103,7 +146,10 @@ impl Attestations {
                 None
             }
         };
-        let held = dir.as_deref().map(load_dir).unwrap_or_default();
+        let held = dir
+            .as_deref()
+            .map(|dir| load_dir(dir, &verifier))
+            .unwrap_or_default();
         Self::with(verifier, held, dir, origin)
     }
 
@@ -121,8 +167,8 @@ impl Attestations {
     ) -> Self {
         Self {
             verifier,
-            held: RwLock::new(held),
-            retry_at: RwLock::new(HashMap::new()),
+            held: RwLock::new(held.into_iter().map(|(k, h)| (k, Entry::new(h))).collect()),
+            persist: Mutex::new(()),
             jitter: std::collections::hash_map::RandomState::new(),
             dir,
             origin,
@@ -155,33 +201,28 @@ impl Attestations {
         let Some(signer) = self.verifier.verify_at(hash, &attestation, now) else {
             return false;
         };
-        let replaces = self
-            .held
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&hash)
-            .is_none_or(|held| {
-                held.attestation.expires_at_us() < attestation.expires_at_us()
-                    || self
+        let replaced = {
+            let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+            let replaces = held.get(&hash).is_none_or(|entry| {
+                entry.held.attestation.expires_at_us() < attestation.expires_at_us()
+                    || !self
                         .verifier
-                        .verify_at(hash, &held.attestation, now)
-                        .is_none()
+                        .still_valid(&entry.held.attestation, &entry.held.signer, now)
             });
-        if replaces {
-            let entry = Held {
-                hash,
-                attestation,
-                signer,
-            };
-            self.persist(&entry);
-            self.held
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(hash, entry);
-            self.retry_at
-                .write()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&hash);
+            if replaces {
+                held.insert(
+                    hash,
+                    Entry::new(Held {
+                        hash,
+                        attestation,
+                        signer,
+                    }),
+                );
+            }
+            replaces
+        };
+        if replaced {
+            self.sync_file(&hash);
         }
         true
     }
@@ -200,15 +241,21 @@ impl Attestations {
 
     /// The live, valid attestation held for `hash`, to serve, forward and
     /// publish with. `None` means the node neither serves nor publishes
-    /// `hash`.
+    /// `hash`. The signer recovered once, when the store kept the
+    /// attestation, so this reads no signature and is cheap enough for every
+    /// frame a delivery sends.
     #[must_use]
     pub fn live(&self, hash: &[u8; 32]) -> Option<OriginAttestation> {
+        let now = now_us();
         self.held
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(hash)
-            .filter(|held| self.verifier.verify(*hash, &held.attestation).is_some())
-            .map(|held| held.attestation.clone())
+            .filter(|entry| {
+                self.verifier
+                    .still_valid(&entry.held.attestation, &entry.held.signer, now)
+            })
+            .map(|entry| entry.held.attestation.clone())
     }
 
     /// The attestation held for `hash`, valid or not.
@@ -218,7 +265,7 @@ impl Attestations {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(hash)
-            .map(|h| h.attestation.clone())
+            .map(|entry| entry.held.attestation.clone())
     }
 
     /// Sign and keep this node's own attestation for `hash`, which its own
@@ -254,35 +301,54 @@ impl Attestations {
 
     /// The held attestations whose refresh is due at `now_us`: half their
     /// lifetime has passed, plus a per-hash jitter of up to a quarter of the
-    /// lifetime, and no failed refresh asked to wait longer.
+    /// lifetime, and no failed refresh asked to wait longer. The live ones
+    /// come first, the soonest to expire first, so expired ones the node
+    /// keeps retrying never hold back a refresh that keeps a hash served.
     #[must_use]
     pub fn refresh_due(&self, now_us: u64) -> Vec<RefreshDue> {
-        let retry_at = self.retry_at.read().unwrap_or_else(PoisonError::into_inner);
-        self.held
+        let mut due: Vec<RefreshDue> = self
+            .held
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .values()
-            .filter(|held| {
+            .filter(|entry| {
+                let held = &entry.held;
                 let due = held
                     .attestation
                     .half_life_at_us()
                     .saturating_add(self.jitter_us(&held.hash, &held.attestation));
-                now_us >= due && retry_at.get(&held.hash).is_none_or(|at| now_us >= *at)
+                now_us >= due && entry.retry_at.is_none_or(|at| now_us >= at)
             })
-            .map(|held| RefreshDue {
-                hash: held.hash,
-                attestation: held.attestation.clone(),
+            .map(|entry| RefreshDue {
+                hash: entry.held.hash,
+                attestation: entry.held.attestation.clone(),
             })
-            .collect()
+            .collect();
+        due.sort_by_key(|d| {
+            (
+                !d.attestation.is_live_at(now_us),
+                d.attestation.expires_at_us(),
+            )
+        });
+        due
     }
 
-    /// Hold off the next refresh of `hash` for [`REFRESH_RETRY_US`] after a
-    /// refresh found nothing fresher.
-    pub fn defer_refresh(&self, hash: [u8; 32], now_us: u64) {
-        self.retry_at
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(hash, now_us.saturating_add(REFRESH_RETRY_US));
+    /// Record a refresh of `hash` that found nothing fresher at `now_us`: hold
+    /// off its next try for [`REFRESH_RETRY_US`], and report what the node
+    /// holds now. It reads the entry held now, not the one the refresh
+    /// started from, so a fresh attestation kept while the refresh ran counts.
+    pub fn refresh_failed(&self, hash: [u8; 32], now_us: u64) -> RefreshFailed {
+        let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = held.get_mut(&hash) else {
+            return RefreshFailed::Gone;
+        };
+        entry.retry_at = Some(now_us.saturating_add(REFRESH_RETRY_US));
+        if entry.held.attestation.is_live_at(now_us) {
+            return RefreshFailed::Live;
+        }
+        let first = !entry.lapsed;
+        entry.lapsed = true;
+        RefreshFailed::Lapsed { first }
     }
 
     /// This hash's refresh jitter: up to a quarter of the attestation's
@@ -298,30 +364,57 @@ impl Attestations {
     }
 
     /// Drop the attestation for `hash`, once the node no longer holds the
-    /// blob or the attestation expired with no fresher one found.
+    /// blob.
     pub fn forget(&self, hash: &[u8; 32]) {
         let removed = self
             .held
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(hash);
-        self.retry_at
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(hash);
-        if let (Some(_), Some(dir)) = (removed, &self.dir) {
-            let _ = std::fs::remove_file(dir.join(file_name(hash)));
+        if removed.is_some() {
+            self.sync_file(hash);
         }
     }
 
-    /// Write `entry` to its file. A failed write leaves the attestation in
+    /// Drop the attestation for `hash` when the one held now has expired at
+    /// `now_us`, and say whether it did. A fresh attestation kept since the
+    /// caller looked stays.
+    pub fn forget_lapsed(&self, hash: &[u8; 32], now_us: u64) -> bool {
+        let removed = {
+            let mut held = self.held.write().unwrap_or_else(PoisonError::into_inner);
+            let lapsed = held
+                .get(hash)
+                .is_some_and(|entry| !entry.held.attestation.is_live_at(now_us));
+            lapsed && held.remove(hash).is_some()
+        };
+        if removed {
+            self.sync_file(hash);
+        }
+        removed
+    }
+
+    /// Bring the file of `hash` to the entry held in memory now: write it, or
+    /// remove the file when the store holds none. The writes are serialized,
+    /// and each reads the entry under the lock, so the last write leaves the
+    /// file at the last change. A failed write leaves the attestation in
     /// memory for this process, with a warning.
-    fn persist(&self, entry: &Held) {
+    fn sync_file(&self, hash: &[u8; 32]) {
         let Some(dir) = &self.dir else {
             return;
         };
-        let path = dir.join(file_name(&entry.hash));
-        let result = postcard::to_allocvec(entry)
+        let _serial = self.persist.lock().unwrap_or_else(PoisonError::into_inner);
+        let current = self
+            .held
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(hash)
+            .map(|entry| entry.held.clone());
+        let path = dir.join(file_name(hash));
+        let Some(entry) = current else {
+            let _ = std::fs::remove_file(&path);
+            return;
+        };
+        let result = postcard::to_allocvec(&entry)
             .map_err(std::io::Error::other)
             .and_then(|bytes| {
                 let tmp = path.with_extension("tmp");
@@ -346,7 +439,7 @@ fn file_name(hash: &[u8; 32]) -> String {
     })
 }
 
-fn load_dir(dir: &Path) -> HashMap<[u8; 32], Held> {
+fn load_dir(dir: &Path, verifier: &AttestationVerifier) -> HashMap<[u8; 32], Held> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return HashMap::new();
     };
@@ -354,6 +447,7 @@ fn load_dir(dir: &Path) -> HashMap<[u8; 32], Held> {
         .filter_map(Result::ok)
         .filter_map(|e| std::fs::read(e.path()).ok())
         .filter_map(|bytes| postcard::from_bytes::<Held>(&bytes).ok())
+        .filter(|h| verifier.recover(h.hash, &h.attestation) == Some(h.signer))
         .map(|h| (h.hash, h))
         .collect()
 }

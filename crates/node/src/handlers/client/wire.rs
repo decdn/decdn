@@ -6,8 +6,8 @@ use std::collections::VecDeque;
 use anyhow::Context as _;
 use bytes::Bytes;
 
-use decdn_protocol::Coverage;
 use decdn_protocol::client::StreamOutcome;
+use decdn_protocol::{Coverage, OriginAttestation};
 use iroh::endpoint::WriteError;
 
 use super::{
@@ -16,6 +16,22 @@ use super::{
     StreamResponseExt, StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
     write_frame,
 };
+
+/// What [`ClientHandler::sign_served`] produced.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the caller destructures it at once; boxing would allocate on every served answer"
+)]
+pub(super) enum Served {
+    /// The signed `ok: true` response and its extension, which carries the
+    /// live origin attestation the node holds for the hash.
+    Signed(StreamResponse, StreamResponseExt),
+    /// The node no longer holds a live attestation for the hash: it expired,
+    /// or its signer lost its seat, after the open-time gate passed. The
+    /// caller refuses with [`ServeRejectReason::Unattested`] instead of
+    /// promising a stream it may not serve (ADR 005 § Serving rule).
+    Unattested,
+}
 
 impl ClientHandler {
     /// Enqueue one audit receipt for a served-and-paid chunk (issues
@@ -50,6 +66,30 @@ impl ClientHandler {
     ) {
         let receipt = RawReceipt::new(hash, delta_bytes, client_node_id.0, U256::from(wire_amount));
         self.receipt_sink.record(receipt);
+    }
+
+    /// Whether this node still holds a live attestation for `hash`, or needs
+    /// none: the check a running delivery repeats before each frame (ADR 005
+    /// § Serving rule). Unlike [`Self::attested`], it signs nothing and reads
+    /// no backend.
+    pub(super) fn attested_now(&self, hash: Hash) -> bool {
+        self.attestations
+            .as_ref()
+            .is_none_or(|a| hash == Hash::EMPTY || a.live(hash.as_bytes()).is_some())
+    }
+
+    /// The live attestation an `ok: true` response for `hash` carries, or
+    /// `Err(())` when the node holds none and must refuse. `Ok(None)` for the
+    /// empty blob and for a node with no attestation store.
+    fn served_attestation(&self, hash: Hash) -> Result<Option<OriginAttestation>, ()> {
+        let Some(attestations) = &self.attestations else {
+            return Ok(None);
+        };
+        match attestations.live(hash.as_bytes()) {
+            Some(live) => Ok(Some(live)),
+            None if hash == Hash::EMPTY => Ok(None),
+            None => Err(()),
+        }
     }
 
     /// Whether this node may serve `hash` (ADR 022 § Origin Attestation): it
@@ -97,13 +137,23 @@ impl ClientHandler {
     /// `coverage` is the discovery blocks the node serves. It covers every
     /// block of the requested span, or the payer drops the answer
     /// (`StreamResponseExt::consistent_with`).
+    ///
+    /// The response carries the live origin attestation the node holds for
+    /// the hash. With none, it signs nothing and returns
+    /// [`Served::Unattested`]: the open-time gate ran before the funding and
+    /// fill awaits, and a coalescing miss reaches here without a handshake of
+    /// its own, so the attestation is read again at the one point every
+    /// served answer passes.
     pub(super) async fn sign_served(
         &self,
         req: &StreamRequest,
         rate_per_mb: u64,
         total_bytes: u64,
         coverage: Coverage,
-    ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
+    ) -> anyhow::Result<Served> {
+        let Ok(origin_attestation) = self.served_attestation(Hash::from_bytes(req.hash)) else {
+            return Ok(Served::Unattested);
+        };
         let proof = self
             .cache
             .size_proof(Hash::from_bytes(req.hash), total_bytes)
@@ -121,7 +171,13 @@ impl ClientHandler {
             rate_per_mb,
             timestamp_us: req.timestamp_us,
         };
-        self.sign_response(body, StreamOutcome::Served(size_proof), coverage)
+        let (resp, ext) = self.sign_response(
+            body,
+            StreamOutcome::Served(size_proof),
+            origin_attestation,
+            coverage,
+        )?;
+        Ok(Served::Signed(resp, ext))
     }
 
     /// Sign an `ok: false` refusal of `req` with `error` at `rate_per_mb`,
@@ -141,17 +197,18 @@ impl ClientHandler {
             rate_per_mb,
             timestamp_us: req.timestamp_us,
         };
-        self.sign_response(body, StreamOutcome::Refused(error), coverage)
+        self.sign_response(body, StreamOutcome::Refused(error), None, coverage)
     }
 
     /// Sign a `StreamResponse` body and assemble the frozen base plus its
-    /// unsigned extension (ADR 013 §Tier 1). The outcome rides in the
-    /// extension, so the pair must be written together — see
-    /// [`Self::write_stream_response`].
+    /// unsigned extension (ADR 013 §Tier 1). The outcome and the origin
+    /// attestation ride in the extension, so the pair must be written
+    /// together — see [`Self::write_stream_response`].
     fn sign_response(
         &self,
         body: StreamResponseBody,
         outcome: StreamOutcome,
+        origin_attestation: Option<OriginAttestation>,
         coverage: Coverage,
     ) -> anyhow::Result<(StreamResponse, StreamResponseExt)> {
         // Every stream signature passes through here, and every caller echoes
@@ -173,13 +230,6 @@ impl ClientHandler {
             .map_err(|e| anyhow::anyhow!("stream slash_sig signing failed: {e}"))?
             .as_bytes()
             .to_vec();
-        // An `ok: true` response forwards the live origin attestation this
-        // node holds for the hash (ADR 022 § Origin Attestation), so the
-        // pulling relay can serve and advertise what it pulls.
-        let origin_attestation = body
-            .ok
-            .then(|| self.attestations.as_ref()?.live(&body.hash))
-            .flatten();
         Ok((
             StreamResponse { body, slash_sig },
             StreamResponseExt {

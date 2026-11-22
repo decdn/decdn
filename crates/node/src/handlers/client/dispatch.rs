@@ -1149,6 +1149,16 @@ impl ClientHandler {
                         .await;
                 }
             }
+            // The fill tiers land the blob, not an attestation for it: a
+            // buffered fill from this node's own origin signs none. The serving
+            // rule binds the landed blob as it binds a hit, so a seated origin
+            // signs its own here, and a node that can neither sign nor holds a
+            // live one refuses (ADR 005 § Serving rule).
+            if !self.attested(hash).await {
+                return self
+                    .respond_error(&mut send, &req, ServeRejectReason::Unattested, rate_per_mb)
+                    .await;
+            }
             // The blob landed: hold it for the rest of the stream.
             pin = Some(self.cache.hold_in_use(hash));
             admitted_at_open = Some(funding);
@@ -1330,9 +1340,14 @@ impl ClientHandler {
         } else {
             super::fill::full_coverage(total_bytes)
         };
-        let (resp, resp_ext) = self
+        let super::wire::Served::Signed(resp, resp_ext) = self
             .sign_served(&req, rate_per_mb, total_bytes, coverage)
-            .await?;
+            .await?
+        else {
+            return self
+                .respond_error(&mut send, &req, ServeRejectReason::Unattested, rate_per_mb)
+                .await;
+        };
         self.write_stream_response(&mut send, &resp, &resp_ext)
             .await?;
         let mut first_byte = FirstByteClock::new(request_decoded_at, admitted_at, request_class);

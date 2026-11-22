@@ -21,8 +21,11 @@
 //!
 //! A refresh that finds nothing fresher retries after
 //! [`crate::attestations::REFRESH_RETRY_US`]. Once the held attestation has
-//! expired with nothing fresher found, the node drops it, and stops serving
-//! and publishing the hash.
+//! expired with nothing fresher found, the node stops serving and publishing
+//! the hash. While it still holds the blob, it keeps the expired attestation
+//! and keeps retrying, so the hash serves again once an origin of its
+//! namespace attests it. Once it no longer holds the blob, it drops the
+//! attestation.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -34,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::{NodeOriginDeps, OpenSpec, discovery_answer, discovery_ctx, fallback_origins};
-use crate::attestations::{Attestations, RefreshDue};
+use crate::attestations::{Attestations, RefreshDue, RefreshFailed};
 use crate::dht::negative_cache::Hash as DhtHash;
 use crate::handlers::timestamp_skew::now_us;
 use crate::metrics::Metrics;
@@ -99,19 +102,34 @@ impl Refresher {
             Some(Source::Origin) => self.metrics.attestation_refreshed_origin(),
             None => {
                 self.metrics.attestation_refresh_failed();
-                let now = now_us();
-                if due.attestation.is_live_at(now) {
-                    self.attestations.defer_refresh(due.hash, now);
-                } else {
+                let RefreshFailed::Lapsed { first } =
+                    self.attestations.refresh_failed(due.hash, now_us())
+                else {
+                    return;
+                };
+                let hash = Hash::from_bytes(due.hash);
+                if first {
                     debug!(
-                        hash = %Hash::from_bytes(due.hash),
+                        %hash,
                         "origin attestation expired with no fresher one found; no longer serving the hash"
                     );
-                    self.attestations.forget(&due.hash);
                     self.metrics.attestation_expired();
+                }
+                if !self.holds_blob(hash).await
+                    && self.attestations.forget_lapsed(&due.hash, now_us())
+                {
+                    debug!(%hash, "dropped the expired origin attestation of a blob the node no longer holds");
                 }
             }
         }
+    }
+
+    /// Whether the node holds any of `hash`: its cache holds a byte of it, or
+    /// its own origin backend holds it. A store fault counts as held, so a
+    /// fault never drops an attestation the node may still serve under.
+    async fn holds_blob(&self, hash: Hash) -> bool {
+        self.cache.origin_held_size(hash).is_some()
+            || !matches!(self.cache.coverage(hash).await, Ok(coverage) if coverage.is_empty())
     }
 
     /// Find and keep an attestation that expires after `due`'s, and say where
