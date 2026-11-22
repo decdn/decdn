@@ -551,8 +551,10 @@ async fn pull<B: Backend>(
 /// keeps its slot for as long as the response stays unread. This bound ends
 /// such a pull. It counts only the time a write waits on the response; the
 /// time between writes, while the holders are slow, is the progress clock's
-/// to judge. A response that keeps reading, however slowly, resets it with
-/// each write it lets through.
+/// to judge. Each write the response lets through restarts the limit, so a
+/// response keeps its pull while it takes the next frame (up to
+/// `CHUNK_BYTES`) within the limit: a client that reads slower than one
+/// frame per limit loses it.
 struct StallLimit<W> {
     inner: W,
     limit: Duration,

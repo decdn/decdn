@@ -384,8 +384,11 @@ waits for a slot. A pull gives up after `--give-up-after-secs` (120 by
 default) with no verified byte. A pull also gives up when its response takes
 no byte for the same time. The fetch stops its progress clock while the
 consumer does not read, so without this second limit a client that stops
-reading keeps its slot. A client that reads slowly keeps its slot, because
-each byte it takes resets the limit.
+reading keeps its slot. The limit restarts each time the response takes a
+frame from the pull, and a frame holds up to 256 KiB. A client that reads
+slowly keeps its slot only while it takes each frame within the limit. At
+the default limit, a client that reads slower than about 2 KiB/s loses its
+slot.
 
 The gateway sees its reverse proxy, not the client, so it sets no limit per
 client. A per-client limit on concurrent requests belongs to the proxy.
