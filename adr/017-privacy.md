@@ -46,7 +46,7 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 | P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) § iroh Identity Key |
 | P-22 | On-chain settlement volume leakage | Cumulative amount and byte count at `redeem` reveal per-lane delivery volume; their spacing across redemptions reveals session granularity | T1 | [003](003-payments.md#adr-003-payment-model) § Redemption and Close |
 | P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on a `StreamResponse` with `ok: true`, the answer to a discovery open included, constitutes non-repudiable cryptographic proof that the node served specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) § slash_sig |
-| P-24 | Origin attestation in DHT records | Every DHT record carries the signed `StreamResponse` of the seated origin that served the hash, so anyone who runs FIND_VALUE for a known hash learns which origin operator served it, the blob size, the origin's rate and the time of that serve. The origin's seats make the hash-to-namespace link inferable | T2 | [022](022-content-discovery.md#origin-attestation) § Origin Attestation |
+| P-24 | Origin attestation in DHT records | Every DHT record carries the signed attestation of a seated origin for the hash, so anyone who runs FIND_VALUE for a known hash learns which origin operator attests it, one namespace that it belongs to, and the time and TTL of that attestation | T2 | [022](022-content-discovery.md#origin-attestation) § Origin Attestation |
 
 ### Analysis by Adversary Tier
 
@@ -134,7 +134,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 | P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by the stable Ethereum address the payment model requires (P-02); the residual benefit against participants that get no request is already leaked through accepted P-08 and P-10 | — |
 | P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
 | P-23 | `slash_sig` content inventory | Accept | Required for on-chain accountability; removing `slash_sig` eliminates slashability | — |
-| P-24 | Origin attestation in DHT records | Accept | Required so that every cached copy traces to a vetted origin. The attestation names no pool, payer or client, and an origin's seats and rate are public already | — |
+| P-24 | Origin attestation in DHT records | Accept | Required so that every cached copy traces to a vetted origin. The attestation names no pool, payer or client, and an origin's seats are public already. The link from a hash to one of its namespaces is new public information. It is accepted: the namespace is the publisher's own, and the publisher chooses to publish the hash through it | — |
 
 ### Candidate Mitigations
 

@@ -100,6 +100,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_rejected_timestamp_skew_total",
     "decdn_serve_stream_rejected_unadmitted_cap_full_total",
     "decdn_serve_stream_rejected_unaccepted_pool_total",
+    "decdn_serve_stream_rejected_unattested_total",
     "decdn_serve_stream_rejected_unknown_lane_total",
     "decdn_serve_stream_request_unreadable_total",
     "decdn_serve_stream_midstream_pool_exhausted_total",
@@ -107,6 +108,7 @@ pub const INBOUND_FAILURE_REASONS: &[&str] = &[
     "decdn_serve_stream_midstream_signer_cap_exhausted_total",
     "decdn_serve_stream_midstream_blob_too_large_total",
     "decdn_serve_stream_terminated_takedown_total",
+    "decdn_serve_stream_terminated_unattested_total",
     "decdn_serve_stream_voucher_rejected_total",
     "decdn_serve_stream_proof_budget_exhausted_total",
     "decdn_serve_stream_client_declined_total",
@@ -1805,6 +1807,31 @@ pub struct DecdnMetrics {
     /// [`Self::serve_stream_rejected_internal_error`] instead. Visible name:
     /// `decdn_serve_stream_rejected_foreign_declined_total`.
     pub serve_stream_rejected_foreign_declined: Counter,
+    /// Delivery declined because the node holds the blob but no live, valid
+    /// origin attestation for it, and cannot sign its own (ADR 022 § Origin
+    /// Attestation). Signed as `Declined`. A rise after a takedown is the
+    /// withdrawn hash leaving this node. Visible name:
+    /// `decdn_serve_stream_rejected_unattested_total`.
+    pub serve_stream_rejected_unattested: Counter,
+    /// Held origin attestations refreshed from a fresher one in the DHT
+    /// records for the hash (ADR 022 § Origin Attestation). Visible name:
+    /// `decdn_attestation_refreshed_dht_total`.
+    pub attestation_refreshed_dht: Counter,
+    /// Held origin attestations refreshed from a voucher-less stream open to
+    /// a seated origin of the attested namespace. Visible name:
+    /// `decdn_attestation_refreshed_origin_total`.
+    pub attestation_refreshed_origin: Counter,
+    /// Held origin attestations this node re-signed as the seated origin of
+    /// the content. Visible name: `decdn_attestation_refreshed_self_total`.
+    pub attestation_refreshed_self: Counter,
+    /// Attestation refreshes that found nothing fresher; the node retries
+    /// later. Visible name: `decdn_attestation_refresh_failed_total`.
+    pub attestation_refresh_failed: Counter,
+    /// Held origin attestations that expired with no fresher one found,
+    /// counted once per expiry: the node stops serving and publishing the
+    /// hash. It keeps retrying while it holds the blob. Visible name:
+    /// `decdn_attestation_expired_total`.
+    pub attestation_expired: Counter,
     /// A serve refused because the node has been unable to reach the chain for
     /// longer than `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving
     /// while chain-stale): its deny-set, pool-solvency, and signer-cap guards
@@ -1828,6 +1855,15 @@ pub struct DecdnMetrics {
     /// would otherwise keep a multi-GB blob flowing for minutes after the order
     /// took effect, which is the slashable one.
     pub serve_stream_terminated_takedown: Counter,
+    /// An already-running delivery cut off at a frame boundary because the
+    /// node no longer holds a live origin attestation for the hash: it expired
+    /// with no fresher one kept, or its signer lost its seat or landed on the
+    /// origin deny-set (ADR 005 § Serving rule). Visible name:
+    /// `decdn_serve_stream_terminated_unattested_total`.
+    ///
+    /// The in-flight sibling of [`Self::serve_stream_rejected_unattested`],
+    /// which counts the refusals at stream open.
+    pub serve_stream_terminated_unattested: Counter,
     /// `decdn_serve_stream_rejected_load_shed_hit_total`: cache-hit serves shed
     /// under node overload (egress saturation).
     pub serve_stream_rejected_load_shed_hit: Counter,
@@ -2959,6 +2995,25 @@ recorders! {
     /// not hold the hash.
     serve_stream_rejected_foreign_declined => serve_stream_rejected_foreign_declined.inc();
 
+    /// Record a `serve_stream` delivery declined because the node holds no
+    /// live origin attestation for the hash.
+    serve_stream_rejected_unattested => serve_stream_rejected_unattested.inc();
+
+    /// Record a held attestation refreshed from the DHT.
+    attestation_refreshed_dht => attestation_refreshed_dht.inc();
+
+    /// Record a held attestation refreshed from a seated origin.
+    attestation_refreshed_origin => attestation_refreshed_origin.inc();
+
+    /// Record a held attestation re-signed by this node as the origin.
+    attestation_refreshed_self => attestation_refreshed_self.inc();
+
+    /// Record an attestation refresh that found nothing fresher.
+    attestation_refresh_failed => attestation_refresh_failed.inc();
+
+    /// Record a held attestation that expired with no fresher one found.
+    attestation_expired => attestation_expired.inc();
+
     /// Record a `serve_stream` request refused because the node's chain reads
     /// are stale past `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving
     /// while chain-stale).
@@ -2967,6 +3022,10 @@ recorders! {
     /// Record an in-flight delivery cut off at an MB boundary because a takedown
     /// landed after the stream opened (ADR 011 §On Blacklist Event).
     serve_stream_terminated_takedown => serve_stream_terminated_takedown.inc();
+
+    /// Record an in-flight delivery cut off at a frame boundary because the
+    /// node no longer holds a live origin attestation for the hash.
+    serve_stream_terminated_unattested => serve_stream_terminated_unattested.inc();
 
     /// Record a `serve_stream` cache-hit request refused by the load-shed policy
     /// (egress saturation).

@@ -1372,7 +1372,7 @@ mod batch_store_admission {
         for h in &hashes {
             assert!(
                 store
-                    .providers_at(&ContentHash::from_bytes(*h), 0, |_| true)
+                    .providers_at(&ContentHash::from_bytes(*h), 0, |_, _| true)
                     .iter()
                     .any(|p| p.node == holder),
                 "hash {h:?} must be in the record store after a batch admit"
@@ -1395,7 +1395,7 @@ mod batch_store_admission {
             records
                 .lock()
                 .expect("records lock")
-                .providers_at(&ContentHash::from_bytes([0x42u8; 32]), 0, |_| true)
+                .providers_at(&ContentHash::from_bytes([0x42u8; 32]), 0, |_, _| true)
                 .iter()
                 .any(|p| p.node == holder)
         );
@@ -1603,7 +1603,7 @@ mod batch_store_admission {
         for h in hashes.iter().take(4) {
             assert!(
                 store
-                    .providers_at(&ContentHash::from_bytes(*h), 0, |_| true)
+                    .providers_at(&ContentHash::from_bytes(*h), 0, |_, _| true)
                     .iter()
                     .any(|p| p.node == holder)
             );
@@ -1611,7 +1611,7 @@ mod batch_store_admission {
         for h in hashes.iter().skip(4) {
             assert!(
                 !store
-                    .providers_at(&ContentHash::from_bytes(*h), 0, |_| true)
+                    .providers_at(&ContentHash::from_bytes(*h), 0, |_, _| true)
                     .iter()
                     .any(|p| p.node == holder),
                 "deferred hash {h:?} must NOT be inserted"

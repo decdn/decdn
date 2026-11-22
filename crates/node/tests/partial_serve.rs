@@ -350,6 +350,8 @@ async fn partial_serve_within_cached_range_serves_without_any_fill() -> anyhow::
     cache.admit_bao(hash, g0_ranges, g0_bao).await?;
     let (tail_ranges, tail_bao) = bao_for(hash, &plaintext, outboard, total - group, group, total)?;
     cache.admit_bao(hash, tail_ranges, tail_bao).await?;
+    // The fixture handler attests registered payloads.
+    support::register_payload(&plaintext);
 
     let pool_id = B256::repeat_byte(0x42);
     let client_eth = Arc::new(PrivateKeySigner::random());

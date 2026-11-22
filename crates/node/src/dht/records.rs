@@ -42,8 +42,9 @@
 //! (ADR 022 § Origin Attestation). The handler verifies an attestation before
 //! [`RecordStore::insert_at`]; a re-publish carrying the same attestation
 //! reuses the stored signer ([`RecordStore::stored_signer`]) instead of
-//! recovering it again. [`RecordStore::providers_at`] leaves out a record whose
-//! signer no longer holds a seat.
+//! recovering it again. A re-publish keeps whichever attestation expires
+//! last. [`RecordStore::providers_at`] leaves out a record whose attestation
+//! expired or whose signer no longer holds a seat in its namespace.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -234,6 +235,10 @@ impl RecordStore {
     /// valid origin attestation). This method enforces only the
     /// storage-level invariants (per-publisher quota with hard reject, global
     /// LRU with eviction, per-hash provider cap with oldest-provider eviction).
+    ///
+    /// A re-publish keeps the held attestation only while `valid` still
+    /// accepts it and it expires after the offered one, so an attestation
+    /// whose signer lost its seat never displaces a valid replacement.
     pub fn insert_at(
         &mut self,
         holder: NodeId,
@@ -241,6 +246,7 @@ impl RecordStore {
         coverage: Coverage,
         attested: AttestedBy,
         receive_us: u64,
+        valid: impl Fn(&OriginAttestation, &Address) -> bool,
     ) -> InsertOutcome {
         // Allocate one monotonic sequence per call. Stored on the entry
         // and used as the second component of the `global_lru` key, so
@@ -257,7 +263,20 @@ impl RecordStore {
         // is net-zero on the per-publisher count and keeps the tri-index
         // update atomic, so there is no hand-rolled in-place mutation (and
         // no `get_mut` corruption branch) to keep in sync.
-        if self.remove_entry(holder, hash).is_some() {
+        if let Some(old) = self.remove_entry(holder, hash) {
+            // The record keeps the valid attestation that expires last, so a
+            // re-publish never trades a fresher attestation for a staler one,
+            // and a valid one always replaces one that is no longer valid.
+            let attested = if old.attestation.expires_at_us() > attested.attestation.expires_at_us()
+                && valid(&old.attestation, &old.signer)
+            {
+                AttestedBy {
+                    attestation: old.attestation,
+                    signer: old.signer,
+                }
+            } else {
+                attested
+            };
             self.add_entry(holder, hash, coverage, attested, receive_us, sequence);
             return InsertOutcome::Refreshed;
         }
@@ -307,8 +326,10 @@ impl RecordStore {
     }
 
     /// Return the current holders for `hash`, dropping any whose
-    /// `expiry_us <= now_us` and leaving out any whose attestation signer
-    /// `admits` rejects (it lost its seat since admission). The result is
+    /// `expiry_us <= now_us` and leaving out any whose attestation `valid`
+    /// rejects (it expired, or its signer lost its seat since admission).
+    /// `valid` gets the attestation and the signer recovered at admission.
+    /// The result is
     /// capped at the configured per-hash provider count (which equals the wire
     /// [`MAX_PROVIDERS_PER_HASH`] in production), so the handler can
     /// serialise the return value directly into a
@@ -321,7 +342,7 @@ impl RecordStore {
         &mut self,
         hash: &Hash,
         now_us: u64,
-        admits: impl Fn(&Address) -> bool,
+        valid: impl Fn(&OriginAttestation, &Address) -> bool,
     ) -> Vec<Provider> {
         // Scrub expired entries for this hash before returning.
         self.scrub_hash_expired(hash, now_us);
@@ -330,7 +351,7 @@ impl RecordStore {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| admits(&e.signer))
+                    .filter(|e| valid(&e.attestation, &e.signer))
                     .map(|e| Provider {
                         node: e.holder,
                         coverage: e.coverage.clone(),

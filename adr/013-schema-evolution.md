@@ -33,9 +33,9 @@ Each read has a frame ceiling. The ceiling is at least the largest legitimate me
 | Ceiling | Value | Reads | Largest legitimate message |
 | --- | --- | --- | --- |
 | `MAX_CLIENT_CONTROL_FRAME` | 4 KiB | `StreamRequest`, `Voucher` and `ChunkPreimage`, which the node reads | `StreamRequest` with a binding, a capability, the pull-through flag and a payment pool: 474 B |
-| `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a full size proof, an origin attestation, a coverage bitmap and 8 payment pools: 6,272 B. The widest refusal is 1,944 B |
+| `MAX_STREAM_RESPONSE_FRAME` | 8 KiB | `StreamResponse`, which the payer reads | `StreamResponse` with a full size proof, an origin attestation, a coverage bitmap and 8 payment pools: 6,299 B. The widest refusal is 1,971 B |
 | `MAX_CHUNK_FRAME` | 1,048,580 B | Every node → payer frame after `StreamResponse` | `ChunkData` with one `CHUNK_BYTES` payload |
-| `MAX_DHT_FRAME` | 64 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 256 entries: 59,939 B |
+| `MAX_DHT_FRAME` | 72 KiB | Every `cdn/dht/v1` read, request and response | `BatchStoreRequest` with 192 entries, each with a full coverage bitmap and origin attestation: 66,659 B. The widest response is a full `FindValueResponse`: 18,025 B |
 
 The sizes use 65-byte EOA signatures, full-width varints, 200-byte coverage bitmaps and 170-byte pool accounts. Every signature on the wire is a 65-byte EOA signature. A test beside each ceiling encodes the largest message and fails if the message outgrows the ceiling. The headroom is for Tier-1 extension fields. A message that needs more than its ceiling is a wire change: the same change updates the constant and this table.
 
@@ -47,7 +47,7 @@ The node bounds the number of connections with `security.max_concurrent_handlers
 
 - 2 GiB of unread transport data (256 connections × 8 MiB).
 - 200 MiB of `cdn/client/v1` reader buffers (256 × 100 streams × 8 KiB). Each stream holds a request of at most one ceiling, or a partial proof frame of at most one ceiling plus one 4 KiB read.
-- 16 MiB of `cdn/dht/v1` reader buffers (256 × 64 KiB).
+- 18 MiB of `cdn/dht/v1` reader buffers (256 × 72 KiB).
 
 A peer must send these bytes to pin them, so the cost grows with its bandwidth. An operator with less memory lowers `security.max_concurrent_handlers`. The value `0` removes the connection cap and with it this bound. The node keeps no count of connections per source. A relay-routed connection carries no source address, so a per-source count does not bind an attacker, and it refuses honest clients that share one address behind NAT. A requester that gets `RATE_LIMITED` moves to another source. The ceilings are not operator settings: a receiver that refuses a legitimate frame breaks the protocol for its peers.
 

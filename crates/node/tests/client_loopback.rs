@@ -8791,6 +8791,100 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ADR 005 § Serving rule: a node serves a hash only while it holds a live
+/// origin attestation for it, so a delivery stops at the next frame once the
+/// attesting origin loses its seat. The seat is dropped only after a voucher
+/// was accepted, so the test reaches the per-frame check rather than the
+/// open-time gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn unseating_the_attesting_origin_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
+    use decdn_node::dht::attestation::test_support::{NAMESPACE, ORIGIN, attest, domain};
+    use decdn_node::dht::seated_origins::{SeatedOriginSet, SeatedOrigins};
+
+    let payload = vec![0x5Bu8; 16 * 1024 * 1024];
+    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
+    let (store, signer, deposit) = seeded_store()?;
+    let seats = Arc::new(SeatedOriginSet::from_seats([(NAMESPACE, ORIGIN.address())]));
+    let attestations = Arc::new(decdn_node::attestations::Attestations::in_memory(
+        decdn_node::dht::AttestationVerifier::new(
+            Arc::clone(&seats) as Arc<dyn SeatedOrigins>,
+            Arc::new(decdn_node::content_deny::ContentDenylist::empty()),
+            domain(),
+        ),
+        None,
+    ));
+    anyhow::ensure!(attestations.keep(*hash.as_bytes(), attest(*hash.as_bytes())));
+
+    let server_sk = fresh_key();
+    let server_id = server_sk.public();
+    let server_eth = operator_signer();
+    let metrics = Arc::new(Metrics::new());
+    let handler = build_handler_configured(
+        server_id,
+        &server_eth,
+        &metrics,
+        permissive_limiter(&metrics),
+        cache,
+        Arc::clone(&store),
+        RATE_PER_MB,
+        |deps| deps.attestations = Some(attestations),
+    )?;
+    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+    let server_task = spawn_server(server_ep.clone(), handler);
+    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
+
+    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
+    let ctx = pool_context(&client_ep, signer, deposit);
+    let fetch_ep = client_ep.clone();
+    let server_addr = server_eth.address();
+    let hash_bytes = *hash.as_bytes();
+    let fetch = tokio::spawn(async move {
+        stream_fetch(
+            &fetch_ep,
+            target,
+            &ctx,
+            &slash_domain(),
+            server_addr,
+            hash_bytes,
+            0,
+            now_us(),
+            Duration::from_secs(30),
+        )
+        .await
+    });
+
+    // A non-zero `owed` means a proof was accepted and delivery is under way.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !store
+        .load_all()?
+        .iter()
+        .any(|state| state.owed() > U256::ZERO)
+    {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no voucher was ever accepted; the test never reached the mid-stream path"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    seats.unseat(NAMESPACE, ORIGIN.address());
+
+    let err = fetch
+        .await?
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("delivery must not complete once its attestation lapses"))?;
+    support::assert_inbound_failures_attributed(&metrics, 1).await?;
+    anyhow::ensure!(
+        metric_line_present(
+            &metrics.encode()?,
+            "decdn_serve_stream_terminated_unattested_total 1"
+        ),
+        "the cut-off must be metered as an attestation-lapse termination ({err})"
+    );
+
+    shutdown([server_task], [&client_ep, &server_ep]).await?;
+    Ok(())
+}
+
 /// ADR 011 §On Blacklist Event. A pool funded by a blacklisted origin is
 /// refused `Declined` for `origin_denied`, including on a CACHE MISS, which is
 /// the path a late gate misses: every miss arm returns a plain `NotFound`
@@ -16347,6 +16441,8 @@ async fn an_open_on_a_partial_answers_by_whether_it_covers_the_span() -> anyhow:
     // Block 1's middle group is missing.
     admit_span(&cache, blob, 0, block).await?;
     admit_span(&cache, blob, total - group, group).await?;
+    // The fixture handler attests registered payloads.
+    support::register_payload(&plaintext);
 
     let store: Arc<dyn PoolStateStore> = Arc::new(MemoryPoolStateStore::new());
     let (target, _server_eth, server_ep, server_task, _metrics) =

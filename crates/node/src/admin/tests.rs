@@ -820,6 +820,7 @@ fn seeded_dht_handles() -> DhtStatusHandles {
             signer: crate::dht::attestation::test_support::ORIGIN.address(),
         },
         1_000,
+        |_, _| true,
     );
 
     let republish = Arc::new(RepublishScheduler::new());

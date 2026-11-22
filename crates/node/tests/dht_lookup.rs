@@ -269,6 +269,7 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
         Coverage::full(1),
         attested(hash),
         receive_us,
+        |_, _| true,
     );
     assert_matches!(
         outcome,
@@ -473,6 +474,7 @@ async fn find_providers_drops_a_provider_whose_attestation_does_not_verify() -> 
             Coverage::full(1),
             attested([0xBB; 32]),
             receive_us,
+            |_, _| true,
         );
 
     prime_iroh_cache(&client_ep, client_id.as_bytes(), &provider).await?;

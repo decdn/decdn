@@ -106,6 +106,7 @@ pub(super) const fn refusal_reason(reason: ServeRejectReason) -> &'static str {
         ServeRejectReason::ChainHashDenied => "chain_hash_denied",
         ServeRejectReason::OriginDenied => "origin_denied",
         ServeRejectReason::ForeignNamespaceDeclined => "foreign_declined",
+        ServeRejectReason::Unattested => "unattested",
         ServeRejectReason::ChainStale => "chain_stale",
     }
 }
@@ -126,6 +127,8 @@ pub(super) enum ServeStop {
     SignerCapExhausted,
     /// A blacklist takedown landed for the hash.
     Takedown,
+    /// The node no longer holds a live origin attestation for the hash.
+    Unattested,
     /// The payer spent its per-chunk proof budget without settling the chunk.
     ProofBudgetExhausted,
     /// The pull-through fill ended at this node's cap on bytes held for the
@@ -143,6 +146,7 @@ impl ServeStop {
             Self::PoolClosed => "pool_closed",
             Self::SignerCapExhausted => "signer_cap_exhausted",
             Self::Takedown => "takedown",
+            Self::Unattested => "unattested",
             Self::ProofBudgetExhausted => "proof_budget_exhausted",
             Self::BlobTooLarge => "blob_too_large",
         }
@@ -175,6 +179,7 @@ impl ServeEnd {
                     metrics.serve_stream_midstream_signer_cap_exhausted();
                 }
                 ServeStop::Takedown => metrics.serve_stream_terminated_takedown(),
+                ServeStop::Unattested => metrics.serve_stream_terminated_unattested(),
                 ServeStop::ProofBudgetExhausted => metrics.serve_stream_proof_budget_exhausted(),
                 ServeStop::BlobTooLarge => metrics.serve_stream_midstream_blob_too_large(),
             },
@@ -260,6 +265,7 @@ fn meter_refusal(metrics: &Metrics, reason: ServeRejectReason) {
         ServeRejectReason::ForeignNamespaceDeclined => {
             metrics.serve_stream_rejected_foreign_declined();
         }
+        ServeRejectReason::Unattested => metrics.serve_stream_rejected_unattested(),
         ServeRejectReason::ChainStale => {
             metrics.serve_stream_rejected_chain_stale();
         }

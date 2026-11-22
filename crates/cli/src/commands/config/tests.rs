@@ -213,6 +213,7 @@ fn default_config_template_covers_every_wired_field() {
         eviction_tick_secs,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
+        attestation_ttl_sec,
         node_pull_open_fanout,
         node_pull_timeout_sec,
         node_pull_stall_window_sec,
@@ -271,6 +272,7 @@ fn default_config_template_covers_every_wired_field() {
             "relay_foreign_namespaces =",
             relay_foreign_namespaces.is_none(),
         ),
+        ("attestation_ttl_sec =", attestation_ttl_sec.is_none()),
         ("node_pull_open_fanout =", node_pull_open_fanout.is_none()),
         ("node_pull_timeout_sec =", node_pull_timeout_sec.is_none()),
         (

@@ -84,7 +84,7 @@ pub const MAX_CLIENT_CONTROL_FRAME: u32 = 4 * 1024;
 /// The largest legitimate response carries a full [`crate::MAX_SIZE_PROOF_BYTES`]
 /// size proof, an origin attestation, a
 /// [`crate::coverage::MAX_COVERAGE_BYTES`] coverage bitmap and
-/// [`crate::MAX_PAYMENT_POOLS`] full-width payment pools: 6,272 bytes. The
+/// [`crate::MAX_PAYMENT_POOLS`] full-width payment pools: 6,299 bytes. The
 /// ceiling leaves headroom for Tier-1 extension fields and refuses a larger
 /// frame before the reader buffers it. The node reads no response, so this
 /// ceiling adds nothing to the node's reader buffers. The
@@ -497,11 +497,13 @@ pub struct StreamResponseExt {
     /// It agrees with the signed `body.ok`, a cross-half invariant checked by
     /// [`StreamResponseExt::validate`].
     pub outcome: StreamOutcome,
-    /// The origin attestation the serving node holds for the hash (ADR 022
-    /// § Origin Attestation), forwarded so a pulling relay can publish its own
-    /// DHT records. A seated origin serving from its backend leaves it empty,
-    /// because its own `StreamResponse` is the attestation. A client ignores
-    /// it; a relay verifies it before keeping it.
+    /// The live origin attestation the serving node holds for the hash (ADR
+    /// 022 § Origin Attestation). A node serves a non-empty hash only while
+    /// it holds one, so every served answer for one carries it; a seated
+    /// origin carries its own. A pulling relay verifies it and keeps it to
+    /// serve and publish the hash. A relay that holds no live attestation of
+    /// its own for the hash refuses an upstream whose answer carries no valid
+    /// one. A client ignores it.
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
     /// Which 64 MiB discovery blocks ([`crate::coverage`]) the node holds or
     /// can serve. Unsigned: a hint, never a commitment, and nothing may let it

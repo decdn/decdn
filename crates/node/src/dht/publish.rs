@@ -1197,9 +1197,10 @@ async fn cache_still_holds(cache: &decdn_cache::CacheEngine, hash: &ContentHash)
 /// no block and is discoverable by a stream open alone (ADR 022 § Consistency
 /// rule).
 ///
-/// A hash with no valid origin attestation sends nothing either (ADR 022
+/// A hash with no live origin attestation sends nothing either (ADR 022
 /// § Origin Attestation): it stays scheduled, and publishes once the node
-/// pulls it from an attested upstream or its operator takes an origin seat.
+/// pulls it from an attested upstream, or its operator takes an origin seat
+/// and its own backend holds the hash.
 ///
 /// Returns how many peers accepted the record.
 async fn publish_hash(
@@ -1215,7 +1216,7 @@ async fn publish_hash(
     if coverage.is_empty() {
         return 0;
     }
-    let Some(attestation) = attestation_for(attestations, hash) else {
+    let Some(attestation) = attestation_for(cache, attestations, hash).await else {
         return 0;
     };
     let targets: Vec<NodeId> = with_lock(routing, "dht routing table", |table| {
@@ -1317,14 +1318,30 @@ async fn fetch_coverage(cache: &decdn_cache::CacheEngine, hash: ContentHash) -> 
 }
 
 /// The origin attestation to publish `hash` with (ADR 022 § Origin
-/// Attestation), or `None` when the node holds no valid one and cannot sign
-/// its own.
-fn attestation_for(attestations: &Attestations, hash: ContentHash) -> Option<OriginAttestation> {
-    let attestation = attestations.for_publish(*hash.as_bytes());
+/// Attestation): the live one the node holds, else its own when its operator
+/// holds an origin seat and its own backend holds the hash. `None` when it has
+/// neither.
+async fn attestation_for(
+    cache: &decdn_cache::CacheEngine,
+    attestations: &Attestations,
+    hash: ContentHash,
+) -> Option<OriginAttestation> {
+    let mut attestation = attestations.live(hash.as_bytes());
+    if attestation.is_none()
+        && attestations.can_attest_own()
+        && matches!(
+            cache
+                .origin_probe_presence(iroh_blobs::Hash::from_bytes(*hash.as_bytes()))
+                .await,
+            decdn_cache::OriginPresence::Present(_)
+        )
+    {
+        attestation = attestations.attest_own(*hash.as_bytes());
+    }
     if attestation.is_none() {
         tracing::debug!(
             hash = ?hash,
-            "dht republish: no valid origin attestation held; not advertising this cycle"
+            "dht republish: no live origin attestation held; not advertising this cycle"
         );
     }
     attestation
@@ -1413,7 +1430,7 @@ async fn publish_batch(
     let mut record_by_hash = HashMap::with_capacity(hashes.len());
     for hash in hashes {
         let coverage = fetch_coverage(cache, hash).await;
-        if let Some(attestation) = attestation_for(attestations, hash) {
+        if let Some(attestation) = attestation_for(cache, attestations, hash).await {
             record_by_hash.insert(hash, (coverage, attestation));
         }
     }

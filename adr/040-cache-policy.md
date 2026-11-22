@@ -327,6 +327,13 @@ not affect segment membership or frequency tracking; an unpinned hash
 re-enters the eviction pool at whatever segment and frequency it already
 carries.
 
+**A pin keeps bytes, not serve rights.** The node serves a pinned hash only
+while it holds a live origin attestation for it, the same rule as for every
+other hash ([ADR 005 § Serving rule](005-protocol.md#serving-rule)). A pinned
+hash without one stays resident and gets `Declined`. The node serves it again
+once a refresh finds a live attestation
+([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)).
+
 **Durable operator-evict is orthogonal to eviction policy.**
 `CacheEngine::evict` is the operator takedown path. It records the
 hash in a durable, `fsync`-backed log and makes the engine treat the hash as
