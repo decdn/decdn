@@ -544,8 +544,8 @@ pub decdn_client::receipt::ReceiptProof::voucher: decdn_client::receipt::Receipt
 pub struct decdn_client::receipt::ReceiptResponse
 pub decdn_client::receipt::ReceiptResponse::hash: alloy_primitives::aliases::B256
 pub decdn_client::receipt::ReceiptResponse::ok: bool
+pub decdn_client::receipt::ReceiptResponse::operator_sig: alloy_primitives::bytes_::Bytes
 pub decdn_client::receipt::ReceiptResponse::rate_per_mb: u64
-pub decdn_client::receipt::ReceiptResponse::slash_sig: alloy_primitives::bytes_::Bytes
 pub decdn_client::receipt::ReceiptResponse::timestamp_us: u64
 impl core::convert::From<&decdn_protocol::client::StreamResponse> for decdn_client::receipt::ReceiptResponse
 pub fn decdn_client::receipt::ReceiptResponse::from(&decdn_protocol::client::StreamResponse) -> Self

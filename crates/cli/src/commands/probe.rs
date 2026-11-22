@@ -37,8 +37,8 @@ pub(crate) struct ProbeAnswer {
     pub(crate) timestamp_us: u64,
     /// The connection's path RTT, in milliseconds.
     pub(crate) rtt_ms: f64,
-    /// The answer's `slash_sig`.
-    pub(crate) slash_sig: Vec<u8>,
+    /// The answer's `operator_sig`.
+    pub(crate) operator_sig: Vec<u8>,
 }
 
 impl ProbeAnswer {
@@ -54,7 +54,7 @@ impl ProbeAnswer {
             coverage_blocks: opened.coverage().covered_blocks().count(),
             timestamp_us: resp.body.timestamp_us,
             rtt_ms: opened.rtt().map_or(0.0, |(ms, _)| ms),
-            slash_sig: resp.slash_sig.clone(),
+            operator_sig: resp.operator_sig.clone(),
         }
     }
 }
@@ -66,7 +66,7 @@ impl ProbeAnswer {
 /// names the payer's pool, lane key, binding and capability, asks for the
 /// whole blob, and asks no pull-through. The keystore unlocks and the pool is
 /// named as for `decdn get` (`Payer::discovery_ctx`); no voucher is sent and
-/// no transaction. The answer is verified before it prints: its `slash_sig`
+/// no transaction. The answer is verified before it prints: its `operator_sig`
 /// must recover to `--provider-address` (ADR 005 § Signer binding), its echoed hash and
 /// timestamp must match the request, a size it states must carry its proof,
 /// and its coverage must agree with its signed `ok`.
@@ -99,14 +99,14 @@ pub async fn probe(
             target = target.with_relay_url(url.clone());
         }
         let chain = &host.chain().config;
-        let slash_dom =
+        let stream_dom =
             capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
         let opened = decdn_client::discovery_open(
             host.connections(),
             &target,
             pinned.provider,
             &ctx,
-            &slash_dom,
+            &stream_dom,
             hash,
             decdn_protocol::client::NO_NAMESPACE,
             (0, 0),
@@ -160,14 +160,14 @@ pub(crate) fn fetch_args(args: &cli::ProbeArgs) -> anyhow::Result<cli::ClientFet
 ///
 /// Public-in-crate so unit tests can capture the output into a buffer and
 /// assert on the wire contract — in particular the `--json` shape (key set,
-/// `rtt_ms` quantization, `slash_sig` hex encoding).
+/// `rtt_ms` quantization, `operator_sig` hex encoding).
 pub(crate) fn write_probe_answer(
     w: &mut impl std::io::Write,
     answer: &ProbeAnswer,
     json: bool,
 ) -> std::io::Result<()> {
     let hash_hex = alloy::primitives::hex::encode(answer.hash);
-    let slash_sig_hex = alloy::primitives::hex::encode(&answer.slash_sig);
+    let operator_sig_hex = alloy::primitives::hex::encode(&answer.operator_sig);
     if json {
         // Quantize `rtt_ms` to three decimals before serialization; serde_json
         // drops insignificant trailing zeros, so the field carries at most
@@ -181,7 +181,7 @@ pub(crate) fn write_probe_answer(
             "coverage_blocks": answer.coverage_blocks,
             "timestamp_us": answer.timestamp_us,
             "rtt_ms": rtt_ms_quantized,
-            "slash_sig": slash_sig_hex,
+            "operator_sig": operator_sig_hex,
         });
         writeln!(w, "{output}")
     } else {
@@ -195,7 +195,7 @@ pub(crate) fn write_probe_answer(
         writeln!(w, "coverage_blocks: {}", answer.coverage_blocks)?;
         writeln!(w, "timestamp_us:    {} (echoed ok)", answer.timestamp_us)?;
         writeln!(w, "rtt:             {:.3} ms", answer.rtt_ms)?;
-        writeln!(w, "slash_sig:       {slash_sig_hex}")
+        writeln!(w, "operator_sig:       {operator_sig_hex}")
     }
 }
 

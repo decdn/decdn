@@ -1116,7 +1116,7 @@ impl NodeOrigin {
             EndpointAddr::new(pk),
             Arc::new(std::sync::Mutex::new(ctx.clone())),
             Arc::clone(&ledger),
-            &deps.slash_domain,
+            &deps.stream_domain,
             provider_addr,
             namespace_bytes,
             deps.config.max_blob_size_bytes,
@@ -1435,7 +1435,7 @@ fn handshake_verdict(
 /// current-thread tokio runtime and `block_on`s this. All inputs are therefore
 /// OWNED + `'static` (no borrow crosses the thread): `deps_lock` is a clone of
 /// [`NodeOrigin::deps_arc`], read via `get()` HERE so `&deps.endpoint` /
-/// `&deps.slash_domain` are borrowed only within this runtime's scope. The shared
+/// `&deps.stream_domain` are borrowed only within this runtime's scope. The shared
 /// coordination state (the shared [`FillSession`]'s [`DownstreamWatch`]) crosses
 /// runtimes safely — atomics and `Notify` wakers are runtime-agnostic — and the
 /// [`CacheEngine`] store actor is reached through its own channel. Upstream
@@ -1949,7 +1949,7 @@ impl PeerRunSink<'_> {
             EndpointAddr::new(pk),
             Arc::clone(&ctx),
             Arc::clone(&ledger),
-            &self.deps.slash_domain,
+            &self.deps.stream_domain,
             provider_addr,
             self.namespace_id,
             self.deps.config.max_blob_size_bytes,

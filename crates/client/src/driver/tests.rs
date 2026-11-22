@@ -1532,12 +1532,12 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     timestamp_us: 0,
                 };
                 // `open` retains the response as-is without re-validating the
-                // signature, so an EOA-length (65-byte) placeholder slash-sig is
+                // signature, so an EOA-length (65-byte) placeholder operator signature is
                 // enough: this test exercises the refusal's routing, not slash
                 // evidence.
                 let resp = StreamResponse {
                     body,
-                    slash_sig: vec![0u8; 65],
+                    operator_sig: vec![0u8; 65],
                 };
                 let ext = StreamResponseExt::refused(StreamError::Unfunded, Coverage::empty());
                 return Err(UpstreamRefused::open(

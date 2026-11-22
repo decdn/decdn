@@ -67,7 +67,7 @@ pub fn attest_at(hash: [u8; 32], timestamp_us: u64) -> OriginAttestation {
         namespace_id: NAMESPACE.to_be_bytes(),
         timestamp_us,
         ttl_sec: DEFAULT_ATTESTATION_TTL_SEC,
-        sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
+        sig: vec![0; decdn_protocol::message::OPERATOR_SIG_LEN],
     })
 }
 

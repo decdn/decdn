@@ -34,7 +34,7 @@ rejects any other format when it parses the document. It has these parts:
 | `chain` | The payment chain id and the `PaymentPool` address, and the governance chain id and the `CapacityBond` address. | Nobody. The EIP-712 domain of each signature below binds it to these values. |
 | `content` | The requested hash, `blob` or `bundle`, the namespace, the whole blobs that landed with their sizes, the hashes that a node accepted but that did not land (`unlanded`), and whether the pull completed. | Nobody. The client states it. |
 | `window` | The start time and the end time of the pull. | Nobody. The client states it. |
-| `lanes[].responses` | For each hash a node served on the lane, the first accepting `StreamResponse` body and its `slash_sig`. | The node's operator key, under the `CapacityBond` domain. |
+| `lanes[].responses` | For each hash a node served on the lane, the first accepting `StreamResponse` body and its `operator_sig`. | The node's operator key, under the `CapacityBond` domain. |
 | `lanes[].proof.voucher` | The voucher that signs the lane's anchor at the end of the pull. | The lane signer, under the `PaymentPool` domain. |
 | `lanes[].proof.reveal` | The deepest preimage released under that voucher's chain. | Nobody. The preimage proves itself against the voucher's `chain_root` ([ADR 003](003-payments.md#hash-chain-metering-payword)). |
 | `lanes[].proof.claim` | `amount + index × chunk_price` over `bytes_delivered + index × CHUNK_BYTES`. | Nobody. A reader computes it again from the voucher and the reveal. |
@@ -60,7 +60,7 @@ node's and the payer's, and the receipt already holds them.
 
 1. Each response is valid on the wire, accepts (`ok = true`), names its
    lane's pool, and answers for a hash that the receipt lists.
-2. Each response's `slash_sig` recovers to the lane's provider.
+2. Each response's `operator_sig` recovers to the lane's provider.
 3. Each entry that a response covers has the size that the response signs.
    `verify` does not check an entry that no response covers, for example an
    entry that the client built from local data.
@@ -113,8 +113,8 @@ A receipt links a content hash to a lane signer, a pool and the nodes that
 served it. The chain already links the signer, the pool and the provider at
 redemption ([ADR 017](017-privacy.md#payment-and-identity-linkability-p-02-p-03-p-07)).
 The chain does not link them to a hash. A published receipt adds that link.
-A node's `slash_sig` already proves what that node holds
-([ADR 017](017-privacy.md#slash_sig-as-content-inventory-proof-p-23)). A
+A node's `operator_sig` already proves what that node holds
+([ADR 017](017-privacy.md#operator_sig-as-content-inventory-proof-p-23)). A
 published receipt shows that proof to everyone.
 
 `decdn get` writes a receipt only to the local file that `--receipt` names.

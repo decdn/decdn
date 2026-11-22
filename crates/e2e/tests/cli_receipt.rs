@@ -171,7 +171,7 @@ async fn run() -> anyhow::Result<()> {
 
     // ---- A flipped bit in the node's signature fails verification, by name.
     let mut tampered = receipt.clone();
-    let sig = &mut tampered.lanes[0].responses[0].slash_sig;
+    let sig = &mut tampered.lanes[0].responses[0].operator_sig;
     let mut bytes = sig.to_vec();
     bytes[5] ^= 0x01;
     *sig = bytes.into();

@@ -184,7 +184,7 @@ pub struct BlockchainConfig {
     /// that submits attested sweeps, which defaults to the known target's.
     pub cctp_iris_url: Option<String>,
     /// `CapacityBond` contract address. Also the EIP-712 `verifyingContract`
-    /// for `StreamResponse` `slash_sig` signatures and origin attestations
+    /// for `StreamResponse` `operator_sig` signatures and origin attestations
     /// (ADR 005 § Signer binding). Required: a wrong address silently produces
     /// signatures no verifier accepts.
     pub capacity_bond_address: Option<String>,

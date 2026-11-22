@@ -36,7 +36,7 @@ use decdn_client::LocalPullFault;
 use decdn_client::{PoolContext, Recovery};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    StreamSlashData, Voucher, binding_signing_hash, capacity_bond_domain, min_payment,
+    StreamSigData, Voucher, binding_signing_hash, capacity_bond_domain, min_payment,
     signed_to_wire_voucher, voucher_domain,
 };
 use decdn_node::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
@@ -95,11 +95,11 @@ const STALL_RATE: u64 = RATE / 2;
 /// gap — the most `MAX_RATE_PER_MB` allows — outweighs it (#2268).
 const RANK_LAST_RATE: u64 = 1_000;
 
-const fn slash_verifying() -> Address {
+const fn domain_verifying() -> Address {
     Address::repeat_byte(0x11)
 }
-fn slash_domain() -> Eip712Domain {
-    capacity_bond_domain(CHAIN_ID, slash_verifying())
+fn stream_domain() -> Eip712Domain {
+    capacity_bond_domain(CHAIN_ID, domain_verifying())
 }
 fn voucher_dom() -> Eip712Domain {
     voucher_domain(CHAIN_ID, Address::repeat_byte(0x34))
@@ -848,7 +848,7 @@ async fn build_origin_with_discovery(
         buyer,
         buyer_pool: buyer_pool(),
         self_id: b_dht,
-        slash_domain: slash_domain(),
+        stream_domain: stream_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
         negative_cache,
@@ -1017,7 +1017,7 @@ async fn build_origin_multi_hash(
         buyer,
         buyer_pool: buyer_pool(),
         self_id: b_dht,
-        slash_domain: slash_domain(),
+        stream_domain: stream_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
         negative_cache: NegativeCandidateCache::new(),
@@ -1233,7 +1233,7 @@ async fn node_origin_pull_chains_reactive_origin_via_client_binding() -> Result<
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -1334,7 +1334,7 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -1498,7 +1498,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -1574,7 +1574,7 @@ async fn large_blob_populates_via_streaming_pull() -> Result<()> {
         buyer,
         buyer_pool: buyer_pool(),
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
-        slash_domain: slash_domain(),
+        stream_domain: stream_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         negative_cache: NegativeCandidateCache::new(),
@@ -1633,7 +1633,7 @@ async fn serve_wrong_bytes(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     served: &[u8],
     rate: u64,
 ) -> Result<()> {
@@ -1655,12 +1655,12 @@ async fn serve_wrong_bytes(
         timestamp_us: req.timestamp_us,
     };
     let total_bytes = u64::try_from(served.len()).unwrap_or(u64::MAX);
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse { body, slash_sig };
+    let resp = StreamResponse { body, operator_sig };
     write_frame(
         &mut send,
         &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
@@ -1701,7 +1701,7 @@ async fn serve_wrong_bytes(
 fn spawn_a_lying_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     served: Vec<u8>,
     rate: u64,
 ) -> tokio::task::JoinHandle<()> {
@@ -1712,7 +1712,7 @@ fn spawn_a_lying_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let served = served.clone();
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
                 let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
@@ -1733,7 +1733,7 @@ fn spawn_a_lying_server(
 async fn serve_gated_correct_bytes(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     served: &[u8],
     rate: u64,
     received: &tokio::sync::Notify,
@@ -1770,12 +1770,12 @@ async fn serve_gated_correct_bytes(
             rate_per_mb: rate,
             timestamp_us: req.timestamp_us,
         };
-        let slash_sig = StreamSlashData::from_response_body(&body)
-            .sign(eth.as_ref(), slash)
-            .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+        let operator_sig = StreamSigData::from_response_body(&body)
+            .sign(eth.as_ref(), stream_dom)
+            .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
             .as_bytes()
             .to_vec();
-        let resp = StreamResponse { body, slash_sig };
+        let resp = StreamResponse { body, operator_sig };
         let resp_ext = support::proven_ext(&resp, u64::try_from(served.len()).unwrap_or(u64::MAX));
         write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
             .await
@@ -1831,7 +1831,7 @@ async fn serve_gated_correct_bytes(
 fn spawn_a_gated_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     served: Vec<u8>,
     rate: u64,
     received: Arc<tokio::sync::Notify>,
@@ -1844,7 +1844,7 @@ fn spawn_a_gated_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let served = served.clone();
             let received = Arc::clone(&received);
             let release = Arc::clone(&release);
@@ -1881,7 +1881,7 @@ async fn spawn_gated_node_a(
     let task_a = spawn_a_gated_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         payload.to_vec(),
         RATE,
         Arc::clone(&received),
@@ -1927,7 +1927,7 @@ async fn serve_then_reject_voucher(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     served: &[u8],
     rate: u64,
     reason: VoucherRejectReason,
@@ -1950,12 +1950,12 @@ async fn serve_then_reject_voucher(
         timestamp_us: req.timestamp_us,
     };
     let total_bytes = u64::try_from(served.len()).unwrap_or(u64::MAX);
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse { body, slash_sig };
+    let resp = StreamResponse { body, operator_sig };
     write_frame(
         &mut send,
         &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
@@ -2010,7 +2010,7 @@ async fn serve_then_error_on_voucher(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     served: &[u8],
     rate: u64,
     error: StreamError,
@@ -2033,12 +2033,12 @@ async fn serve_then_error_on_voucher(
         timestamp_us: req.timestamp_us,
     };
     let total_bytes = u64::try_from(served.len()).unwrap_or(u64::MAX);
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse { body, slash_sig };
+    let resp = StreamResponse { body, operator_sig };
     write_frame(
         &mut send,
         &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
@@ -2081,7 +2081,7 @@ async fn serve_then_error_on_voucher(
 fn spawn_a_voucher_erroring_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     served: Vec<u8>,
     rate: u64,
     error: StreamError,
@@ -2093,7 +2093,7 @@ fn spawn_a_voucher_erroring_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let served = served.clone();
             let error = error.clone();
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
@@ -2112,7 +2112,7 @@ fn spawn_a_voucher_erroring_server(
 fn spawn_a_voucher_rejecting_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     served: Vec<u8>,
     rate: u64,
     reason: VoucherRejectReason,
@@ -2124,7 +2124,7 @@ fn spawn_a_voucher_rejecting_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let served = served.clone();
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
                 let (eth, dom, served) = (Arc::clone(&eth), dom.clone(), served.clone());
@@ -2144,7 +2144,7 @@ fn spawn_a_voucher_rejecting_server(
 fn spawn_a_voucher_rejecting_server_with_counters(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     served: Vec<u8>,
     rate: u64,
     reason: VoucherRejectReason,
@@ -2157,7 +2157,7 @@ fn spawn_a_voucher_rejecting_server_with_counters(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let served = served.clone();
             let streams = Arc::clone(&streams);
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
@@ -2276,7 +2276,7 @@ async fn node_origin_pull_falls_through_a_stalled_candidate() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -2445,7 +2445,7 @@ async fn wedged_open_does_not_starve_the_candidate_loop() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -2784,7 +2784,7 @@ async fn an_origin_directory_entry_for_this_node_is_not_a_candidate() -> Result<
 
 /// A discovered provider with no resolvable operator address is skipped without
 /// tarnishing its reputation (payment-safety: never pay an address we can't
-/// resolve / verify a `slash_sig` against). Discovery drops it before any open,
+/// resolve / verify a `operator_sig` against). Discovery drops it before any open,
 /// the fetch is a clean `NotFound`, and no outcome is recorded.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> {
@@ -2895,7 +2895,7 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
     let task_a = spawn_a_lying_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         served,
         RATE,
     );
@@ -2971,7 +2971,7 @@ async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
     let task_a = spawn_a_voucher_rejecting_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         payload.clone(),
         RATE,
         VoucherRejectReason::AmountRegression,
@@ -3049,7 +3049,7 @@ async fn pull_against_a_voucher_rejecting_upstream_n(
     let task_a = spawn_a_voucher_rejecting_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         payload.clone(),
         RATE,
         reason,
@@ -3298,7 +3298,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     let task_f = spawn_a_voucher_rejecting_server(
         ep_f.clone(),
         Arc::clone(&f_eth),
-        slash_domain(),
+        stream_domain(),
         payload.clone(),
         CHEAP_RATE,
         VoucherRejectReason::BadSignature,
@@ -3327,7 +3327,7 @@ async fn a_local_fault_on_one_candidate_does_not_sink_a_walk_that_still_delivers
     let a_metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&a_metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -3514,7 +3514,7 @@ async fn answer_open(
     recv: &mut iroh::endpoint::RecvStream,
     req: &StreamRequest,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     rate: u64,
     total_bytes: u64,
     coverage: &Coverage,
@@ -3535,7 +3535,7 @@ async fn answer_open(
     let (resp, mut resp_ext) = signed_response(
         req,
         eth,
-        slash,
+        stream_dom,
         rate,
         total_bytes,
         (!covers).then_some(StreamError::NotFound),
@@ -3566,14 +3566,14 @@ async fn answer_open(
 /// is the shape `StreamResponse::validate` demands (`ok == false` ⇒ exactly one
 /// error) and the shape `UpstreamRefused` is built from (#1144).
 ///
-/// The `slash_sig` is real: the buyer's `verify_response` recovers it against
+/// The `operator_sig` is real: the buyer's `verify_response` recovers it against
 /// the provider's operator address before it even looks at `ok`, so a refusal
 /// that is not properly signed would fail as a bad signature and never reach the
 /// classification path under test.
 fn signed_response(
     req: &StreamRequest,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     rate: u64,
     total_bytes: u64,
     error: Option<StreamError>,
@@ -3584,9 +3584,9 @@ fn signed_response(
         rate_per_mb: rate,
         timestamp_us: req.timestamp_us,
     };
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
     let ext = match error {
@@ -3597,7 +3597,7 @@ fn signed_response(
         ),
         Some(error) => StreamResponseExt::refused(error, decdn_protocol::Coverage::empty()),
     };
-    Ok((StreamResponse { body, slash_sig }, ext))
+    Ok((StreamResponse { body, operator_sig }, ext))
 }
 
 /// The honest whole-blob bao verified-stream wire for `payload` (ADR 038), with
@@ -3662,12 +3662,12 @@ async fn serve_empty_chunks(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     total_bytes: u64,
     rate: u64,
 ) -> Result<()> {
     let req = read_stream_request(&mut recv).await?;
-    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    let (resp, resp_ext) = signed_response(&req, eth, stream_dom, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -3686,7 +3686,7 @@ async fn serve_empty_chunks(
 fn spawn_an_empty_chunk_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     total_bytes: u64,
     rate: u64,
 ) -> tokio::task::JoinHandle<()> {
@@ -3697,7 +3697,7 @@ fn spawn_an_empty_chunk_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
                 let (eth, dom) = (Arc::clone(&eth), dom.clone());
                 async move { serve_empty_chunks(send, recv, &eth, &dom, total_bytes, rate).await }
@@ -3726,14 +3726,14 @@ async fn serve_then_go_silent(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     wire: Arc<Vec<u8>>,
     total_bytes: u64,
     rate: u64,
     prefix_chunks: usize,
 ) -> Result<()> {
     let req = read_stream_request(&mut recv).await?;
-    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    let (resp, resp_ext) = signed_response(&req, eth, stream_dom, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -3776,7 +3776,7 @@ fn wire_frames(wire: &[u8], chunks: usize) -> Result<Vec<Vec<u8>>> {
 fn spawn_a_mid_stream_silent_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     wire: Arc<Vec<u8>>,
     total_bytes: u64,
     rate: u64,
@@ -3789,7 +3789,7 @@ fn spawn_a_mid_stream_silent_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let wire = Arc::clone(&wire);
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
                 let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
@@ -3826,13 +3826,13 @@ async fn serve_a_paid_interval_then_go_silent(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     wire: Arc<Vec<u8>>,
     total_bytes: u64,
     rate: u64,
 ) -> Result<()> {
     let req = read_stream_request(&mut recv).await?;
-    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    let (resp, resp_ext) = signed_response(&req, eth, stream_dom, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -3879,7 +3879,7 @@ async fn serve_a_paid_interval_then_go_silent(
 fn spawn_a_paid_then_silent_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     wire: Arc<Vec<u8>>,
     total_bytes: u64,
     rate: u64,
@@ -3891,7 +3891,7 @@ fn spawn_a_paid_then_silent_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let wire = Arc::clone(&wire);
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
                 let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
@@ -3954,7 +3954,7 @@ async fn node_origin_cancelled_pull_still_persists_the_acked_watermark() -> Resu
     let task_a = spawn_a_paid_then_silent_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::new(honest_bao_wire(&payload)?),
         total_bytes,
         RATE,
@@ -4078,7 +4078,7 @@ async fn serve_then_error_mid_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     wire: Arc<Vec<u8>>,
     total_bytes: u64,
     rate: u64,
@@ -4087,7 +4087,7 @@ async fn serve_then_error_mid_stream(
     let req = read_stream_request(&mut recv).await?;
     // An HONEST open: ok == true, signed. The peer has proven it is reachable and
     // answering — everything after this is about how it stops.
-    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    let (resp, resp_ext) = signed_response(&req, eth, stream_dom, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -4122,7 +4122,7 @@ async fn serve_then_error_mid_stream(
 fn spawn_a_mid_stream_error_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     wire: Arc<Vec<u8>>,
     total_bytes: u64,
     rate: u64,
@@ -4135,7 +4135,7 @@ fn spawn_a_mid_stream_error_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let err = error.clone();
             let wire = Arc::clone(&wire);
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
@@ -4179,7 +4179,7 @@ enum RefuseDiscovery {
 fn spawn_a_refusing_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     total_bytes: u64,
     rate: u64,
     error: StreamError,
@@ -4187,7 +4187,7 @@ fn spawn_a_refusing_server(
     spawn_refusing_server(
         ep,
         a_eth,
-        slash,
+        stream_dom,
         (total_bytes, rate),
         error,
         RefuseDiscovery::AtAdmission,
@@ -4200,14 +4200,14 @@ fn spawn_a_refusing_server(
 fn spawn_a_missing_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     total_bytes: u64,
     rate: u64,
 ) -> tokio::task::JoinHandle<()> {
     spawn_refusing_server(
         ep,
         a_eth,
-        slash,
+        stream_dom,
         (total_bytes, rate),
         StreamError::NotFound,
         RefuseDiscovery::AtOpen,
@@ -4223,7 +4223,7 @@ fn spawn_a_missing_server(
 fn spawn_a_refusing_server_with_counters(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     total_bytes: u64,
     rate: u64,
     error: StreamError,
@@ -4232,7 +4232,7 @@ fn spawn_a_refusing_server_with_counters(
     spawn_refusing_server(
         ep,
         a_eth,
-        slash,
+        stream_dom,
         (total_bytes, rate),
         error,
         RefuseDiscovery::AtAdmission,
@@ -4245,7 +4245,7 @@ fn spawn_a_refusing_server_with_counters(
 fn spawn_refusing_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     (total_bytes, rate): (u64, u64),
     error: StreamError,
     discovery: RefuseDiscovery,
@@ -4258,7 +4258,7 @@ fn spawn_refusing_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let error = error.clone();
             let streams = streams.clone();
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
@@ -4289,7 +4289,7 @@ fn spawn_refusing_server(
 async fn serve_refusal(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
-    (eth, slash): (&Arc<PrivateKeySigner>, &Eip712Domain),
+    (eth, stream_dom): (&Arc<PrivateKeySigner>, &Eip712Domain),
     (total_bytes, rate): (u64, u64),
     error: StreamError,
     discovery: RefuseDiscovery,
@@ -4302,7 +4302,7 @@ async fn serve_refusal(
             &mut recv,
             &req,
             eth,
-            slash,
+            stream_dom,
             rate,
             total_bytes,
             &full,
@@ -4311,7 +4311,7 @@ async fn serve_refusal(
         .await?;
         return Ok(());
     }
-    refuse_at_open(send, &req, (eth, slash), (total_bytes, rate), error).await
+    refuse_at_open(send, &req, (eth, stream_dom), (total_bytes, rate), error).await
 }
 
 /// Answer `req` with a signed refusal (`ok: false`, `error`), then finish the
@@ -4319,11 +4319,11 @@ async fn serve_refusal(
 async fn refuse_at_open(
     mut send: iroh::endpoint::SendStream,
     req: &StreamRequest,
-    (eth, slash): (&Arc<PrivateKeySigner>, &Eip712Domain),
+    (eth, stream_dom): (&Arc<PrivateKeySigner>, &Eip712Domain),
     (total_bytes, rate): (u64, u64),
     error: StreamError,
 ) -> Result<()> {
-    let (resp, resp_ext) = signed_response(req, eth, slash, rate, total_bytes, Some(error))?;
+    let (resp, resp_ext) = signed_response(req, eth, stream_dom, rate, total_bytes, Some(error))?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write refusal: {e}"))?;
@@ -4344,7 +4344,7 @@ async fn refuse_at_open(
 fn spawn_a_slow_but_healthy_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     wire: Vec<u8>,
     total_bytes: u64,
     rate: u64,
@@ -4358,7 +4358,7 @@ fn spawn_a_slow_but_healthy_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let wire = Arc::clone(&wire);
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
                 let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
@@ -4410,7 +4410,7 @@ async fn node_origin_empty_chunk_stream_is_rejected_not_spun_on() -> Result<()> 
     let task_a = spawn_an_empty_chunk_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
     );
@@ -4509,7 +4509,7 @@ async fn node_origin_mid_stream_silence_does_not_score_stalled_upstream() -> Res
     let task_a = spawn_a_mid_stream_silent_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::new(honest_bao_wire(&payload)?),
         total_bytes,
         RATE,
@@ -4619,7 +4619,7 @@ async fn node_origin_a_silent_first_byte_is_our_deadline_not_the_peers_fault() -
     let task_a = spawn_a_mid_stream_silent_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::new(honest_bao_wire(&payload)?),
         total_bytes,
         RATE,
@@ -4737,7 +4737,7 @@ async fn node_origin_mid_stream_refusal_is_metered_not_scored() -> Result<()> {
     let task_a = spawn_a_mid_stream_error_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::new(honest_bao_wire(&payload)?),
         total_bytes,
         RATE,
@@ -4842,7 +4842,7 @@ async fn node_origin_an_ack_wait_refusal_is_metered_not_scored() -> Result<()> {
     let task_a = spawn_a_voucher_erroring_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         payload.clone(),
         RATE,
         StreamError::NotFound,
@@ -4937,7 +4937,7 @@ async fn node_origin_a_wedged_provider_is_skipped_for_other_hashes() -> Result<(
     let task_a = spawn_a_voucher_rejecting_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         payload1.clone(),
         RATE,
         VoucherRejectReason::AmountRegression,
@@ -5048,7 +5048,7 @@ async fn node_origin_a_mid_stream_voucher_rejection_still_reaches_the_lane_remed
     let task_a = spawn_a_mid_stream_error_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::new(honest_bao_wire(&payload)?),
         total_bytes,
         RATE,
@@ -5179,7 +5179,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     let task_s1 = spawn_a_mid_stream_silent_server(
         ep_s1.clone(),
         Arc::clone(&s1_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::clone(&wire),
         total_bytes,
         STALL_RATE,
@@ -5193,7 +5193,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     let task_s2 = spawn_a_mid_stream_silent_server(
         ep_s2.clone(),
         Arc::clone(&s2_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::clone(&wire),
         total_bytes,
         STALL_RATE,
@@ -5223,7 +5223,7 @@ async fn silent_upstreams_do_not_starve_the_candidate_loop() -> Result<()> {
     let a_metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&a_metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -5373,7 +5373,7 @@ async fn node_origin_slow_but_healthy_transfer_completes_past_pull_timeout() -> 
     let task_a = spawn_a_slow_but_healthy_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         wire,
         total_bytes,
         RATE,
@@ -5474,7 +5474,7 @@ async fn node_origin_not_found_refusal_does_not_tar_upstream() -> Result<()> {
     let b_buyer = Arc::new(PrivateKeySigner::random());
     let pool_id = B256::repeat_byte(0x4E);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -5689,7 +5689,7 @@ async fn refusal_suppression_after(error: StreamError, wait: Duration) -> Result
     let task_a = spawn_a_refusing_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
         error,
@@ -5818,7 +5818,7 @@ async fn node_origin_declined_refusal_is_not_scored() -> Result<()> {
     let task_a = spawn_a_refusing_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
         StreamError::Declined,
@@ -5913,7 +5913,7 @@ async fn node_origin_oversized_blob_aborts_on_received_bytes_without_scoring() -
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -6019,7 +6019,7 @@ async fn empty_blob_fetch_at_ceiling(ceiling: u64) -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -6124,7 +6124,7 @@ async fn node_origin_over_ceiling_rate_is_rejected_without_scoring() -> Result<(
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -6246,7 +6246,7 @@ async fn node_origin_reused_lane_resumes_voucher_progress() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -6391,7 +6391,7 @@ async fn node_origin_persist_failure_still_delivers_and_is_counted() -> Result<(
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -7142,7 +7142,7 @@ async fn build_node_b_with_store(
     }) as Arc<dyn decdn_node::pool_view::PoolView>;
     let limiter = permissive_limiter(&b_metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -7236,7 +7236,7 @@ async fn spawn_node_a_metered(
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -7834,7 +7834,7 @@ async fn window_pull_through_honest_upstream_miss_still_refuses_not_found() -> R
     let task_a = spawn_a_missing_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
     );
@@ -8949,7 +8949,7 @@ async fn spawn_lying_node_a(
     let task_a = spawn_a_lying_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         served_wrong,
         RATE,
     );
@@ -9090,7 +9090,7 @@ async fn serve_wire_paced(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     wire: &[u8],
     total_bytes: u64,
     rate: u64,
@@ -9113,12 +9113,12 @@ async fn serve_wire_paced(
         rate_per_mb: rate,
         timestamp_us: req.timestamp_us,
     };
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse { body, slash_sig };
+    let resp = StreamResponse { body, operator_sig };
     write_frame(
         &mut send,
         &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
@@ -9169,7 +9169,7 @@ async fn spawn_paced_lying_node_a(
     let a_id = a_sk.public();
     let a_eth = Arc::new(PrivateKeySigner::random());
     let (ep_a, addr_a) = local_endpoint(a_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let eth = Arc::clone(&a_eth);
     let accept_ep = ep_a.clone();
     let wire = Arc::new(wire);
@@ -9180,7 +9180,7 @@ async fn spawn_paced_lying_node_a(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let wire = Arc::clone(&wire);
             tokio::spawn(serve_each_stream(conn, move |send, recv| {
                 let (eth, dom, wire) = (Arc::clone(&eth), dom.clone(), Arc::clone(&wire));
@@ -10129,7 +10129,7 @@ async fn window_pull_through_leaf_gone_while_the_pull_owes_the_first_byte_ends_t
     let task_a = spawn_a_mid_stream_silent_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         Arc::new(honest_bao_wire(&payload)?),
         total_bytes,
         RATE,
@@ -10789,7 +10789,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -10855,7 +10855,7 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
         buyer,
         buyer_pool: buyer_pool(),
         self_id: DhtNodeId::from_bytes(*b_id.as_bytes()),
-        slash_domain: slash_domain(),
+        stream_domain: stream_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         negative_cache: NegativeCandidateCache::new(),
@@ -11019,7 +11019,7 @@ async fn a_second_fetch_inside_the_ttl_skips_discovery_entirely() -> Result<()> 
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -11133,7 +11133,7 @@ async fn a_fetch_past_the_ttl_opens_again() -> Result<()> {
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -11265,7 +11265,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     let task_n0 = spawn_a_refusing_server_with_counters(
         ep_n0.clone(),
         Arc::clone(&n0_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
         StreamError::Declined,
@@ -11279,7 +11279,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     let task_n1 = spawn_a_refusing_server_with_counters(
         ep_n1.clone(),
         Arc::clone(&n1_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
         StreamError::Declined,
@@ -11293,7 +11293,7 @@ async fn cached_candidates_and_the_cold_path_share_one_attempt_budget() -> Resul
     let task_n2 = spawn_a_refusing_server_with_counters(
         ep_n2.clone(),
         Arc::clone(&n2_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
         StreamError::Declined,
@@ -11452,7 +11452,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     let task_n = spawn_a_refusing_server_with_counters(
         ep_n.clone(),
         Arc::clone(&n_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RANK_LAST_RATE,
         StreamError::Declined,
@@ -11557,7 +11557,7 @@ async fn a_partial_cached_budget_falls_through_to_the_cold_path_and_meters_once(
     let metrics_h_side = Arc::new(Metrics::new());
     let limiter_h = permissive_limiter(&metrics_h_side);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -11652,7 +11652,7 @@ async fn a_candidate_cache_hit_still_honours_the_negative_cache() -> Result<()> 
     let task_n = spawn_a_refusing_server_with_counters(
         ep_n.clone(),
         Arc::clone(&n_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         1,
         StreamError::NotFound,
@@ -11682,7 +11682,7 @@ async fn a_candidate_cache_hit_still_honours_the_negative_cache() -> Result<()> 
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -11830,7 +11830,7 @@ async fn an_entry_whose_every_provider_is_suppressed_is_a_miss_not_a_hit() -> Re
     let task_n = spawn_a_refusing_server_with_counters(
         ep_n.clone(),
         Arc::clone(&n_eth),
-        slash_domain(),
+        stream_domain(),
         total_bytes,
         RATE,
         StreamError::Declined,
@@ -11974,7 +11974,7 @@ async fn a_candidate_cache_hit_still_honours_the_wedged_provider_filter() -> Res
     let task_a = spawn_a_voucher_rejecting_server_with_counters(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         payload1.clone(),
         RANK_LAST_RATE,
         VoucherRejectReason::AmountRegression,
@@ -12006,7 +12006,7 @@ async fn a_candidate_cache_hit_still_honours_the_wedged_provider_filter() -> Res
     let metrics_h_side = Arc::new(Metrics::new());
     let limiter_h = permissive_limiter(&metrics_h_side);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -12291,7 +12291,7 @@ async fn a_candidate_cache_hit_drops_a_provider_no_longer_admitted() -> Result<(
     let metrics_a = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics_a);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -12373,7 +12373,7 @@ async fn a_candidate_cache_hit_drops_a_provider_no_longer_admitted() -> Result<(
         buyer,
         buyer_pool: buyer_pool(),
         self_id: b_dht,
-        slash_domain: slash_domain(),
+        stream_domain: stream_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(&local_rep),
         negative_cache: NegativeCandidateCache::new(),
@@ -12688,7 +12688,7 @@ async fn serve_with_deposit_ceiling(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     payloads: &[Arc<Vec<u8>>],
     rate: u64,
     deposit: &SharedDeposit,
@@ -12705,7 +12705,7 @@ async fn serve_with_deposit_ceiling(
         .map(|p| p.as_slice())
         .ok_or_else(|| anyhow::anyhow!("deposit-capped upstream: unknown hash requested"))?;
     let total_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    let (resp, resp_ext) = signed_response(&req, eth, slash, rate, total_bytes, None)?;
+    let (resp, resp_ext) = signed_response(&req, eth, stream_dom, rate, total_bytes, None)?;
     write_frame(&mut send, &encode_stream_response(&resp, Some(&resp_ext))?)
         .await
         .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
@@ -12894,7 +12894,7 @@ fn payable_interval(sent: u64, settled: u64, done: bool) -> Option<u64> {
 fn spawn_deposit_capped_server(
     ep: iroh::Endpoint,
     a_eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     payloads: Vec<Arc<Vec<u8>>>,
     rate: u64,
     deposit: SharedDeposit,
@@ -12917,7 +12917,7 @@ fn spawn_deposit_capped_server(
             };
             let Ok(conn) = connecting.await else { continue };
             let eth = Arc::clone(&a_eth);
-            let dom = slash.clone();
+            let dom = stream_dom.clone();
             let payloads = Arc::clone(&payloads);
             let deposit = Arc::clone(&deposit);
             let lane = Arc::clone(&lane);
@@ -13049,7 +13049,7 @@ async fn top_up_fixture_multi_rep(
     let task_a = spawn_deposit_capped_server(
         ep_a.clone(),
         Arc::clone(&a_eth),
-        slash_domain(),
+        stream_domain(),
         payloads,
         RATE,
         Arc::clone(&ceiling),
@@ -13930,7 +13930,7 @@ async fn build_origin_economics(
         buyer,
         buyer_pool: buyer_pool(),
         self_id: b_dht,
-        slash_domain: slash_domain(),
+        stream_domain: stream_domain(),
         bind_domain: binding_dom(),
         local_rep: Arc::clone(local_rep),
         negative_cache: NegativeCandidateCache::new(),
@@ -14043,7 +14043,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
     let a_metrics = Arc::new(Metrics::new());
     let a_limiter = permissive_limiter(&a_metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -14186,7 +14186,7 @@ async fn attack_a_over_market_loss_is_bounded() -> Result<()> {
         &client_ep,
         target_b,
         &ctx_client_to_b,
-        &slash_domain(),
+        &stream_domain(),
         b_eth.address(),
         *hash.as_bytes(),
         0,
@@ -14287,7 +14287,7 @@ async fn attack_b_attempt(
     let a_metrics = Arc::new(Metrics::new());
     let a_limiter = permissive_limiter(&a_metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -14426,7 +14426,7 @@ async fn attack_b_attempt(
                 &client_ep,
                 target_b,
                 &ctx,
-                &slash_domain(),
+                &stream_domain(),
                 b_eth.address(),
                 *hash.as_bytes(),
                 0,
@@ -14810,7 +14810,7 @@ async fn spawn_holder_on(
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -14832,7 +14832,7 @@ async fn spawn_holder_on(
         use iroh::protocol::ProtocolHandler;
         let ep = ep.clone();
         let eth = Arc::clone(&eth);
-        let slash = slash_domain();
+        let stream_dom = stream_domain();
         // Refusals spent so far, across every client connection: the holder
         // refuses its first `refuse_client_streams` streams, whichever pooled
         // connection carries them.
@@ -14844,7 +14844,7 @@ async fn spawn_holder_on(
                 };
                 let Ok(conn) = connecting.await else { continue };
                 let handler = Arc::clone(&handler);
-                let (eth, dom) = (Arc::clone(&eth), slash.clone());
+                let (eth, dom) = (Arc::clone(&eth), stream_dom.clone());
                 let refused = Arc::clone(&refused);
                 let coverage = coverage.clone();
                 tokio::spawn(async move {
@@ -15000,7 +15000,7 @@ async fn build_serving_node(
     }) as Arc<dyn decdn_node::pool_view::PoolView>;
     let limiter = permissive_limiter(&s_metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -15703,7 +15703,7 @@ async fn a_negative_cached_only_candidate_is_skipped_once_per_walk() -> Result<(
     let task_a = spawn_refusing_server(
         ep_a.clone(),
         a_signer,
-        slash_domain(),
+        stream_domain(),
         (u64::try_from(payload.len())?, RATE),
         StreamError::Declined,
         RefuseDiscovery::AtOpen,
@@ -16596,7 +16596,7 @@ async fn spawn_fs_origin_node(
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };
@@ -16800,7 +16800,7 @@ async fn more_concurrent_misses_than_the_unadmitted_cap_share_one_upstream() -> 
     ))?;
     let metrics_a = Arc::new(Metrics::new());
     let domains = HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     };

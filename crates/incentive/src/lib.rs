@@ -18,7 +18,7 @@
 //! | Spend delegation | [`capability`] (the signed capability), [`capability_grant`] (its transferable `dcap1:` form) |
 //! | Lane state | [`lane`] (the seller's per-lane watermark), [`store`] (persistence traits and in-memory stores, the settlement ledger among them), [`earnings`] (sums over the ledger for `decdn node earnings`), [`deployment`] (which `PaymentPool` a state belongs to) |
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
-//! | Response signatures | [`stream_sig`] (the `slash_sig` on stream responses), [`origin_attestation`] (origin attestations), [`bind_sig`] (client bindings and the shared `CapacityBond` domain), [`sig_canon`] (canonical `s`) |
+//! | Response signatures | [`stream_sig`] (the `operator_sig` on stream responses), [`origin_attestation`] (origin attestations), [`bind_sig`] (client bindings and the shared `CapacityBond` domain), [`sig_canon`] (canonical `s`) |
 //! | Keys | [`eth_identity`] (Web3 Secret Storage keystores and the `PrivateKeySigner` they load) |
 //! | Contract bindings | [`payment_pool`] (`PaymentPool`, `FeeRouter`, `CctpSweepReceiver`),[`capacity_bond`], [`node_register`], [`erc20`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
 //! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding), [`log_scan`] (bounded `eth_getLogs` windows that learn a provider's range cap) |
@@ -135,7 +135,7 @@ pub use store::{
     MemoryPoolStateStore, MemorySettlementLedger, PendingSettle, PendingSettleStore,
     PoolStateStore, SettlementKey, SettlementLedger, SettlementRecord, StoreError,
 };
-pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
+pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSigData, StreamSigError};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };

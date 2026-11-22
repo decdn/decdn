@@ -1192,7 +1192,7 @@ async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
 /// out with it, not just the wire code (#1042).
 ///
 /// This is the seam that keeps real daemon output attributable. The
-/// `slash_sig` here is produced by the same `StreamSlashData` signer the node
+/// `operator_sig` here is produced by the same `StreamSigData` signer the node
 /// uses, so what the assertion actually proves is that the operator's signed
 /// statement survives the client's error path intact — byte-for-byte, still
 /// recovering to the signer. A `refusal()` that kept only `response.error`
@@ -1221,7 +1221,7 @@ fn the_wire_bounds_a_size_proof_at_the_codecs_longest() {
 fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::capacity_bond_domain;
-    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_incentive::stream_sig::StreamSigData;
     use decdn_protocol::client::{
         StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
     };
@@ -1243,10 +1243,10 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
             rate_per_mb: 10,
             timestamp_us: ts,
         };
-        let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+        let sig = StreamSigData::from_response_body(&body).sign(&operator, &domain)?;
         let resp = StreamResponse {
             body,
-            slash_sig: sig.as_bytes().to_vec(),
+            operator_sig: sig.as_bytes().to_vec(),
         };
         super::verify_response(&resp, &ext, &domain, operator.address(), hash, ts, 0, 0)
     };
@@ -1302,7 +1302,7 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
 fn an_open_whose_coverage_disagrees_is_a_source_fault() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::capacity_bond_domain;
-    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_incentive::stream_sig::StreamSigData;
     use decdn_protocol::client::{
         StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
     };
@@ -1324,10 +1324,10 @@ fn an_open_whose_coverage_disagrees_is_a_source_fault() -> anyhow::Result<()> {
             rate_per_mb: 10,
             timestamp_us: ts,
         };
-        let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+        let sig = StreamSigData::from_response_body(&body).sign(&operator, &domain)?;
         let resp = StreamResponse {
             body,
-            slash_sig: sig.as_bytes().to_vec(),
+            operator_sig: sig.as_bytes().to_vec(),
         };
         // A bounded span: a refusal states no size, so only a bounded span
         // can be covered by it.
@@ -1390,7 +1390,7 @@ fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
             rate_per_mb: 10,
             timestamp_us: 1_700_000_000_000_000,
         },
-        slash_sig: vec![0; 65],
+        operator_sig: vec![0; 65],
     };
     let requested = PoolAccount::eip155(8_453, [0xa1; 20]);
     let accepted = vec![PoolAccount::eip155(8_453, [0xb1; 20])];
@@ -1429,7 +1429,7 @@ fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
 fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::capacity_bond_domain;
-    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_incentive::stream_sig::StreamSigData;
     use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
 
     use super::UpstreamRefused;
@@ -1444,10 +1444,10 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         rate_per_mb: 10,
         timestamp_us: 1_700_000_000_000_000,
     };
-    let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+    let sig = StreamSigData::from_response_body(&body).sign(&operator, &domain)?;
     let response = StreamResponse {
         body: body.clone(),
-        slash_sig: sig.as_bytes().to_vec(),
+        operator_sig: sig.as_bytes().to_vec(),
     };
     let response_ext = decdn_protocol::StreamResponseExt::refused(
         StreamError::Declined,
@@ -1487,8 +1487,8 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
     );
     // The whole point: the surviving signature still recovers to the operator,
     // so a third party can check it with no re-signing by the observer.
-    let recovered = alloy::primitives::Signature::try_from(preserved.slash_sig.as_slice())?;
-    StreamSlashData::from_response_body(&preserved.body).verify_signer(
+    let recovered = alloy::primitives::Signature::try_from(preserved.operator_sig.as_slice())?;
+    StreamSigData::from_response_body(&preserved.body).verify_signer(
         &recovered,
         operator.address(),
         &domain,
@@ -1513,7 +1513,7 @@ fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {
             rate_per_mb: 10,
             timestamp_us: 1_700_000_000_000_000,
         },
-        slash_sig: vec![0u8; decdn_protocol::message::SLASH_SIG_LEN],
+        operator_sig: vec![0u8; decdn_protocol::message::OPERATOR_SIG_LEN],
     };
     // A served outcome on `ok == false` names no refusal class.
     let served = decdn_protocol::StreamResponseExt::served(

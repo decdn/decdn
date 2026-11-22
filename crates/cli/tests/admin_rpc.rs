@@ -100,7 +100,7 @@ fn seeded_dht_handles() -> DhtStatusHandles {
                 namespace_id: [1; 32],
                 timestamp_us: 1,
                 ttl_sec: decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC,
-                sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
+                sig: vec![0; decdn_protocol::message::OPERATOR_SIG_LEN],
             },
             signer: alloy::primitives::Address::ZERO,
         },

@@ -104,7 +104,7 @@ pub struct NodeCandidate {
     /// iroh endpoint id — dialed via discovery, never needs an explicit addr.
     pub node_id: PublicKey,
     /// The node's Ethereum address — the `--provider-address` discovery derives
-    /// (the lane pays it and the `slash_sig` is verified against it).
+    /// (the lane pays it and the `operator_sig` is verified against it).
     pub eth_address: Address,
     /// The node's self-attested region (ADR 030), used for locality-aware
     /// selection. `None` when the node registered without one, or with a code
@@ -701,7 +701,7 @@ pub struct DiscoveredHolder {
     pub total_bytes: Option<crate::ProvenSize>,
     /// Which discovery blocks this holder holds or can serve
     /// (`decdn_protocol::coverage`), taken from its answer's extension.
-    /// Unsigned and outside `slash_sig`: a hint for the scheduler's segment
+    /// Unsigned and outside `operator_sig`: a hint for the scheduler's segment
     /// assignment, never a commitment. This may be a proper subset of the
     /// blob rather than the whole thing — a **partial holder** is admitted
     /// here exactly like a full one; nothing in this module treats the two
@@ -725,7 +725,7 @@ pub struct WarmingCandidate {
     /// The candidate proxy's iroh id.
     pub node_id: PublicKey,
     /// Its Ethereum address — the `--provider-address` a warming lane pays
-    /// and the `slash_sig` is verified against.
+    /// and the `operator_sig` is verified against.
     pub eth_address: Address,
     /// Measured round-trip time in milliseconds, from the **live discovery
     /// open issued for this request**.

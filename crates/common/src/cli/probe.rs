@@ -25,7 +25,7 @@ pub struct ProbeArgs {
     pub node_id: String,
 
     /// The node operator's Ethereum address (0x-prefixed hex): the answer's
-    /// `slash_sig` must recover to it (ADR 005 § Signer binding).
+    /// `operator_sig` must recover to it (ADR 005 § Signer binding).
     #[arg(long, value_name = "0xADDR")]
     pub provider_address: String,
 

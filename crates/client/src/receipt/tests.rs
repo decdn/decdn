@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH, preimage_at, root_from_seed};
-use decdn_incentive::stream_sig::StreamSlashData;
+use decdn_incentive::stream_sig::StreamSigData;
 use decdn_incentive::{
     LaneKey, Voucher, capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
 };
@@ -77,7 +77,7 @@ impl Keys {
             timestamp_us,
         };
         let c = chain();
-        let sig = StreamSlashData::from_response_body(&body)
+        let sig = StreamSigData::from_response_body(&body)
             .sign(
                 &self.node,
                 &capacity_bond_domain(c.chain_id, c.capacity_bond),
@@ -85,7 +85,7 @@ impl Keys {
             .unwrap();
         StreamResponse {
             body,
-            slash_sig: sig.as_bytes().to_vec(),
+            operator_sig: sig.as_bytes().to_vec(),
         }
     }
 
@@ -751,7 +751,7 @@ async fn malformed_signatures_say_so() {
     let good = chained_receipt(&keys, Cumulative::default()).await;
 
     let mut r = good.clone();
-    response0(&mut r).slash_sig = Bytes::from_static(&[1, 2, 3]);
+    response0(&mut r).operator_sig = Bytes::from_static(&[1, 2, 3]);
     assert!(matches!(
         r.verify().as_slice(),
         [ReceiptFault::ResponseMalformed { .. }]
@@ -960,7 +960,7 @@ fn the_json_schema_is_pinned() {
             ok: true,
             rate_per_mb: 10,
             timestamp_us: 30,
-            slash_sig: Bytes::from_static(&[0xaa]),
+            operator_sig: Bytes::from_static(&[0xaa]),
         }],
         proof: Some(ReceiptProof {
             voucher: ReceiptVoucher {
@@ -1032,7 +1032,7 @@ fn the_json_schema_is_pinned() {
                 "ok": true,
                 "rate_per_mb": 10,
                 "timestamp_us": 30,
-                "slash_sig": "0xaa",
+                "operator_sig": "0xaa",
             }],
             "proof": {
                 "voucher": {

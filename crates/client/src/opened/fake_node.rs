@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use alloy::primitives::{Address, Bytes};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
-use decdn_incentive::stream_sig::StreamSlashData;
+use decdn_incentive::stream_sig::StreamSigData;
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
     StreamResponseBody, StreamResponseExt,
@@ -267,10 +267,10 @@ async fn answer_stream(
         rate_per_mb: rate,
         timestamp_us: req.timestamp_us,
     };
-    let sig = StreamSlashData::from_response_body(&body).sign(&operator, &domain)?;
+    let sig = StreamSigData::from_response_body(&body).sign(&operator, &domain)?;
     let resp = StreamResponse {
         body,
-        slash_sig: sig.as_bytes().to_vec(),
+        operator_sig: sig.as_bytes().to_vec(),
     };
     let payload = decdn_protocol::client::encode_stream_response(&resp, Some(&resp_ext))?;
     decdn_protocol::write_frame(&mut send, &payload).await?;

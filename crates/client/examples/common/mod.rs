@@ -86,7 +86,7 @@ pub(crate) struct Buyer {
     store: RedbBuyerPoolStore,
     pool: BuyerPoolState,
     voucher_domain: Eip712Domain,
-    slash_domain: Eip712Domain,
+    stream_domain: Eip712Domain,
     bind_domain: Eip712Domain,
     endpoint: Endpoint,
 }
@@ -106,8 +106,8 @@ impl Buyer {
         let voucher_domain = deployment.voucher_domain();
         // Stream responses and the identity binding share the `CapacityBond`
         // domain.
-        let slash_domain = capacity_bond_domain(env.chain_id, env.capacity_bond);
-        let bind_domain = slash_domain.clone();
+        let stream_domain = capacity_bond_domain(env.chain_id, env.capacity_bond);
+        let bind_domain = stream_domain.clone();
 
         // The store is the buyer's only record of its pool and of what each lane
         // has paid. Keep it for the life of the pool.
@@ -151,7 +151,7 @@ impl Buyer {
             store,
             pool,
             voucher_domain,
-            slash_domain,
+            stream_domain,
             bind_domain,
             endpoint,
         })
@@ -216,7 +216,7 @@ impl Buyer {
                 &dial_target(&candidate),
                 candidate.eth_address,
                 &ctx,
-                &self.slash_domain,
+                &self.stream_domain,
                 hash,
                 decdn_protocol::client::NO_NAMESPACE,
                 (0, 0),
@@ -286,7 +286,7 @@ impl Buyer {
                 dial_target(&holder.candidate),
                 Arc::clone(&ctx),
                 Arc::clone(&ledger),
-                &self.slash_domain,
+                &self.stream_domain,
                 provider,
                 decdn_protocol::client::NO_NAMESPACE,
                 // No received-byte ceiling beyond the proven size.

@@ -1347,7 +1347,7 @@ fn resolve_blockchain_into(
     // The all-zero address checksum-validates cleanly but is never a real
     // deployment; staking against a codeless address surfaces only as an
     // opaque on-chain revert, and signing stream responses against it
-    // produces `slash_sig`s no verifier accepts (ADR 005 § Signer binding).
+    // produces `operator_sig`s no verifier accepts (ADR 005 § Signer binding).
     // Reject it here — mirroring `content_blacklist_address` below — so `decdn config check` catches it
     // and the daemon's runtime guard (#1219) is uniform defense-in-depth rather
     // than the sole check. Skipped when the value is an empty placeholder: the
@@ -1492,7 +1492,7 @@ fn resolve_blockchain_into(
         .unwrap_or(DEFAULT_CHAIN_ID);
     // `chain_id` is bound into every `CapacityBond` EIP-712 domain separator
     // (and the runtime signer). Chain id 0 is not a real network; signing
-    // against it produces `slash_sig`s no verifier accepts — the same
+    // against it produces `operator_sig`s no verifier accepts — the same
     // silently-broken-but-running failure mode the zero-`capacity_bond_address`
     // check above prevents.
     bag.check_with(chain_id != 0, "blockchain.chain_id", || {

@@ -9,7 +9,7 @@
 //! when there is none), and fetch it through the acquire loop
 //! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
 //! per holder (signing cumulative vouchers, resuming each lane's persisted
-//! watermark, verifying the `slash_sig` recovers to the provider, ADR 005 § Signer binding).
+//! watermark, verifying the `operator_sig` recovers to the provider, ADR 005 § Signer binding).
 //! Every byte is bao-verified; each lane's new watermark is persisted, and the
 //! file is promoted atomically. A holder that faults cools and returns; the
 //! command ends on done, a fault only the user can fix, or the stop policy.
@@ -1376,7 +1376,7 @@ pub(crate) async fn fetch_on(
     let config = &chain.config;
     // Every discovery answer and stream response verifies on the governance
     // chain.
-    let slash_dom =
+    let stream_dom =
         capacity_bond_domain(config.governance.chain_id, config.governance.capacity_bond);
 
     let max_blob_bytes = held_cap(common.max_blob_mb, args.size_cap);
@@ -1527,7 +1527,7 @@ pub(crate) async fn fetch_on(
             store,
             contract: &contract,
             rpc: &rpc,
-            slash_dom: &slash_dom,
+            stream_dom: &stream_dom,
             self_address,
             token,
             chain: config,

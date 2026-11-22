@@ -82,7 +82,7 @@ fn pool_declined(accepted: Vec<decdn_protocol::PoolAccount>) -> anyhow::Error {
             rate_per_mb: 1,
             timestamp_us: 1,
         },
-        slash_sig: vec![0; 65],
+        operator_sig: vec![0; 65],
     };
     crate::UpstreamRefused::open(
         response,

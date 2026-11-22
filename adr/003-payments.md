@@ -863,7 +863,7 @@ constructor() {
 }
 ```
 
-The domain separator binds every capability and voucher to a specific contract deployment on a specific chain. A signature made for one chain cannot be replayed on another, and one made for one `PaymentPool` deployment cannot be replayed against a redeployed contract at a different address. The voucher and capability domain binds the payment chain id and the pool address. The `CapacityBond` domain binds the governance chain. A node signs vouchers under the payment-chain domain and `slash_sig` under the `CapacityBond` domain ([ADR 005 § Signer binding](005-protocol.md#signer-binding)).
+The domain separator binds every capability and voucher to a specific contract deployment on a specific chain. A signature made for one chain cannot be replayed on another, and one made for one `PaymentPool` deployment cannot be replayed against a redeployed contract at a different address. The voucher and capability domain binds the payment chain id and the pool address. The `CapacityBond` domain binds the governance chain. A node signs vouchers under the payment-chain domain and `operator_sig` under the `CapacityBond` domain ([ADR 005 § Signer binding](005-protocol.md#signer-binding)).
 
 **Capability type** (owner-signed, verified once per signer on first redemption):
 

@@ -2136,9 +2136,9 @@ async fn sign_response_signs_a_timestamp_far_older_than_the_skew_bound() -> anyh
             .await?,
     )?;
     assert_eq!(resp.body.timestamp_us, an_hour_ago);
-    let sig = alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?;
-    let recovered = StreamSlashData::from_response_body(&resp.body)
-        .recover_signer(&sig, &handler.slash_domain)?;
+    let sig = alloy::primitives::Signature::try_from(resp.operator_sig.as_slice())?;
+    let recovered = StreamSigData::from_response_body(&resp.body)
+        .recover_signer(&sig, &handler.stream_domain)?;
     assert_eq!(recovered, handler.eth_signer.address());
     Ok(())
 }

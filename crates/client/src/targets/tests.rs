@@ -1029,7 +1029,7 @@ fn classify_open_types_each_failure() {
             |o| matches!(o, OpenOutcome::ClockSkewed),
         ),
         (
-            anyhow::anyhow!("slash_sig verification failed").context(UnverifiedAnswer),
+            anyhow::anyhow!("operator_sig verification failed").context(UnverifiedAnswer),
             |o| matches!(o, OpenOutcome::Unverifiable),
         ),
         (anyhow::anyhow!("connect failed: timed out"), |o| {

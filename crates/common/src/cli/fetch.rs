@@ -77,7 +77,7 @@ pub struct ClientFetchArgs {
 
     /// The delivering node's Ethereum address (0x-prefixed hex). The caller's
     /// pool lane for this provider is opened/reused against it, and the
-    /// response `slash_sig` must recover to it (ADR 005 § Signer binding); a
+    /// response `operator_sig` must recover to it (ADR 005 § Signer binding); a
     /// mismatch aborts
     /// the pull. Omit it when auto-discovering (no `--node-id`): it is derived
     /// from the selected node's registry entry.
@@ -97,7 +97,7 @@ pub struct ClientFetchArgs {
     #[command(flatten)]
     pub payment: super::common::PoolSelectArgs,
 
-    /// `CapacityBond` contract address (0x hex) — the `slash_sig` EIP-712
+    /// `CapacityBond` contract address (0x hex) — the `operator_sig` EIP-712
     /// `verifyingContract`, and the active-node registry read when
     /// auto-discovering (no `--node-id`). Overrides
     /// `blockchain.capacity_bond_address`.

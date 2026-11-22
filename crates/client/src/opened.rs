@@ -374,8 +374,8 @@ fn throughput_floor(
 #[derive(Clone, Copy)]
 pub(crate) struct OpenArgs<'a> {
     pub(crate) ctx: &'a PoolContext,
-    pub(crate) slash_domain: &'a Eip712Domain,
-    /// The operator address the answer's `slash_sig` must recover to.
+    pub(crate) stream_domain: &'a Eip712Domain,
+    /// The operator address the answer's `operator_sig` must recover to.
     pub(crate) expected_signer: Address,
     pub(crate) hash: [u8; 32],
     pub(crate) namespace_id: [u8; 32],
@@ -403,7 +403,7 @@ pub(crate) async fn open_answer(
     let verified = verify_response(
         &resp,
         &resp_ext,
-        args.slash_domain,
+        args.stream_domain,
         args.expected_signer,
         args.hash,
         args.timestamp_us,
@@ -599,7 +599,7 @@ pub async fn discovery_open(
     target: &EndpointAddr,
     expected_signer: Address,
     ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     hash: [u8; 32],
     namespace_id: [u8; 32],
     span: (u64, u64),
@@ -611,7 +611,7 @@ pub async fn discovery_open(
     let permit = permit_within(open, conns.discovery_permit(target.id)).await?;
     let args = OpenArgs {
         ctx,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         namespace_id,
