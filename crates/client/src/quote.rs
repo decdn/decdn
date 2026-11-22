@@ -279,7 +279,8 @@ pub async fn census(
         outage_fallback,
     } = nodes;
     let outage_fallback = *outage_fallback;
-    let slash_dom = capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
+    let stream_dom =
+        capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
     // The whole blob, with no rate ceiling: the census keeps every answer,
     // and `serve_order` applies the ceiling the pull would.
     let spec = OpenSpec {
@@ -296,13 +297,13 @@ pub async fn census(
     });
     let outcomes: Vec<(usize, NodeCandidate, OpenOutcome)> = futures_util::stream::iter(opens)
         .map(|(at, hash, cand, target)| {
-            let slash_dom = &slash_dom;
+            let stream_dom = &stream_dom;
             async move {
                 // Each open stamps its own timestamp once it holds its
                 // node's permit: a node refuses one more than 30 s from its
                 // clock, and a census can run longer. The open bounds its own
                 // dial and exchange.
-                let res = open_at(target, cand, spec, slash_dom, hash, false).await;
+                let res = open_at(target, cand, spec, stream_dom, hash, false).await;
                 let (outcome, stream) = classify_open(cand, res, 0);
                 if let Some(stream) = stream {
                     stream.cancel();

@@ -306,7 +306,7 @@ pub(crate) enum OpenOutcome {
     /// (`APP_ERR_TIMESTAMP_SKEW`): its clock and this machine's differ by more
     /// than 30 seconds.
     ClockSkewed,
-    /// The answer did not verify: its `slash_sig` did not recover to the
+    /// The answer did not verify: its `operator_sig` did not recover to the
     /// candidate's operator, or its coverage disagreed with its signed `ok`.
     Unverifiable,
     /// The answer was verified but unusable: a size with no valid proof, or a
@@ -606,12 +606,12 @@ pub(crate) async fn open_candidate(
     cand: &NodeCandidate,
     relay: Option<RelayUrl>,
     spec: OpenSpec<'_>,
-    slash_domain: &alloy::sol_types::Eip712Domain,
+    stream_domain: &alloy::sol_types::Eip712Domain,
     hash: [u8; 32],
     pull_through: bool,
 ) -> anyhow::Result<OpenedStream> {
     let target = candidate_target(cand, relay);
-    open_at(&target, cand, spec, slash_domain, hash, pull_through).await
+    open_at(&target, cand, spec, stream_domain, hash, pull_through).await
 }
 
 /// [`open_candidate`] at a dial `target` the caller built, such as a pinned
@@ -620,7 +620,7 @@ pub(crate) async fn open_at(
     target: &EndpointAddr,
     cand: &NodeCandidate,
     spec: OpenSpec<'_>,
-    slash_domain: &alloy::sol_types::Eip712Domain,
+    stream_domain: &alloy::sol_types::Eip712Domain,
     hash: [u8; 32],
     pull_through: bool,
 ) -> anyhow::Result<OpenedStream> {
@@ -630,7 +630,7 @@ pub(crate) async fn open_at(
             target,
             cand.eth_address,
             spec.ctx,
-            slash_domain,
+            stream_domain,
             hash,
             spec.namespace_id,
             span,
@@ -780,7 +780,7 @@ pub(crate) fn classify_open(
 /// a holder answers its signed quote, its proven size and its coverage, and a
 /// node that misses answers a signed `NotFound` at once. Every answer is
 /// verified before it can influence the order: value invariants, echoed-field
-/// correlation, `slash_sig` recovery to the candidate's on-chain operator
+/// correlation, `operator_sig` recovery to the candidate's on-chain operator
 /// address (ADR 005 § Signer binding), and the coverage against the signed `ok`. A
 /// candidate whose answer fails is dropped, exactly as for a timeout; it is
 /// requester-local policy and never scored against the peer. A holder that
@@ -808,7 +808,7 @@ pub async fn open_and_order(
     hash: [u8; 32],
     spec: OpenSpec<'_>,
     warming: ProxyWarmingParams,
-    slash_domain: &alloy::sol_types::Eip712Domain,
+    stream_domain: &alloy::sol_types::Eip712Domain,
     round: OpenRound,
 ) -> anyhow::Result<ResolvedTargets> {
     // Open concurrently in one task. Each open is bounded by its own timeout
@@ -818,7 +818,7 @@ pub async fn open_and_order(
     let started = std::time::Instant::now();
     let opens = candidates.iter().cloned().map(|cand| {
         let relay = relay_hint.cloned();
-        let slash_domain = slash_domain.clone();
+        let stream_domain = stream_domain.clone();
         let conns = spec.conns.clone();
         let ctx = spec.ctx.clone();
         let (namespace_id, span, max_rate_per_mb) =
@@ -831,7 +831,7 @@ pub async fn open_and_order(
                 span,
                 max_rate_per_mb,
             };
-            let res = open_candidate(&cand, relay, spec, &slash_domain, hash, false).await;
+            let res = open_candidate(&cand, relay, spec, &stream_domain, hash, false).await;
             log_open_result(&cand, &res, started);
             let (outcome, opened) = classify_open(&cand, res, max_rate_per_mb);
             (cand.node_id, outcome, opened)
@@ -1202,7 +1202,7 @@ async fn discover_provider(
             &store_cfg,
         );
         if selected.len() >= store_cfg.min_fresh_candidates {
-            let slash_dom =
+            let stream_dom =
                 capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
             mark_round_start();
             let targets = open_and_order(
@@ -1211,7 +1211,7 @@ async fn discover_provider(
                 hash,
                 open.spec,
                 opts.proxy_warming,
-                &slash_dom,
+                &stream_dom,
                 open.round,
             )
             .await?;
@@ -1258,7 +1258,8 @@ async fn discover_provider(
         &[]
     };
     let selected = select_with_widening(all, site.region.as_deref(), allow, &store_cfg);
-    let slash_dom = capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
+    let stream_dom =
+        capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
     mark_round_start();
     let targets = open_and_order(
         &selected,
@@ -1266,7 +1267,7 @@ async fn discover_provider(
         hash,
         open.spec,
         opts.proxy_warming,
-        &slash_dom,
+        &stream_dom,
         open.round,
     )
     .await?;
@@ -1797,13 +1798,14 @@ pub(crate) async fn open_pinned(
         marks.discovery_started();
     }
     let started = std::time::Instant::now();
-    let slash_dom = capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
+    let stream_dom =
+        capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
     let res = crate::discovery_open(
         open.spec.conns,
         &target,
         cand.eth_address,
         open.spec.ctx,
-        &slash_dom,
+        &stream_dom,
         hash,
         open.spec.namespace_id,
         open.spec.span,

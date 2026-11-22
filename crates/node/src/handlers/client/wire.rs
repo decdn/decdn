@@ -13,7 +13,7 @@ use iroh::endpoint::WriteError;
 use super::{
     B256, ClientHandler, ClientMessage, FrameError, Hash, MissPath, MissRefusal, RawReceipt,
     SendStream, ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
-    StreamResponseExt, StreamSlashData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
+    StreamResponseExt, StreamSigData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
     write_frame,
 };
 
@@ -238,13 +238,13 @@ impl ClientHandler {
                     .saturating_add(crate::handlers::timestamp_skew::MAX_REQUEST_TIMESTAMP_SKEW_US),
             "signing a timestamp the admission gate cannot have admitted"
         );
-        let slash_sig = StreamSlashData::from_response_body(&body)
-            .sign(self.eth_signer.as_ref(), &self.slash_domain)
-            .map_err(|e| anyhow::anyhow!("stream slash_sig signing failed: {e}"))?
+        let operator_sig = StreamSigData::from_response_body(&body)
+            .sign(self.eth_signer.as_ref(), &self.stream_domain)
+            .map_err(|e| anyhow::anyhow!("stream operator_sig signing failed: {e}"))?
             .as_bytes()
             .to_vec();
         Ok((
-            StreamResponse { body, slash_sig },
+            StreamResponse { body, operator_sig },
             StreamResponseExt {
                 outcome,
                 origin_attestation,

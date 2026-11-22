@@ -1662,7 +1662,7 @@ async fn rank_by_open(
         Some(placeholder),
     )
     .await?;
-    let slash_dom =
+    let stream_dom =
         decdn_incentive::capacity_bond_domain(governance.chain_id, governance.capacity_bond);
     let hash = lookup_sentinel();
     let mut rows = Vec::with_capacity(candidates.len());
@@ -1677,7 +1677,7 @@ async fn rank_by_open(
             &target,
             c.eth_address,
             &ctx,
-            &slash_dom,
+            &stream_dom,
             hash,
             decdn_protocol::client::NO_NAMESPACE,
             (0, 0),

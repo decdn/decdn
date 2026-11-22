@@ -53,7 +53,7 @@ use support::{
 const CHAIN_ID: u64 = 421_614;
 const RATE_PER_MB: u64 = 10;
 
-fn slash_dom() -> Eip712Domain {
+fn stream_dom() -> Eip712Domain {
     capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x11))
 }
 fn voucher_dom() -> Eip712Domain {
@@ -64,7 +64,7 @@ fn binding_dom() -> Eip712Domain {
 }
 fn domains() -> HandlerDomains {
     HandlerDomains {
-        slash: slash_dom(),
+        stream_dom: stream_dom(),
         voucher: voucher_dom(),
         binding: binding_dom(),
     }

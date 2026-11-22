@@ -332,13 +332,13 @@ async fn a_leg_that_times_out_unpins_its_connection() {
     let connections = super::Connections::new(ep.clone());
     let ctx = crate::source::ctx_with(0xB0, U256::from(1_000_000u64));
     let ledger = std::sync::Arc::new(ctx.new_ledger());
-    let slash = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
+    let stream_dom = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
     let source = crate::PeerSource::new(
         &ep,
         peer_addr.clone(),
         std::sync::Arc::new(std::sync::Mutex::new(ctx)),
         ledger,
-        &slash,
+        &stream_dom,
         Address::repeat_byte(0xB0),
         [0u8; 32],
         0,
@@ -546,7 +546,7 @@ async fn closing_peer(closes: usize) -> (Endpoint, EndpointAddr) {
 fn pooled_source<'a>(
     ep: &'a Endpoint,
     peer_addr: &EndpointAddr,
-    slash: &'a alloy::dyn_abi::Eip712Domain,
+    stream_dom: &'a alloy::dyn_abi::Eip712Domain,
     connections: &super::Connections,
 ) -> crate::PeerSource<'a> {
     use alloy::primitives::{Address, U256};
@@ -558,7 +558,7 @@ fn pooled_source<'a>(
         peer_addr.clone(),
         std::sync::Arc::new(std::sync::Mutex::new(ctx)),
         ledger,
-        slash,
+        stream_dom,
         Address::repeat_byte(0xB0),
         [0u8; 32],
         0,
@@ -583,8 +583,8 @@ async fn a_leg_on_a_pinned_connection_closed_under_the_open_redials_once() {
     let (_peer, peer_addr) = closing_peer(1).await;
     let (ep, _) = loopback_endpoint(Vec::new()).await;
     let connections = super::Connections::new(ep.clone());
-    let slash = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
-    let source = pooled_source(&ep, &peer_addr, &slash, &connections);
+    let stream_dom = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
+    let source = pooled_source(&ep, &peer_addr, &stream_dom, &connections);
 
     let pinned = connections.get(&peer_addr).await.expect("pin a connection");
     let err = source
@@ -615,8 +615,8 @@ async fn a_leg_on_a_fresh_connection_that_fails_is_not_retried() {
     let (_peer, peer_addr) = closing_peer(1).await;
     let (ep, _) = loopback_endpoint(Vec::new()).await;
     let connections = super::Connections::new(ep.clone());
-    let slash = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
-    let source = pooled_source(&ep, &peer_addr, &slash, &connections);
+    let stream_dom = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
+    let source = pooled_source(&ep, &peer_addr, &stream_dom, &connections);
 
     let err = source
         .open([7u8; 32], align_range(0, 0, 1024).expect("range"))

@@ -712,7 +712,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let voucher_dom = voucher_domain(CHAIN_ID, payment_pool);
     let domains = HandlerDomains {
-        slash: capacity_bond_domain(CHAIN_ID, capacity_bond),
+        stream_dom: capacity_bond_domain(CHAIN_ID, capacity_bond),
         voucher: voucher_dom.clone(),
         binding: bind_domain.clone(),
     };
@@ -875,7 +875,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         &client_ep,
         target.clone(),
         &ctx,
-        &domains.slash,
+        &domains.stream_dom,
         node_addr,
         *hash.as_bytes(),
         0,
@@ -1020,7 +1020,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         &client_ep,
         target.clone(),
         &second_ctx,
-        &domains.slash,
+        &domains.stream_dom,
         node_addr,
         *hash.as_bytes(),
         0,
@@ -1362,7 +1362,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         &client_ep,
         target.clone(),
         &buyer_ctx,
-        &domains.slash,
+        &domains.stream_dom,
         node_addr,
         *hash.as_bytes(),
         MIB as u64,

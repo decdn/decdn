@@ -303,7 +303,7 @@ struct StreamResponseBody {
 #[derive(Serialize, Deserialize)]
 struct StreamResponse {
     body: StreamResponseBody,
-    slash_sig: Bytes,
+    operator_sig: Bytes,
 }
 
 /// Unsigned fields — a separate postcard value appended after the base.

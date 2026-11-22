@@ -41,7 +41,7 @@ use decdn_cache::CacheEngine;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    StreamSlashData, binding_signing_hash, capacity_bond_domain, voucher_domain,
+    StreamSigData, binding_signing_hash, capacity_bond_domain, voucher_domain,
 };
 use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
@@ -89,19 +89,19 @@ fn expected_amount(rate: u64) -> U256 {
     U256::from(amount)
 }
 
-const fn slash_verifying() -> Address {
+const fn domain_verifying() -> Address {
     Address::repeat_byte(0x11)
 }
 
-fn slash_domain() -> Eip712Domain {
-    capacity_bond_domain(CHAIN_ID, slash_verifying())
+fn stream_domain() -> Eip712Domain {
+    capacity_bond_domain(CHAIN_ID, domain_verifying())
 }
 
 /// The fixed EIP-712 domains shared by both hops' handlers. The hops are
 /// distinguished by per-node identities and pool ids, not by domain.
 fn hop_domains() -> HandlerDomains {
     HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: voucher_domain(CHAIN_ID, Address::repeat_byte(0x34)),
         binding: capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x99)),
     }
@@ -280,7 +280,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
         &ep_b,
         target_a,
         &ctx_b_to_a,
-        &slash_domain(),
+        &stream_domain(),
         a_eth.address(),
         *hash.as_bytes(),
         0,
@@ -339,7 +339,7 @@ async fn node_to_node_pull_through_two_hops() -> anyhow::Result<()> {
         &client_ep,
         target_b,
         &ctx_client_to_b,
-        &slash_domain(),
+        &stream_domain(),
         b_eth.address(),
         *hash.as_bytes(),
         0,
@@ -421,7 +421,7 @@ async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
         &ep_b,
         target_a,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         Address::repeat_byte(0x55), // expected upstream signer (never reached)
         [0x42u8; 32],
         0,
@@ -584,7 +584,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
         &honest_ep,
         target_b,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         b_eth.address(),
         *hash.as_bytes(),
         0,
@@ -618,7 +618,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
 async fn lying_upstream(
     ep: &Endpoint,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     served: &[u8],
     rate_per_mb: u64,
 ) -> anyhow::Result<()> {
@@ -641,12 +641,12 @@ async fn lying_upstream(
         rate_per_mb,
         timestamp_us: req.timestamp_us,
     };
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse { body, slash_sig };
+    let resp = StreamResponse { body, operator_sig };
     let payload = decdn_protocol::encode_stream_response(
         &resp,
         Some(&support::proven_ext(&resp, total_bytes)),
@@ -736,9 +736,11 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
     let liar = {
         let ep_up = ep_up.clone();
         let eth = Arc::clone(&upstream_eth);
-        let slash = slash_domain();
+        let stream_dom = stream_domain();
         let served = served.clone();
-        tokio::spawn(async move { lying_upstream(&ep_up, &eth, &slash, &served, RATE_A).await })
+        tokio::spawn(
+            async move { lying_upstream(&ep_up, &eth, &stream_dom, &served, RATE_A).await },
+        )
     };
 
     // Downstream B pulls the (honest) hash; the bytes that arrive are wrong.
@@ -753,7 +755,7 @@ async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
         &ep_b,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         upstream_eth.address(),
         *requested_hash.as_bytes(),
         0,

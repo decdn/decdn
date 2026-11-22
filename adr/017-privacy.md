@@ -45,7 +45,7 @@ Each row is a discrete data exposure. **ID** back-references the analysis and di
 | P-18 | Unencrypted iroh key (PoC) | Client's Ed25519 secret key stored at `~/.decdn/iroh_key` with `0600` permissions, no encryption | T4 | [012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) § iroh Identity Key |
 | P-21 | Permanent client NodeId | Ed25519 identity is persistent across sessions; all content requests are correlatable under one identity | T2 | [012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) § iroh Identity Key |
 | P-22 | On-chain settlement volume leakage | Cumulative amount and byte count at `redeem` reveal per-lane delivery volume; their spacing across redemptions reveals session granularity | T1 | [003](003-payments.md#adr-003-payment-model) § Redemption and Close |
-| P-23 | `slash_sig` as content inventory proof | A node's `slash_sig` on a `StreamResponse` with `ok: true`, the answer to a discovery open included, constitutes non-repudiable cryptographic proof that the node served specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [005](005-protocol.md#signer-binding) § Signer binding |
+| P-23 | `operator_sig` as content inventory proof | A node's `operator_sig` on a `StreamResponse` with `ok: true`, the answer to a discovery open included, constitutes non-repudiable cryptographic proof that the node served specific content at a specific time; accumulated signatures build a verifiable content inventory | T2 | [005](005-protocol.md#signer-binding) § Signer binding |
 | P-24 | Origin attestation in DHT records | Every DHT record carries the signed attestation of a seated origin for the hash, so anyone who runs FIND_VALUE for a known hash learns which origin operator attests it, one namespace that it belongs to, and the time and TTL of that attestation | T2 | [022](022-content-discovery.md#origin-attestation) § Origin Attestation |
 
 ### Analysis by Adversary Tier
@@ -86,9 +86,9 @@ A discovery open for a hash tells every candidate what is requested. It also nam
 
 The on-chain registry active set is enumerable; reading it reveals all active nodes' identities and self-reported regions. Combined with `multiaddrs` from the same registry, this enables geolocation. Inherent to any system where nodes must be discoverable to serve content.
 
-##### `slash_sig` as content inventory proof (P-23)
+##### `operator_sig` as content inventory proof (P-23)
 
-Every `StreamResponse` carries a `slash_sig` — an EIP-712 secp256k1 signature binding the node's Ethereum address to specific content hashes and timestamps ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). The answer to a discovery open is a `StreamResponse` too. Any T2 participant that sends discovery opens collects non-repudiable, EVM-verifiable, individually attributable proof that the node committed to serving (or refused) specific content at a specific time. Systematic discovery opens build a cryptographic per-node content inventory keyed by Ethereum address. Inherent to signed answers — `slash_sig` exists to make node commitments attributable. A requester recovers it before it trusts a quote, and a pull receipt keeps it as portable evidence of a serve ([Appendix: Pull Receipts](appendix-pull-receipts.md#what-a-receipt-proves)). Removing it leaves a quote that binds the node to nothing.
+Every `StreamResponse` carries an `operator_sig` — an EIP-712 secp256k1 signature binding the node's Ethereum address to specific content hashes and timestamps ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). The answer to a discovery open is a `StreamResponse` too. Any T2 participant that sends discovery opens collects non-repudiable, EVM-verifiable, individually attributable proof that the node committed to serving (or refused) specific content at a specific time. Systematic discovery opens build a cryptographic per-node content inventory keyed by Ethereum address. Inherent to signed answers — `operator_sig` exists to make node commitments attributable. A requester recovers it before it trusts a quote, and a pull receipt keeps it as portable evidence of a serve ([Appendix: Pull Receipts](appendix-pull-receipts.md#what-a-receipt-proves)). Removing it leaves a quote that binds the node to nothing.
 
 ##### Cross-session client tracking (P-21)
 
@@ -133,7 +133,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 | P-18 | Unencrypted iroh key | Mitigate | Already planned: platform keychain in production | Pre-mainnet |
 | P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by the stable Ethereum address the payment model requires (P-02); the residual benefit against participants that get no request is already leaked through accepted P-08 and P-10 | — |
 | P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
-| P-23 | `slash_sig` content inventory | Accept | Required for attributable quotes and pull receipts; removing `slash_sig` leaves the quote unattributed | — |
+| P-23 | `operator_sig` content inventory | Accept | Required for attributable quotes and pull receipts; removing `operator_sig` leaves the quote unattributed | — |
 | P-24 | Origin attestation in DHT records | Accept | Required so that every cached copy traces to a vetted origin. The attestation names no pool, payer or client, and an origin's seats are public already. The link from a hash to one of its namespaces is new public information. It is accepted: the namespace is the publisher's own, and the publisher chooses to publish the hash through it | — |
 
 ### Candidate Mitigations

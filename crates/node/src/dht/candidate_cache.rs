@@ -22,7 +22,7 @@
 //! terms the pull checks again. That is why the TTL is the short refusal
 //! suppression's, and not something tighter.
 //!
-//! The cache stores no signature. A `StreamResponse` carries `slash_sig`: a
+//! The cache stores no signature. A `StreamResponse` carries `operator_sig`: a
 //! peer's signed statement about one answer at one time. The next pull opens
 //! the candidate again and verifies a fresh signed answer before it pays, so a
 //! retained signature is never read. A structure that survives one request to
@@ -31,7 +31,7 @@
 //!
 //! `Coverage` and the proven size are exempt from that concern, not an
 //! exception to it: both ride the unsigned `StreamResponseExt`, outside the
-//! `slash_sig` set, so they carry no author. They ride the entry so a cache-hit candidate can still be
+//! `operator_sig` set, so they carry no author. They ride the entry so a cache-hit candidate can still be
 //! range-planned (`plan_covered_runs`) against its coverage; without it a real
 //! partial holder would read as covering nothing on the hit path and be
 //! excluded from range assignment.
@@ -93,13 +93,13 @@ pub struct CachedCandidate {
     /// The path RTT measured on that open.
     pub rtt_ms: u32,
     /// The discovery blocks the provider reported holding on that answer
-    /// (`StreamResponseExt.coverage`). UNSIGNED, outside the `slash_sig` set,
+    /// (`StreamResponseExt.coverage`). UNSIGNED, outside the `operator_sig` set,
     /// so retaining it is not the signature retention the module doc forbids;
     /// it carries no author. A cache-hit candidate is range-planned
     /// against this value rather than reading as covering nothing.
     pub coverage: Coverage,
     /// The blob size the answer proved, when it carried a size proof. Outside
-    /// `slash_sig`, like `coverage`, so it carries no author either.
+    /// `operator_sig`, like `coverage`, so it carries no author either.
     /// The pull leg cuts its first upstream open from it.
     pub total_bytes_hint: Option<u64>,
 }

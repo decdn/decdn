@@ -16,7 +16,7 @@ fn sample_body() -> StreamResponseBody {
 fn sample_response() -> StreamResponse {
     StreamResponse {
         body: sample_body(),
-        slash_sig: vec![0xABu8; SLASH_SIG_LEN],
+        operator_sig: vec![0xABu8; OPERATOR_SIG_LEN],
     }
 }
 
@@ -556,7 +556,7 @@ fn stream_response_wire_format_is_stable() -> Result<(), Box<dyn std::error::Err
             rate_per_mb: 4,
             timestamp_us: 7,
         },
-        slash_sig: vec![0xABu8; SLASH_SIG_LEN],
+        operator_sig: vec![0xABu8; OPERATOR_SIG_LEN],
     };
     let bytes = postcard::to_allocvec(&resp)?;
     let mut expected = Vec::new();
@@ -564,8 +564,8 @@ fn stream_response_wire_format_is_stable() -> Result<(), Box<dyn std::error::Err
     expected.push(1u8); // body.ok = true
     expected.push(4u8); // body.rate_per_mb varint
     expected.push(7u8); // body.timestamp_us varint
-    expected.push(SLASH_SIG_LEN as u8); // slash_sig length prefix (65)
-    expected.extend_from_slice(&[0xABu8; SLASH_SIG_LEN]); // slash_sig bytes
+    expected.push(OPERATOR_SIG_LEN as u8); // operator_sig length prefix (65)
+    expected.extend_from_slice(&[0xABu8; OPERATOR_SIG_LEN]); // operator_sig bytes
     assert_eq!(bytes, expected);
 
     // Base ‖ ext, with the ext contributing only its own bytes: a reader that
@@ -671,27 +671,27 @@ fn stream_response_validate_rejects_zero_rate() {
 }
 
 #[test]
-fn stream_response_validate_rejects_empty_slash_sig() {
+fn stream_response_validate_rejects_empty_operator_sig() {
     let resp = StreamResponse {
-        slash_sig: Vec::new(),
+        operator_sig: Vec::new(),
         ..sample_response()
     };
     assert_eq!(
         resp.validate(),
-        Err(MessageValidationError::InvalidSlashSigLen { len: 0 })
+        Err(MessageValidationError::InvalidOperatorSigLen { len: 0 })
     );
 }
 
 #[test]
-fn stream_response_validate_rejects_wrong_len_slash_sig() {
+fn stream_response_validate_rejects_wrong_len_operator_sig() {
     let resp = StreamResponse {
-        slash_sig: vec![0xAB; SLASH_SIG_LEN - 1],
+        operator_sig: vec![0xAB; OPERATOR_SIG_LEN - 1],
         ..sample_response()
     };
     assert_eq!(
         resp.validate(),
-        Err(MessageValidationError::InvalidSlashSigLen {
-            len: SLASH_SIG_LEN - 1
+        Err(MessageValidationError::InvalidOperatorSigLen {
+            len: OPERATOR_SIG_LEN - 1
         })
     );
 }
@@ -1546,12 +1546,12 @@ fn client_message_validate_dispatches_to_payload() -> Result<(), MessageValidati
     assert_eq!(ClientMessage::Voucher(sample_voucher()).validate(), Ok(()));
     // Invalid payloads propagate their own error through the dispatcher.
     let bad_resp = StreamResponse {
-        slash_sig: Vec::new(),
+        operator_sig: Vec::new(),
         ..sample_response()
     };
     assert_eq!(
         ClientMessage::StreamResponse(bad_resp).validate(),
-        Err(MessageValidationError::InvalidSlashSigLen { len: 0 })
+        Err(MessageValidationError::InvalidOperatorSigLen { len: 0 })
     );
     let bad_voucher = Voucher {
         signature: Vec::new(),
@@ -1679,13 +1679,13 @@ fn stream_response_frame_ceiling_holds_the_largest_response()
             rate_per_mb: MAX_RATE_PER_MB,
             timestamp_us: u64::MAX,
         },
-        slash_sig: vec![0x09; SLASH_SIG_LEN],
+        operator_sig: vec![0x09; OPERATOR_SIG_LEN],
     };
     let attestation = crate::dht::OriginAttestation {
         namespace_id: [0xFF; 32],
         timestamp_us: u64::MAX,
         ttl_sec: u32::MAX,
-        sig: vec![0x0D; SLASH_SIG_LEN],
+        sig: vec![0x0D; OPERATOR_SIG_LEN],
     };
     let response_len = encode_stream_response(
         &response,

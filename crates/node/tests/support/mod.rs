@@ -547,7 +547,7 @@ pub(crate) async fn reap<T>(label: &str, task: tokio::task::JoinHandle<T>) -> an
 /// client-binding. Grouped so callers thread one value through the builders.
 #[derive(Clone)]
 pub(crate) struct HandlerDomains {
-    pub slash: Eip712Domain,
+    pub stream_dom: Eip712Domain,
     pub voucher: Eip712Domain,
     pub binding: Eip712Domain,
 }
@@ -800,7 +800,7 @@ fn client_handler_deps(
         limiter,
         cache,
         Arc::clone(server_eth),
-        domains.slash.clone(),
+        domains.stream_dom.clone(),
         domains.binding.clone(),
         decdn_node::handlers::client::PoolRoute::new(deployment_of(&domains.voucher), store),
         receipt_sink,

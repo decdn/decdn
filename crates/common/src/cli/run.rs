@@ -90,7 +90,7 @@ pub struct BlockchainArgs {
     pub keystore_password_file: Option<PathBuf>,
 
     /// `CapacityBond` contract address (0x-prefixed hex). Also the EIP-712
-    /// `verifyingContract` for the stream response signature `slash_sig`
+    /// `verifyingContract` for the stream response signature `operator_sig`
     /// (ADR 005 § Signer binding).
     #[arg(long, value_name = "ADDR", env = "DECDN_CAPACITY_BOND_ADDRESS")]
     pub capacity_bond_address: Option<String>,

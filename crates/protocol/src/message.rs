@@ -1,9 +1,9 @@
-//! Items every signed wire message shares: the rate bound, the `slash_sig`
+//! Items every signed wire message shares: the rate bound, the `operator_sig`
 //! length, the validation errors, and the empty-blob root.
 //!
 //! The per-ALPN message types live in [`crate::client`] and [`crate::dht`].
 //! This crate holds no cryptography: the caller (`decdn_incentive`) computes
-//! and verifies every EIP-712 `slash_sig`.
+//! and verifies every EIP-712 `operator_sig`.
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -32,22 +32,22 @@ pub const MAX_RATE_PER_MB: u64 = 1000;
 
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///
-/// ADR 005 § Signer binding mandates `slash_sig` is **non-empty** and that
+/// ADR 005 § Signer binding mandates `operator_sig` is **non-empty** and that
 /// requesters MUST reject missing/zero-length signatures — it does not itself
-/// fix a byte length. Off-chain `slash_sig` producers are EOA-only — ADR 024
+/// fix a byte length. Off-chain `operator_sig` producers are EOA-only — ADR 024
 /// §Off-Chain ERC-1271 Verification: "Every signature deCDN produces or
 /// verifies off-chain … is the fixed 65-byte secp256k1 `r‖s‖v` form" — which
 /// is always exactly this length. Enforcing exactly this length off-chain is
 /// the correct, intentionally-strict bound for the EOA producer set. When
 /// off-chain ERC-1271 handling lands this constant becomes a lower bound.
-pub const SLASH_SIG_LEN: usize = 65;
+pub const OPERATOR_SIG_LEN: usize = 65;
 
 /// Errors produced when validating wire-decoded protocol messages.
 ///
 /// `RateTooLarge` surfaces from the [`Deserialize`] impl on
 /// [`crate::StreamResponseBody`] (postcard wraps it as [`postcard::Error`]
 /// which the framing layer maps to [`crate::FrameError::Decode`]).
-/// `InvalidSlashSigLen` is a requester-side obligation enforced via
+/// `InvalidOperatorSigLen` is a requester-side obligation enforced via
 /// [`crate::StreamResponse::validate`] — it is intentionally NOT enforced at
 /// decode time so the handler can build the response before signing it.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -67,17 +67,17 @@ pub enum MessageValidationError {
     /// can still build a response before signing it.
     #[error("rate_per_mb is zero (requesters must reject; #252)")]
     RateIsZero,
-    /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 005
+    /// `operator_sig` is missing or not [`OPERATOR_SIG_LEN`] bytes. ADR 005
     /// § Signer binding mandates a non-empty signature on every signed response; the
     /// EOA-only off-chain signing path (ADR 024 §Off-Chain Signature
-    /// Verification — EOA Recovery Only) makes that exactly [`SLASH_SIG_LEN`],
+    /// Verification — EOA Recovery Only) makes that exactly [`OPERATOR_SIG_LEN`],
     /// which requesters MUST reject deviations from.
     #[error(
-        "slash_sig has invalid length {len} \
+        "operator_sig has invalid length {len} \
          (ADR 005 § Signer binding: mandatory non-empty; EOA form is {expected} bytes)",
-        expected = SLASH_SIG_LEN
+        expected = OPERATOR_SIG_LEN
     )]
-    InvalidSlashSigLen {
+    InvalidOperatorSigLen {
         /// The signature length that was offered.
         len: usize,
     },

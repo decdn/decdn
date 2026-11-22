@@ -59,7 +59,7 @@ use decdn_client::{
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
     binding_signing_hash, capacity_bond_domain, min_payment, signed_to_wire_voucher,
-    stream_sig::StreamSlashData, voucher_domain,
+    stream_sig::StreamSigData, voucher_domain,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps, ClientProtocol};
@@ -101,7 +101,7 @@ fn hex_lower(bytes: &[u8]) -> String {
     })
 }
 
-fn slash_domain() -> Eip712Domain {
+fn stream_domain() -> Eip712Domain {
     capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x11))
 }
 
@@ -133,7 +133,7 @@ fn binding_domain() -> Eip712Domain {
 /// The loopback suite's fixed EIP-712 domains.
 fn loopback_domains() -> HandlerDomains {
     HandlerDomains {
-        slash: slash_domain(),
+        stream_dom: stream_domain(),
         voucher: payment_domain(),
         binding: binding_domain(),
     }
@@ -370,7 +370,7 @@ async fn client_delivery_roundtrip_advances_lane_state() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -488,7 +488,7 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     let got_a = stream_fetch_on(
         &warm,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash_a.as_bytes(),
         0,
@@ -515,7 +515,7 @@ async fn two_hashes_reuse_one_warm_connection() -> anyhow::Result<()> {
     let got_b = stream_fetch_on(
         &warm,
         &ctx_b,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash_b.as_bytes(),
         0,
@@ -593,14 +593,14 @@ async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Res
     let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let connections = Connections::new(client_ep.clone());
     let source = PeerSource::new(
         &client_ep,
         target,
         Arc::clone(&ctx),
         Arc::clone(&ledger),
-        &slash,
+        &stream_dom,
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
@@ -721,13 +721,13 @@ async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
     let ctx = pool_context(&client_ep, Arc::clone(&client_signer), deposit);
     let ledger = Arc::new(ctx.new_ledger());
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let source = PeerSource::new(
         &client_ep,
         target,
         Arc::clone(&ctx),
         Arc::clone(&ledger),
-        &slash,
+        &stream_dom,
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
@@ -853,7 +853,7 @@ async fn restarted_sub_chunk_transfer(earlier: u64) -> anyhow::Result<()> {
                 client_ep,
                 target,
                 &ctx,
-                &slash_domain(),
+                &stream_domain(),
                 server,
                 *hash.as_bytes(),
                 0,
@@ -3204,7 +3204,7 @@ async fn empty_blob_delivery(max_blob_size_bytes: u64) -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -3317,7 +3317,7 @@ async fn tracked_watermark_survives_post_ack_error() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -3456,7 +3456,7 @@ async fn accepted_voucher_advances_lane_activity_clock() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -3551,7 +3551,7 @@ async fn voucher_acceptance_appends_download_receipt() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -3702,7 +3702,7 @@ async fn delivery_completes_while_receipt_writer_is_stalled() -> anyhow::Result<
             &client_ep,
             target,
             &ctx,
-            &slash_domain(),
+            &stream_domain(),
             server_eth.address(),
             *hash.as_bytes(),
             0,
@@ -3791,7 +3791,7 @@ async fn receipt_log_write_failure_does_not_fail_delivery() -> anyhow::Result<()
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -3872,7 +3872,7 @@ async fn client_reused_lane_resumes() -> anyhow::Result<()> {
         &client_ep,
         target.clone(),
         &ctx1,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -3906,7 +3906,7 @@ async fn client_reused_lane_resumes() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx2,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -3996,7 +3996,7 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
         &client_ep,
         target.clone(),
         &ctx1,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4032,7 +4032,7 @@ async fn client_restart_with_stale_watermark_heals_and_resumes() -> anyhow::Resu
         &client_ep,
         target,
         &ctx2,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4110,7 +4110,7 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
         &client_ep,
         target.clone(),
         &ctx1,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4134,7 +4134,7 @@ async fn client_ahead_of_the_node_rebases_and_resumes() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx2,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4267,7 +4267,7 @@ async fn a_restarted_payer_beside_a_live_sibling_heals_below_the_anchor() -> any
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4403,7 +4403,7 @@ async fn resume_under_a_live_chain(above_anchor: u64) -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4489,7 +4489,7 @@ async fn an_unadopted_chain_past_the_bundle_is_retired_and_the_pull_completes() 
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4578,7 +4578,7 @@ async fn an_amount_regression_on_a_trailing_reveal_heals_and_the_pull_completes(
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -4633,7 +4633,7 @@ async fn a_process_that_exits_before_its_last_persist_heals_in_one_rejection() -
     let (target, server_eth, server_ep, server_task, metrics) =
         spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let sd = slash_domain();
+    let sd = stream_domain();
     let deadlines = PullDeadlines::whole_transfer(Duration::from_secs(15));
 
     // The first process: one ledger across both entries. It persists after
@@ -4770,7 +4770,7 @@ async fn client_byte_offset_returns_suffix_multi_group() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         offset,
@@ -4860,7 +4860,7 @@ async fn client_byte_offset_returns_suffix() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         offset,
@@ -4944,7 +4944,7 @@ async fn client_rejects_zero_rate_response() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -5399,7 +5399,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -5732,7 +5732,7 @@ async fn client_store_record_failure_aborts_the_stream() -> anyhow::Result<()> {
             &client_ep,
             target,
             &ctx,
-            &slash_domain(),
+            &stream_domain(),
             server_eth.address(),
             *hash.as_bytes(),
             0,
@@ -5812,7 +5812,7 @@ async fn fetch_on_a_lane_expiring_at(
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -5942,7 +5942,7 @@ fn seeded_store() -> anyhow::Result<(Arc<dyn PoolStateStore>, Arc<PrivateKeySign
 }
 
 /// Spin up a server endpoint running a `ClientHandler` over `cache`/`store`,
-/// returning the dialable target, the node's Ethereum signer (for `slash_sig`
+/// returning the dialable target, the node's Ethereum signer (for `operator_sig`
 /// verification), the server endpoint, and its accept-loop handle.
 async fn spawn_handler_server(
     cache: CacheEngine,
@@ -7142,7 +7142,7 @@ async fn a_mid_stream_pool_exhausted_keeps_the_proofs_the_node_accepted() -> any
     )
     .await?;
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let sd = slash_domain();
+    let sd = stream_domain();
     let deadlines = PullDeadlines::whole_transfer(Duration::from_secs(15));
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -7309,7 +7309,7 @@ async fn a_pool_exhausted_between_root_voucher_and_reveal_resumes_without_heal()
     )
     .await?;
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let sd = slash_domain();
+    let sd = stream_domain();
     let deadlines = PullDeadlines::whole_transfer(Duration::from_secs(15));
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
@@ -7391,7 +7391,7 @@ async fn a_payer_that_leaves_mid_stream_books_no_loss_and_the_lane_resumes() -> 
         spawn_pipelined_server_with_metrics(cache, store).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let sd = slash_domain();
+    let sd = stream_domain();
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
 
@@ -7492,7 +7492,7 @@ async fn a_mere_disconnect_is_not_a_write_off() -> anyhow::Result<()> {
         spawn_pipelined_server(cache, store).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let sd = slash_domain();
+    let sd = stream_domain();
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
 
@@ -8004,7 +8004,7 @@ async fn buyer_refuses_an_oversized_small_blob_without_paying() -> anyhow::Resul
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -8055,7 +8055,7 @@ async fn buyer_refuses_an_over_ceiling_blob_without_paying() -> anyhow::Result<(
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -8105,7 +8105,7 @@ async fn buyer_rejects_over_ceiling_rate() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -8165,7 +8165,7 @@ async fn buyer_accepts_blob_at_exact_ceiling() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -8233,13 +8233,13 @@ async fn a_pull_stopped_at_a_split_pays_within_one_window_and_the_lane_pulls_on(
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, signer, deposit);
     let ledger = Arc::new(ctx.new_ledger());
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let source = PeerSource::new(
         &client_ep,
         target,
         Arc::new(std::sync::Mutex::new(ctx)),
         Arc::clone(&ledger),
-        &slash,
+        &stream_dom,
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
@@ -8338,13 +8338,13 @@ async fn gap_scoped_leg_bounds_its_received_bytes_by_the_cap_from_its_own_offset
     let ledger = Arc::new(ctx.new_ledger());
     let mib: u64 = 1024 * 1024;
     let ceiling: u64 = 3 * mib / 2;
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let source = PeerSource::new(
         &client_ep,
         target,
         Arc::new(std::sync::Mutex::new(ctx)),
         Arc::clone(&ledger),
-        &slash,
+        &stream_dom,
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         ceiling,
@@ -8417,7 +8417,7 @@ async fn buyer_accepts_rate_at_exact_ceiling() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -8470,7 +8470,7 @@ async fn progress_callback_reports_monotonic_delivery() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -8628,7 +8628,7 @@ async fn denylisted_hash_is_refused_even_when_held() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -8685,7 +8685,7 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -8754,7 +8754,7 @@ async fn takedown_mid_stream_terminates_the_delivery() -> anyhow::Result<()> {
             &fetch_ep,
             target,
             &ctx,
-            &slash_domain(),
+            &stream_domain(),
             server_addr,
             hash_bytes,
             0,
@@ -8858,7 +8858,7 @@ async fn unseating_the_attesting_origin_mid_stream_terminates_the_delivery() -> 
             &fetch_ep,
             target,
             &ctx,
-            &slash_domain(),
+            &stream_domain(),
             server_addr,
             hash_bytes,
             0,
@@ -8926,7 +8926,7 @@ async fn blacklisted_funder_is_refused_on_a_cache_miss() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         [0x5a; 32], // never cached — the miss path
         0,
@@ -8970,7 +8970,7 @@ async fn client_withdrawn_blob_is_refused() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -9356,7 +9356,7 @@ async fn expect_signed_refusal(
     match raw_request(client_ep, target, req, ext).await? {
         (ClientMessage::StreamResponse(resp), resp_ext) => {
             anyhow::ensure!(!resp.body.ok, "expected a refusal, got a serve");
-            anyhow::ensure!(!resp.slash_sig.is_empty(), "the refusal must be signed");
+            anyhow::ensure!(!resp.operator_sig.is_empty(), "the refusal must be signed");
             anyhow::ensure!(
                 resp.body.timestamp_us == req.timestamp_us,
                 "the signed refusal echoes the request timestamp"
@@ -9402,7 +9402,7 @@ async fn a_stale_stream_on_a_warm_connection_is_typed_and_refused_alone() -> any
             stream_fetch_on(
                 warm,
                 &ctx,
-                &slash_domain(),
+                &stream_domain(),
                 expected,
                 *hash.as_bytes(),
                 0,
@@ -9826,7 +9826,7 @@ async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Re
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -9898,7 +9898,7 @@ async fn blacklisting_the_funder_mid_stream_cuts_off_a_delegated_delivery() -> a
             &fetch_ep,
             target,
             &ctx,
-            &slash_domain(),
+            &stream_domain(),
             server_addr,
             hash_bytes,
             0,
@@ -9990,7 +9990,7 @@ async fn client_concurrent_same_lane_both_succeed() -> anyhow::Result<()> {
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let server_addr = server_eth.address();
-    let sd = slash_domain();
+    let sd = stream_domain();
     let (ra, rb) = tokio::join!(
         stream_fetch_shared(
             &client_ep,
@@ -10101,7 +10101,7 @@ async fn honest_concurrent_rollovers_draw_no_voucher_rejection() -> anyhow::Resu
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let server_addr = server_eth.address();
-    let sd = slash_domain();
+    let sd = stream_domain();
     for round in 0..2u64 {
         let (ra, rb) = tokio::join!(
             stream_fetch_shared(
@@ -10179,7 +10179,7 @@ async fn a_sub_chunk_stream_on_a_live_chain_sends_only_its_closing_voucher() -> 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let sd = slash_domain();
+    let sd = stream_domain();
     let fetch = |hash: decdn_cache::Hash, request_id: u64| {
         stream_fetch_shared(
             &client_ep,
@@ -10282,7 +10282,7 @@ async fn client_not_found_is_refused() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         [0x42u8; 32], // a hash the node does not hold
         0,
@@ -11373,7 +11373,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -11488,7 +11488,7 @@ async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *foreign_hash.as_bytes(),
         0,
@@ -11526,7 +11526,7 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -11567,7 +11567,7 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *foreign_hash.as_bytes(),
         0,
@@ -11615,7 +11615,7 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -11712,7 +11712,7 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -11817,7 +11817,7 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -11872,7 +11872,7 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -11922,7 +11922,7 @@ async fn own_origin_serves_with_node_to_node_off() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -11965,7 +11965,7 @@ async fn own_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -12024,7 +12024,7 @@ async fn own_origin_absence_is_clean_cache_miss() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -12121,7 +12121,7 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
             &client_ep,
             target.clone(),
             &ctx,
-            &slash_domain(),
+            &stream_domain(),
             server_eth_addr,
             *hash.as_bytes(),
             0,
@@ -12214,13 +12214,13 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     let own_node_id = B256::from(*client_ep.id().as_bytes());
     let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let fetch = || {
         stream_fetch(
             &client_ep,
             target.clone(),
             &ctx,
-            &slash,
+            &stream_dom,
             server_eth_addr,
             *hash.as_bytes(),
             0,
@@ -12571,7 +12571,7 @@ async fn own_origin_fault_is_internal_error_not_signed_not_found() -> anyhow::Re
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -12635,7 +12635,7 @@ async fn own_origin_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -12714,7 +12714,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth_addr,
         *hash.as_bytes(),
         0,
@@ -14205,7 +14205,7 @@ enum Lie {
 async fn serve_lying_stream(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     served_wire: &[u8],
     advertised_total_bytes: u64,
     lie: Lie,
@@ -14235,12 +14235,12 @@ async fn serve_lying_stream(
         rate_per_mb: RATE_PER_MB,
         timestamp_us: req.timestamp_us,
     };
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse { body, slash_sig };
+    let resp = StreamResponse { body, operator_sig };
     write_frame(
         &mut send,
         &encode_stream_response(
@@ -14323,7 +14323,7 @@ async fn serve_lying_stream(
 fn spawn_lying_server(
     ep: Endpoint,
     eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     served_wire: Vec<u8>,
     advertised_total_bytes: u64,
     lie: Lie,
@@ -14333,7 +14333,7 @@ fn spawn_lying_server(
             let _ = serve_lying_stream(
                 conn,
                 &eth,
-                &slash,
+                &stream_dom,
                 &served_wire,
                 advertised_total_bytes,
                 lie,
@@ -14367,7 +14367,7 @@ async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> an
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         wire,
         total_bytes,
         Lie::OverSend,
@@ -14384,7 +14384,7 @@ async fn client_rejects_a_server_that_oversends_past_the_promised_length() -> an
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -14425,7 +14425,7 @@ async fn a_zero_byte_stream_end_against_held_credit_is_written_off() -> anyhow::
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         Vec::new(),
         total_bytes,
         Lie::WrongBytes,
@@ -14444,7 +14444,7 @@ async fn a_zero_byte_stream_end_against_held_credit_is_written_off() -> anyhow::
     ledger.trust().note_verified(100 * 1024 * 1024);
     let window_before = ledger.trust().window_bytes(RATE_PER_MB);
 
-    let sd = slash_domain();
+    let sd = stream_domain();
     let err = stream_fetch_shared(
         &client_ep,
         target,
@@ -14512,7 +14512,7 @@ async fn a_partial_delivery_before_an_early_stream_end_writes_off_the_unverified
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         prefix,
         total_bytes,
         Lie::WrongBytes,
@@ -14526,7 +14526,7 @@ async fn a_partial_delivery_before_an_early_stream_end_writes_off_the_unverified
         U256::from(10_000_000u64),
     );
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let sd = slash_domain();
+    let sd = stream_domain();
     let err = stream_fetch_shared(
         &client_ep,
         target,
@@ -14594,7 +14594,7 @@ async fn a_stop_counts_the_frames_it_reads_past_the_split_as_wire_bytes() -> any
                 let _ = serve_lying_stream(
                     conn,
                     &eth,
-                    &slash_domain(),
+                    &stream_domain(),
                     &wire,
                     total,
                     Lie::OverSend,
@@ -14613,13 +14613,13 @@ async fn a_stop_counts_the_frames_it_reads_past_the_split_as_wire_bytes() -> any
         U256::from(10_000_000u64),
     );
     let ledger = Arc::new(ctx.new_ledger());
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let source = PeerSource::new(
         &client_ep,
         target,
         Arc::new(std::sync::Mutex::new(ctx)),
         Arc::clone(&ledger),
-        &slash,
+        &stream_dom,
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
@@ -14676,7 +14676,7 @@ async fn client_rejects_a_frame_that_straddles_the_promised_length() -> anyhow::
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         wire,
         total_bytes,
         Lie::OverSendStraddling,
@@ -14694,7 +14694,7 @@ async fn client_rejects_a_frame_that_straddles_the_promised_length() -> anyhow::
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -14749,7 +14749,7 @@ async fn client_rejects_hash_mismatched_bytes() -> anyhow::Result<()> {
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         served_wire,
         total_bytes,
         Lie::WrongBytes,
@@ -14766,7 +14766,7 @@ async fn client_rejects_hash_mismatched_bytes() -> anyhow::Result<()> {
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *wanted_hash.as_bytes(),
         0,
@@ -14802,7 +14802,7 @@ async fn client_rejects_an_empty_claim_for_a_non_empty_hash() -> anyhow::Result<
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         Vec::new(),
         0,
         Lie::WrongBytes,
@@ -14819,7 +14819,7 @@ async fn client_rejects_an_empty_claim_for_a_non_empty_hash() -> anyhow::Result<
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *wanted_hash.as_bytes(),
         0,
@@ -14854,7 +14854,7 @@ async fn fetch_inflated_garbage(frame: usize) -> anyhow::Result<(anyhow::Error, 
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         Vec::new(),
         claimed_total,
         Lie::InflatedGarbage { frame },
@@ -14874,7 +14874,7 @@ async fn fetch_inflated_garbage(frame: usize) -> anyhow::Result<(anyhow::Error, 
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -14933,7 +14933,7 @@ async fn client_refuses_an_oversized_stream_response_on_its_prefix() -> anyhow::
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         Vec::new(),
         1024,
         Lie::OversizedResponse,
@@ -14952,7 +14952,7 @@ async fn client_refuses_an_oversized_stream_response_on_its_prefix() -> anyhow::
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -15063,7 +15063,7 @@ async fn client_pays_for_an_honest_prefix_and_stops_at_the_first_bad_group() -> 
     let server_task = spawn_lying_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         wire,
         total_bytes,
         Lie::WrongBytes,
@@ -15081,7 +15081,7 @@ async fn client_pays_for_an_honest_prefix_and_stops_at_the_first_bad_group() -> 
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         decdn_protocol::client::NO_NAMESPACE,
@@ -15363,7 +15363,7 @@ enum StopThenSignal {
 async fn serve_stop_send_then_signal(
     conn: Connection,
     eth: &Arc<PrivateKeySigner>,
-    slash: &Eip712Domain,
+    stream_dom: &Eip712Domain,
     payload: &[u8],
     signal: StopThenSignal,
 ) -> anyhow::Result<()> {
@@ -15383,12 +15383,12 @@ async fn serve_stop_send_then_signal(
         rate_per_mb: RATE_PER_MB,
         timestamp_us: req.timestamp_us,
     };
-    let slash_sig = StreamSlashData::from_response_body(&body)
-        .sign(eth.as_ref(), slash)
-        .map_err(|e| anyhow::anyhow!("slash sign: {e}"))?
+    let operator_sig = StreamSigData::from_response_body(&body)
+        .sign(eth.as_ref(), stream_dom)
+        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
         .as_bytes()
         .to_vec();
-    let resp = StreamResponse { body, slash_sig };
+    let resp = StreamResponse { body, operator_sig };
     write_frame(
         &mut send,
         &encode_stream_response(&resp, Some(&support::proven_ext(&resp, total_bytes)))?,
@@ -15440,11 +15440,11 @@ async fn serve_stop_send_then_signal(
 fn spawn_stop_send_server(
     ep: Endpoint,
     eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     payload: Vec<u8>,
     signal: StopThenSignal,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_stop_send_server_counting(ep, eth, slash, payload, signal, 1, Arc::default())
+    spawn_stop_send_server_counting(ep, eth, stream_dom, payload, signal, 1, Arc::default())
 }
 
 /// Spawn a [`serve_stop_send_then_signal`] server that accepts up to `max_conns`
@@ -15456,7 +15456,7 @@ fn spawn_stop_send_server(
 fn spawn_stop_send_server_counting(
     ep: Endpoint,
     eth: Arc<PrivateKeySigner>,
-    slash: Eip712Domain,
+    stream_dom: Eip712Domain,
     payload: Vec<u8>,
     signal: StopThenSignal,
     max_conns: usize,
@@ -15471,9 +15471,11 @@ fn spawn_stop_send_server_counting(
                 break;
             };
             accepted.fetch_add(1, Ordering::SeqCst);
-            let (eth, slash, payload) = (Arc::clone(&eth), slash.clone(), Arc::clone(&payload));
+            let (eth, stream_dom, payload) =
+                (Arc::clone(&eth), stream_dom.clone(), Arc::clone(&payload));
             serves.push(tokio::spawn(async move {
-                let _ = serve_stop_send_then_signal(conn, &eth, &slash, &payload, signal).await;
+                let _ =
+                    serve_stop_send_then_signal(conn, &eth, &stream_dom, &payload, signal).await;
             }));
         }
         for serve in serves {
@@ -15504,7 +15506,7 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
     let server_task = spawn_stop_send_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         payload.clone(),
         StopThenSignal::Reject(VoucherRejectReason::SpendingCapExhausted),
     );
@@ -15520,7 +15522,7 @@ async fn client_surfaces_typed_rejection_when_its_send_is_stopped_before_the_clo
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -15554,7 +15556,7 @@ async fn fetch_with_frames_in_flight(signal: StopThenSignal) -> anyhow::Result<a
     let server_task = spawn_stop_send_server(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         payload,
         signal,
     );
@@ -15570,7 +15572,7 @@ async fn fetch_with_frames_in_flight(signal: StopThenSignal) -> anyhow::Result<a
         &client_ep,
         target,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,
@@ -15703,7 +15705,7 @@ async fn drive_against_stop_send_server(
     let server_task = spawn_stop_send_server_counting(
         server_ep.clone(),
         Arc::clone(&server_eth),
-        slash_domain(),
+        stream_domain(),
         payload,
         signal,
         3,
@@ -15721,13 +15723,13 @@ async fn drive_against_stop_send_server(
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
     let store_dir = tempfile::tempdir()?;
     let store = ClientRangedStore::create(store_dir.path(), "blob", *hash.as_bytes(), total_bytes)?;
-    let slash = slash_domain();
+    let stream_dom = stream_domain();
     let source = PeerSource::new(
         &client_ep,
         target,
         Arc::clone(&ctx),
         Arc::clone(&ledger),
-        &slash,
+        &stream_dom,
         server_eth.address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,
@@ -16040,10 +16042,10 @@ async fn an_open_on_a_hit_answers_its_quote_size_and_full_coverage() -> anyhow::
         "a hit covers every block"
     );
     anyhow::ensure!(resp_ext.consistent_with(&resp.body, 0, 0));
-    let slash = StreamSlashData::from_response_body(&resp.body);
-    let recovered = slash.recover_signer(
-        &alloy::primitives::Signature::try_from(resp.slash_sig.as_slice())?,
-        &slash_domain(),
+    let sig_data = StreamSigData::from_response_body(&resp.body);
+    let recovered = sig_data.recover_signer(
+        &alloy::primitives::Signature::try_from(resp.operator_sig.as_slice())?,
+        &stream_domain(),
     )?;
     anyhow::ensure!(recovered == server_eth.address(), "the answer is signed");
     anyhow::ensure!(view.reads() == 0, "the open reads no chain state");
@@ -16343,7 +16345,7 @@ async fn a_discovery_open_past_the_end_asks_for_the_whole_blob() -> anyhow::Resu
             rtt_threshold_ms: 150.0,
             margin_ms: 30.0,
         },
-        &slash_domain(),
+        &stream_domain(),
         decdn_client::targets::OpenRound::Settle,
     )
     .await?;
@@ -16971,7 +16973,7 @@ async fn unpaid_opens_take_no_shed_slot() -> anyhow::Result<()> {
     let got = stream_fetch_on(
         &warm,
         &ctx,
-        &slash_domain(),
+        &stream_domain(),
         server_eth.address(),
         *hash.as_bytes(),
         0,

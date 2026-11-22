@@ -22,7 +22,7 @@ fn att() -> OriginAttestation {
         namespace_id: [7; 32],
         timestamp_us: 1_700_000_000_000_000,
         ttl_sec: DEFAULT_ATTESTATION_TTL_SEC,
-        sig: vec![0x5A; SLASH_SIG_LEN],
+        sig: vec![0x5A; OPERATOR_SIG_LEN],
     }
 }
 
@@ -32,7 +32,7 @@ fn widest_att() -> OriginAttestation {
         namespace_id: [0xFF; 32],
         timestamp_us: u64::MAX,
         ttl_sec: u32::MAX,
-        sig: vec![0x5A; SLASH_SIG_LEN],
+        sig: vec![0x5A; OPERATOR_SIG_LEN],
     }
 }
 
@@ -549,7 +549,7 @@ fn closer_nodes_try_new_enforces_cap() {
 
 #[test]
 fn attestation_decode_rejects_a_wrong_signature_length() -> Result<(), postcard::Error> {
-    for len in [0, SLASH_SIG_LEN - 1, SLASH_SIG_LEN + 1] {
+    for len in [0, OPERATOR_SIG_LEN - 1, OPERATOR_SIG_LEN + 1] {
         let bytes = postcard::to_allocvec(&OriginAttestation {
             sig: vec![0; len],
             ..att()

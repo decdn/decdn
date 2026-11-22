@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::coverage::Coverage;
 use crate::identity::{ContentHash, NodeId};
-use crate::message::SLASH_SIG_LEN;
+use crate::message::OPERATOR_SIG_LEN;
 
 /// Wire-level maximum number of providers a [`FindValueResponse`] may carry
 /// (ADR 022 §Content Records and TTL). With 200-byte coverage bitmaps and full
@@ -126,7 +126,7 @@ pub struct OriginAttestation {
     /// The attestation's lifetime in seconds, from `timestamp_us`.
     pub ttl_sec: u32,
     /// The origin's 65-byte EIP-712 signature. Any other length fails decode.
-    #[serde(deserialize_with = "deserialize_slash_sig")]
+    #[serde(deserialize_with = "deserialize_operator_sig")]
     pub sig: Vec<u8>,
 }
 
@@ -579,14 +579,14 @@ where
     deserialize_bounded_vec(d, MAX_BATCH_STORE_HASHES, "entries")
 }
 
-fn deserialize_slash_sig<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+fn deserialize_operator_sig<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let v = Vec::<u8>::deserialize(d)?;
-    if v.len() != SLASH_SIG_LEN {
+    if v.len() != OPERATOR_SIG_LEN {
         return Err(de::Error::custom(format!(
-            "attestation signature length {} is not {SLASH_SIG_LEN}",
+            "attestation signature length {} is not {OPERATOR_SIG_LEN}",
             v.len(),
         )));
     }

@@ -12,7 +12,7 @@
 //! Like [`crate::message`] this is a leaf crate with **no crypto dependency**.
 //! The two signed artifacts on this protocol are produced/verified by
 //! `decdn_incentive`:
-//!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
+//!   - `StreamResponse.operator_sig` — an EIP-712 secp256k1 signature over the
 //!     signed body fields `{hash, ok, rate_per_mb, timestamp_us}` (ADR 005
 //!     § Signer binding), produced by the stream-response signer in
 //!     `decdn_incentive`.
@@ -37,7 +37,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::message::{EMPTY_ROOT, MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
+use crate::message::{EMPTY_ROOT, MAX_RATE_PER_MB, MessageValidationError, OPERATOR_SIG_LEN};
 
 /// One megabyte in bytes (ADR 003: 1 MB = 1,048,576 bytes, exactly). The unit
 /// of `rate_per_mb` and, by the identity below, of [`CHUNK_BYTES`].
@@ -109,14 +109,14 @@ pub const MAX_STREAM_RESPONSE_FRAME: u32 = 8 * 1024;
 pub const MAX_CHUNK_FRAME: u32 = chunk_frame_postcard_len(CHUNK_BYTES as usize) as u32;
 
 /// Exact byte length of an EOA secp256k1 voucher signature (`r‖s‖v`, 32+32+1).
-/// Mirrors [`SLASH_SIG_LEN`]; both are the EOA off-chain signing form (ADR 024
+/// Mirrors [`OPERATOR_SIG_LEN`]; both are the EOA off-chain signing form (ADR 024
 /// §Off-Chain Signature Verification — EOA Recovery Only). Carried as a `Vec<u8>` on the wire (serde
 /// derives array impls only up to `[T; 32]`), with the length pinned by
 /// [`Voucher::validate`].
 pub const VOUCHER_SIG_LEN: usize = 65;
 
 /// Exact byte length of a `BindNodeId` client-binding signature (`r‖s‖v`,
-/// 32+32+1). The same EOA off-chain EIP-712 signing form as [`SLASH_SIG_LEN`] /
+/// 32+32+1). The same EOA off-chain EIP-712 signing form as [`OPERATOR_SIG_LEN`] /
 /// [`VOUCHER_SIG_LEN`] (ADR 024 §Off-Chain Signature Verification — EOA Recovery Only); pinned by
 /// [`ClientBinding::validate`].
 pub const BINDING_SIG_LEN: usize = 65;
@@ -468,11 +468,11 @@ pub fn parse_stream_request_ext(remainder: &[u8]) -> Result<StreamRequestExt, po
 /// Node → payer response to a [`StreamRequest`] (ADR 005 §`cdn/client/v1`).
 ///
 /// **This struct holds only the frozen base** (ADR 013 §Tier 1): the signed
-/// [`StreamResponseBody`] and the `slash_sig` covering it. Unsigned fields live
+/// [`StreamResponseBody`] and the `operator_sig` covering it. Unsigned fields live
 /// in [`StreamResponseExt`], which travels as separate trailing bytes — see
 /// [`encode_stream_response`] / [`parse_stream_response_ext`].
 ///
-/// `slash_sig` is mandatory and non-empty (exactly [`SLASH_SIG_LEN`] bytes);
+/// `operator_sig` is mandatory and non-empty (exactly [`OPERATOR_SIG_LEN`] bytes);
 /// requesters MUST reject missing/zero-length or zero-`rate_per_mb` responses
 /// (enforced via [`StreamResponse::validate`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,15 +481,15 @@ pub struct StreamResponse {
     pub body: StreamResponseBody,
     /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 005
     /// § Signer binding; produced by the `decdn_incentive` stream signer). Always exactly
-    /// [`SLASH_SIG_LEN`] bytes — *not* a signature over postcard bytes.
-    pub slash_sig: Vec<u8>,
+    /// [`OPERATOR_SIG_LEN`] bytes — *not* a signature over postcard bytes.
+    pub operator_sig: Vec<u8>,
 }
 
 /// Optional [`StreamResponse`] extension fields, carried as trailing bytes after
 /// the `StreamResponse` message via the two-phase pattern (ADR 013 §Tier 1; see
 /// [`encode_stream_response`] / [`parse_stream_response_ext`]).
 ///
-/// Nothing here is covered by `slash_sig`. New fields are appended to the END
+/// Nothing here is covered by `operator_sig`. New fields are appended to the END
 /// and MUST be `Option<T>` or have a meaningful `Default`; insertions and
 /// reordering are Tier-3.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -783,7 +783,7 @@ impl StreamResponse {
     /// - `rate_per_mb` within `(0, MAX_RATE_PER_MB]` (the decode path already
     ///   enforces the upper bound via `deserialize_rate_per_mb`; this adds the
     ///   zero-rate rule),
-    /// - `slash_sig` exactly [`SLASH_SIG_LEN`] bytes.
+    /// - `operator_sig` exactly [`OPERATOR_SIG_LEN`] bytes.
     ///
     /// The `ok`/`error` consistency rule is NOT here: `error` lives in
     /// [`StreamResponseExt`], which this method cannot see. A receiver must also
@@ -803,9 +803,9 @@ impl StreamResponse {
         if self.body.rate_per_mb == 0 {
             return Err(MessageValidationError::RateIsZero);
         }
-        if self.slash_sig.len() != SLASH_SIG_LEN {
-            return Err(MessageValidationError::InvalidSlashSigLen {
-                len: self.slash_sig.len(),
+        if self.operator_sig.len() != OPERATOR_SIG_LEN {
+            return Err(MessageValidationError::InvalidOperatorSigLen {
+                len: self.operator_sig.len(),
             });
         }
         Ok(())

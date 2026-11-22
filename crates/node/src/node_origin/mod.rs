@@ -697,9 +697,9 @@ pub struct NodeOriginDeps {
     pub buyer_pool: BuyerPool,
     /// This node's DHT id, the lookup requester.
     pub self_id: DhtNodeId,
-    /// EIP-712 domain verifying the delivery `slash_sig` (ADR 005 § Signer
+    /// EIP-712 domain verifying the delivery `operator_sig` (ADR 005 § Signer
     /// binding).
-    pub slash_domain: Eip712Domain,
+    pub stream_domain: Eip712Domain,
     /// `CapacityBond` EIP-712 bind domain (ADR 005). Used to sign the client
     /// identity binding this node attaches — over its OWN iroh `NodeId` with
     /// the buyer key — to every node→node pull, so an upstream node can prove
@@ -1385,7 +1385,7 @@ enum OpenDrop {
     /// The peer has no resolvable operator address, or its id does not decode.
     NoAddress,
     /// The answer failed verification: its shape, its echoed fields, its
-    /// `slash_sig` recovery, its size proof, or its coverage.
+    /// `operator_sig` recovery, its size proof, or its coverage.
     Unverifiable,
     /// The peer quoted above this node's `max_rate_per_mb`.
     OverCeiling,
@@ -1696,7 +1696,7 @@ fn cache_holders(deps: &NodeOriginDeps, target: DhtHash, ranked: &[Candidate]) {
     // selection order, which is the ordering that claim depends on.
     //
     // The triple plus the answer's UNSIGNED coverage and proven size is stored
-    // — never the signed `StreamResponse` (its `slash_sig` is another node's
+    // — never the signed `StreamResponse` (its `operator_sig` is another node's
     // signed statement, and #1165's "no signature retention" is that this
     // cache holds none; coverage and size carry no such author), and never
     // `reputation`, which `cached_candidates`
@@ -1925,7 +1925,7 @@ fn rank(candidates: Vec<Candidate>) -> Vec<Candidate> {
         .collect()
 }
 
-/// One discovery open of `spec` on `pk`, its answer's `slash_sig` recovering to
+/// One discovery open of `spec` on `pk`, its answer's `operator_sig` recovering to
 /// the peer's operator address `provider_addr`, the whole open under
 /// [`OPEN_CEILING`]. A span the peer cannot serve as asked — past the blob's
 /// end, or refused `Declined` — is asked once more as the whole blob, so a
@@ -1945,7 +1945,7 @@ async fn discovery_answer(
             &target,
             provider_addr,
             &spec.ctx,
-            &deps.slash_domain,
+            &deps.stream_domain,
             hash_bytes,
             spec.namespace_id,
             span,
@@ -2027,7 +2027,7 @@ async fn open_candidate(
         // implies upstream state corruption — skip rather than panic.
         return Err(OpenDrop::NoAddress);
     };
-    // The answer's `slash_sig` must recover to the peer's registered operator
+    // The answer's `operator_sig` must recover to the peer's registered operator
     // address (ADR 005 § Signer binding). Selection reads the answer's
     // quote and then PAYS the winner, so an unrecovered signature would let a
     // node win on a rate it never committed to.
@@ -2077,7 +2077,7 @@ async fn open_candidate(
                 );
                 return Err(OpenDrop::TimestampRejected);
             }
-            // An answer that does not verify (shape, echoed fields, `slash_sig`
+            // An answer that does not verify (shape, echoed fields, `operator_sig`
             // recovery, size proof, coverage) is requester-local policy, never an
             // attributable fault: dropped without a reputation event, because a
             // signature that does not recover attributes nothing to anyone (ADR 008).
@@ -2295,7 +2295,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             // candidate is range-planned against a real holder's blocks rather
             // than reading as covering nothing. This is not the evidence-retention
             // the cache's module doc forbids — coverage is outside the
-            // `slash_sig` set and has no author to slash.
+            // `operator_sig` set, so it attributes nothing to anyone.
             coverage: provider.coverage.clone(),
             total_bytes_hint: provider.total_bytes_hint,
         });
@@ -2938,7 +2938,7 @@ async fn pull_from_candidate_in_span(
         .address_of(&DhtNodeId::from_bytes(candidate.node_id))
     else {
         // No bonded address → we cannot safely open a lane to, or verify the
-        // `slash_sig` of, this provider. Skip rather than guess.
+        // `operator_sig` of, this provider. Skip rather than guess.
         debug!("node-origin: candidate has no resolvable operator address; skipping");
         return Err(PullMiss::Clean);
     };
@@ -3054,7 +3054,7 @@ async fn pull_from_candidate_in_span(
         EndpointAddr::new(pk),
         Arc::new(Mutex::new(ctx.clone())),
         Arc::clone(&ledger),
-        &deps.slash_domain,
+        &deps.stream_domain,
         provider_addr,
         NO_NAMESPACE,
         deps.config.max_blob_size_bytes,
@@ -3151,7 +3151,7 @@ async fn pull_from_candidate_in_span(
     let hash = Hash::from(hash_bytes);
     let endpoint = deps.endpoint.clone();
     let connections = deps.connections.clone();
-    let slash_domain = deps.slash_domain.clone();
+    let stream_domain = deps.stream_domain.clone();
     let engine = deps.engine.clone();
     let metrics = Arc::clone(&deps.metrics);
     let attestations = Arc::clone(&deps.attestations);
@@ -3197,7 +3197,7 @@ async fn pull_from_candidate_in_span(
                 EndpointAddr::new(pk),
                 Arc::clone(&ctx),
                 Arc::clone(&ledger_for_drive),
-                &slash_domain,
+                &stream_domain,
                 provider_addr,
                 NO_NAMESPACE,
                 max_blob_size_bytes,

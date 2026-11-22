@@ -835,7 +835,7 @@ async fn serve_until_shutdown(
 /// `P` at the call site and hands it to [`ShutdownHandles`].
 struct ChainHandlers<P: Provider + Clone + 'static> {
     receipt_poll_interval: Duration,
-    slash_domain: alloy::dyn_abi::Eip712Domain,
+    stream_domain: alloy::dyn_abi::Eip712Domain,
     bind_domain: alloy::dyn_abi::Eip712Domain,
     staker_set: Arc<dyn StakerSet>,
     /// Stops the governance chain's refresh loops: registry, origin seats and
@@ -948,12 +948,12 @@ async fn build_chain_and_handlers(
         &cfg.blockchain.capacity_bond_address,
         "blockchain.capacity_bond_address",
     )?;
-    // The `CapacityBond` EIP-712 domain the stream `slash_sig` and the origin
+    // The `CapacityBond` EIP-712 domain the stream `operator_sig` and the origin
     // attestations sign under (ADR 005 § Signer binding). Parsed through the
     // shared zero-address guard (#1219); `resolve_blockchain` already rejects
     // a zero or malformed `capacity_bond_address` at config load, so here the
     // guard is defense-in-depth rather than the sole check.
-    let slash_domain =
+    let stream_domain =
         decdn_incentive::capacity_bond_domain(cfg.blockchain.chain_id, capacity_bond_addr);
     // Mandatory for paid delivery. Config resolution rejects absence; this
     // runtime guard preserves fail-closed behavior for directly constructed
@@ -1139,7 +1139,7 @@ async fn build_chain_and_handlers(
     let attestation_verifier = crate::dht::AttestationVerifier::new(
         Arc::clone(&seated_origins) as Arc<dyn crate::dht::SeatedOrigins>,
         reload_state.content_denylist(),
-        slash_domain.clone(),
+        stream_domain.clone(),
     );
     let attestations = Arc::new(crate::attestations::Attestations::open(
         attestation_verifier.clone(),
@@ -1225,7 +1225,7 @@ async fn build_chain_and_handlers(
     .await;
 
     // Client bindings sign under the same `CapacityBond` domain.
-    let bind_domain = slash_domain.clone();
+    let bind_domain = stream_domain.clone();
 
     // Node→node pull-through deps (#831/#856/#821), all gated on
     // `node_to_node_pull_through_enabled`. Computed as `Option`s here so the handler's
@@ -1390,7 +1390,7 @@ async fn build_chain_and_handlers(
         shed: Arc::clone(&shed_controller),
         cache: infra.cache.clone(),
         eth_signer: Arc::clone(&infra.eth_signer),
-        slash_domain: slash_domain.clone(),
+        stream_domain: stream_domain.clone(),
         bind_domain: bind_domain.clone(),
         pools: routes,
         receipt_sink: Arc::clone(&infra.receipt_sink),
@@ -1531,7 +1531,7 @@ async fn build_chain_and_handlers(
 
     Ok(ChainHandlers {
         receipt_poll_interval,
-        slash_domain,
+        stream_domain,
         bind_domain,
         staker_set,
         chain_sync_stop,
@@ -2062,7 +2062,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
     let buyer_wallet = Arc::new(crate::buyer_pool::BuyerWallet::new(pull_through_enabled));
     let buyer_wallet_for_buyer = Arc::clone(&buyer_wallet);
     let node_origin_self_id = crate::dht::NodeId::from_bytes(*infra.secret_key.public().as_bytes());
-    let node_origin_slash_domain = ch.slash_domain.clone();
+    let node_origin_stream_domain = ch.stream_domain.clone();
     // #1117: the `CapacityBond` bind domain this node signs its node→node client
     // identity binding under — reuses the serving-side `bind_domain` constructed
     // once above so an upstream verifies against an identical domain.
@@ -2182,7 +2182,7 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
                     buyer: Arc::clone(&service) as Arc<dyn crate::buyer_pool::PoolOpener>,
                     buyer_pool: buyer_route,
                     self_id: node_origin_self_id,
-                    slash_domain: node_origin_slash_domain,
+                    stream_domain: node_origin_stream_domain,
                     bind_domain: node_origin_bind_domain,
                     local_rep: local_reputation_c,
                     negative_cache: crate::dht::NegativeCandidateCache::new(),
@@ -3216,7 +3216,7 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
         .await
         .map_err(|e| anyhow::anyhow!("keystore decrypt task panicked: {e}"))??;
     // Bind the signer to the governance chain id, the chain id of the
-    // `CapacityBond` EIP-712 domain (see the `slash_domain` build). Raw EIP-712
+    // `CapacityBond` EIP-712 domain (see the `stream_domain` build). Raw EIP-712
     // `sign_hash_sync` does not consult the bound chain id. Every wallet
     // provider rebinds its clone to its own chain's id
     // (`ProviderFactory::wallet`), so a payment-chain transaction is signed

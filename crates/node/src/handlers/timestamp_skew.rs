@@ -6,7 +6,7 @@
 //! receipt carries it as the approximate time of each serve. A node that signs
 //! whatever timestamp a requester chose therefore attests to a serve time of
 //! the requester's choosing. The client handler refuses a skewed request
-//! before anything is signed, so every `slash_sig` this node emits carries a
+//! before anything is signed, so every `operator_sig` this node emits carries a
 //! timestamp consistent with its clock at admission. A long serve only ages
 //! the admitted timestamp: the window tiers and the closing response sign it
 //! later, and signing never checks the bound again. An honest requester stamps

@@ -234,7 +234,7 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::capacity_bond_domain(1, Address::repeat_byte(0x44));
+    let stream_dom = decdn_incentive::capacity_bond_domain(1, Address::repeat_byte(0x44));
     let connections = Connections::new(ep.clone());
     let writes = OrderedWrites::default();
     let funding = RunFunding::default();
@@ -246,7 +246,7 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
             store: &store,
             contract: &contract,
             rpc: &rpc,
-            slash_dom: &slash_dom,
+            stream_dom: &stream_dom,
             self_address: Address::repeat_byte(0x0A),
             token: Address::repeat_byte(0x22),
             chain: &chain,
@@ -696,7 +696,7 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::capacity_bond_domain(1, Address::repeat_byte(0x44));
+    let stream_dom = decdn_incentive::capacity_bond_domain(1, Address::repeat_byte(0x44));
     let connections = Connections::new(ep.clone());
     let writes = OrderedWrites::default();
     let funding = RunFunding::default();
@@ -707,7 +707,7 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
         store: &store,
         contract: &contract,
         rpc: &rpc,
-        slash_dom: &slash_dom,
+        stream_dom: &stream_dom,
         self_address: Address::repeat_byte(0x0A),
         token: Address::repeat_byte(0x22),
         chain: &chain,

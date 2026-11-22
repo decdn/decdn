@@ -23,7 +23,7 @@ use alloy::primitives::{Address, B256, Bytes};
 use alloy::signers::Signature;
 use alloy::sol_types::Eip712Domain;
 use decdn_incentive::chain::CHUNK_BYTES;
-use decdn_incentive::stream_sig::StreamSlashData;
+use decdn_incentive::stream_sig::StreamSigData;
 use decdn_incentive::{
     Deployment, LaneKey, capacity_bond_domain, verify_forward, voucher_domain,
     wire_voucher_to_signed,
@@ -532,7 +532,7 @@ pub struct ReceiptResponse {
     /// The requester's timestamp, echoed and signed by the node.
     pub timestamp_us: u64,
     /// The node's 65-byte EIP-712 signature.
-    pub slash_sig: Bytes,
+    pub operator_sig: Bytes,
 }
 
 impl From<&StreamResponse> for ReceiptResponse {
@@ -542,7 +542,7 @@ impl From<&StreamResponse> for ReceiptResponse {
             ok: r.body.ok,
             rate_per_mb: r.body.rate_per_mb,
             timestamp_us: r.body.timestamp_us,
-            slash_sig: Bytes::copy_from_slice(&r.slash_sig),
+            operator_sig: Bytes::copy_from_slice(&r.operator_sig),
         }
     }
 }
@@ -556,7 +556,7 @@ impl ReceiptResponse {
                 rate_per_mb: self.rate_per_mb,
                 timestamp_us: self.timestamp_us,
             },
-            slash_sig: self.slash_sig.to_vec(),
+            operator_sig: self.operator_sig.to_vec(),
         }
     }
 }
@@ -879,7 +879,7 @@ impl PullReceipt {
     /// the chain.
     #[must_use]
     pub fn verify(&self) -> Vec<ReceiptFault> {
-        let slash_dom = capacity_bond_domain(self.chain.chain_id, self.chain.capacity_bond);
+        let stream_dom = capacity_bond_domain(self.chain.chain_id, self.chain.capacity_bond);
         let voucher_dom = voucher_domain(self.chain.payment_chain_id, self.chain.payment_pool);
         let content = &self.content;
         let listed = |hash: &B256| {
@@ -898,7 +898,7 @@ impl PullReceipt {
         }
         for lane in &self.lanes {
             for r in &lane.responses {
-                faults.extend(verify_response(lane, r, &listed, &slash_dom));
+                faults.extend(verify_response(lane, r, &listed, &stream_dom));
             }
             faults.extend(verify_payment(lane, &voucher_dom));
         }
@@ -911,7 +911,7 @@ fn verify_response(
     lane: &ReceiptLane,
     r: &ReceiptResponse,
     listed: &impl Fn(&B256) -> bool,
-    slash_dom: &Eip712Domain,
+    stream_dom: &Eip712Domain,
 ) -> Vec<ReceiptFault> {
     let (provider, hash) = (lane.provider, r.hash);
     let wire = r.to_wire();
@@ -925,9 +925,9 @@ fn verify_response(
     if let Err(e) = wire.validate() {
         return malformed(e.to_string());
     }
-    let sig = match Signature::from_raw(&wire.slash_sig) {
+    let sig = match Signature::from_raw(&wire.operator_sig) {
         Ok(sig) => sig,
-        Err(e) => return malformed(format!("slash_sig does not parse: {e}")),
+        Err(e) => return malformed(format!("operator_sig does not parse: {e}")),
     };
     let mut faults = Vec::new();
     if !r.ok {
@@ -936,8 +936,8 @@ fn verify_response(
     if !listed(&hash) {
         faults.push(ReceiptFault::ResponseHash { provider, hash });
     }
-    if StreamSlashData::from_response_body(&wire.body)
-        .verify_signer(&sig, provider, slash_dom)
+    if StreamSigData::from_response_body(&wire.body)
+        .verify_signer(&sig, provider, stream_dom)
         .is_err()
     {
         faults.push(ReceiptFault::ResponseSignature { provider, hash });

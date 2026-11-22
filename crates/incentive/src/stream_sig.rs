@@ -1,7 +1,7 @@
-//! EIP-712 `slash_sig` signatures for `cdn/client/v1` `StreamResponse` messages.
+//! EIP-712 `operator_sig` signatures for `cdn/client/v1` `StreamResponse` messages.
 //!
 //! Every `StreamResponse` carries a mandatory, non-empty secp256k1 EIP-712
-//! signature (`slash_sig`) over its frozen signed field set. The signature
+//! signature (`operator_sig`) over its frozen signed field set. The signature
 //! makes the response attributable to a registered node: the requester checks
 //! that it recovers to the operator bound to the serving `NodeId` (ADR 005
 //! § Signer binding). Pull receipts carry the signed `timestamp_us`: the
@@ -89,7 +89,7 @@ pub const STREAM_RESPONSE_TYPEHASH: B256 =
 /// from the `StreamRequest`. Together with `ok` and `rate_per_mb`, these are
 /// exactly the fields a verifier reconstructs to recover the signer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StreamSlashData {
+pub struct StreamSigData {
     /// BLAKE3 hash of the delivered blob (iroh `Hash` bytes).
     pub hash: B256,
     /// Whether the node committed to serving the blob.
@@ -100,7 +100,7 @@ pub struct StreamSlashData {
     pub timestamp_us: u64,
 }
 
-impl StreamSlashData {
+impl StreamSigData {
     /// Build the signed-field view from a wire [`StreamResponseBody`].
     #[must_use]
     pub fn from_response_body(body: &StreamResponseBody) -> Self {
@@ -130,7 +130,7 @@ impl StreamSlashData {
     }
 
     /// Sign the stream response with `signer` for the given EIP-712 `domain`,
-    /// returning the 65-byte (`r‖s‖v`) signature for the wire `slash_sig`.
+    /// returning the 65-byte (`r‖s‖v`) signature for the wire `operator_sig`.
     ///
     /// # Errors
     ///
@@ -150,42 +150,42 @@ impl StreamSlashData {
     ///
     /// # Errors
     ///
-    /// Returns [`StreamSlashError::InvalidSignature`] if the signature is
+    /// Returns [`StreamSigError::InvalidSignature`] if the signature is
     /// malformed (non-canonical `s`, invalid recovery id, etc.).
     pub fn recover_signer(
         &self,
         signature: &Signature,
         domain: &Eip712Domain,
-    ) -> Result<Address, StreamSlashError> {
+    ) -> Result<Address, StreamSigError> {
         // Reject non-canonical high-`s`: each response has exactly one
         // accepted signature encoding (#836).
         if crate::sig_canon::is_high_s(signature) {
-            return Err(StreamSlashError::InvalidSignature);
+            return Err(StreamSigError::InvalidSignature);
         }
         let hash = self.signing_hash(domain);
         signature
             .recover_address_from_prehash(&hash)
-            .map_err(|_| StreamSlashError::InvalidSignature)
+            .map_err(|_| StreamSigError::InvalidSignature)
     }
 
     /// Verify `signature` was produced by `expected` for `domain`.
     ///
     /// # Errors
     ///
-    /// - [`StreamSlashError::InvalidSignature`] — signature is malformed.
-    /// - [`StreamSlashError::WrongSigner`] — recovered address differs from
+    /// - [`StreamSigError::InvalidSignature`] — signature is malformed.
+    /// - [`StreamSigError::WrongSigner`] — recovered address differs from
     ///   `expected`.
     pub fn verify_signer(
         &self,
         signature: &Signature,
         expected: Address,
         domain: &Eip712Domain,
-    ) -> Result<(), StreamSlashError> {
+    ) -> Result<(), StreamSigError> {
         let recovered = self.recover_signer(signature, domain)?;
         if recovered == expected {
             Ok(())
         } else {
-            Err(StreamSlashError::WrongSigner {
+            Err(StreamSigError::WrongSigner {
                 expected,
                 recovered,
             })
@@ -195,16 +195,16 @@ impl StreamSlashData {
 
 /// Failure modes for stream-response signature verification.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum StreamSlashError {
+pub enum StreamSigError {
     /// The signature is malformed — non-canonical `s`, invalid recovery id, or
     /// a corrupted byte. (Length is enforced earlier at the protocol boundary
-    /// via `decdn_protocol::SLASH_SIG_LEN` before a `Signature` is ever
+    /// via `decdn_protocol::OPERATOR_SIG_LEN` before a `Signature` is ever
     /// constructed; this variant does not itself length-check.)
-    #[error("stream slash_sig is malformed")]
+    #[error("stream operator_sig is malformed")]
     InvalidSignature,
     /// The signature is well-formed but recovers to an address that does not
     /// match the expected signer.
-    #[error("stream slash_sig signed by {recovered}, expected {expected}")]
+    #[error("stream operator_sig signed by {recovered}, expected {expected}")]
     WrongSigner {
         /// The address the stream response had to be signed by.
         expected: Address,

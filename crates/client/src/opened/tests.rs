@@ -507,13 +507,13 @@ async fn every_open_holds_its_place_until_its_first_voucher() -> anyhow::Result<
                 .1,
         );
     }
-    let slash = domain();
+    let stream_dom = domain();
     let source = crate::PeerSource::new(
         &ep,
         node.addr.clone(),
         Arc::new(std::sync::Mutex::new(ctx.clone())),
         Arc::clone(&ledger),
-        &slash,
+        &stream_dom,
         node.operator_address(),
         decdn_protocol::client::NO_NAMESPACE,
         0,

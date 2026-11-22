@@ -1,5 +1,5 @@
 use super::*;
-use decdn_protocol::SLASH_SIG_LEN;
+use decdn_protocol::OPERATOR_SIG_LEN;
 
 fn fixture(ok: bool, total_bytes: Option<u64>) -> ProbeAnswer {
     ProbeAnswer {
@@ -10,7 +10,7 @@ fn fixture(ok: bool, total_bytes: Option<u64>) -> ProbeAnswer {
         coverage_blocks: usize::from(ok),
         timestamp_us: 1_700_000_000_000_000,
         rtt_ms: 12.5,
-        slash_sig: vec![0xCD; SLASH_SIG_LEN],
+        operator_sig: vec![0xCD; OPERATOR_SIG_LEN],
     }
 }
 
@@ -27,7 +27,7 @@ fn json_output_keys_and_types() {
         obj.len(),
         8,
         "eight keys: hash/ok/rate_per_mb/total_bytes/coverage_blocks/timestamp_us/rtt_ms/\
-         slash_sig"
+         operator_sig"
     );
     assert_eq!(obj["hash"].as_str().map(str::len), Some(64));
     assert_eq!(obj["ok"].as_bool(), Some(true));
@@ -38,9 +38,9 @@ fn json_output_keys_and_types() {
     assert_eq!(obj["timestamp_us"].as_u64(), Some(1_700_000_000_000_000));
     assert!(obj["rtt_ms"].is_number());
     assert_eq!(
-        obj["slash_sig"].as_str().map(str::len),
-        Some(SLASH_SIG_LEN * 2),
-        "slash_sig is hex-encoded (2 chars/byte)"
+        obj["operator_sig"].as_str().map(str::len),
+        Some(OPERATOR_SIG_LEN * 2),
+        "operator_sig is hex-encoded (2 chars/byte)"
     );
 }
 
@@ -104,7 +104,13 @@ fn pretty_output_emits_labelled_lines_in_stable_order() {
     assert!(lines[4].starts_with("coverage_blocks:"));
     assert!(lines[5].starts_with("timestamp_us:"));
     assert!(lines[6].starts_with("rtt:"));
-    assert!(lines[7].starts_with("slash_sig:"));
+    assert!(lines[7].starts_with("operator_sig:"));
+    // Every value starts at column 17, so the rows read as one aligned table.
+    for line in lines.iter().take(8) {
+        let value_at_17 = line.get(..17).is_some_and(|label| label.ends_with(' '))
+            && line.get(17..).is_some_and(|value| !value.starts_with(' '));
+        assert!(value_at_17, "value must start at column 17: {line:?}");
+    }
     assert!(
         lines[6].contains("1.234 ms"),
         "pretty rtt: line keeps 3-decimal format, got {:?}",

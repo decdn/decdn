@@ -95,7 +95,7 @@ fn a_stream_response_signature_is_no_attestation() {
         rate_per_mb: 1,
         timestamp_us: 3,
     };
-    let sig = crate::StreamSlashData::from_response_body(&body)
+    let sig = crate::StreamSigData::from_response_body(&body)
         .sign(&signer, &domain())
         .unwrap();
     let att = OriginAttestation {

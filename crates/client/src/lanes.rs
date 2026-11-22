@@ -157,7 +157,7 @@ pub struct LaneDeps<'a, P> {
     /// go through.
     pub rpc: &'a P,
     /// The `CapacityBond` domain every stream response verifies against.
-    pub slash_dom: &'a Eip712Domain,
+    pub stream_dom: &'a Eip712Domain,
     /// The buyer's own address: the pool owner on the self-owned path, the
     /// delegate signer on the delegated one. On the self-owned path it need not
     /// be the key the lanes sign under ([`OwnedPayer::lane`]).
@@ -434,7 +434,7 @@ fn lane_source<'a, P>(
         target,
         ctx,
         ledger,
-        deps.slash_dom,
+        deps.stream_dom,
         provider,
         deps.namespace_id,
         deps.max_blob_bytes,

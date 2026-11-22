@@ -1267,7 +1267,7 @@ impl BundlePullerBuilder {
         let discovery = self.nodes.applied_to(self.discovery);
         let governance = &self.chain.governance;
         let ctx = engine::PullCtx {
-            slash_dom: capacity_bond_domain(governance.chain_id, governance.capacity_bond),
+            stream_dom: capacity_bond_domain(governance.chain_id, governance.capacity_bond),
             pass: engine::PassPool::new(pool, rpc, token, &self.escrows),
             parked: std::collections::HashMap::new(),
             connect: Box::new(connect),

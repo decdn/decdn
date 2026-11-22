@@ -734,9 +734,9 @@ pub struct RegisterArgs {
 /// A `ValueEnum` with **no default**: the two paths differ by orders of
 /// magnitude in cost and are not interchangeable, so the operator names one.
 /// These are the operator's only two keys. There is no separate stream
-/// signing key: an operator serves from the EOA it registered, so `slash_sig`
+/// signing key: an operator serves from the EOA it registered, so `operator_sig`
 /// is signed by the Ethereum key above. Serving from a smart account while a
-/// hot key signs `slash_sig` is unimplemented
+/// hot key signs `operator_sig` is unimplemented
 /// (`adr/024-account-abstraction.md` § Unimplemented — Operator Custody While
 /// Serving), so there is no third variant to rotate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]

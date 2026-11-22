@@ -257,7 +257,7 @@ fn micros_now() -> u64 {
 /// holds the pull context (`endpoint`, `target`, `ctx`, `ledger`, …) but not a
 /// [`Funder`]: funding recovery is the acquire loop's concern, not the source's.
 ///
-/// Borrows its `endpoint`/`slash_domain` (the driver, which owns these for the
+/// Borrows its `endpoint`/`stream_domain` (the driver, which owns these for the
 /// whole fetch, outlives every `open`/`finish` call), but holds the pool
 /// context behind a SHARED `Arc<Mutex<PoolContext>>` rather than a `&'a`
 /// borrow. That shared handle is what resolves the #1608 borrow conflict: the
@@ -276,7 +276,7 @@ pub struct PeerSource<'a> {
     target: EndpointAddr,
     ctx: Arc<Mutex<PoolContext>>,
     ledger: Arc<PoolLedger>,
-    slash_domain: &'a Eip712Domain,
+    stream_domain: &'a Eip712Domain,
     expected_signer: Address,
     namespace_id: [u8; 32],
     max_blob_size_bytes: u64,
@@ -328,7 +328,7 @@ impl<'a> PeerSource<'a> {
         target: EndpointAddr,
         ctx: Arc<Mutex<PoolContext>>,
         ledger: Arc<PoolLedger>,
-        slash_domain: &'a Eip712Domain,
+        stream_domain: &'a Eip712Domain,
         expected_signer: Address,
         namespace_id: [u8; 32],
         max_blob_size_bytes: u64,
@@ -341,7 +341,7 @@ impl<'a> PeerSource<'a> {
             target,
             ctx,
             ledger,
-            slash_domain,
+            stream_domain,
             expected_signer,
             namespace_id,
             max_blob_size_bytes,
@@ -419,7 +419,7 @@ impl<'a> PeerSource<'a> {
                 self.target.clone(),
                 &ctx,
                 Arc::clone(&self.ledger),
-                self.slash_domain,
+                self.stream_domain,
                 self.expected_signer,
                 hash,
                 self.namespace_id,
@@ -489,7 +489,7 @@ impl<'a> PeerSource<'a> {
         .await?;
         let args = crate::opened::OpenArgs {
             ctx,
-            slash_domain: self.slash_domain,
+            stream_domain: self.stream_domain,
             expected_signer: self.expected_signer,
             hash,
             namespace_id: self.namespace_id,

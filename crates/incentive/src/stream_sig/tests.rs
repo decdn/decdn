@@ -3,8 +3,8 @@ use crate::capacity_bond_domain;
 use alloy::primitives::address;
 use alloy::signers::local::PrivateKeySigner;
 
-fn sample_data() -> StreamSlashData {
-    StreamSlashData {
+fn sample_data() -> StreamSigData {
+    StreamSigData {
         hash: B256::repeat_byte(0x7A),
         ok: true,
         rate_per_mb: 10_000,
@@ -49,7 +49,7 @@ fn high_s_stream_signature_rejected() -> anyhow::Result<()> {
 
     let twin = crate::sig_canon::high_s_twin(&sig);
     anyhow::ensure!(
-        data.recover_signer(&twin, &domain) == Err(StreamSlashError::InvalidSignature),
+        data.recover_signer(&twin, &domain) == Err(StreamSigError::InvalidSignature),
         "high-s stream signature twin must be rejected as InvalidSignature"
     );
     Ok(())
@@ -65,7 +65,7 @@ fn wrong_signer_address_rejected() -> anyhow::Result<()> {
     let sig = data.sign(&signer, &domain)?;
     let err = err_of(data.verify_signer(&sig, other, &domain))?;
     anyhow::ensure!(
-        matches!(err, StreamSlashError::WrongSigner { .. }),
+        matches!(err, StreamSigError::WrongSigner { .. }),
         "expected WrongSigner, got: {err:?}"
     );
     Ok(())
@@ -84,7 +84,7 @@ fn different_chain_id_rejected() -> anyhow::Result<()> {
     let sig = data.sign(&signer, &domain_a)?;
     let err = err_of(data.verify_signer(&sig, signer.address(), &domain_b))?;
     anyhow::ensure!(
-        matches!(err, StreamSlashError::WrongSigner { .. }),
+        matches!(err, StreamSigError::WrongSigner { .. }),
         "expected WrongSigner, got: {err:?}"
     );
     Ok(())
@@ -106,7 +106,7 @@ fn different_verifying_contract_rejected() -> anyhow::Result<()> {
     let sig = data.sign(&signer, &domain_a)?;
     let err = err_of(data.verify_signer(&sig, signer.address(), &domain_b))?;
     anyhow::ensure!(
-        matches!(err, StreamSlashError::WrongSigner { .. }),
+        matches!(err, StreamSigError::WrongSigner { .. }),
         "expected WrongSigner, got: {err:?}"
     );
     Ok(())
@@ -121,17 +121,17 @@ fn tampered_fields_rejected() -> anyhow::Result<()> {
     let data = sample_data();
     let sig = data.sign(&signer, &domain)?;
 
-    let mutations: [StreamSlashData; 4] = [
-        StreamSlashData {
+    let mutations: [StreamSigData; 4] = [
+        StreamSigData {
             hash: B256::ZERO,
             ..data
         },
-        StreamSlashData { ok: false, ..data },
-        StreamSlashData {
+        StreamSigData { ok: false, ..data },
+        StreamSigData {
             rate_per_mb: data.rate_per_mb + 1,
             ..data
         },
-        StreamSlashData {
+        StreamSigData {
             timestamp_us: data.timestamp_us + 1,
             ..data
         },
@@ -139,7 +139,7 @@ fn tampered_fields_rejected() -> anyhow::Result<()> {
     for (i, m) in mutations.into_iter().enumerate() {
         let err = err_of(m.verify_signer(&sig, signer.address(), &domain))?;
         anyhow::ensure!(
-            matches!(err, StreamSlashError::WrongSigner { .. }),
+            matches!(err, StreamSigError::WrongSigner { .. }),
             "mutation {i} should flip the signer, got {err:?}"
         );
     }
@@ -218,7 +218,7 @@ fn from_response_body_maps_fields() {
         rate_per_mb: 10_000,
         timestamp_us: 1_700_000_000_000_000,
     };
-    assert_eq!(StreamSlashData::from_response_body(&body), sample_data());
+    assert_eq!(StreamSigData::from_response_body(&body), sample_data());
 }
 
 /// Lock the `CapacityBond` domain separator to the canonical EIP-712 form.

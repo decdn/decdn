@@ -44,7 +44,7 @@ use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verif
 use decdn_incentive::store::{PoolStateStore, StoreError};
 use decdn_incentive::{
     Capability, Deployment, LaneKey, LaneState, RetrySignal, SignedCapability, SignedVoucher,
-    StreamSlashData, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    StreamSigData, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
@@ -662,7 +662,7 @@ impl ServeRejectReason {
 /// only the reason's class ([`ServeRejectReason::wire_error`]). An operator whose origin is 5xx-ing must
 /// not see that reported as a cache miss.
 ///
-/// Note the reason code is NOT covered by the response's EIP-712 `slash_sig`,
+/// Note the reason code is NOT covered by the response's EIP-712 `operator_sig`,
 /// which signs only [`StreamResponseBody`] (`ok: false`); `StreamResponse::error`
 /// is explicitly "unsigned and informational". So a misclassification is a
 /// correctness and observability bug, not a false attestation.
@@ -852,12 +852,12 @@ pub struct ClientHandlerDeps {
     /// Blob store the serve path reads from, and the pull-through target on a
     /// miss.
     pub cache: CacheEngine,
-    /// The operator's Ethereum key. Signs the `slash_sig` on each
+    /// The operator's Ethereum key. Signs the `operator_sig` on each
     /// `StreamResponse`; every other use reads it only for its address.
     /// Client bindings are verified here, never signed.
     pub eth_signer: Arc<PrivateKeySigner>,
-    /// `CapacityBond` EIP-712 domain for the `StreamResponse` `slash_sig`.
-    pub slash_domain: Eip712Domain,
+    /// `CapacityBond` EIP-712 domain for the `StreamResponse` `operator_sig`.
+    pub stream_domain: Eip712Domain,
     /// EIP-712 domain for lane bindings.
     pub bind_domain: Eip712Domain,
     /// The payment pools this node accepts, in configuration order, each with
@@ -986,7 +986,7 @@ impl ClientHandlerDeps {
         limiter: Arc<ConnectionLimiter>,
         cache: CacheEngine,
         eth_signer: Arc<PrivateKeySigner>,
-        slash_domain: Eip712Domain,
+        stream_domain: Eip712Domain,
         bind_domain: Eip712Domain,
         pool: PoolRoute,
         receipt_sink: Arc<dyn ReceiptSink>,
@@ -1003,7 +1003,7 @@ impl ClientHandlerDeps {
             shed,
             cache,
             eth_signer,
-            slash_domain,
+            stream_domain,
             bind_domain,
             pools: vec![pool],
             receipt_sink,
@@ -1152,8 +1152,8 @@ pub struct ClientHandler {
     shed: Arc<crate::load_shed::LoadShedController>,
     cache: CacheEngine,
     eth_signer: Arc<PrivateKeySigner>,
-    /// `CapacityBond` EIP-712 domain for `StreamResponse.slash_sig`.
-    slash_domain: Eip712Domain,
+    /// `CapacityBond` EIP-712 domain for `StreamResponse.operator_sig`.
+    stream_domain: Eip712Domain,
     /// Held origin attestations, forwarded on `ok: true` responses.
     attestations: Option<Arc<crate::attestations::Attestations>>,
     /// `CapacityBond` EIP-712 domain for ephemeral `BindNodeId` verification.
@@ -1374,7 +1374,7 @@ impl ClientHandler {
             shed: deps.shed,
             cache: deps.cache,
             eth_signer: deps.eth_signer,
-            slash_domain: deps.slash_domain,
+            stream_domain: deps.stream_domain,
             bind_domain: deps.bind_domain,
             pools: deps.pools,
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,

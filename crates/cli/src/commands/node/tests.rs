@@ -1502,13 +1502,12 @@ async fn not_found_node(
                         rate_per_mb: 7,
                         timestamp_us: req.timestamp_us,
                     };
-                    let sig =
-                        decdn_incentive::stream_sig::StreamSlashData::from_response_body(&body)
-                            .sign(&operator, &domain)
-                            .unwrap();
+                    let sig = decdn_incentive::stream_sig::StreamSigData::from_response_body(&body)
+                        .sign(&operator, &domain)
+                        .unwrap();
                     let resp = StreamResponse {
                         body,
-                        slash_sig: sig.as_bytes().to_vec(),
+                        operator_sig: sig.as_bytes().to_vec(),
                     };
                     let ext = StreamResponseExt::refused(
                         StreamError::NotFound,

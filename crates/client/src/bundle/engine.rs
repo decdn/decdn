@@ -1763,7 +1763,7 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// The keys every entry's lanes sign under.
     pub(super) payer: RunPayer,
     pub(super) self_address: Address,
-    pub(super) slash_dom: Eip712Domain,
+    pub(super) stream_dom: Eip712Domain,
     pub(super) chain: ChainConfig,
     /// The payment pool the current pass pays through, with its lanes,
     /// funding facts and recovery gate. The first pass pays through the first
@@ -1865,7 +1865,7 @@ impl<P: Provider + Clone> PullCtx<P> {
             store: &self.store,
             contract: &self.pass.contract,
             rpc: &self.pass.rpc,
-            slash_dom: &self.slash_dom,
+            stream_dom: &self.stream_dom,
             self_address: self.self_address,
             token: self.pass.token,
             chain: &self.chain,
@@ -2020,7 +2020,7 @@ impl<P: Provider + Clone> PullCtx<P> {
                     hash,
                     spec,
                     self.discovery.proxy_warming,
-                    &self.slash_dom,
+                    &self.stream_dom,
                     round,
                 )
                 .await?;

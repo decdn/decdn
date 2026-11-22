@@ -85,9 +85,9 @@ const DISCOVERY_OPEN: Duration = Duration::from_secs(10);
 pub struct PoolSession {
     ctx: PoolContext,
     target: EndpointAddr,
-    slash_domain: Eip712Domain,
+    stream_domain: Eip712Domain,
     /// The delivering node's operator address — the `expected_signer` that
-    /// verifies the response `slash_sig`, and the voucher lane's `provider`.
+    /// verifies the response `operator_sig`, and the voucher lane's `provider`.
     /// Deliberately *not* called `provider` at the fixture level: in an
     /// alloy-facing file that word means the RPC handle.
     operator_addr: Address,
@@ -289,7 +289,7 @@ impl ClientFixture {
                 &self.endpoint,
                 target.clone(),
                 &session.ctx,
-                &session.slash_domain,
+                &session.stream_domain,
                 session.operator_addr,
                 *hash.as_bytes(),
                 namespace_id.to_be_bytes(),
@@ -439,7 +439,7 @@ impl ClientFixture {
             &self.endpoint,
             session.target.clone(),
             &session.ctx,
-            &session.slash_domain,
+            &session.stream_domain,
             session.operator_addr,
             *hash.as_bytes(),
             namespace_id.to_be_bytes(),
@@ -616,7 +616,7 @@ impl ClientFixture {
             &bind_domain,
         )?);
 
-        let slash_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
+        let stream_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
         // Pinned into the session at open time, at the identity the daemon is
         // serving under now. A session deliberately keeps that pin: its pool and
         // lane watermark belong to this connection, so it must not silently follow
@@ -626,7 +626,7 @@ impl ClientFixture {
         Ok(PoolSession {
             ctx,
             target,
-            slash_domain,
+            stream_domain,
             operator_addr: node.operator_addr(),
         })
     }
@@ -691,13 +691,13 @@ impl ClientFixture {
         let placeholder =
             decdn_client::funding::predicted_pool_id(self.signer.address(), U256::ZERO);
         let ctx = self.pool_context(chain, node, placeholder)?;
-        let slash_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
+        let stream_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
         decdn_client::discovery_open(
             &Connections::new(self.endpoint.clone()),
             &target,
             node.operator_addr(),
             &ctx,
-            &slash_domain,
+            &stream_domain,
             *hash.as_bytes(),
             decdn_protocol::client::NO_NAMESPACE,
             (0, 0),

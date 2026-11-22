@@ -507,7 +507,7 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
+    let stream_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
     let connections = crate::Connections::new(ep.clone());
     let writes = crate::ordered_writes::OrderedWrites::default();
     let funding = crate::funding::RunFunding::default();
@@ -518,7 +518,7 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         store: &store,
         contract: &contract,
         rpc: &rpc,
-        slash_dom: &slash_dom,
+        stream_dom: &stream_dom,
         self_address: first.address(),
         token: Address::repeat_byte(0x22),
         chain: &chain,
@@ -783,7 +783,7 @@ async fn each_pass_pays_the_holders_routed_to_its_pool() -> anyhow::Result<()> {
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
+    let stream_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
     let connections = crate::Connections::new(ep.clone());
     let writes = crate::ordered_writes::OrderedWrites::default();
     let funding = crate::funding::RunFunding::default();
@@ -825,7 +825,7 @@ async fn each_pass_pays_the_holders_routed_to_its_pool() -> anyhow::Result<()> {
             store: &store,
             contract: &contract,
             rpc: &rpc,
-            slash_dom: &slash_dom,
+            stream_dom: &stream_dom,
             self_address: payer.owner().address(),
             token: Address::repeat_byte(0x22),
             chain: &chain,
@@ -905,7 +905,7 @@ struct LaneFixture {
     pool: crate::session::PaymentPoolChain,
     passes: crate::pool_route::PoolPasses,
     site: crate::session::PullSite,
-    slash_dom: alloy::sol_types::Eip712Domain,
+    stream_dom: alloy::sol_types::Eip712Domain,
     connections: crate::Connections,
     writes: crate::ordered_writes::OrderedWrites,
     funding: crate::funding::RunFunding,
@@ -979,7 +979,7 @@ impl LaneFixture {
             region: None,
             region_allowlist: Vec::new(),
         };
-        let slash_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
+        let stream_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
         let voucher_dom = pool.deployment.voucher_domain();
         Ok(Self {
             _dir: dir,
@@ -992,7 +992,7 @@ impl LaneFixture {
             pool,
             passes,
             site,
-            slash_dom,
+            stream_dom,
             writes: crate::ordered_writes::OrderedWrites::default(),
             funding: crate::funding::RunFunding::default(),
             slot,
@@ -1016,7 +1016,7 @@ impl LaneFixture {
             store: &self.store,
             contract: &self.contract,
             rpc: &self.rpc,
-            slash_dom: &self.slash_dom,
+            stream_dom: &self.stream_dom,
             self_address: Address::repeat_byte(0x0A),
             token: Address::repeat_byte(0x22),
             chain: &self.chain,
@@ -1103,7 +1103,7 @@ async fn discover_on<'a>(
             max_rate_per_mb: 0,
         },
         warming(false),
-        &fx.slash_dom,
+        &fx.stream_dom,
         round,
     )
     .await
@@ -1138,7 +1138,7 @@ async fn the_first_claim_adopts_the_winners_stream_with_no_second_open() -> anyh
             blob: blob.clone(),
             rate: 5,
         },
-        fx.slash_dom.clone(),
+        fx.stream_dom.clone(),
     )
     .await?;
     let targets = discover_on(
@@ -1198,7 +1198,7 @@ async fn losers_are_cancelled_with_their_connections_kept() -> anyhow::Result<()
             blob: blob.clone(),
             rate: 5,
         },
-        fx.slash_dom.clone(),
+        fx.stream_dom.clone(),
     )
     .await?;
     let dear = FakeNode::spawn(
@@ -1206,7 +1206,7 @@ async fn losers_are_cancelled_with_their_connections_kept() -> anyhow::Result<()
             blob: blob.clone(),
             rate: 9,
         },
-        fx.slash_dom.clone(),
+        fx.stream_dom.clone(),
     )
     .await?;
     let targets = discover_on(
@@ -1263,8 +1263,8 @@ async fn a_multi_holder_download_adopts_the_winners_stream() -> anyhow::Result<(
         blob: blob.clone(),
         rate,
     };
-    let cheap = FakeNode::spawn(serve(5), fx.slash_dom.clone()).await?;
-    let dear = FakeNode::spawn(serve(9), fx.slash_dom.clone()).await?;
+    let cheap = FakeNode::spawn(serve(5), fx.stream_dom.clone()).await?;
+    let dear = FakeNode::spawn(serve(9), fx.stream_dom.clone()).await?;
     let targets = discover_on(
         &sources,
         &fx,
@@ -1346,7 +1346,7 @@ async fn a_leg_quoted_above_the_first_quote_is_refused_unpaid_and_fails_over() -
             first: 5,
             then: 50,
         },
-        fx.slash_dom.clone(),
+        fx.stream_dom.clone(),
     )
     .await?;
     let honest = FakeNode::spawn(
@@ -1354,7 +1354,7 @@ async fn a_leg_quoted_above_the_first_quote_is_refused_unpaid_and_fails_over() -
             blob: blob.clone(),
             rate: 9,
         },
-        fx.slash_dom.clone(),
+        fx.stream_dom.clone(),
     )
     .await?;
     let targets = discover_on(
@@ -1437,7 +1437,7 @@ async fn a_size_lookup_takes_the_answers_size_with_no_lane() -> anyhow::Result<(
             blob: blob.clone(),
             rate: 5,
         },
-        fx.slash_dom.clone(),
+        fx.stream_dom.clone(),
     )
     .await?;
     let targets = discover_on(

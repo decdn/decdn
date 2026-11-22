@@ -111,7 +111,7 @@ impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::StreamResponse
 pub decdn_protocol::client::StreamResponse::body: decdn_protocol::client::StreamResponseBody
-pub decdn_protocol::client::StreamResponse::slash_sig: alloc::vec::Vec<u8>
+pub decdn_protocol::client::StreamResponse::operator_sig: alloc::vec::Vec<u8>
 impl decdn_protocol::client::StreamResponse
 pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::client::StreamResponseBody
@@ -332,8 +332,8 @@ pub decdn_protocol::message::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::message::MessageValidationError::EmptyChunk
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::message::MessageValidationError::InvalidBindingSigLen::len: usize
-pub decdn_protocol::message::MessageValidationError::InvalidSlashSigLen
-pub decdn_protocol::message::MessageValidationError::InvalidSlashSigLen::len: usize
+pub decdn_protocol::message::MessageValidationError::InvalidOperatorSigLen
+pub decdn_protocol::message::MessageValidationError::InvalidOperatorSigLen::len: usize
 pub decdn_protocol::message::MessageValidationError::InvalidVoucherSigLen
 pub decdn_protocol::message::MessageValidationError::InvalidVoucherSigLen::len: usize
 pub decdn_protocol::message::MessageValidationError::MissingStreamError
@@ -344,7 +344,7 @@ pub decdn_protocol::message::MessageValidationError::StreamErrorWithOk
 pub decdn_protocol::message::MessageValidationError::VoucherRejectedInResponse
 pub const decdn_protocol::message::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::message::MAX_RATE_PER_MB: u64
-pub const decdn_protocol::message::SLASH_SIG_LEN: usize
+pub const decdn_protocol::message::OPERATOR_SIG_LEN: usize
 pub mod decdn_protocol::pool_account
 pub enum decdn_protocol::pool_account::PoolAccountError
 pub decdn_protocol::pool_account::PoolAccountError::BadAddress
@@ -451,8 +451,8 @@ pub decdn_protocol::MessageValidationError::EmptyCapabilitySignature
 pub decdn_protocol::MessageValidationError::EmptyChunk
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen
 pub decdn_protocol::MessageValidationError::InvalidBindingSigLen::len: usize
-pub decdn_protocol::MessageValidationError::InvalidSlashSigLen
-pub decdn_protocol::MessageValidationError::InvalidSlashSigLen::len: usize
+pub decdn_protocol::MessageValidationError::InvalidOperatorSigLen
+pub decdn_protocol::MessageValidationError::InvalidOperatorSigLen::len: usize
 pub decdn_protocol::MessageValidationError::InvalidVoucherSigLen
 pub decdn_protocol::MessageValidationError::InvalidVoucherSigLen::len: usize
 pub decdn_protocol::MessageValidationError::MissingStreamError
@@ -689,7 +689,7 @@ impl decdn_protocol::client::StreamRequestExt
 pub const fn decdn_protocol::client::StreamRequestExt::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::StreamResponse
 pub decdn_protocol::StreamResponse::body: decdn_protocol::client::StreamResponseBody
-pub decdn_protocol::StreamResponse::slash_sig: alloc::vec::Vec<u8>
+pub decdn_protocol::StreamResponse::operator_sig: alloc::vec::Vec<u8>
 impl decdn_protocol::client::StreamResponse
 pub const fn decdn_protocol::client::StreamResponse::validate(&self) -> core::result::Result<(), decdn_protocol::message::MessageValidationError>
 pub struct decdn_protocol::StreamResponseBody
@@ -751,7 +751,7 @@ pub const decdn_protocol::MAX_SIZE_PROOF_BYTES: usize
 pub const decdn_protocol::MAX_STREAM_RESPONSE_FRAME: u32
 pub const decdn_protocol::MB_BYTES: u64
 pub const decdn_protocol::MIN_ATTESTATION_TTL_SEC: u32
-pub const decdn_protocol::SLASH_SIG_LEN: usize
+pub const decdn_protocol::OPERATOR_SIG_LEN: usize
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize
 pub trait decdn_protocol::TopLevelEnum
 pub const decdn_protocol::TopLevelEnum::VARIANT_COUNT: u32

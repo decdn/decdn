@@ -306,7 +306,7 @@ fn unsigned_notfound_refusal_is_untouched() {
 /// way the fetch path holds one: an `UpstreamRefused` whose `evidence()` is
 /// the signed response.
 fn signed_open(rate_per_mb: u64, error: StreamError) -> anyhow::Error {
-    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_incentive::stream_sig::StreamSigData;
     use decdn_protocol::client::{StreamResponse, StreamResponseBody};
 
     let body = StreamResponseBody {
@@ -316,12 +316,12 @@ fn signed_open(rate_per_mb: u64, error: StreamError) -> anyhow::Error {
         timestamp_us: 1_700_000_000_000_000,
     };
     let operator = PrivateKeySigner::random();
-    let sig = StreamSlashData::from_response_body(&body)
+    let sig = StreamSigData::from_response_body(&body)
         .sign(&operator, &capacity_bond_domain(1, Address::ZERO))
         .unwrap();
     let response = StreamResponse {
         body,
-        slash_sig: sig.as_bytes().to_vec(),
+        operator_sig: sig.as_bytes().to_vec(),
     };
     anyhow::Error::new(UpstreamRefused::open_for_test(response, error))
 }

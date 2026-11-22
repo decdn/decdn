@@ -4,7 +4,7 @@
 //! [`NodeId`] (DHT `FIND_VALUE` / origin directory), but paying one requires
 //! its bonded operator address: [`crate::buyer_pool::BuyerPoolService`]
 //! opens the USDC pool *to* that address, and the pull's open stage
-//! (`open_progressive_pull`) verifies the delivery `slash_sig`
+//! (`open_progressive_pull`) verifies the delivery `operator_sig`
 //! recovers *to* it. This module resolves that binding from the same
 //! `CapacityBond` data [`crate::dht::chain_staker_set::ChainStakerSet`] already
 //! reads — `getRegisteredNodes()` returns `NodeInfo { nodeId, ethAddress, .. }`
@@ -50,7 +50,7 @@ pub trait NodeAddressResolver: Send + Sync + std::fmt::Debug {
     /// The bonded operator address for `node_id`, or `None` if the node is not
     /// currently registered. `None` means the caller MUST NOT attempt a paid
     /// pull from it — there is no address to pay or to verify the
-    /// `slash_sig` against.
+    /// `operator_sig` against.
     fn address_of(&self, node_id: &NodeId) -> Option<Address>;
 }
 

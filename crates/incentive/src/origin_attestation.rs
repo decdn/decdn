@@ -21,7 +21,7 @@ use alloy::sol_types::SolStruct;
 
 use decdn_protocol::OriginAttestation;
 
-use crate::StreamSlashError;
+use crate::StreamSigError;
 
 // Field names and order are part of the signed type.
 mod sol_types {
@@ -90,20 +90,20 @@ pub fn sign_origin_attestation<S: SignerSync>(
 ///
 /// # Errors
 ///
-/// [`StreamSlashError::InvalidSignature`] if the signature does not parse,
+/// [`StreamSigError::InvalidSignature`] if the signature does not parse,
 /// has a high `s`, or does not recover.
 pub fn recover_origin_attestation_signer(
     hash: [u8; 32],
     attestation: &OriginAttestation,
     domain: &Eip712Domain,
-) -> Result<Address, StreamSlashError> {
+) -> Result<Address, StreamSigError> {
     let sig = Signature::try_from(attestation.sig.as_slice())
-        .map_err(|_| StreamSlashError::InvalidSignature)?;
+        .map_err(|_| StreamSigError::InvalidSignature)?;
     if crate::sig_canon::is_high_s(&sig) {
-        return Err(StreamSlashError::InvalidSignature);
+        return Err(StreamSigError::InvalidSignature);
     }
     sig.recover_address_from_prehash(&origin_attestation_signing_hash(hash, attestation, domain))
-        .map_err(|_| StreamSlashError::InvalidSignature)
+        .map_err(|_| StreamSigError::InvalidSignature)
 }
 
 #[cfg(test)]

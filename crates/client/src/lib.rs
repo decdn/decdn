@@ -396,7 +396,7 @@ use decdn_bao_range::align_range_clamped;
 #[cfg(any(test, feature = "test-util"))]
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE};
 use decdn_incentive::{
-    BuyerPoolState, EPHEMERAL_BINDING_NONCE, SignedCapability, SignedVoucher, StreamSlashData,
+    BuyerPoolState, EPHEMERAL_BINDING_NONCE, SignedCapability, SignedVoucher, StreamSigData,
     Voucher, binding_signing_hash, signed_to_wire_voucher,
 };
 use decdn_protocol::client::{
@@ -1167,7 +1167,7 @@ impl UpstreamRefused {
     /// Takes the whole `response` rather than just its `error` so the operator's
     /// own signed refusal survives on the value ([`Self::evidence`], #1042) —
     /// `body` is exactly the field set the EIP-712 `StreamResponse` typehash
-    /// covers and `slash_sig` is the operator's secp256k1 signature over it.
+    /// covers and `operator_sig` is the operator's secp256k1 signature over it.
     ///
     /// The retention is an attributable, non-repudiable record of *why* a paid
     /// pull was declined, which the caller can log, surface, or present in a
@@ -1331,13 +1331,13 @@ impl UpstreamRefused {
 
 impl std::fmt::Debug for UpstreamRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Elide the 65-byte `slash_sig` (and the full signed body) to a length so
+        // Elide the 65-byte `operator_sig` (and the full signed body) to a length so
         // `tracing::error!(?err)` stays readable — the derived `Debug` would dump
         // the entire attestation on every logged refusal.
         let mut dbg = f.debug_struct("UpstreamRefused");
         dbg.field("error", self.error());
         match self.evidence() {
-            Some(resp) => dbg.field("evidence_slash_sig_len", &resp.slash_sig.len()),
+            Some(resp) => dbg.field("evidence_operator_sig_len", &resp.operator_sig.len()),
             None => dbg.field("evidence", &Option::<()>::None),
         };
         dbg.finish()
@@ -1690,7 +1690,7 @@ impl PullDeadlines {
 /// arrive and verifying each bao chunk group as it lands.
 ///
 /// `expected_signer` is the delivering node's Ethereum address, used to verify
-/// the response `slash_sig`. `byte_offset` resumes a partial fetch. Use
+/// the response `operator_sig`. `byte_offset` resumes a partial fetch. Use
 /// [`stream_fetch_tracked`] instead if you need to persist the voucher watermark
 /// the lane reached (#852); this convenience wrapper discards it.
 ///
@@ -1704,7 +1704,7 @@ impl PullDeadlines {
 /// # Errors
 ///
 /// Fails on connect/transport errors, an invalid or zero-rate response, a
-/// `slash_sig` that does not recover to `expected_signer`, a mismatched echoed
+/// `operator_sig` that does not recover to `expected_signer`, a mismatched echoed
 /// field, a mid-stream `VoucherRejected`, a hash mismatch, or a timeout.
 #[cfg(any(test, feature = "test-util"))]
 #[allow(clippy::too_many_arguments)]
@@ -1712,7 +1712,7 @@ pub async fn stream_fetch(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     byte_offset: u64,
@@ -1723,7 +1723,7 @@ pub async fn stream_fetch(
         endpoint,
         target,
         ctx,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         // `stream_fetch` models a node-to-node pull; a suite that routes on a
@@ -1762,7 +1762,7 @@ pub async fn stream_fetch(
 pub async fn stream_fetch_on(
     warm: &WarmConnection,
     ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     byte_offset: u64,
@@ -1774,7 +1774,7 @@ pub async fn stream_fetch_on(
         warm,
         ctx,
         ledger,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         // Models a node-to-node pull, matching `stream_fetch`.
@@ -1808,7 +1808,7 @@ pub async fn stream_fetch_tracked(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -1823,7 +1823,7 @@ pub async fn stream_fetch_tracked(
         endpoint,
         target,
         ctx,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         namespace_id,
@@ -1867,7 +1867,7 @@ pub async fn stream_fetch_tracked_with_progress(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -1889,7 +1889,7 @@ pub async fn stream_fetch_tracked_with_progress(
             endpoint,
             target,
             ctx,
-            slash_domain,
+            stream_domain,
             expected_signer,
             hash,
             namespace_id,
@@ -1965,7 +1965,7 @@ pub async fn stream_fetch_shared(
     target: EndpointAddr,
     ctx: &PoolContext,
     ledger: &Arc<PoolLedger>,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     byte_offset: u64,
@@ -1980,7 +1980,7 @@ pub async fn stream_fetch_shared(
             endpoint,
             target,
             ctx,
-            slash_domain,
+            stream_domain,
             expected_signer,
             hash,
             // Shared-lane pulls model the daemon as buyer on a node-to-node
@@ -2185,7 +2185,7 @@ async fn fetch_inner(
     endpoint: &Endpoint,
     target: EndpointAddr,
     ctx: &PoolContext,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -2203,7 +2203,7 @@ async fn fetch_inner(
             target.clone(),
             ctx,
             Arc::clone(ledger),
-            slash_domain,
+            stream_domain,
             expected_signer,
             hash,
             namespace_id,
@@ -2270,7 +2270,7 @@ async fn fetch_in_memory_once(
     target: EndpointAddr,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -2286,7 +2286,7 @@ async fn fetch_in_memory_once(
         target,
         ctx,
         ledger,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         namespace_id,
@@ -2342,7 +2342,7 @@ async fn fetch_in_memory_once_on(
     warm: &WarmConnection,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -2358,7 +2358,7 @@ async fn fetch_in_memory_once_on(
         connection::ConnOwner::Borrowed,
         ctx,
         ledger,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         namespace_id,
@@ -3136,7 +3136,7 @@ impl std::fmt::Debug for UpstreamPull {
 /// Open a progressive `cdn/client/v1` pull (#856): connect, send the
 /// [`StreamRequest`], read and verify the signed [`StreamResponse`] (so
 /// `total_bytes` is known up front), and return its header plus a live
-/// [`UpstreamPull`] to drive. Zero-rate rejection, `slash_sig` recovery, echoed
+/// [`UpstreamPull`] to drive. Zero-rate rejection, `operator_sig` recovery, echoed
 /// field checks, the buyer's rate ceiling, and the `total_bytes >= byte_offset`
 /// floor are all enforced BEFORE the first chunk, and so is the size proof of
 /// `total_bytes` ([`UnprovenSize`]). The `max_blob_size_bytes` cap binds on the
@@ -3147,7 +3147,7 @@ impl std::fmt::Debug for UpstreamPull {
 ///
 /// # Errors
 ///
-/// Connect / transport faults, a refused or zero-rate response, a bad `slash_sig`,
+/// Connect / transport faults, a refused or zero-rate response, a bad `operator_sig`,
 /// a mismatched echoed field, a [`RateAboveCeiling`] quote, or a
 /// [`ResumeOffsetPastEnd`] offset. The cap surfaces later, as a [`BlobTooLarge`]
 /// abort once the stream's received bytes cross the cap's worth from its offset.
@@ -3181,7 +3181,7 @@ pub async fn open_progressive_pull(
     target: EndpointAddr,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -3197,7 +3197,7 @@ pub async fn open_progressive_pull(
         target,
         ctx,
         ledger,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         namespace_id,
@@ -3234,7 +3234,7 @@ pub(crate) async fn open_dialled_pull(
     target: EndpointAddr,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -3251,7 +3251,7 @@ pub(crate) async fn open_dialled_pull(
         connection::ConnOwner::Owned,
         ctx,
         ledger,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         namespace_id,
@@ -3297,7 +3297,7 @@ pub(crate) async fn open_progressive_pull_on(
     owner: connection::ConnOwner,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -3314,7 +3314,7 @@ pub(crate) async fn open_progressive_pull_on(
         owner.clone(),
         ctx,
         ledger,
-        slash_domain,
+        stream_domain,
         expected_signer,
         hash,
         namespace_id,
@@ -3345,7 +3345,7 @@ async fn open_progressive_pull_impl(
     owner: connection::ConnOwner,
     ctx: &PoolContext,
     ledger: Arc<PoolLedger>,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     namespace_id: [u8; 32],
@@ -3364,7 +3364,7 @@ async fn open_progressive_pull_impl(
     let result: anyhow::Result<(UpstreamPullHeader, UpstreamPull)> = async {
         let args = opened::OpenArgs {
             ctx,
-            slash_domain,
+            stream_domain,
             expected_signer,
             hash,
             // Node-to-node pull. `NO_NAMESPACE` (0) for a DHT-discovered *holder* — it
@@ -4564,14 +4564,14 @@ fn voucher_rejection(
 fn verify_response(
     resp: &StreamResponse,
     ext: &StreamResponseExt,
-    slash_domain: &Eip712Domain,
+    stream_domain: &Eip712Domain,
     expected_signer: Address,
     hash: [u8; 32],
     timestamp_us: u64,
     byte_offset: u64,
     byte_len: u64,
 ) -> anyhow::Result<Option<ProvenSize>> {
-    // #252 + slash_sig length/upper-bound checks on the frozen base...
+    // #252 + operator_sig length/upper-bound checks on the frozen base...
     resp.validate()
         .map_err(|e| anyhow::anyhow!("invalid stream response: {e}"))?;
     // ...and the ok/error agreement, which spans the signed base and the unsigned
@@ -4585,12 +4585,12 @@ fn verify_response(
     if resp.body.timestamp_us != timestamp_us {
         anyhow::bail!("response timestamp_us not echoed");
     }
-    // slash_sig must recover to the delivering node's Ethereum address.
-    let sig = Signature::try_from(resp.slash_sig.as_slice())
-        .map_err(|e| anyhow::anyhow!("slash_sig parse: {e}"))?;
-    StreamSlashData::from_response_body(&resp.body)
-        .verify_signer(&sig, expected_signer, slash_domain)
-        .map_err(|e| anyhow::anyhow!("slash_sig verification failed: {e}"))?;
+    // operator_sig must recover to the delivering node's Ethereum address.
+    let sig = Signature::try_from(resp.operator_sig.as_slice())
+        .map_err(|e| anyhow::anyhow!("operator_sig parse: {e}"))?;
+    StreamSigData::from_response_body(&resp.body)
+        .verify_signer(&sig, expected_signer, stream_domain)
+        .map_err(|e| anyhow::anyhow!("operator_sig verification failed: {e}"))?;
     // A served response states its size only in its proof (ADR 005 § Bounded
     // byte ranges), and `validate` above ties a served outcome to `ok`.
     let proven = ext

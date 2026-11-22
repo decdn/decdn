@@ -21,7 +21,7 @@
 //! | [`chain_id`] | The CAIP-2 [`ChainId`] of a chain |
 //! | [`pool_account`] | The CAIP-10 [`PoolAccount`] that names a `PaymentPool` contract |
 //! | [`region`] | ISO 3166-1 alpha-2 [`Region`] codes |
-//! | [`message`] | Items every signed message shares: [`MAX_RATE_PER_MB`], [`SLASH_SIG_LEN`], [`MessageValidationError`], [`EMPTY_ROOT`] |
+//! | [`message`] | Items every signed message shares: [`MAX_RATE_PER_MB`], [`OPERATOR_SIG_LEN`], [`MessageValidationError`], [`EMPTY_ROOT`] |
 //!
 //! # Frames and extensions
 //!
@@ -102,7 +102,7 @@ pub use framing::{
     write_frame,
 };
 pub use identity::{ContentHash, ID_LEN, NodeId};
-pub use message::{EMPTY_ROOT, MAX_RATE_PER_MB, MessageValidationError, SLASH_SIG_LEN};
+pub use message::{EMPTY_ROOT, MAX_RATE_PER_MB, MessageValidationError, OPERATOR_SIG_LEN};
 pub use pool_account::{MAX_PAYMENT_POOLS, MAX_POOL_ACCOUNT_LEN, PoolAccount, PoolAccountError};
 pub use region::{InvalidRegion, Region, is_valid_region};
 pub use size_proof::{MAX_SIZE_PROOF_BYTES, SizeProof, SizeProofTooLong};
