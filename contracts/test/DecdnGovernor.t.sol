@@ -285,6 +285,26 @@ contract DecdnGovernorTest is Test {
         assertEq(gov.quorum(tp), 40_000);
     }
 
+    /// @notice `firstBondedAt` is read live, so an operator whose tenure ends
+    ///         after a snapshot (an `unbond` below its floor) and re-enters
+    ///         holds 0 weight at that snapshot: the fresh stamp postdates it.
+    function test_getVotes_tenureResetAfterSnapshotZeroesWeight() public {
+        vm.warp(BASE + 2);
+        bond.setFirstBondedAt(operator, uint64(BASE - 365 days));
+        _setBytesAtTimepoint(operator, 100_000, 1_000_000);
+        assertEq(gov.getVotes(operator, tp), 100_000, "setup: full weight at the snapshot");
+
+        // The operator unbonds below its floor: the tenure ends.
+        vm.warp(BASE + 10);
+        bond.setFirstBondedAt(operator, 0);
+        assertEq(gov.getVotes(operator, tp), 0, "no tenure, no weight");
+
+        // It re-bonds `minBond`: the entry stamps a fresh tenure after `tp`.
+        vm.warp(BASE + 20);
+        bond.setFirstBondedAt(operator, uint64(BASE + 20));
+        assertEq(gov.getVotes(operator, tp), 0, "the fresh tenure postdates the snapshot");
+    }
+
     /// @notice #847 edge — before any epoch has fully elapsed (snapshot inside
     ///         epoch 0), the window is empty: weight, quorum, and threshold all
     ///         return 0 without underflowing `uint64` in `_endEpoch`.

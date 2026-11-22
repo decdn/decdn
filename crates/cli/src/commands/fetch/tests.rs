@@ -302,10 +302,10 @@ fn unsigned_notfound_refusal_is_untouched() {
     assert_eq!(annotated.to_string(), want);
 }
 
-/// An open-stage `NotFound` the node signed at `rate_per_mb`, built the way
-/// the fetch path holds one: an `UpstreamRefused` whose `evidence()` is the
-/// signed response.
-fn signed_notfound(rate_per_mb: u64) -> anyhow::Error {
+/// An open-stage `error` refusal the node signed at `rate_per_mb`, built the
+/// way the fetch path holds one: an `UpstreamRefused` whose `evidence()` is
+/// the signed response.
+fn signed_open(rate_per_mb: u64, error: StreamError) -> anyhow::Error {
     use decdn_incentive::stream_sig::StreamSigData;
     use decdn_protocol::client::{StreamResponse, StreamResponseBody};
 
@@ -323,10 +323,12 @@ fn signed_notfound(rate_per_mb: u64) -> anyhow::Error {
         body,
         operator_sig: sig.as_bytes().to_vec(),
     };
-    anyhow::Error::new(UpstreamRefused::open_for_test(
-        response,
-        StreamError::NotFound,
-    ))
+    anyhow::Error::new(UpstreamRefused::open_for_test(response, error))
+}
+
+/// [`signed_open`] for a `NotFound` refusal.
+fn signed_notfound(rate_per_mb: u64) -> anyhow::Error {
+    signed_open(rate_per_mb, StreamError::NotFound)
 }
 
 /// A pool context with `deposit − prior_amount` of headroom.
@@ -378,13 +380,31 @@ fn signed_notfound_within_the_headroom_is_untouched() {
     assert_eq!(annotated.to_string(), want);
 }
 
-/// A zero quoted rate prices nothing, so no deposit can fall short of it.
+/// A zero quoted rate prices one chunk at 0, which even an empty pool covers,
+/// so a free quote is never blamed on the deposit.
 #[test]
 fn signed_notfound_at_rate_zero_is_untouched() {
+    assert_eq!(
+        min_payment(decdn_protocol::client::CHUNK_BYTES, 0),
+        U256::ZERO
+    );
     let err = signed_notfound(0);
     let want = err.to_string();
     let annotated = annotate_cache_miss(err, &ctx_with_headroom(0, 0));
     assert_eq!(annotated.to_string(), want);
+}
+
+/// A signed open-stage refusal that is NOT `NotFound` is never annotated,
+/// even when its quoted rate prices a chunk above an empty pool: the filter
+/// on the refusal kind, not the headroom, is what passes it through.
+#[test]
+fn signed_non_notfound_refusal_is_untouched() {
+    for error in [StreamError::Declined, StreamError::Unfunded] {
+        let err = signed_open(1_000, error);
+        let want = format!("{err:#}");
+        let annotated = annotate_cache_miss(err, &ctx_with_headroom(0, 0));
+        assert_eq!(format!("{annotated:#}"), want, "no context added");
+    }
 }
 
 /// A refusal that is NOT `NotFound`, or a non-refusal failure, is never

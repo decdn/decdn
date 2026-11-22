@@ -200,6 +200,8 @@ fn release_pin_refuses_a_decdn_below_the_installers_minimum() {
     ] {
         let err = ReleasePin::new(tag, &digest).unwrap_err().to_string();
         assert!(err.contains("below v0.4.0"), "{tag}: {err}");
+        assert!(err.contains("refuses hidden paths"), "{tag}: {err}");
+        assert!(err.contains("--slash-judge-address"), "{tag}: {err}");
     }
     let parsed = args(&["--decdn-release", "v0.3.0"]).unwrap();
     let err = OnrampConfig::from_args(parsed).unwrap_err().to_string();
@@ -216,21 +218,34 @@ fn release_pin_refuses_per_crate_tags() {
 
 #[test]
 fn release_pin_rejects_anything_a_script_could_misread() {
+    // Every input sits at or above the minimum, so the shape and digest
+    // checks, not the version floor, refuse them.
     let digest = "ab".repeat(32);
     for tag in [
-        "0.3.0",
-        "v0.2",
-        "v0.3.0.1",
+        "0.4.0",
+        "v0.4",
+        "v0.4.0.1",
         "v0..0",
-        "v0.3.0-",
-        "v0.3.0 ",
-        "v0.3.0;rm",
-        "v0.3.0$(id)",
-        "v0.3.0'",
+        "v0.4.0-",
+        "v0.4.0 ",
+        "v0.4.0;rm",
+        "v0.4.0$(id)",
+        "v0.4.0'",
+        "v1.0.0-x;rm",
+        "v1.0.0-$(id)",
+        "v1.0.0-a'b",
     ] {
-        assert!(ReleasePin::new(tag, &digest).is_err(), "{tag:?}");
+        let err = ReleasePin::new(tag, &digest).unwrap_err().to_string();
+        assert!(
+            err.contains("is not vMAJOR.MINOR.PATCH[-pre]"),
+            "{tag:?}: {err}"
+        );
     }
     for bad in [&"AB".repeat(32), &"ab".repeat(31), &"zz".repeat(32)] {
-        assert!(ReleasePin::new("v0.3.0", bad).is_err(), "{bad}");
+        let err = ReleasePin::new("v0.4.0", bad).unwrap_err().to_string();
+        assert!(
+            err.contains("is not 64 lowercase hex characters"),
+            "{bad}: {err}"
+        );
     }
 }

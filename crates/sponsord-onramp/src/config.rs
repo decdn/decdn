@@ -70,7 +70,9 @@ impl ReleasePin {
             at_least(version, MIN_DECDN_RELEASE),
             "release tag {tag:?} is below {RELEASE_TAG_PREFIX}{min_major}.{min_minor}.{min_patch}, \
              the oldest decdn whose `get` picks the destination and refuses hidden paths \
-             when the installers pass no `-o`"
+             when the installers pass no `-o`, and verifies node answers under the \
+             `CapacityBond` EIP-712 domain (an older `get` needs `--slash-judge-address`, \
+             which the installers do not pass)"
         );
         anyhow::ensure!(
             sums_sha256.len() == 64

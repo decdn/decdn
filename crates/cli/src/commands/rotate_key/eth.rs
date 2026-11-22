@@ -29,9 +29,10 @@
 //! displaced by `reclaimNodeId`) still has its tier, and `deregisterNode`
 //! reverts `NodeNotActive` for it. The unbond phase therefore clears that tier
 //! with `declareMbps(0)` before it withdraws, as `decdn node unbond --all` does
-//! for an inactive operator, and prints that tier in its receipt. A run
-//! that lands the clear and loses the withdrawal re-reads a zero tier and only
-//! withdraws on re-run.
+//! for an inactive operator. It names that tier in its confirmation, in its
+//! receipt, and on stderr when the receipt cannot be written. A run that lands
+//! the clear and loses the withdrawal re-reads a zero tier and only withdraws
+//! on re-run.
 //!
 //! # The node id changes too
 //!
@@ -130,23 +131,67 @@ pub(crate) async fn run(
     let mut out = io::stdout().lock();
     let written = write_plan(&mut out, &plan, json, &outcome, false);
     drop(out);
+    settle_receipt(&plan, result, written, &mut io::stderr().lock())
+}
+
+/// Combine the operation result with the receipt write.
+///
+/// A failed receipt write degrades to `stderr`, and it carries the tier the
+/// unbond phase clears ([`tier_to_record`]): that tier is in the receipt and
+/// nowhere else after the run, so a broken pipe must not take it with it.
+fn settle_receipt(
+    plan: &Plan,
+    result: anyhow::Result<()>,
+    written: io::Result<()>,
+    stderr: &mut dyn io::Write,
+) -> anyhow::Result<()> {
+    let tier = tier_to_record(plan);
     match (result, written) {
         // A failed operation outranks a failed receipt: `?`-ing the write here
         // would let piping into `head` replace "deregisterNode reverted (tx …)"
         // with "Broken pipe".
         (Err(op), written) => {
             if let Err(err) = written {
-                eprintln!("failed to write the result receipt to stdout: {err}");
+                // Best effort: stderr is the last place left to report to.
+                let _ = writeln!(
+                    stderr,
+                    "failed to write the result receipt to stdout: {err}"
+                );
+                if let Some(tier) = &tier {
+                    let _ = writeln!(stderr, "{tier}");
+                }
             }
             Err(op)
         }
         // Nothing else to report, so the receipt IS the output — a lost one
         // must not exit 0, or a wrapper records a phase that was never recorded.
-        (Ok(()), Err(err)) => Err(err).context(
-            "the phase completed but its receipt could not be written; re-run to re-read the \
-             phase from chain state before assuming anything about what landed",
-        ),
+        (Ok(()), Err(err)) => {
+            let mut msg = String::from(
+                "the phase completed but its receipt could not be written; re-run to re-read the \
+                 phase from chain state before assuming anything about what landed",
+            );
+            if let Some(tier) = tier {
+                msg.push_str(". ");
+                msg.push_str(&tier);
+            }
+            Err(err).context(msg)
+        }
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// The tier line an operator must record before the unbond phase clears it,
+/// or `None` when the phase clears no tier. `declareMbps(0)` destroys the tier,
+/// and the re-onboarding phase needs it back as `--mbps`.
+fn tier_to_record(plan: &Plan) -> Option<String> {
+    match plan.phase {
+        Phase::Unbond {
+            clear_tier: Some(mbps),
+            ..
+        } => Some(format!(
+            "RECORD THIS: the declared tier is {mbps} Mbps; pass --mbps {mbps} at re-onboarding."
+        )),
+        _ => None,
     }
 }
 
@@ -192,14 +237,20 @@ impl Phase {
 
     /// Whether this phase asks before submitting.
     ///
-    /// The two that do are the ones that cost something irreversible: leaving
-    /// the active set, and spending TOKEN from a new address. `Unbond` only
-    /// returns the operator's own money (clearing first a tier its receipt
-    /// prints, for an operator that never deregistered), and `Complete` submits
-    /// nothing —
-    /// prompting there would train the operator to confirm reflexively.
+    /// Every phase that submits costs something irreversible, so each one
+    /// asks: leaving the active set, withdrawing the whole bond, and spending
+    /// TOKEN from a new address. The whole-bond `unbond` leaves nothing, which
+    /// is below any activation floor, so it ends a running tenure: it clears
+    /// `firstBondedAt` and the floor, and a later re-bond restarts the
+    /// governance age ramp from zero. For an operator that left the active set without
+    /// `deregisterNode`, it also clears the declared tier first, which nothing
+    /// can read back. That operator never passed the deregister phase's
+    /// confirmation, so this one is the first place either loss is disclosed.
+    /// `Complete` submits nothing, and prompting there would train the
+    /// operator to confirm reflexively. `--yes` skips the prompt for every
+    /// phase alike, after the disclosure prints.
     const fn needs_confirmation(&self) -> bool {
-        matches!(*self, Self::Deregister { .. } | Self::Reonboard { .. })
+        !matches!(*self, Self::Complete { .. })
     }
 
     /// The address being migrated onto, once it is known.
@@ -456,28 +507,7 @@ async fn execute<P: Provider + Clone>(
             .await?;
         }
         Phase::Unbond { amount, clear_tier } => {
-            if clear_tier.is_some() {
-                chain_ctx::send(
-                    bond_contract.declareMbps(U256::ZERO),
-                    "declareMbps",
-                    Some(
-                        "declareMbps(0) is accepted only from an operator that is NOT in the \
-                         registered set; re-run this command to re-read the phase",
-                    ),
-                    &mut outcome.declare,
-                )
-                .await?;
-            }
-            chain_ctx::send(
-                bond_contract.unbond(*amount),
-                "unbond",
-                Some(
-                    "the declared tier must be 0 and the active bond unchanged since this run \
-                     read them; re-run this command to re-read the phase",
-                ),
-                &mut outcome.unbond,
-            )
-            .await?;
+            unbond_whole_bond(&bond_contract, *amount, clear_tier.is_some(), outcome).await?;
         }
         Phase::Reonboard {
             new_operator,
@@ -499,6 +529,40 @@ async fn execute<P: Provider + Clone>(
         }
         Phase::Complete { .. } => {}
     }
+    Ok(())
+}
+
+/// The unbond phase's transactions: `declareMbps(0)` when `clear_tier`, then
+/// `unbond(amount)`. The clear comes first because `unbond` reverts
+/// `BondBelowCurve` against a standing tier.
+async fn unbond_whole_bond<P: Provider>(
+    bond_contract: &CapacityBond::CapacityBondInstance<P>,
+    amount: U256,
+    clear_tier: bool,
+    outcome: &mut Outcome,
+) -> anyhow::Result<()> {
+    if clear_tier {
+        chain_ctx::send(
+            bond_contract.declareMbps(U256::ZERO),
+            "declareMbps",
+            Some(
+                "declareMbps(0) is accepted only from an operator that is NOT in the \
+                 registered set; re-run this command to re-read the phase",
+            ),
+            &mut outcome.declare,
+        )
+        .await?;
+    }
+    chain_ctx::send(
+        bond_contract.unbond(amount),
+        "unbond",
+        Some(
+            "the declared tier must be 0 and the active bond unchanged since this run \
+             read them; re-run this command to re-read the phase",
+        ),
+        &mut outcome.unbond,
+    )
+    .await?;
     Ok(())
 }
 
@@ -736,7 +800,7 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
                 w,
                 "Withdrawing the whole bond clears this address's firstBondedAt ({}), so its \
                  governance age-ramp ends. The new address's ramp starts at its own bond and \
-                 rebuilds to full weight over six months.",
+                 rebuilds to full weight over `age_ramp_months` (6 by default).",
                 p.first_bonded_at,
             )?;
         }
@@ -761,8 +825,8 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
             writeln!(
                 w,
                 "firstBondedAt resets to now: the new address's governance age-ramp starts at \
-                 this bond and rebuilds to full weight over six months. Peer reputation against \
-                 the old node id is stranded."
+                 this bond and rebuilds to full weight over `age_ramp_months` (6 by default). \
+                 Peer reputation against the old node id is stranded."
             )?;
             writeln!(
                 w,
@@ -771,9 +835,40 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
                  those lanes."
             )?;
         }
-        // The remaining phases either submit nothing or only return the
-        // operator's own money, and are gated out by `needs_confirmation`.
-        Phase::Unbond { .. } | Phase::Complete { .. } => {}
+        Phase::Unbond { amount, .. } => {
+            writeln!(
+                w,
+                "About to withdraw the whole bond of {amount} base units from {:#x}.",
+                p.old_operator,
+            )?;
+            if let Some(tier) = tier_to_record(p) {
+                writeln!(
+                    w,
+                    "This address left the active set without deregistering, so its declared \
+                     tier still stands. This call clears it with declareMbps(0) first, and it \
+                     cannot be read back afterwards."
+                )?;
+                writeln!(w, "{tier}")?;
+            }
+            if p.first_bonded_at == 0 {
+                writeln!(
+                    w,
+                    "This address holds no tenure (firstBondedAt is 0), so no governance \
+                     age-ramp is lost."
+                )?;
+            } else {
+                writeln!(
+                    w,
+                    "Withdrawing the whole bond ends this address's tenure: it clears \
+                     firstBondedAt ({}) and the recorded bond floor, and nothing restores them. \
+                     The new address's governance age-ramp starts at its own bond and rebuilds \
+                     to full weight over `age_ramp_months` (6 by default).",
+                    p.first_bonded_at,
+                )?;
+            }
+        }
+        // `Complete` submits nothing, and `needs_confirmation` gates it out.
+        Phase::Complete { .. } => {}
     }
     Ok(())
 }

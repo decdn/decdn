@@ -874,7 +874,8 @@ impl ChainFixture {
             .context("read nodeIdToAddress")
     }
 
-    /// Unix timestamp of `operator`'s first bond — the ADR 026 age-ramp anchor.
+    /// Unix timestamp of the start of `operator`'s current tenure, or 0 while
+    /// none runs — the ADR 026 age-ramp anchor.
     /// An iroh-key rotation must preserve it; an Ethereum-key migration cannot.
     pub async fn first_bonded_at(&self, operator: Address) -> anyhow::Result<u64> {
         CapacityBond::new(self.addrs.capacity_bond, &self.admin)

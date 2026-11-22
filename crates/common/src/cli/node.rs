@@ -154,7 +154,8 @@ pub enum NodeCommand {
     /// tier down (if needed), then withdraws the released TOKEN to the
     /// operator in the same run. The node goes INACTIVE only when the retained
     /// bond drops below the operator's bond floor (the minBond in force when
-    /// it activated). Pass `--dry-run` to print the plan without submitting.
+    /// its tenure began), and that unbond also ends the tenure, clearing
+    /// `firstBondedAt`. Pass `--dry-run` to print the plan without submitting.
     Unbond(UnbondArgs),
     /// Leave the active node set on-chain via `CapacityBond.deregisterNode`
     /// (ADR 003 § Node Registry) — the reverse of `decdn node register`, and
@@ -883,8 +884,10 @@ pub struct UnbondArgs {
     /// `bondRequired(declaredMbps)`. Unlike `--to-mbps` this ignores the
     /// `minBond` floor, so at low declared tiers the retained bond can land
     /// below the operator's bond floor and the node stays inactive until it
-    /// re-bonds. Whether it does is tier-dependent; the command reports `below_floor` before
-    /// submitting.
+    /// re-bonds. Such an unbond also ends the tenure: it clears
+    /// `firstBondedAt`, which restarts the governance age ramp at the next
+    /// entry. Whether it does is tier-dependent; the command reports it
+    /// (`below_floor`) before submitting.
     ///
     /// For an operator that is NOT in the registered set — ejected, or bonded
     /// and declared but never registered — this additionally clears the

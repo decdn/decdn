@@ -285,7 +285,8 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
 
     /// @dev Linear ramp from 0 → 1e18 over `rampMonths × SECONDS_PER_MONTH`
     ///      since `firstBondedAt`. Returns 1e18 (full weight) once tenure
-    ///      exceeds the ramp horizon; 0 if `firstBondedAt == 0` (never bonded).
+    ///      exceeds the ramp horizon; 0 if `firstBondedAt == 0` (no running
+    ///      tenure: never entered, or tenure ended by an unbond below the floor).
     function _ageRampScaled(uint64 firstBondedAt, uint256 timepoint, uint256 rampMonths)
         internal
         pure

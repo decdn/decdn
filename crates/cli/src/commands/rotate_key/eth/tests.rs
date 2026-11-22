@@ -208,27 +208,190 @@ fn reonboard_disclosure_names_the_fresh_node_id_and_the_carry_over_route() {
     );
 }
 
-/// Prompting on a phase that only returns the operator's own money — or
-/// submits nothing at all — trains reflexive confirmation, which is how the
-/// prompts that matter stop being read.
+/// Every phase that submits asks first, the unbond phase included: the
+/// whole-bond `unbond` ends the tenure (it clears `firstBondedAt` and the
+/// activation floor) whether or not it clears a tier. `Complete` submits
+/// nothing, and prompting there trains reflexive confirmation.
 #[test]
-fn only_the_costly_phases_prompt() {
+fn every_submitting_phase_prompts() {
     assert!(Phase::Deregister { declared_mbps: 1 }.needs_confirmation());
     assert!(reonboard_phase().needs_confirmation());
+    for clear_tier in [Some(5_000), None] {
+        assert!(
+            Phase::Unbond {
+                amount: U256::from(1u64),
+                clear_tier,
+            }
+            .needs_confirmation(),
+            "{clear_tier:?}"
+        );
+    }
 
-    assert!(
-        !Phase::Unbond {
-            amount: U256::from(1u64),
-            clear_tier: Some(5_000),
-        }
-        .needs_confirmation()
-    );
     assert!(
         !Phase::Complete {
             new_operator: Address::ZERO
         }
         .needs_confirmation()
     );
+}
+
+/// An operator that never deregistered sees no other confirmation before
+/// its tier and its tenure go, so this disclosure names both.
+#[test]
+fn unbond_disclosure_records_the_tier_and_the_tenure_loss() {
+    let s = disclosure(&plan(Phase::Unbond {
+        amount: U256::from(50_000u64),
+        clear_tier: Some(5_000),
+    }));
+    assert!(s.contains("50000 base units"), "{s}");
+    assert!(
+        s.contains(
+            "RECORD THIS: the declared tier is 5000 Mbps; pass --mbps 5000 at re-onboarding"
+        ),
+        "{s}"
+    );
+    assert!(s.contains("declareMbps(0)"), "{s}");
+    assert!(
+        s.contains("clears firstBondedAt (1700000000)"),
+        "the tenure loss is disclosed: {s}"
+    );
+    assert!(s.contains("`age_ramp_months` (6 by default)"), "{s}");
+}
+
+/// A deregistered operator has no tier left to record, but the whole-bond
+/// unbond still ends its tenure.
+#[test]
+fn unbond_disclosure_without_a_tier_still_names_the_tenure_loss() {
+    let s = disclosure(&plan(Phase::Unbond {
+        amount: U256::from(50_000u64),
+        clear_tier: None,
+    }));
+    assert!(!s.contains("RECORD THIS"), "{s}");
+    assert!(!s.contains("declareMbps(0)"), "{s}");
+    assert!(s.contains("clears firstBondedAt (1700000000)"), "{s}");
+
+    let mut no_tenure = plan(Phase::Unbond {
+        amount: U256::from(50_000u64),
+        clear_tier: None,
+    });
+    no_tenure.first_bonded_at = 0;
+    let s = disclosure(&no_tenure);
+    assert!(s.contains("holds no tenure"), "{s}");
+    assert!(!s.contains("clears firstBondedAt"), "{s}");
+}
+
+/// A receipt write that fails after a failed operation degrades to stderr,
+/// and the cleared tier goes with it: the receipt is the only other place
+/// it is written.
+#[test]
+fn a_lost_receipt_after_a_failed_unbond_keeps_the_tier_on_stderr() {
+    let p = plan(Phase::Unbond {
+        amount: U256::from(50_000u64),
+        clear_tier: Some(5_000),
+    });
+    let mut stderr = Vec::new();
+    let err = settle_receipt(
+        &p,
+        Err(anyhow::anyhow!("unbond reverted")),
+        Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        &mut stderr,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unbond reverted",
+        "the operation error outranks the receipt"
+    );
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(
+        stderr.contains("failed to write the result receipt"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--mbps 5000"), "{stderr}");
+}
+
+/// A receipt write that fails after a completed unbond fails the run, and
+/// its error carries the cleared tier.
+#[test]
+fn a_lost_receipt_after_a_completed_unbond_names_the_tier_in_the_error() {
+    let p = plan(Phase::Unbond {
+        amount: U256::from(50_000u64),
+        clear_tier: Some(5_000),
+    });
+    let mut stderr = Vec::new();
+    let err = settle_receipt(
+        &p,
+        Ok(()),
+        Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        &mut stderr,
+    )
+    .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("receipt could not be written"), "{msg}");
+    assert!(
+        msg.contains("RECORD THIS: the declared tier is 5000 Mbps; pass --mbps 5000"),
+        "{msg}"
+    );
+
+    // No tier to clear: the error carries none.
+    let p = plan(Phase::Unbond {
+        amount: U256::from(50_000u64),
+        clear_tier: None,
+    });
+    let err = settle_receipt(
+        &p,
+        Ok(()),
+        Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        &mut stderr,
+    )
+    .unwrap_err();
+    assert!(!format!("{err:#}").contains("RECORD THIS"), "{err:#}");
+}
+
+/// For an operator that never deregistered, `declareMbps(0)` goes out before
+/// `unbond`: the reverse order reverts `BondBelowCurve` against the standing
+/// tier. Both sends land in the outcome.
+#[tokio::test]
+async fn the_unbond_phase_clears_the_tier_before_it_withdraws() {
+    use alloy::sol_types::SolCall;
+    use decdn_incentive::test_rpc::{ScriptedRpc, mined_receipt};
+
+    let cb = Address::repeat_byte(0xCB);
+    let rpc = ScriptedRpc::mined(mined_receipt(cb, Vec::new()));
+    let bond_contract = CapacityBond::new(cb, rpc.clone().provider());
+    let amount = U256::from(50_000u64);
+    let mut outcome = Outcome::default();
+    unbond_whole_bond(&bond_contract, amount, true, &mut outcome)
+        .await
+        .unwrap();
+
+    let sent = rpc.sent_inputs();
+    let expected = [
+        CapacityBond::declareMbpsCall { mbps: U256::ZERO }.abi_encode(),
+        CapacityBond::unbondCall { amount }.abi_encode(),
+    ];
+    assert_eq!(
+        sent.iter().map(|b| b.to_vec()).collect::<Vec<_>>(),
+        expected.to_vec()
+    );
+    assert!(outcome.declare.is_some(), "the clear is recorded");
+    assert!(outcome.unbond.is_some(), "the withdrawal is recorded");
+
+    // A cleared tier: the re-run only withdraws.
+    let rpc = ScriptedRpc::mined(mined_receipt(cb, Vec::new()));
+    let bond_contract = CapacityBond::new(cb, rpc.clone().provider());
+    let mut outcome = Outcome::default();
+    unbond_whole_bond(&bond_contract, amount, false, &mut outcome)
+        .await
+        .unwrap();
+    assert_eq!(
+        rpc.sent_inputs()
+            .iter()
+            .map(|b| b.to_vec())
+            .collect::<Vec<_>>(),
+        vec![CapacityBond::unbondCall { amount }.abi_encode()]
+    );
+    assert!(outcome.declare.is_none(), "{:?}", outcome.declare);
 }
 
 #[test]
