@@ -238,12 +238,16 @@ const KNOWN_SIGNER_LOOKUPS_PER_MINUTE: u32 = 10;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A gateway pull that makes no verified progress for this long gives up, so
-/// a stuck request does not hold its pull slot.
+/// a stuck request does not hold its pull slot. It is the gateway's default
+/// for `--give-up-after-secs`. The same limit bounds how long a pull's write
+/// waits on a response that does not read, so a client that stops reading
+/// frees its slot.
 const GIVE_UP_AFTER_SECS: u64 = 120;
 
 /// The most pulls that run at once; a request past it waits for a slot. Each
 /// pull stripes across up to `--max-sources` holders, so this also bounds the
-/// streams the gateway opens on one node's connection.
+/// streams the gateway opens on one node's connection. A public gateway sees
+/// its proxy, not the client, so a per-client limit belongs on the proxy.
 const MAX_PULLS: usize = 16;
 
 /// The most parsed manifests the gateway keeps.
@@ -315,7 +319,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     let file = load_file_config(config_path)?;
     fill_chain_defaults(&mut common, &file)?;
     let chain = resolve_chain(&common, &file)?.config;
-    common.give_up_after_secs = common.give_up_after_secs.or(Some(GIVE_UP_AFTER_SECS));
+    let stall = Duration::from_secs(*common.give_up_after_secs.get_or_insert(GIVE_UP_AFTER_SECS));
     let root = common
         .data_dir
         .clone()
@@ -340,6 +344,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
             cache: cache.clone().map(CacheStores::new),
         },
         MAX_PULLS,
+        stall,
     )
     .await
     .context("start the gateway's pull worker")?;
@@ -1911,6 +1916,8 @@ impl Gateway {
                 paying: paying.clone(),
                 writer,
                 done,
+                // A size lookup is not a pull in flight.
+                listing: Box::new(()),
             })
             .map_err(PullError::Other)?;
         match ended.await {
@@ -2186,7 +2193,7 @@ impl Gateway {
         paying: &Credential,
         cap_mb: u64,
     ) -> Result<(Arc<BundleManifest>, usize), ManifestStop> {
-        let (first, mut reader, done, _guard) = self
+        let (first, mut reader, done, _delivered) = self
             .start_pull(hash, namespace, paying, cap_mb, None, None)
             .await
             .map_err(|e| over_manifest_cap(e.into()))?;
@@ -2249,7 +2256,7 @@ impl Gateway {
         let (content_type, rewrite) = presentation(present, &name);
         // The pull holds no more than the size the manifest declares or a
         // pull verified, and takes only the window a range asked for.
-        let (first, reader, done, guard) = self
+        let (first, reader, done, delivered_at) = self
             .start_pull(
                 hash,
                 namespace,
@@ -2265,7 +2272,8 @@ impl Gateway {
             done: Some(done),
             rewrite,
             delivered: 0,
-            guard,
+            delivered_at,
+            gateway: Arc::clone(self),
         };
         let held = Arc::new(paying.clone());
         let body = futures_util::stream::unfold(state, move |s| next_frame(s, Arc::clone(&held)));
@@ -2445,7 +2453,9 @@ impl Gateway {
     /// Hand the pull of `hash` to the worker, capped at `max_blob_mb` and at
     /// `size_cap` bytes when the blob's size is known, over the byte window
     /// `range` or the whole blob, and wait for its first verified bytes. The
-    /// pull writes into a pipe the response reads from.
+    /// pull writes into a pipe the response reads from. It is listed as in
+    /// flight until the worker's pull ends; the last value returned is its
+    /// listing's count of delivered bytes.
     async fn start_pull(
         self: &Arc<Self>,
         hash: [u8; 32],
@@ -2459,7 +2469,7 @@ impl Gateway {
             Bytes,
             DuplexStream,
             oneshot::Receiver<anyhow::Result<()>>,
-            PullGuard,
+            Arc<AtomicU64>,
         ),
         PullError,
     > {
@@ -2470,6 +2480,7 @@ impl Gateway {
         // Listed before the worker has the job, so a pull waiting for its
         // slot shows as in flight.
         let guard = PullGuard::new(Arc::clone(self), paying, hash, namespace, range);
+        let delivered = Arc::clone(&guard.delivered);
         self.pulls
             .pull(Job {
                 blob: BlobFetch {
@@ -2487,10 +2498,11 @@ impl Gateway {
                 paying: paying.clone(),
                 writer,
                 done: done_tx,
+                listing: Box::new(guard),
             })
             .map_err(PullError::Other)?;
         let (first, done_rx) = first_chunk(&mut reader, done_rx).await?;
-        Ok((first, reader, done_rx, guard))
+        Ok((first, reader, done_rx, delivered))
     }
 }
 
@@ -2503,7 +2515,7 @@ async fn next_frame(
     mut s: Streaming,
     held: Arc<Credential>,
 ) -> Option<(Result<Frame<Bytes>, std::io::Error>, Streaming)> {
-    let gateway = Arc::clone(&s.guard.gateway);
+    let gateway = Arc::clone(&s.gateway);
     let chunk = if let Some(first) = s.first.take() {
         first
     } else {
@@ -2535,7 +2547,7 @@ async fn next_frame(
     s.delivered = s
         .delivered
         .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-    s.guard.delivered.store(s.delivered, Ordering::Relaxed);
+    s.delivered_at.store(s.delivered, Ordering::Relaxed);
     gateway.metrics.bytes(chunk.len());
     let out = match s.rewrite.as_mut() {
         Some(rewrite) => rewrite.feed(&chunk),
@@ -2718,8 +2730,10 @@ struct Streaming {
     rewrite: Option<Rewrite>,
     /// Content bytes handed to the response so far.
     delivered: u64,
-    /// Lists the pull in flight until the body drops.
-    guard: PullGuard,
+    /// The pull's listing's count of delivered bytes, which `/_status` reads
+    /// while the worker runs the pull.
+    delivered_at: Arc<AtomicU64>,
+    gateway: Arc<Gateway>,
 }
 
 /// Serialize `address` EIP-55 checksummed: every address in `/_status` and
@@ -2805,7 +2819,9 @@ impl Gateway {
 
 /// A pull in flight, counted among the gateway's pulls and listed in
 /// [`Gateway::active`] from before the job reaches the worker until the
-/// guard drops.
+/// worker's pull ends: the job carries the guard, and the worker drops it.
+/// A response the client stops reading thus leaves the count when its pull
+/// gives up, though its connection may stay open.
 struct PullGuard {
     gateway: Arc<Gateway>,
     /// The pull's entry in [`Gateway::active`].

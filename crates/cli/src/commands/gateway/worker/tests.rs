@@ -15,7 +15,7 @@ use decdn_incentive::lane::{LaneKey, PoolId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
 
-use super::{Backend, DelegateLanes, Job, PoolSnapshot, PullWorker, read_pools};
+use super::{Backend, DelegateLanes, Job, PoolSnapshot, PullWorker, StallLimit, read_pools};
 use crate::commands::fetch::{BlobFetch, Credential, Sink};
 
 /// The blob a [`Fake`] pull stalls on: it writes more than the pipe holds.
@@ -211,12 +211,23 @@ fn send_paid(
             paying,
             writer,
             done,
+            listing: Box::new(()),
         })
         .expect("the worker takes the job");
     (reader, result)
 }
 
+/// A stall limit no test reaches unless it means to.
+const LONG_STALL: Duration = Duration::from_secs(60);
+
 async fn start(max_pulls: usize) -> (PullWorker, Arc<Mutex<Log>>, Arc<Notify>) {
+    start_with(max_pulls, LONG_STALL).await
+}
+
+async fn start_with(
+    max_pulls: usize,
+    stall: Duration,
+) -> (PullWorker, Arc<Mutex<Log>>, Arc<Notify>) {
     let log = Arc::new(Mutex::new(Log::default()));
     let release = Arc::new(Notify::new());
     let worker = PullWorker::start(
@@ -225,6 +236,7 @@ async fn start(max_pulls: usize) -> (PullWorker, Arc<Mutex<Log>>, Arc<Notify>) {
             release: Arc::clone(&release),
         },
         max_pulls,
+        stall,
     )
     .await
     .expect("start the worker");
@@ -268,6 +280,93 @@ async fn pulls_past_the_bound_wait_for_a_slot() {
     assert_eq!(read_all(reader).await, b"hello");
     done.await.unwrap().unwrap();
     worker.stop().await;
+}
+
+/// Responses that are never read hold their slots only for the stall limit:
+/// with every slot held by one, a further request still streams. Each unread
+/// pull ends with the stall error. The unread pipes stay open, so the pulls
+/// cannot end on a closed pipe instead.
+#[tokio::test]
+async fn unread_responses_free_their_slots() {
+    let (worker, _log, _release) = start_with(2, Duration::from_millis(200)).await;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (first_pipe, first_ended) = send(&worker, STALL, &signer, 1024);
+    let (second_pipe, second_ended) = send(&worker, STALL, &signer, 1024);
+    let (reader, done) = send(&worker, HELLO, &signer, 1024);
+    let bytes = tokio::time::timeout(Duration::from_secs(10), read_all(reader))
+        .await
+        .expect("a further request streams once the unread pulls give up");
+    assert_eq!(bytes, b"hello");
+    done.await.unwrap().unwrap();
+    for ended in [first_ended, second_ended] {
+        let err = ended.await.unwrap().expect_err("an unread pull fails");
+        assert!(
+            format!("{err:#}").contains("read nothing"),
+            "the pull ends on the stall limit: {err:#}"
+        );
+    }
+    drop((first_pipe, second_pipe));
+    worker.stop().await;
+}
+
+/// A response that reads each frame within the stall limit is not cut,
+/// however long the whole pull takes: the limit counts each wait, not the
+/// pull. Each wait here is about 50 ms against a 1 s limit, and the pull
+/// takes about 1.6 s.
+#[tokio::test]
+async fn a_slow_reader_is_not_cut() {
+    let stall = Duration::from_secs(1);
+    let (worker, _log, _release) = start_with(1, stall).await;
+    let signer = Arc::new(PrivateKeySigner::random());
+    let (mut reader, done) = send(&worker, STALL, &signer, 32 * 1024);
+    let started = tokio::time::Instant::now();
+    let mut buf = vec![0u8; 32 * 1024];
+    let mut total = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let n = reader.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    assert_eq!(total, 1 << 20, "every byte arrives");
+    assert!(
+        started.elapsed() > stall,
+        "the pull outlasts the stall limit, so the test is not vacuous"
+    );
+    done.await.unwrap().unwrap();
+    worker.stop().await;
+}
+
+/// The stall limit counts each wait on the response, not the whole pull: a
+/// write still waits just short of the limit, a read before it lands the
+/// write and restarts the limit, and a wait that reaches it fails with
+/// `TimedOut`.
+#[tokio::test(start_paused = true)]
+async fn the_stall_limit_counts_each_wait() {
+    let limit = Duration::from_secs(10);
+    let short = Duration::from_millis(9_999);
+    let (inner, mut reader) = tokio::io::duplex(4);
+    let mut writer = StallLimit::new(inner, limit, [0; 32]);
+    writer.write_all(&[0; 4]).await.unwrap();
+    let mut buf = [0u8; 4];
+    for _ in 0..2 {
+        let write = writer.write_all(&[1; 4]);
+        tokio::pin!(write);
+        assert!(
+            tokio::time::timeout(short, &mut write).await.is_err(),
+            "a write into a full pipe still waits short of the limit"
+        );
+        reader.read_exact(&mut buf).await.unwrap();
+        write.await.expect("a read lands the waiting write");
+    }
+    let err = writer
+        .write_all(&[2; 4])
+        .await
+        .expect_err("the wait reaches the limit");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(err.to_string().contains("read nothing"), "{err}");
 }
 
 /// A size lookup takes no pull slot: it is answered while every slot is
@@ -424,7 +523,7 @@ async fn a_host_that_cannot_be_built_fails_the_start() {
         }
         async fn close(&self, (): ()) {}
     }
-    let Err(err) = PullWorker::start(Broken, 1).await else {
+    let Err(err) = PullWorker::start(Broken, 1, LONG_STALL).await else {
         panic!("a broken host starts no worker");
     };
     assert!(format!("{err:#}").contains("no endpoint"), "{err:#}");

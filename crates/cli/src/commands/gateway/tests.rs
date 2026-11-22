@@ -227,7 +227,13 @@ async fn test_gateway_cached(
         common,
         chain,
         delegates: std::sync::Mutex::default(),
-        pulls: PullWorker::start(backend, worker_slots).await.unwrap(),
+        pulls: PullWorker::start(
+            backend,
+            worker_slots,
+            Duration::from_secs(GIVE_UP_AFTER_SECS),
+        )
+        .await
+        .unwrap(),
         cache,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
@@ -2981,11 +2987,14 @@ async fn the_capability_list_keeps_its_shape() {
     );
 }
 
-/// A pull in flight is listed with its hash and payer, and leaves the list
-/// when its request ends.
+/// A pull in flight is listed with its hash and payer until the worker's pull
+/// ends, which is when its slot frees. A dropped request leaves its pull
+/// listed while the worker still runs it.
 #[tokio::test]
-async fn an_active_pull_is_listed_while_it_streams() {
-    let (gateway, _, _) = public_gateway().await;
+async fn an_active_pull_is_listed_until_the_worker_ends_it() {
+    let notice = Arc::new(tokio::sync::Notify::new());
+    let replies = HashMap::from([(HELD, Reply::FailOn(Arc::clone(&notice)))]);
+    let (gateway, _caps, _pointers) = public_gateway_replying(replies).await;
     assert!(gateway.active_pulls().is_empty());
     let held = alloy::hex::encode(HELD);
     let req = Request::builder()
@@ -3020,10 +3029,20 @@ async fn an_active_pull_is_listed_while_it_streams() {
     assert_eq!(pull.delivered_bytes, 0);
     pending.abort();
     let _ = pending.await;
-    assert!(
-        gateway.active_pulls().is_empty(),
-        "the dropped request's pull leaves the list"
+    assert_eq!(
+        gateway.active_pulls().len(),
+        1,
+        "the worker still runs the dropped request's pull"
     );
+    assert_eq!(gateway.metrics.snapshot().pulls_active, 1);
+    notice.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !gateway.active_pulls().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the pull leaves the list when the worker's pull ends");
     assert_eq!(gateway.metrics.snapshot().pulls_active, 0);
 }
 

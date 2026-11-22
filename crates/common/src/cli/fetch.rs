@@ -154,7 +154,9 @@ pub struct ClientFetchArgs {
     pub max_sources: usize,
 
     /// Stop after this many seconds with no verified progress. Without it, a
-    /// terminal waits until Ctrl-C and a script stops after 10 minutes.
+    /// terminal waits until Ctrl-C and a script stops after 10 minutes. The
+    /// gateway defaults it to 120, and also ends a pull whose response reads
+    /// nothing for this long.
     #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
     pub give_up_after_secs: Option<u64>,
 
