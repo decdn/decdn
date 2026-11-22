@@ -30,8 +30,10 @@ async fn e2e_pipeline_reads_real_metrics_server() -> anyhow::Result<()> {
     // fields — proves the parser saw the real bytes the encoder
     // wrote, not just an empty/200 response.
     metrics.dispatch_permit_acquired();
-    metrics.cache_metrics().hits.inc();
-    metrics.cache_metrics().bytes_returned.inc_by(1024);
+    metrics.serve_cache_hit();
+    metrics.serve_cache_partial_hit();
+    metrics.serve_cache_miss();
+    metrics.bytes_served(1024);
 
     // Fetch via reqwest, parse, build a Snapshot — the same
     // path the CLI's `run` takes in JSON mode.
@@ -50,12 +52,16 @@ async fn e2e_pipeline_reads_real_metrics_server() -> anyhow::Result<()> {
         "in_flight should reflect the dispatch_permit_acquired bump"
     );
     assert_eq!(
-        snap.cache_hits, 1,
-        "hits should reflect the cache_metrics().hits.inc() bump"
+        snap.serve_cache_hits, 2,
+        "hits should sum the complete and the partial hit bumps"
     );
     assert_eq!(
-        snap.cache_bytes_returned, 1024,
-        "bytes should reflect the inc_by(1024) bump"
+        snap.serve_cache_misses, 1,
+        "misses should reflect the serve_cache_miss bump"
+    );
+    assert_eq!(
+        snap.bytes_served, 1024,
+        "bytes should reflect the bytes_served(1024) bump"
     );
 
     // Drive the high-level `run` in JSON mode against the same

@@ -917,10 +917,7 @@ fn assert_one_completed_inbound_stream(metrics: &Metrics, vouchers: u64) -> anyh
         format!("decdn_vouchers_received_total {vouchers}"),
         // The harness seeds the blob locally, so the availability gate must
         // classify this serve as a complete-blob hit and leave both siblings
-        // at zero. Pinned here because the serve path reads the store through
-        // `export_bao_range_stream`, never `CacheEngine::get` — the `get`-scoped
-        // `decdn_cache_hits_total` stays at zero throughout a real serve, so it
-        // cannot stand in for this assertion.
+        // at zero.
         "decdn_serve_cache_hit_total 1".to_string(),
         "decdn_serve_cache_partial_hit_total 0".to_string(),
         "decdn_serve_cache_miss_total 0".to_string(),
@@ -6665,7 +6662,7 @@ async fn drained_pool_stops_a_paid_serve_miss_stream() -> anyhow::Result<()> {
     // runs there.
     let payload = vec![0xC4u8; 16 * 1024 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
-        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+        empty_cache_with_fs_origin(&payload).await?;
 
     let signer = Arc::new(PrivateKeySigner::random());
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -6938,6 +6935,24 @@ fn assert_own_origin_spine(metrics: &Metrics, cache_metrics: &CacheMetrics) -> a
     Ok(())
 }
 
+/// Assert the node served `payload` from a cold cache by reading its own
+/// origin once through the own-origin spine: the outboard and every data byte,
+/// and no buffered populate.
+fn assert_one_own_origin_read(cache_metrics: &CacheMetrics, payload: &[u8]) -> anyhow::Result<()> {
+    let want = support::own_origin_egress(payload)?;
+    anyhow::ensure!(
+        cache_metrics.pull_through_bytes.get() == want,
+        "expected one own-origin read of {want} bytes, got {}",
+        cache_metrics.pull_through_bytes.get()
+    );
+    anyhow::ensure!(
+        cache_metrics.origin_fetches.get() == 0,
+        "the buffered populate must not run, got {} origin fetches",
+        cache_metrics.origin_fetches.get()
+    );
+    Ok(())
+}
+
 /// A pool that closes under a live cache-hit stream: the `deliver` loop stops
 /// it at the next re-check.
 #[tokio::test(flavor = "multi_thread")]
@@ -6981,7 +6996,7 @@ async fn forgotten_signer_stops_a_cache_hit_stream_as_pool_closed() -> anyhow::R
 async fn forgotten_pool_stops_a_serve_miss_stream() -> anyhow::Result<()> {
     let payload = vec![0xC6u8; 16 * 1024 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
-        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+        empty_cache_with_fs_origin(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
     let metrics =
         closed_pool_stops_the_stream(cache, hash, signer, forgotten_pool_view(), || {}).await?;
@@ -7011,7 +7026,7 @@ async fn closing_pool_past_its_cutoff_stops_a_cache_hit_stream() -> anyhow::Resu
 async fn closing_pool_past_its_cutoff_stops_a_serve_miss_stream() -> anyhow::Result<()> {
     let payload = vec![0xC8u8; 16 * 1024 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
-        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+        empty_cache_with_fs_origin(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
     let (view, closing) = closing_pool_view(unix_now()?);
     let metrics = closed_pool_stops_the_stream(cache, hash, signer, view, || {
@@ -7042,7 +7057,7 @@ async fn closing_pool_stops_a_slow_payers_cache_hit_batch_between_proofs() -> an
 async fn closing_pool_stops_a_slow_payers_serve_miss_batch_between_proofs() -> anyhow::Result<()> {
     let payload = vec![0xCCu8; 16 * 1024 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
-        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+        empty_cache_with_fs_origin(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
     let (view, closing) = closing_pool_view(unix_now()?);
     let close = || closing.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -9946,21 +9961,12 @@ async fn cache_with_two_blobs(
     decdn_cache::Hash,
     tempfile::TempDir,
 )> {
-    let origin_dir = tempfile::tempdir()?;
-    let hash_a = support::seed_origin_object(origin_dir.path(), a)?;
-    let hash_b = support::seed_origin_object(origin_dir.path(), b)?;
-
     let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
-        cache_dir.path(),
-        vec![origin as Arc<dyn decdn_cache::Origin>],
-        16,
-    )
-    .await?;
-    let _ = cache.get(hash_a).await?; // populate local store
-    let _ = cache.get(hash_b).await?;
-    drop(origin_dir);
+    let cache = CacheEngine::open(cache_dir.path(), vec![], 16).await?;
+    support::register_payload(a);
+    support::register_payload(b);
+    let hash_a = cache.insert_blob(a.to_vec()).await?;
+    let hash_b = cache.insert_blob(b.to_vec()).await?;
     Ok((cache, hash_a, hash_b, cache_dir))
 }
 
@@ -11011,12 +11017,15 @@ async fn pull_through_allows_a_clean_funder_with_a_blacklisted_delegate() -> any
 // `NodeOrigin::fetch` has no outer wrapper).
 // ===========================================================================
 
-/// An origin that returns the blob after a fixed delay — models a pull whose
-/// total wall-clock exceeds one per-candidate budget (stall-then-fallback).
+/// An origin that admits the blob into the engine store after a fixed delay,
+/// as the node-to-node origin does — models a pull whose total wall-clock
+/// exceeds one per-candidate budget (stall-then-fallback).
 #[derive(Debug)]
 struct SlowOrigin {
     payload: Vec<u8>,
     delay: Duration,
+    /// The engine this origin fills, set right after the engine opens.
+    engine: Arc<std::sync::OnceLock<CacheEngine>>,
 }
 
 impl decdn_cache::Origin for SlowOrigin {
@@ -11036,9 +11045,14 @@ impl decdn_cache::Origin for SlowOrigin {
         let delay = self.delay;
         Box::pin(async move {
             tokio::time::sleep(delay).await;
-            Ok(decdn_cache::origin::OriginFetch::found_one_shot(
-                payload.into(),
-            ))
+            let engine = self.engine.get().ok_or_else(|| {
+                decdn_cache::OriginPullError::Permanent(anyhow::anyhow!("engine not set"))
+            })?;
+            engine
+                .insert_blob(payload)
+                .await
+                .map_err(|e| decdn_cache::OriginPullError::Permanent(e.into()))?;
+            Ok(decdn_cache::origin::OriginFetch::AlreadyAdmitted)
         })
     }
 
@@ -11060,15 +11074,18 @@ async fn pull_through_fills_under_deadline(
     let payload = vec![0x5Au8; 4096];
     let want = support::register_payload(&payload);
     let cache_tmp = tempfile::tempdir()?;
+    let engine_slot = Arc::new(std::sync::OnceLock::new());
     let cache = CacheEngine::open(
         cache_tmp.path(),
         vec![Arc::new(SlowOrigin {
             payload: payload.clone(),
             delay: origin_delay,
+            engine: Arc::clone(&engine_slot),
         }) as Arc<dyn decdn_cache::Origin>],
         16,
     )
     .await?;
+    let _ = engine_slot.set(cache.clone());
     let cache_probe = cache.clone();
 
     let (store, owner, _deposit) = seeded_store()?;
@@ -11153,15 +11170,16 @@ async fn pull_through_outer_deadline_accommodates_a_slow_pull() -> anyhow::Resul
 }
 
 /// Build a cache whose local store is EMPTY but whose filesystem origin holds
-/// `payload`, so a `cdn/client/v1` cache miss must reactively pull the origin
-/// through to serve. Both temp dirs are returned so the caller keeps the origin
-/// alive across the fetch (unlike [`cache_with_two_blobs`], which pre-populates
-/// the store and drops the origin).
+/// `payload` as `decdn origin import` publishes it, so a `cdn/client/v1` cache
+/// miss is served through the own-origin spine (`serve_via_backend_origin` and
+/// its `serve_leg` loop). Both temp dirs are returned so the caller keeps the
+/// origin alive across the fetch (unlike [`cache_with_two_blobs`], which
+/// pre-populates the store and drops the origin).
 ///
 /// The engine is opened with an `Arc<CacheMetrics>` (returned) so callers can
-/// assert `origin_fetches` — the counter that pins whether the node actually
-/// read its origin (`1`) or short-circuited before any egress (`0`). `open`
-/// wires no metrics, so `origin_fetches.inc()` would be a no-op there.
+/// assert `pull_through_bytes`, the origin egress the node spent, and
+/// `origin_fetches`, the buffered populates it ran. `open` wires no metrics, so
+/// both would read zero there.
 async fn empty_cache_with_fs_origin(
     payload: &[u8],
 ) -> anyhow::Result<(
@@ -11173,47 +11191,6 @@ async fn empty_cache_with_fs_origin(
 )> {
     let origin_dir = tempfile::tempdir()?;
     let hash = support::seed_origin_object(origin_dir.path(), payload)?;
-    open_empty_cache_over_fs_origin(hash, origin_dir).await
-}
-
-/// [`empty_cache_with_fs_origin`] whose origin also publishes the blob's
-/// `{H}.obao4` outboard, so the own-origin spine (`serve_via_backend_origin`
-/// and its `serve_leg` loop) serves a miss rather than the buffered populate.
-async fn empty_cache_with_fs_origin_and_outboard(
-    payload: &[u8],
-) -> anyhow::Result<(
-    CacheEngine,
-    decdn_cache::Hash,
-    Arc<CacheMetrics>,
-    tempfile::TempDir,
-    tempfile::TempDir,
-)> {
-    let origin_dir = tempfile::tempdir()?;
-    let hash = support::seed_origin_object(origin_dir.path(), payload)?;
-    let encoded = decdn_bao_range::encode_outboard(payload, payload.len() as u64)?;
-    std::fs::write(
-        origin_dir
-            .path()
-            .join(encoded.shard())
-            .join(encoded.obao4_name()),
-        &encoded.outboard,
-    )?;
-    open_empty_cache_over_fs_origin(hash, origin_dir).await
-}
-
-/// Open an empty cache over the filesystem origin at `origin_dir`, which holds
-/// `hash`, with an `Arc<CacheMetrics>` wired. The shared tail of
-/// [`empty_cache_with_fs_origin`] and [`empty_cache_with_fs_origin_and_outboard`].
-async fn open_empty_cache_over_fs_origin(
-    hash: decdn_cache::Hash,
-    origin_dir: tempfile::TempDir,
-) -> anyhow::Result<(
-    CacheEngine,
-    decdn_cache::Hash,
-    Arc<CacheMetrics>,
-    tempfile::TempDir,
-    tempfile::TempDir,
-)> {
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
     let cache_metrics = Arc::new(CacheMetrics::default());
@@ -11234,7 +11211,7 @@ async fn open_empty_cache_over_fs_origin(
     Ok((cache, hash, cache_metrics, origin_dir, cache_dir))
 }
 
-/// Spawn a `ClientHandler` server with buffered origin pull-through attached
+/// Spawn a `ClientHandler` server with node-to-node pull-through attached
 /// (`ClientHandlerDeps.pull_through`), returning the dial target and the server's voucher
 /// signer address. Unlike [`spawn_handler_server`], the handler is built inline
 /// so pull-through can be wired before it is spawned.
@@ -11355,8 +11332,8 @@ async fn spawn_origin_only_server_with_metrics(
     ))
 }
 
-/// #1766: an origin-only node whose own backend FAULTS on the live probe (a
-/// connection-refused `HEAD` against an unreachable http origin) must refuse
+/// #1766: an origin-only node whose own backend FAULTS on the presence read (a
+/// connection-refused `{H}.sizeproof` GET against an unreachable http origin) must refuse
 /// with `InternalError`, NOT a signed `NotFound` — a fault is not an
 /// absence, and signing an authoritative negative during a backend outage
 /// would tell a paying client this node's own content is gone.
@@ -11364,7 +11341,7 @@ async fn spawn_origin_only_server_with_metrics(
 /// `http://127.0.0.1:1/` is used as the "unreachable" origin: port 1 is a
 /// privileged, essentially never-listening port, so `reqwest` gets an
 /// immediate connection-refused rather than a slow timeout — the origin-chain
-/// walk in `origin_probe_presence` sees a live `Err`, not the timeout arm
+/// walk in `CacheEngine::origin_presence` sees a live `Err`, not the timeout arm
 /// (that arm is already covered by the cache-engine unit tests).
 #[tokio::test(flavor = "multi_thread")]
 async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyhow::Result<()> {
@@ -11448,7 +11425,7 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
 
 /// Build a cache holding a blob that the local STORE has already accepted (a
 /// past import) but whose backing filesystem origin is deleted — the backend
-/// does not hold it, so a fresh `CacheEngine::origin_probe_presence` finds no
+/// does not hold it, so a fresh `CacheEngine::origin_presence` finds no
 /// blob there (a fault against the deleted origin directory) even though
 /// `cache.has` is `true`. Used
 /// to prove the origin-only gate (#1759) sits ABOVE the cache-hit branch: a
@@ -11478,7 +11455,7 @@ async fn cache_with_foreign_blob_imported(
         Duration::ZERO,
     )
     .await?;
-    let _ = cache.get(hash).await?; // pulls into the local store now
+    cache.insert_blob(payload.to_vec()).await?;
     anyhow::ensure!(
         cache.has(hash).await?,
         "precondition: the blob must be in the local store"
@@ -11523,9 +11500,9 @@ async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
 
     // Declined BEFORE any origin egress / discovery.
     anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 0,
-        "foreign decline must not touch the origin, got {}",
-        cache_metrics.origin_fetches.get()
+        cache_metrics.pull_through_bytes.get() == 0 && cache_metrics.origin_fetches.get() == 0,
+        "foreign decline must not read the origin, got {} bytes",
+        cache_metrics.pull_through_bytes.get()
     );
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -11561,11 +11538,7 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
         got.as_ref() == payload.as_slice(),
         "delivered bytes mismatch for own-backend hash"
     );
-    anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 1,
-        "expected exactly 1 origin fetch to fill the own-backend hash, got {}",
-        cache_metrics.origin_fetches.get()
-    );
+    assert_one_own_origin_read(&cache_metrics, &payload)?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -11583,9 +11556,9 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
     let (target, server_eth_addr, server_ep, server_task) =
         spawn_origin_only_server(cache, Arc::clone(&store)).await?;
 
-    // Baseline AFTER setup's own origin fetch (from importing the blob into the
-    // store), so the assertion below isolates fetches caused by THIS request.
-    let baseline_fetches = cache_metrics.origin_fetches.get();
+    // Baseline AFTER setup, so the assertion below isolates origin reads caused
+    // by THIS request.
+    let baseline_bytes = cache_metrics.pull_through_bytes.get();
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
@@ -11607,10 +11580,10 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
         "origin-only node must decline a foreign hash even when it is already cached"
     );
     anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == baseline_fetches,
-        "the cache-hit gate must not touch the origin, got {} beyond baseline {}",
-        cache_metrics.origin_fetches.get(),
-        baseline_fetches
+        cache_metrics.pull_through_bytes.get() == baseline_bytes,
+        "the cache-hit gate must not read the origin, got {} bytes beyond baseline {}",
+        cache_metrics.pull_through_bytes.get(),
+        baseline_bytes
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -11619,8 +11592,9 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
 
 /// #1115: a direct client fetch that sends the ADR 005 client identity binding
 /// authorizes reactive origin pull-through — with the blob present only in the
-/// node's filesystem origin (an empty local store), the miss populates from the
-/// origin and the bytes are delivered + hash-verified.
+/// node's filesystem origin (an empty local store), the miss fills from the
+/// origin through the own-origin spine and the bytes are delivered +
+/// hash-verified.
 #[tokio::test(flavor = "multi_thread")]
 async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::Result<()> {
     let payload = vec![0x7Bu8; 64 * 1024];
@@ -11654,13 +11628,9 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         "delivered bytes mismatch"
     );
     // The blob existed only in the fs origin, so serving it proves the node
-    // reactively pulled the origin exactly once (not a double-pull, not some
+    // reactively read the origin exactly once (not a double-pull, not some
     // other path).
-    anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 1,
-        "expected exactly 1 origin fetch, got {}",
-        cache_metrics.origin_fetches.get()
-    );
+    assert_one_own_origin_read(&cache_metrics, &payload)?;
     support::assert_inbound_streams_ended(&metrics, 1, 0).await?;
     assert_first_byte_class(&metrics, "miss")?;
 
@@ -11754,11 +11724,8 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
         got.as_ref() == payload.as_slice(),
         "delivered bytes mismatch"
     );
-    anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 1,
-        "expected exactly 1 origin fetch (own-namespace path taken), got {}",
-        cache_metrics.origin_fetches.get()
-    );
+    // The own-namespace path taken: one read of the node's own origin.
+    assert_one_own_origin_read(&cache_metrics, &payload)?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
@@ -11885,9 +11852,9 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
 }
 
 /// #1115 control: the SAME setup WITHOUT a client binding is refused. An
-/// unauthenticated request fails `pull_authorized`, so the buffered pull-through
-/// never runs and the origin-only blob is a clean `CacheMiss` delivery refusal —
-/// pinning that the binding is what unlocks the reactive path.
+/// unauthenticated request names no lane, so the own-origin spine's admission
+/// refuses it at the first proof, before the spine reads the outboard or any
+/// range: pinning that the binding is what unlocks the reactive path.
 #[tokio::test(flavor = "multi_thread")]
 async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result<()> {
     let payload = vec![0x7Bu8; 64 * 1024];
@@ -11921,183 +11888,30 @@ async fn unbound_client_fetch_is_refused_on_origin_only_blob() -> anyhow::Result
         ),
     }
     // The anti-griefing guarantee: an unauthorized request must not make the node
-    // front upstream/origin work. Prove the gate short-circuited BEFORE any origin
-    // egress — not that it read the origin and then refused.
+    // front upstream/origin work. Prove the gate refused BEFORE any origin
+    // egress, not that it read the origin and then refused.
     anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 0,
-        "unbound request must not trigger an origin fetch, got {}",
-        cache_metrics.origin_fetches.get()
+        cache_metrics.pull_through_bytes.get() == 0 && cache_metrics.origin_fetches.get() == 0,
+        "unbound request must not read the origin, got {} bytes",
+        cache_metrics.pull_through_bytes.get()
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
-/// A serve miss on a hash the node **advertises as origin-held** answers with a
-/// signed `StreamResponse{ok: false}` rather than dropping the stream.
-///
-/// A fail-silent gate (#1130) would suppress this path. A signed `ok: false`
-/// stream is inert as evidence (blacklist violation requires a served claim —
-/// ADR 014), so the accountable answer is to sign it. Dropping instead costs the
-/// requester a full open-stage timeout.
-///
-/// The setup is the [`unbound_client_fetch_is_refused_on_origin_only_blob`]
-/// control plus the one thing it lacks: `rescan_origins()`, which populates the
-/// `origin_held` index so `origin_held_size(hash)` is `Some`. Without that call
-/// the branch is unreachable.
+/// #1116: a node with node→node pull-through DISABLED (the cache-only-operator
+/// wiring: `[cache.origin]` set, `node_to_node_pull_through_enabled` off) still
+/// reactively serves a blob present solely in its own filesystem origin to a
+/// bound, pool-owning client, through the own-origin spine.
 #[tokio::test(flavor = "multi_thread")]
-async fn origin_held_serve_miss_signs_a_refusal_rather_than_dropping() -> anyhow::Result<()> {
-    let payload = vec![0x3Cu8; 32 * 1024];
-    let (cache, hash, _cache_metrics, _origin_tmp, _cache_tmp) =
-        empty_cache_with_fs_origin(&payload).await?;
-    // Populate the origin-held index: the node now advertises this hash even
-    // though the store has never held it.
-    cache.rescan_origins().await;
-    anyhow::ensure!(
-        cache.origin_held_size(hash) == Some(payload.len() as u64),
-        "precondition: the hash must be indexed as origin-held"
-    );
-    let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task, _metrics) =
-        spawn_pull_through_server(cache, Arc::clone(&store)).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    // No client binding => `pull_authorized` fails, so the reactive pull never
-    // runs and the serve path reaches a plain `CacheMiss` on origin-held content.
-    let ctx = unbound_context(Arc::clone(&signer), deposit);
-
-    let Err(err) = stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &slash_domain(),
-        server_eth_addr,
-        *hash.as_bytes(),
-        0,
-        now_us(),
-        Duration::from_secs(20),
-    )
-    .await
-    else {
-        anyhow::bail!("an unbound fetch of origin-held content must be refused")
-    };
-
-    // The assertion that distinguishes this from the deleted behaviour: a typed
-    // refusal carrying the operator's signed response, not a timeout on a
-    // silently-dropped stream.
-    let refused = err
-        .downcast_ref::<decdn_client::UpstreamRefused>()
-        .ok_or_else(|| anyhow::anyhow!("expected a typed UpstreamRefused, got: {err:#}"))?;
-    let evidence = refused.evidence().ok_or_else(|| {
-        anyhow::anyhow!("the refusal must carry the operator's signed StreamResponse")
-    })?;
-    anyhow::ensure!(
-        !evidence.body.ok,
-        "an origin-held serve miss must sign ok:false, got ok:{}",
-        evidence.body.ok
-    );
-    anyhow::ensure!(
-        evidence.body.hash == *hash.as_bytes(),
-        "the signed refusal must name the requested hash"
-    );
-    anyhow::ensure!(
-        !evidence.slash_sig.is_empty(),
-        "the refusal must be signed — an unsigned one is unattributable"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// Like [`spawn_pull_through_server`] but arms ONLY the reactive LOCAL-origin
-/// populate (`ClientHandlerDeps.local_populate`) — NOT the node→node buffered/window paths.
-/// This is the cache-only-operator wiring (#1116): `[cache.origin]` set,
-/// `node_to_node_pull_through_enabled` off.
-async fn spawn_local_populate_server(
-    cache: CacheEngine,
-    store: Arc<dyn PoolStateStore>,
-) -> anyhow::Result<(
-    EndpointAddr,
-    Address,
-    Endpoint,
-    tokio::task::JoinHandle<()>,
-    Arc<Metrics>,
-)> {
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_limited_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store,
-        RATE_PER_MB,
-        16,
-        |deps| deps.local_populate = Some(Duration::from_secs(20)),
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((
-        target,
-        server_eth.address(),
-        server_ep,
-        server_task,
-        metrics,
-    ))
-}
-
-/// A server with BOTH the reactive local populate AND a node→node window origin
-/// armed — but the window origin is left UNPROVISIONED (a dead peer path). If the
-/// serve path (wrongly) preferred the peer window path over the local origin for
-/// a whole-blob request, the pull would hit this dead origin and the fetch would
-/// be refused; a successful local serve proves local-first (#1116 shadowing fix).
-async fn spawn_local_and_window_server(
-    cache: CacheEngine,
-    store: Arc<dyn PoolStateStore>,
-) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_limited_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store,
-        RATE_PER_MB,
-        16,
-        |deps| {
-            deps.local_populate = Some(Duration::from_secs(20));
-            deps.pull_through_origin = Some(Arc::new(decdn_node::node_origin::NodeOrigin::new()));
-        },
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_eth.address(), server_ep, server_task))
-}
-
-/// #1116: a node with node→node pull-through DISABLED — only the reactive
-/// LOCAL-origin populate armed — still reactively serves a blob present solely in
-/// its own filesystem origin to a bound, pool-owning client. This is the
-/// cache-only-operator flow that was a silent `NotFound` before decoupling local
-/// populate from `node_to_node_pull_through_enabled`.
-#[tokio::test(flavor = "multi_thread")]
-async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Result<()> {
+async fn own_origin_serves_with_node_to_node_off() -> anyhow::Result<()> {
     let payload = vec![0x5Au8; 64 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task, metrics) =
-        spawn_local_populate_server(cache, Arc::clone(&store)).await?;
+        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::None).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
@@ -12120,11 +11934,7 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
         got.as_ref() == payload.as_slice(),
         "delivered bytes mismatch"
     );
-    anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 1,
-        "expected exactly 1 local origin fetch, got {}",
-        cache_metrics.origin_fetches.get()
-    );
+    assert_one_own_origin_read(&cache_metrics, &payload)?;
     support::assert_inbound_streams_ended(&metrics, 1, 0).await?;
     assert_first_byte_class(&metrics, "miss")?;
 
@@ -12132,67 +11942,19 @@ async fn local_populate_serves_own_origin_with_node_to_node_off() -> anyhow::Res
     Ok(())
 }
 
-/// #1116 control: the SAME local-populate-only setup WITHOUT a client binding is
-/// refused — reactive local populate is gated on the SAME proven pool
-/// ownership as the node→node paths (`pull_authorized`), so an S3 origin's egress
-/// isn't fronted for an unauthenticated request. No origin fetch is triggered.
+/// #1116 (window shadowing): with a node→node window origin armed, a whole-blob
+/// request for a blob the operator holds in its OWN filesystem origin is served
+/// from that origin. The window (peer) path, here deliberately
+/// dead/unprovisioned, is never taken: had it been, the pull would hit the dead
+/// origin and the fetch would be refused.
 #[tokio::test(flavor = "multi_thread")]
-async fn unbound_local_populate_is_refused() -> anyhow::Result<()> {
-    let payload = vec![0x5Au8; 64 * 1024];
-    let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
-        empty_cache_with_fs_origin(&payload).await?;
-    let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task, _metrics) =
-        spawn_local_populate_server(cache, Arc::clone(&store)).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    // No client binding: reactive local populate must stay gated on proven
-    // pool ownership, so the unbound request is refused.
-    let ctx = unbound_context(Arc::clone(&signer), deposit);
-
-    match stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &slash_domain(),
-        server_eth_addr,
-        *hash.as_bytes(),
-        0,
-        now_us(),
-        Duration::from_secs(20),
-    )
-    .await
-    {
-        Ok(_) => anyhow::bail!("unbound local-populate fetch must be refused"),
-        Err(e) => anyhow::ensure!(
-            e.to_string().contains("delivery refused"),
-            "expected a delivery-refused error, got: {e}"
-        ),
-    }
-    anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 0,
-        "unbound request must not trigger a local origin fetch, got {}",
-        cache_metrics.origin_fetches.get()
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// #1116 (window-shadowing fix): with BOTH the reactive local populate AND a
-/// node→node window origin armed, a whole-blob request for a blob the operator
-/// holds in its OWN filesystem origin is served from that local origin — the
-/// window (peer) path, here deliberately dead/unprovisioned, is never taken.
-/// Before the fix a whole-blob miss went straight to the peer window path and
-/// never read the local origin.
-#[tokio::test(flavor = "multi_thread")]
-async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
+async fn own_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
     let payload = vec![0x3Cu8; 64 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
-        spawn_local_and_window_server(cache, Arc::clone(&store)).await?;
+    let (target, server_eth_addr, server_ep, server_task, _metrics) =
+        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::Window).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
@@ -12215,31 +11977,25 @@ async fn local_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
         got.as_ref() == payload.as_slice(),
         "delivered bytes mismatch"
     );
-    anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 1,
-        "the local origin must be preferred (served) over the peer window path, got {} fetches",
-        cache_metrics.origin_fetches.get()
-    );
+    // The own origin is preferred (served) over the peer window path.
+    assert_one_own_origin_read(&cache_metrics, &payload)?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
 }
 
-/// #1116: with node→node OFF and only the local populate armed, a bound fetch for
-/// a blob ABSENT from the node's own origin cleanly terminates as a delivery
-/// refusal (not a hang or a masked error) after the local origin is consulted
-/// exactly once — the miss path (`try_local_populate` returns
-/// `FillOutcome::CleanMiss` → falls
-/// through to a `CacheMiss`, since node→node is the only further tier and it's
-/// off). Guards that the local-first insertion neither shadows a would-be
-/// node→node fallthrough nor short-circuits the miss handling.
+/// #1116: with node→node OFF, a bound fetch for a blob ABSENT from the node's
+/// own origin (no `{H}.sizeproof`) cleanly terminates as a signed `NotFound`
+/// (not a hang or a masked error): the presence read answers `Absent`, the spine
+/// does not serve, and the miss falls through to a `CacheMiss`, since node→node
+/// is the only further tier and it is off.
 #[tokio::test(flavor = "multi_thread")]
-async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
+async fn own_origin_absence_is_clean_cache_miss() -> anyhow::Result<()> {
     let spans = support::capture_spans();
     let payload = vec![0x2Bu8; 64 * 1024];
     let hash = support::register_payload(&payload);
     // A filesystem origin that does NOT contain the blob (empty dir), plus an
-    // empty local store — so the reactive local populate is a genuine miss.
+    // empty local store: a genuine miss.
     let origin_dir = tempfile::tempdir()?;
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
@@ -12257,7 +12013,7 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     .await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task, metrics) =
-        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::LocalOnly).await?;
+        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::None).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
@@ -12277,7 +12033,7 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
     )
     .await
     {
-        Ok(_) => anyhow::bail!("a blob absent from the local origin must be refused"),
+        Ok(_) => anyhow::bail!("a blob absent from the own origin must be refused"),
         // A GENUINE absence must still sign `NotFound` — the #1129 counterpart of
         // the hard-fault tests below. Pinned to the wire error (not just "refused")
         // so a future change that over-eagerly promotes clean misses to
@@ -12287,14 +12043,14 @@ async fn local_populate_miss_is_clean_cache_miss() -> anyhow::Result<()> {
             "expected a signed NotFound for a genuine absence, got: {e}"
         ),
     }
-    // The local origin states no size for the blob, so the node fetches nothing
+    // The own origin states no size for the blob, so the node fetches nothing
     // from it (it serves no origin blob it cannot size under a proof), and the
-    // request falls through to a clean refusal because node→node is off — the
+    // request falls through to a clean refusal because node→node is off, the
     // only further tier.
     anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 0,
-        "an origin with no size for the blob is not fetched from, got {} fetches",
-        cache_metrics.origin_fetches.get()
+        cache_metrics.pull_through_bytes.get() == 0 && cache_metrics.origin_fetches.get() == 0,
+        "an origin with no size for the blob is not read from, got {} bytes",
+        cache_metrics.pull_through_bytes.get()
     );
     // The inverse of the hard-fault tests, and the guard that makes the pair
     // airtight: a genuine absence must be metered as a cache miss and must NOT
@@ -12354,7 +12110,7 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
     .await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task, metrics) =
-        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::LocalOnly).await?;
+        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::None).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     // No client binding: the request names no signer this node can hold a
@@ -12381,11 +12137,11 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
             ),
         }
     }
-    // No fill tier ran: the local origin was never consulted.
+    // No fill tier ran: the own origin was never read.
     anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 0,
-        "an unbound request must not reach the local origin, got {}",
-        cache_metrics.origin_fetches.get()
+        cache_metrics.pull_through_bytes.get() == 0 && cache_metrics.origin_fetches.get() == 0,
+        "an unbound request must not read the own origin, got {} bytes",
+        cache_metrics.pull_through_bytes.get()
     );
     support::assert_inbound_failures_attributed(&metrics, 2).await?;
     assert_reject_reason(&metrics, 0, 2)?;
@@ -12402,13 +12158,11 @@ async fn unbound_miss_refuses_on_a_throttled_no_lane_line() -> anyhow::Result<()
 /// What the local fs origin holds for a #2315 mid-request-lane test.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OriginHolds {
-    /// Nothing: every local tier misses.
+    /// Nothing: the own-origin spine does not serve, the node→node tiers run.
     Nothing,
-    /// The blob only: the own-origin spine declines (no outboard), the local
-    /// populate and the buffered pull-through can fill.
+    /// The blob as `decdn origin import` publishes it: the own-origin spine
+    /// serves.
     Blob,
-    /// The blob and its `{H}.obao4` outboard: the own-origin spine serves.
-    BlobAndOutboard,
 }
 
 /// #2315: a sibling stream registers this request's lane after the request
@@ -12420,10 +12174,6 @@ enum OriginHolds {
 /// it refuses `unknown_lane` at the first proof, before the fill. The lane is
 /// live for the NEXT request: when the origin holds the blob, a second fetch
 /// on the same binding is served.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one scenario: both requests, the fault tiers and the egress checks"
-)]
 async fn lane_registered_mid_request_refuses_on_no_lane(
     tiers: FaultTiers,
     holds: OriginHolds,
@@ -12432,22 +12182,8 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     let payload = vec![0x6Du8; 64 * 1024];
     let hash = support::register_payload(&payload);
     let origin_dir = tempfile::tempdir()?;
-    if holds != OriginHolds::Nothing {
-        let encoded = decdn_bao_range::encode_outboard(payload.as_slice(), payload.len() as u64)?;
-        anyhow::ensure!(
-            encoded.hash_hex == hash.to_hex().as_str(),
-            "encoder hash mismatch"
-        );
-        let shard = origin_dir.path().join(encoded.shard());
-        std::fs::create_dir_all(&shard)?;
-        std::fs::write(shard.join(&encoded.hash_hex), &payload)?;
-        std::fs::write(
-            shard.join(encoded.size_proof_name()),
-            encoded.size_proof_object(),
-        )?;
-        if holds == OriginHolds::BlobAndOutboard {
-            std::fs::write(shard.join(encoded.obao4_name()), &encoded.outboard)?;
-        }
+    if holds == OriginHolds::Blob {
+        support::seed_origin_object(origin_dir.path(), &payload)?;
     }
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
@@ -12493,7 +12229,7 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
         )
     };
 
-    let spine = holds == OriginHolds::BlobAndOutboard;
+    let spine = holds == OriginHolds::Blob;
     match fetch().await {
         Ok(_) => anyhow::bail!("a request whose lane was unknown at resolution must be refused"),
         Err(e) => anyhow::ensure!(
@@ -12507,9 +12243,10 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
         "precondition: the armed lane must be registered mid-request"
     );
     anyhow::ensure!(
-        cache_metrics.origin_fetches.get() == 0,
-        "no fill tier may run for the request, got {} origin fetches",
-        cache_metrics.origin_fetches.get()
+        cache_metrics.origin_fetches.get() == 0 && cache_metrics.pull_through_bytes.get() == 0,
+        "no fill tier may run for the request, got {} buffered fetches and {} origin bytes",
+        cache_metrics.origin_fetches.get(),
+        cache_metrics.pull_through_bytes.get()
     );
     if spine {
         anyhow::ensure!(
@@ -12538,45 +12275,36 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     Ok(())
 }
 
-/// #2315, local populate leg: see [`lane_registered_mid_request_refuses_on_no_lane`].
-#[tokio::test(flavor = "multi_thread")]
-async fn lane_registered_mid_request_spends_no_origin_egress() -> anyhow::Result<()> {
-    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalOnly, OriginHolds::Blob).await
-}
-
-/// #2315, own-origin spine leg (the origin publishes the outboard): see
+/// #2315, own-origin spine leg: see
 /// [`lane_registered_mid_request_refuses_on_no_lane`].
 #[tokio::test(flavor = "multi_thread")]
 async fn lane_registered_mid_request_skips_the_own_origin_spine() -> anyhow::Result<()> {
-    lane_registered_mid_request_refuses_on_no_lane(
-        FaultTiers::LocalOnly,
-        OriginHolds::BlobAndOutboard,
-    )
-    .await
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::None, OriginHolds::Blob).await
 }
 
 /// #2315, buffered pull-through leg: see
 /// [`lane_registered_mid_request_refuses_on_no_lane`].
 #[tokio::test(flavor = "multi_thread")]
 async fn lane_registered_mid_request_skips_the_buffered_pull() -> anyhow::Result<()> {
-    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::Buffered, OriginHolds::Blob).await
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::Buffered, OriginHolds::Nothing).await
 }
 
 /// #2315, window leg: see [`lane_registered_mid_request_refuses_on_no_lane`].
 #[tokio::test(flavor = "multi_thread")]
 async fn lane_registered_mid_request_is_not_an_internal_error() -> anyhow::Result<()> {
-    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::LocalAndWindow, OriginHolds::Nothing)
-        .await
+    lane_registered_mid_request_refuses_on_no_lane(FaultTiers::Window, OriginHolds::Nothing).await
 }
 
-/// Which reactive fill tiers a fault-test server arms (#1129).
+/// Which node→node fill tiers a fault-test server arms (#1129). The own-origin
+/// spine needs no arming: it serves whenever the node's own origin proves the
+/// blob's size.
 #[derive(Clone, Copy)]
 enum FaultTiers {
-    /// Cache-only operator: local populate only, node→node OFF.
-    LocalOnly,
-    /// Local populate + an UNPROVISIONED node→node window origin (a dead peer
-    /// path that cleanly misses) — exercises the fault surviving a fall-through.
-    LocalAndWindow,
+    /// Cache-only operator: node→node OFF.
+    None,
+    /// An UNPROVISIONED node→node window origin (a dead peer path that cleanly
+    /// misses): exercises a fault surviving a fall-through.
+    Window,
     /// The buffered node→node tier only (`ClientHandlerDeps.pull_through`), no window origin.
     /// This is the `try_pull_through` path — the one whose `HardFault` no other
     /// test reaches.
@@ -12635,9 +12363,8 @@ async fn spawn_fault_server_with_handler(
         RATE_PER_MB,
         16,
         |deps| match tiers {
-            FaultTiers::LocalOnly => deps.local_populate = Some(Duration::from_secs(20)),
-            FaultTiers::LocalAndWindow => {
-                deps.local_populate = Some(Duration::from_secs(20));
+            FaultTiers::None => {}
+            FaultTiers::Window => {
                 deps.pull_through_origin =
                     Some(Arc::new(decdn_node::node_origin::NodeOrigin::new()));
             }
@@ -12714,40 +12441,33 @@ fn assert_one_miss_line(
     Ok(line.clone())
 }
 
-/// An origin that always fails with a TRANSIENT backend error — the shape of an
+/// An origin that always fails with a TRANSIENT backend error: the shape of an
 /// S3 5xx that survives retry exhaustion, an open circuit breaker, or an fs I/O
-/// fault. The engine surfaces this as `CacheError::OriginError`, which is NOT an
-/// absence: the blob may well exist and be servable once the origin recovers
-/// (#1129).
+/// fault. A fault is NOT an absence: the blob may well exist and be servable
+/// once the origin recovers (#1129).
 ///
-/// Distinct from [`CountingOrigin`] in the way that matters: that one is
-/// `OriginKind::Peer`, which `populate_local` deliberately SKIPS, so it can never
-/// exercise the local tier. This one is `OriginKind::Http` — a local-tier origin
-/// the reactive populate does consult. It states the blob's size and serves its
-/// `{H}.sizeproof`, because the node populates only a blob whose size its
-/// origin proves; only the blob fetch fails.
+/// With `OriginKind::Http` it is the operator's own backend, and its
+/// `{H}.sizeproof` read fails, so `CacheEngine::origin_presence` answers
+/// `Fault`. With `OriginKind::Peer` it is the buffered node-to-node tier's
+/// origin: it states no size proof (the presence read answers `Absent`) and its
+/// blob fetch fails. `hits` counts the failed reads.
 #[derive(Debug)]
 struct FailingOrigin {
     hits: Arc<std::sync::atomic::AtomicUsize>,
-    size: u64,
-    size_proof_object: bytes::Bytes,
+    kind: decdn_cache::OriginKind,
+}
+
+impl FailingOrigin {
+    /// Count one failed read and return its transient error.
+    fn outage(&self) -> decdn_cache::OriginPullError {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
+            "synthetic origin outage (HTTP 503)"
+        ))
+    }
 }
 
 impl decdn_cache::Origin for FailingOrigin {
-    fn size(
-        &self,
-        _hash: decdn_cache::Hash,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>>
-                + Send
-                + '_,
-        >,
-    > {
-        let size = self.size;
-        Box::pin(async move { Ok(Some(size)) })
-    }
-
     fn fetch_size_proof(
         &self,
         _hash: decdn_cache::Hash,
@@ -12759,8 +12479,12 @@ impl decdn_cache::Origin for FailingOrigin {
                 + '_,
         >,
     > {
-        let object = self.size_proof_object.clone();
-        Box::pin(async move { Ok(Some(object)) })
+        let result = if self.kind == decdn_cache::OriginKind::Peer {
+            Ok(None)
+        } else {
+            Err(self.outage())
+        };
+        Box::pin(async move { result })
     }
 
     fn fetch(
@@ -12775,24 +12499,24 @@ impl decdn_cache::Origin for FailingOrigin {
                 + '_,
         >,
     > {
-        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Box::pin(async {
-            Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
-                "synthetic origin outage (HTTP 503)"
-            )))
-        })
+        let result = if self.kind == decdn_cache::OriginKind::Peer {
+            Err(self.outage())
+        } else {
+            Ok(decdn_cache::origin::OriginFetch::NotFound)
+        };
+        Box::pin(async move { result })
     }
 
     fn kind(&self) -> decdn_cache::OriginKind {
-        decdn_cache::OriginKind::Http
+        self.kind
     }
 }
 
-/// A cache whose sole configured origin is a [`FailingOrigin`] — the operator's
-/// own backend is down. The local store starts empty, so a serve request is a
-/// miss whose reactive local populate hits a hard fault.
+/// A cache whose sole configured origin is a [`FailingOrigin`] of `kind`. The
+/// local store starts empty, so a serve request is a miss that meets the fault.
 async fn empty_cache_with_failing_origin(
     payload: &[u8],
+    kind: decdn_cache::OriginKind,
 ) -> anyhow::Result<(
     CacheEngine,
     decdn_cache::Hash,
@@ -12802,13 +12526,9 @@ async fn empty_cache_with_failing_origin(
     let hash = support::register_payload(payload);
     let cache_dir = tempfile::tempdir()?;
     let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let size = u64::try_from(payload.len())?;
     let origin = Arc::new(FailingOrigin {
         hits: Arc::clone(&hits),
-        size,
-        size_proof_object: decdn_bao_range::encode_outboard(payload, size)?
-            .size_proof_object()
-            .into(),
+        kind,
     });
     let cache = CacheEngine::open_full(
         cache_dir.path(),
@@ -12825,22 +12545,22 @@ async fn empty_cache_with_failing_origin(
     Ok((cache, hash, hits, cache_dir))
 }
 
-/// #1129: a cache-only operator (node→node OFF) whose OWN origin hard-faults must
-/// refuse `Declined` (reason `InternalError`), NOT a signed `NotFound`.
+/// #1129: a cache-only operator (node→node OFF) whose OWN origin faults on the
+/// `{H}.sizeproof` read must refuse `Declined` (reason `InternalError`), NOT a
+/// signed `NotFound`.
 ///
 /// The refusal is EIP-712 signed, so `NotFound` is an authoritative, attributable
 /// claim that the blob does not exist. Signing it during a transient S3 outage
 /// tells paying clients to stop asking for a blob the node will serve fine once
-/// the origin recovers. The blob's absence from the store is indistinguishable
-/// from a clean miss without the engine's error classification — which is exactly
-/// what a bare-`bool` fill helper would discard.
+/// the origin recovers.
 #[tokio::test(flavor = "multi_thread")]
-async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> anyhow::Result<()> {
+async fn own_origin_fault_is_internal_error_not_signed_not_found() -> anyhow::Result<()> {
     let payload = vec![0x7Eu8; 64 * 1024];
-    let (cache, hash, origin_hits, _cache_tmp) = empty_cache_with_failing_origin(&payload).await?;
+    let (cache, hash, origin_hits, _cache_tmp) =
+        empty_cache_with_failing_origin(&payload, decdn_cache::OriginKind::Http).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task, metrics) =
-        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::LocalOnly).await?;
+        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::None).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
@@ -12876,7 +12596,7 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
     anyhow::ensure!(
         origin_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
         "the failing origin should have been consulted (proving the fault came from \
-         the reactive fill, not a short-circuit before it)"
+         the origin's presence read, not a short-circuit before it)"
     );
     // The operator-facing half: the reject is metered as an internal error, NOT as a
     // cache miss. Without this the wire assertion above still passes while the
@@ -12888,22 +12608,23 @@ async fn local_origin_hard_fault_is_internal_error_not_signed_not_found() -> any
     Ok(())
 }
 
-/// #1129, the arm most likely to regress: with node→node ON, a hard fault on the
-/// LOCAL tier must survive the fall-through to the node→node window tier.
+/// #1129, the arm most likely to regress: with node→node ON, a fault on the
+/// node's OWN origin must survive the fall-through to the node→node window tier.
 ///
-/// Falling through after a local fault is correct — a peer may legitimately still
-/// serve. But the window origin here is unprovisioned (a dead peer path), so it
-/// cleanly misses; the terminal refusal must still be `InternalError`, because a
+/// Falling through after an own-origin fault is correct: a peer may legitimately
+/// still serve. But the window origin here is unprovisioned (a dead peer path), so
+/// it cleanly misses; the terminal refusal must still be `InternalError`, because a
 /// later clean miss must not launder the earlier fault back into a signed
 /// `NotFound`. This is what `fault_seen` threading exists to prevent.
 #[tokio::test(flavor = "multi_thread")]
-async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::Result<()> {
+async fn own_origin_fault_survives_fallthrough_to_the_window_tier() -> anyhow::Result<()> {
     let spans = support::capture_spans();
     let payload = vec![0x3Du8; 64 * 1024];
-    let (cache, hash, origin_hits, _cache_tmp) = empty_cache_with_failing_origin(&payload).await?;
+    let (cache, hash, origin_hits, _cache_tmp) =
+        empty_cache_with_failing_origin(&payload, decdn_cache::OriginKind::Http).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task, metrics) =
-        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::LocalAndWindow).await?;
+        spawn_fault_server(cache, Arc::clone(&store), FaultTiers::Window).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let own_node_id = B256::from(*client_ep.id().as_bytes());
@@ -12928,24 +12649,24 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
             let msg = e.to_string();
             anyhow::ensure!(
                 msg.contains("Declined"),
-                "a local hard fault must still surface as InternalError after the \
+                "an own-origin fault must still surface as InternalError after the \
                  node→node tier cleanly misses, got: {e}"
             );
             anyhow::ensure!(
                 !msg.contains("NotFound"),
-                "the window tier's clean miss must not overwrite the local fault with \
-                 a signed NotFound, got: {e}"
+                "the window tier's clean miss must not overwrite the own-origin fault \
+                 with a signed NotFound, got: {e}"
             );
         }
     }
     anyhow::ensure!(
         origin_hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
-        "the failing local origin should have been consulted before the window tier"
+        "the failing own origin should have been consulted before the window tier"
     );
     support::assert_inbound_failures_attributed(&metrics, 1).await?;
     assert_reject_reason(&metrics, 1, 0)?;
     // The unprovisioned window origin has no provider to open: a clean pull-leg
-    // miss, refused as `internal_error` because the local fault is latched.
+    // miss, refused as `internal_error` because the own-origin fault is latched.
     let line = assert_one_miss_line(&spans, hash, "pull_leg_miss", "internal_error")?;
     anyhow::ensure!(
         line.get("cause").map(String::as_str) == Some("clean_miss"),
@@ -12966,17 +12687,20 @@ async fn local_hard_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
 
 /// #1129 on the BUFFERED node→node tier (`try_pull_through`). Without this test,
 /// reverting that helper's `HardFault` arm to a clean miss breaks nothing: every
-/// other fault test drives `try_local_populate`.
+/// other fault test faults the node's own origin.
 ///
-/// This is the tier a resumed request or an unset window provider lands on,
-/// and its outcome also has to compose with the latch at the call site
-/// (`miss_reason(fault_seen || buffered.is_fault())`) — the `buffered.is_fault()`
-/// side of that `||` is exercised nowhere else.
+/// This is the tier an unset window provider lands on, and its outcome also has
+/// to compose with the latch at the call site
+/// (`miss_reason(fault_seen || buffered.is_fault())`). The node's only origin is
+/// a peer origin that states no size proof, so the presence read answers
+/// `Absent` and latches nothing: the `buffered.is_fault()` side of that `||` is
+/// exercised nowhere else.
 #[tokio::test(flavor = "multi_thread")]
 async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<()> {
     let spans = support::capture_spans();
     let payload = vec![0x9Cu8; 64 * 1024];
-    let (cache, hash, origin_hits, _cache_tmp) = empty_cache_with_failing_origin(&payload).await?;
+    let (cache, hash, origin_hits, _cache_tmp) =
+        empty_cache_with_failing_origin(&payload, decdn_cache::OriginKind::Peer).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task, metrics) =
         spawn_fault_server(cache, Arc::clone(&store), FaultTiers::Buffered).await?;
@@ -16515,15 +16239,15 @@ async fn an_open_on_a_partial_answers_by_whether_it_covers_the_span() -> anyhow:
     Ok(())
 }
 
-/// An open on a blob this node's own origin holds, with a proven size and a
-/// published outboard, answers `ok: true` with full coverage and fills
-/// nothing: the fill starts only once admission passes at the first proof.
+/// An open on a blob this node's own origin holds, with a proven size,
+/// answers `ok: true` with full coverage and fills nothing: the fill starts
+/// only once admission passes at the first proof.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_open_on_an_origin_held_blob_answers_full_coverage_and_fills_nothing()
 -> anyhow::Result<()> {
     let payload = vec![0x72u8; 300_000];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
-        empty_cache_with_fs_origin_and_outboard(&payload).await?;
+        empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, _deposit) = seeded_store()?;
     let (target, _server_eth, server_ep, server_task, metrics) =
         spawn_open_server(cache.clone(), store, None, 16).await?;
@@ -16560,128 +16284,11 @@ async fn an_open_on_an_origin_held_blob_answers_full_coverage_and_fills_nothing(
     );
     anyhow::ensure!(
         cache_metrics.pull_through_bytes.get() == 0,
-        "an open reads no outboard and no range window: only memoised HEADs"
+        "an open reads no outboard and no range window: only the memoised size proof"
     );
     anyhow::ensure!(
         counter(&metrics, "decdn_local_outboard_serves_total")? == 1,
         "the open takes the own-origin spine"
-    );
-
-    conn.close(0u32.into(), b"done");
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// A filesystem origin that publishes outboards but declines every ranged
-/// read: an origin whose range a serve finds unusable.
-#[derive(Debug)]
-struct RangelessOrigin(decdn_cache::FilesystemOrigin);
-
-/// A boxed origin future, as every [`decdn_cache::Origin`] method returns.
-type OriginFuture<'a, T> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<T, decdn_cache::OriginPullError>> + Send + 'a>,
->;
-
-impl decdn_cache::Origin for RangelessOrigin {
-    fn fetch(
-        &self,
-        hash: decdn_cache::Hash,
-        max_bytes: u64,
-    ) -> OriginFuture<'_, decdn_cache::origin::OriginFetch> {
-        self.0.fetch(hash, max_bytes)
-    }
-
-    fn fetch_outboard(
-        &self,
-        hash: decdn_cache::Hash,
-        outboard_max_bytes: u64,
-    ) -> OriginFuture<'_, decdn_cache::origin::OutboardFetch> {
-        self.0.fetch_outboard(hash, outboard_max_bytes)
-    }
-
-    fn has_outboard(&self, hash: decdn_cache::Hash) -> OriginFuture<'_, bool> {
-        self.0.has_outboard(hash)
-    }
-
-    fn fetch_size_proof(&self, hash: decdn_cache::Hash) -> OriginFuture<'_, Option<bytes::Bytes>> {
-        self.0.fetch_size_proof(hash)
-    }
-
-    fn size(&self, hash: decdn_cache::Hash) -> OriginFuture<'_, Option<u64>> {
-        self.0.size(hash)
-    }
-
-    fn kind(&self) -> decdn_cache::OriginKind {
-        self.0.kind()
-    }
-}
-
-/// An open on a blob the node's own origin holds, but whose ranges the origin
-/// declines, answers `ok: true` with no origin read past the memoised `HEAD`s.
-/// Admission at the first proof reads the range and refuses the stream before
-/// any chunk. The next open of the hash takes the degrade: `NotFound` with no
-/// block.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unusable_origin_range_is_refused_after_admission() -> anyhow::Result<()> {
-    let payload = vec![0x74u8; 300_000];
-    let origin_dir = tempfile::tempdir()?;
-    let hash = support::seed_origin_object(origin_dir.path(), &payload)?;
-    let encoded = decdn_bao_range::encode_outboard(payload.as_slice(), payload.len() as u64)?;
-    std::fs::write(
-        origin_dir
-            .path()
-            .join(encoded.shard())
-            .join(encoded.obao4_name()),
-        &encoded.outboard,
-    )?;
-    let origin = RangelessOrigin(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache_dir = tempfile::tempdir()?;
-    let cache_metrics = Arc::new(CacheMetrics::default());
-    let cache = CacheEngine::open_full(
-        cache_dir.path(),
-        vec![Arc::new(origin) as Arc<dyn decdn_cache::Origin>],
-        16,
-        PinnedHashes::empty(),
-        RetryPolicy::default(),
-        CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cache_metrics)),
-        Duration::ZERO,
-    )
-    .await?;
-    let (store, signer, _deposit) = seeded_store()?;
-    let (target, _server_eth, server_ep, server_task, _metrics) =
-        spawn_open_server(cache, store, None, 16).await?;
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let ext = StreamRequestExt {
-        pull_through: false,
-        ..binding_ext(&signer, client_node_id)?
-    };
-    let req = whole_blob_request(*hash.as_bytes());
-
-    let (_s, _r, resp, _) = open_and_read_answer(&conn, &req, Some(&ext)).await?;
-    anyhow::ensure!(resp.body.ok, "the open answers from the published outboard");
-    anyhow::ensure!(
-        cache_metrics.pull_through_bytes.get() == 0,
-        "the unpaid open reads no outboard"
-    );
-    let refusal = request_refused_at_first_proof(&conn, &req, Some(&ext), &signer).await?;
-    anyhow::ensure!(
-        refusal == StreamError::NotFound,
-        "an unusable range is refused before any chunk, got {refusal:?}"
-    );
-    let (resp, resp_ext) = open_expecting_refusal_with(&conn, &req, Some(&ext)).await?;
-    anyhow::ensure!(
-        !resp.body.ok
-            && resp_ext.error() == Some(&StreamError::NotFound)
-            && resp_ext.coverage.is_empty(),
-        "the next open degrades: NotFound with no block, got {:?}",
-        resp_ext.error()
     );
 
     conn.close(0u32.into(), b"done");

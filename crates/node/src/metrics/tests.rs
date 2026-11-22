@@ -5,9 +5,9 @@ use std::time::Duration;
 use super::*;
 
 /// Match an exact `<name> <value>` metric line, anchored against
-/// surrounding lines so `decdn_cache_hits_total 1` doesn't
+/// surrounding lines so `decdn_cache_misses_total 1` doesn't
 /// accidentally substring-match into a future
-/// `decdn_cache_hits_total_foo` series or the `OpenMetrics`
+/// `decdn_cache_misses_total_foo` series or the `OpenMetrics`
 /// `_created` companion line.
 fn has_metric_line(text: &str, name: &str, value: u64) -> bool {
     let needle = format!("{name} {value}");
@@ -316,7 +316,7 @@ fn rpc_request_buckets_reach_the_per_call_deadline() {
 ///
 /// Built from **sample** lines, not `# TYPE` lines. In `OpenMetrics` a
 /// counter's TYPE line carries the *unsuffixed* stem (`# TYPE
-/// decdn_cache_hits counter`) while the sample is `decdn_cache_hits_total
+/// decdn_cache_misses counter`) while the sample is `decdn_cache_misses_total
 /// 0` — so parsing TYPE would blind the gate to the `_total` suffix, which
 /// is the single most common way a documented name goes wrong here. (The
 /// convention is that a counter field omits `_total` and lets the encoder
@@ -568,9 +568,7 @@ fn cache_metrics_counters_start_at_zero() {
         "decdn_cache_origin_fetches_total",
         "decdn_cache_origin_retry_exhausted_total",
         "decdn_cache_origin_fallback_total",
-        "decdn_cache_hits_total",
         "decdn_cache_misses_total",
-        "decdn_cache_bytes_returned_total",
         "decdn_cache_pull_through_bytes_total",
         // GC counters (#518). The Rust struct fields are `gc_runs`
         // / `gc_bytes_reclaimed`; the OpenMetrics encoder appends
@@ -1152,62 +1150,19 @@ fn chain_refresh_liveness_gauges_stamp_wall_clock() {
     }
 }
 
-/// Minimal in-memory origin: returns the prearranged payload for its
-/// hash, `NotFound` otherwise. Mirrors the `StubOrigin` used in
-/// crates/cache tests but is local to these tests so the cache crate's
-/// test fixtures stay private.
-#[derive(Debug)]
-struct StubOrigin {
-    data: bytes::Bytes,
-    hash: iroh_blobs::Hash,
-}
-
-impl decdn_cache::Origin for StubOrigin {
-    fn kind(&self) -> decdn_cache::OriginKind {
-        decdn_cache::OriginKind::Http
-    }
-    fn fetch(
-        &self,
-        hash: iroh_blobs::Hash,
-        _max_bytes: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>,
-                > + Send
-                + '_,
-        >,
-    > {
-        let result = if hash == self.hash {
-            Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(decdn_cache::OriginFetch::NotFound)
-        };
-        Box::pin(async move { result })
-    }
-}
-
 #[tokio::test]
 async fn engine_bumps_surface_in_openmetrics_output() {
     use std::sync::Arc;
 
-    use bytes::Bytes;
     use decdn_cache::{CacheEngine, PinnedHashes, RetryPolicy};
     use iroh_blobs::Hash;
-
-    let payload = b"hello /metrics integration".to_vec();
-    let hash = Hash::new(&payload);
-    let stub = StubOrigin {
-        data: Bytes::from(payload.clone()),
-        hash,
-    };
 
     let metrics = Arc::new(Metrics::new());
     let cache_handle = metrics.cache_metrics();
     let tmp = tempfile::tempdir().unwrap();
     let engine = CacheEngine::open_full(
         tmp.path(),
-        vec![Arc::new(stub) as Arc<dyn decdn_cache::Origin>],
+        Vec::new(),
         10,
         PinnedHashes::empty(),
         RetryPolicy::default(),
@@ -1218,21 +1173,22 @@ async fn engine_bumps_surface_in_openmetrics_output() {
     .await
     .unwrap();
 
-    // 1 miss (pull-through) + 1 hit.
-    let _ = engine.get(hash).await.unwrap();
-    let _ = engine.get(hash).await.unwrap();
+    // One miss (no origin to fill from); a held blob's fill is no miss.
+    let _ = engine.populate(Hash::new(b"absent")).await;
+    let held = engine
+        .insert_blob(b"hello /metrics integration".to_vec())
+        .await
+        .unwrap();
+    engine.populate(held).await.unwrap();
 
     let text = metrics.encode().unwrap();
-    let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
     for (name, expected) in [
-        ("decdn_cache_hits_total", 1u64),
-        ("decdn_cache_misses_total", 1),
-        ("decdn_cache_pull_through_bytes_total", payload_len),
-        ("decdn_cache_bytes_returned_total", payload_len * 2),
+        ("decdn_cache_misses_total", 1u64),
+        ("decdn_cache_pull_through_bytes_total", 0),
     ] {
         assert!(
             has_metric_line(&text, name, expected),
-            "counter {name} should report {expected} after 1 miss + 1 hit:\n{text}"
+            "counter {name} should report {expected} after one miss:\n{text}"
         );
     }
 }
@@ -1240,11 +1196,9 @@ async fn engine_bumps_surface_in_openmetrics_output() {
 /// The serve-path hit family exports at zero and each recorder bumps its
 /// own sibling.
 ///
-/// The zero floor is the load-bearing half. These three exist because the
-/// `get`-scoped `decdn_cache_hits_total` sits at a permanent zero on a node
-/// that only serves paying clients, and a dashboard cannot tell that apart
-/// from "no requests yet". A family that only appeared after its first bump
-/// would reintroduce exactly that ambiguity for its own first hour.
+/// The zero floor is the load-bearing half. This family is the node's hit
+/// rate, and a family that only appeared after its first bump would leave a
+/// dashboard unable to tell "no requests yet" from a missing series.
 #[test]
 fn serve_cache_hit_family_exports_and_records() {
     let metrics = Metrics::new();
@@ -1333,9 +1287,7 @@ fn cache_metrics_handle_shares_atomic_with_registered_group() {
     handle.origin_fetches.inc();
     handle.origin_retry_exhausted.inc();
     handle.origin_fallback.inc();
-    handle.hits.inc();
     handle.misses.inc();
-    handle.bytes_returned.inc_by(1024);
     handle.pull_through_bytes.inc_by(2048);
     // GC counters (#518). The struct fields are `gc_runs` /
     // `gc_bytes_reclaimed`; bumping them here and asserting the
@@ -1347,9 +1299,7 @@ fn cache_metrics_handle_shares_atomic_with_registered_group() {
     for (name, expected) in [
         ("decdn_cache_origin_fetches_total", 1u64),
         ("decdn_cache_origin_retry_exhausted_total", 1),
-        ("decdn_cache_hits_total", 1),
         ("decdn_cache_misses_total", 1),
-        ("decdn_cache_bytes_returned_total", 1024),
         ("decdn_cache_pull_through_bytes_total", 2048),
         ("decdn_cache_gc_runs_total", 1),
         ("decdn_cache_gc_bytes_reclaimed_total", 4096),

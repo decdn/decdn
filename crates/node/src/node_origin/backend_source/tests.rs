@@ -7,8 +7,8 @@ use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::Bytes;
 use decdn_bao_range::{IROH_BLOCK_SIZE, RangedStore, align_range};
 use decdn_cache::{
-    CacheEngine, Hash, Origin, OriginFetch, OriginKind, OriginPullError, OriginRangeFetch,
-    OriginRangeRequest, OutboardFetch,
+    CacheEngine, Hash, Origin, OriginKind, OriginPullError, OriginRangeFetch, OriginRangeRequest,
+    OutboardFetch,
 };
 use decdn_client::{BlobSource, Cumulative, IngestStore, PoolLedger, VoucherProgress};
 use iroh_io::AsyncStreamReader;
@@ -25,7 +25,6 @@ struct FakeOrigin {
     hash: Hash,
     data: Bytes,
     outboard: Bytes,
-    size: u64,
 }
 
 impl FakeOrigin {
@@ -34,7 +33,6 @@ impl FakeOrigin {
             hash,
             data: Bytes::from(data.to_vec()),
             outboard,
-            size: data.len() as u64,
         }
     }
 }
@@ -42,27 +40,6 @@ impl FakeOrigin {
 impl Origin for FakeOrigin {
     fn kind(&self) -> OriginKind {
         OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        let result = if hash == self.hash {
-            Ok(OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(OriginFetch::NotFound)
-        };
-        Box::pin(async move { result })
-    }
-
-    fn size(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        let out = (hash == self.hash).then_some(self.size);
-        Box::pin(async move { Ok(out) })
     }
 
     fn fetch_outboard(
@@ -93,7 +70,7 @@ impl Origin for FakeOrigin {
                 None => OriginRangeFetch::NotFound,
             }
         } else {
-            OriginRangeFetch::Unsupported
+            OriginRangeFetch::NotFound
         };
         Box::pin(async move { Ok(result) })
     }
@@ -152,7 +129,7 @@ async fn backend_source_full_miss_admits_complete_blob() -> anyhow::Result<()> {
         "the whole-blob wire must complete the blob under H"
     );
     assert_eq!(
-        engine2.get(hash).await?.as_ref(),
+        engine2.read_blob(hash).await?.as_ref(),
         data.as_slice(),
         "the reconstructed content must be byte-exact"
     );
@@ -306,7 +283,7 @@ async fn backend_reader_reassembles_a_finely_chunked_wire() -> anyhow::Result<()
     )
     .await?;
     assert!(RangedStore::is_complete(&store).await?);
-    assert_eq!(engine.get(hash).await?.as_ref(), data.as_slice());
+    assert_eq!(engine.read_blob(hash).await?.as_ref(), data.as_slice());
     Ok(())
 }
 

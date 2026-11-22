@@ -1,22 +1,18 @@
-//! Shared fixtures for the `present_ranges` integration suite.
+//! Shared fixtures for the cache integration suites.
 //!
 //! Mirrors the proven helpers in `pull_through.rs` / `range_pull.rs`
-//! (`make_blob`, `sub`, `CacheEngine::open_full`, whole-blob origin mocking) —
-//! duplicated locally by design, matching how those suites already
-//! duplicate each other rather than sharing a cross-suite helper crate.
+//! (`make_blob`, `sub`, `CacheEngine::open_full`) — duplicated locally by
+//! design, matching how those suites already duplicate each other rather than
+//! sharing a cross-suite helper crate.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use decdn_cache::{
-    CacheEngine, CacheMetrics, CircuitBreakerPolicy, HttpOrigin, Origin, PinnedHashes, RetryPolicy,
-};
+use decdn_cache::{CacheEngine, CacheMetrics, CircuitBreakerPolicy, PinnedHashes, RetryPolicy};
 use iroh_blobs::Hash;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Deterministic pseudo-random blob, identical generator to
-/// `pull_through.rs:4035` / `range_pull.rs`.
+/// `pull_through.rs` / `range_pull.rs`.
 #[allow(dead_code)]
 pub(crate) fn make_blob(len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
@@ -39,11 +35,14 @@ pub(crate) fn sub(data: &[u8], start: u64, end: u64) -> anyhow::Result<Vec<u8>> 
         .ok_or_else(|| anyhow::anyhow!("range [{start}, {end}) out of bounds"))
 }
 
-async fn build(origins: Vec<Arc<dyn Origin>>) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+/// An engine with no origins, under a disabled retry policy and a metrics
+/// handle.
+#[allow(dead_code)]
+pub(crate) async fn empty_engine() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let engine = CacheEngine::open_full(
         tmp.path(),
-        origins,
+        Vec::new(),
         16,
         PinnedHashes::empty(),
         RetryPolicy::disabled(),
@@ -55,23 +54,12 @@ async fn build(origins: Vec<Arc<dyn Origin>>) -> anyhow::Result<(CacheEngine, te
     Ok((engine, tmp))
 }
 
-#[allow(dead_code)]
-pub(crate) async fn empty_engine() -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
-    build(vec![]).await
-}
-
+/// An [`empty_engine`] whose store holds `payload` whole.
 #[allow(dead_code)]
 pub(crate) async fn engine_with_whole_blob(
     payload: &[u8],
-) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir, MockServer)> {
-    let hash = Hash::new(payload);
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path(format!("/{}", hash.to_hex())))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.to_vec()))
-        .mount(&server)
-        .await;
-    let origin = Arc::new(HttpOrigin::parse(&server.uri())?) as Arc<dyn Origin>;
-    let (engine, tmp) = build(vec![origin]).await?;
-    Ok((engine, hash, tmp, server))
+) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
+    let (engine, tmp) = empty_engine().await?;
+    let hash = engine.insert_blob(payload.to_vec()).await?;
+    Ok((engine, hash, tmp))
 }

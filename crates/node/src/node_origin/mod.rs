@@ -1182,7 +1182,7 @@ impl Origin for NodeOrigin {
             span.record(
                 "outcome",
                 match &result {
-                    Ok(OriginFetch::AlreadyAdmitted | OriginFetch::Found { .. }) => "filled",
+                    Ok(OriginFetch::AlreadyAdmitted) => "filled",
                     Ok(OriginFetch::NotFound) => "not_found",
                     Err(_) => "failed",
                 },

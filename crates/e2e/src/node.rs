@@ -21,7 +21,7 @@ use std::time::Duration;
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use decdn_cache::{CacheEngine, FilesystemOrigin, Hash, Origin};
+use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, BindingStatus, HealthResponse};
 use decdn_common::identity;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -364,28 +364,24 @@ impl NodeFixture {
         Ok(node)
     }
 
-    /// Write `blob` into the node's opaque origin backend **without** touching its
-    /// cache store, and return its BLAKE3 [`struct@Hash`]. The `fs` origin adapter
+    /// Write `blob` and its `{H}.sizeproof` into the node's opaque origin
+    /// backend **without** touching its cache store or writing the `{H}.obao4`
+    /// outboard, and return its BLAKE3 [`struct@Hash`]. The `fs` origin adapter
     /// reads per request, so a post-launch write is visible to the running daemon.
     ///
-    /// Models "the operator's backend holds `H`, the operator has never served
-    /// it": the only way this blob reaches a client is the reactive local-origin
-    /// pull-through (`populate_local`), which is what the authorized-origin gate
-    /// stands in front of.
+    /// Models an origin that misses one of the three objects ADR 037 requires:
+    /// the node admits the open on the size proof, then the range read faults
+    /// before any `ChunkData`. Seed with
+    /// [`Self::seed_origin_blob_with_outboard`] for a servable blob.
     pub fn seed_origin_blob(&self, blob: &[u8]) -> anyhow::Result<Hash> {
         let hash = Hash::new(blob);
         write_fs_origin_blob(self.origin_dir.path(), &hash, blob)?;
         Ok(hash)
     }
 
-    /// Like [`Self::seed_origin_blob`], but also writes the sibling `{H}.obao4`
-    /// pre-order outboard so a ranged origin fetch reaches the **own-origin streaming spine**.
-    ///
-    /// A range pull treats a missing outboard (`FilesystemOrigin::fetch_outboard`
-    /// `NotFound`) as unsupported by design, so a blob seeded by `seed_origin_blob` alone declines the range
-    /// path and falls through to a whole-blob fill — the ranged spine path and
-    /// `bao-range`'s chunk-group handling are then never exercised (#1372). Seed
-    /// with this variant when a journey asserts on the range path itself.
+    /// Write `blob` into the node's origin with all three objects
+    /// `decdn origin import` writes: `{H}`, `{H}.obao4` and `{H}.sizeproof`.
+    /// The node serves it through the **own-origin streaming spine**.
     pub fn seed_origin_blob_with_outboard(&self, blob: &[u8]) -> anyhow::Result<Hash> {
         let hash = Hash::new(blob);
         write_fs_origin_blob(self.origin_dir.path(), &hash, blob)?;
@@ -404,6 +400,45 @@ impl NodeFixture {
     #[must_use]
     pub fn origin_root(&self) -> &std::path::Path {
         self.origin_dir.path()
+    }
+
+    /// Fill the node's cache store with `hashes` the way a serving node fills
+    /// it: one paid whole-blob fetch each, from a fresh funded client, served
+    /// from the node's own origin. Returns once the store holds every blob.
+    ///
+    /// A journey that models content the operator already holds in its store
+    /// (an eviction, a cache hit) warms first. The warm opens one pool per
+    /// hash, so it moves the node's serve, lane and byte counters: take any
+    /// baseline after it.
+    pub async fn warm(&self, chain: &ChainFixture, hashes: &[Hash]) -> anyhow::Result<()> {
+        let client = crate::client::ClientFixture::new(chain).await?;
+        let admin = self.admin_client()?;
+        for hash in hashes {
+            client
+                .fetch(chain, self, *hash, alloy::primitives::U256::ZERO)
+                .await
+                .with_context(|| format!("warm fetch of {hash}"))?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let held = admin
+                    .evict(decdn_common::admin::EvictRequest {
+                        hash: alloy::hex::encode(hash.as_bytes()),
+                        dry_run: true,
+                    })
+                    .await
+                    .context("admin evict dry-run")?
+                    .was_present;
+                if held {
+                    break;
+                }
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "the node's store never held {hash} after its warm fetch"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Ok(())
     }
 
     /// Poll `admin_v1_lanes` until the daemon reports a lane on `pool_id` (or
@@ -486,13 +521,16 @@ impl NodeFixture {
         let node_secret = identity::load_or_generate(data_dir.path()).context("node iroh key")?;
         let node_id = node_secret.public();
 
-        // Seed each blob into a filesystem origin: `{root}/{hex[..2]}/{hex}`.
+        // Seed each blob into a filesystem origin with the three objects
+        // `decdn origin import` writes. The daemon serves them from its own
+        // origin and fills its cache store as it serves.
         let origin_dir = tempfile::tempdir().context("create origin dir")?;
         let hashes: Vec<Hash> = serve_blobs
             .iter()
             .map(|blob| {
                 let hash = Hash::new(blob);
                 write_fs_origin_blob(origin_dir.path(), &hash, blob)?;
+                write_fs_origin_outboard(origin_dir.path(), &hash, blob)?;
                 Ok(hash)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -530,32 +568,6 @@ impl NodeFixture {
         });
         let config_path = data_dir.path().join("node.toml");
         std::fs::write(&config_path, config).context("write node config")?;
-
-        // Pre-warm the node's cache store from the filesystem origin. The
-        // default fixture models content the operator already holds: warm it
-        // through the production origin engine, then let the daemon reopen the
-        // populated store. The empty pull-through variant has no hashes to warm
-        // and instead exercises the bound client's reactive acquisition path.
-        // Mirrors the node integration `cache_with_blob` helper.
-        std::fs::create_dir_all(&cache_dir).context("create cache dir")?;
-        {
-            let origin: Arc<dyn Origin> = Arc::new(
-                FilesystemOrigin::new(origin_dir.path())
-                    .await
-                    .context("open fs origin for warm")?,
-            );
-            let warm = CacheEngine::open(&cache_dir, vec![origin], 1024)
-                .await
-                .context("open warm cache")?;
-            for hash in &hashes {
-                warm.get(*hash)
-                    .await
-                    .context("warm node cache from fs origin")?;
-            }
-            // Explicitly flush the iroh-blobs store to disk so the daemon's
-            // reopen of `cache_dir` sees the blob (drop alone does not sync).
-            warm.shutdown().await.context("flush warm cache")?;
-        }
 
         // The daemon's boot snapshots pin their reads below the head, so mine
         // past that margin: it sees this operator's onboarding and every seat,

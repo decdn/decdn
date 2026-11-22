@@ -611,7 +611,7 @@ impl ClientHandler {
         // Backend and chain work only for a request that names a lane. A
         // request with no verified binding can name none, so it can never be
         // served; the lane gate below would refuse it `OwnerMismatch`. Refuse it
-        // here instead, before an origin-only node's backend `HEAD` and before
+        // here instead, before an origin-only node's `{H}.sizeproof` read and before
         // an unseen pool costs it a `getPool`: a stream of unbound requests for
         // fresh hashes or random `pool_id`s would otherwise spend one of each.
         // A bound request reads the chain at admission: at its first proof for
@@ -634,8 +634,8 @@ impl ClientHandler {
         // Origin-only policy (#1759). When the operator opts out of foreign
         // relay, the own/foreign decision is backend-authoritative: the request's
         // `namespace_id` is a routing hint, not a trust anchor (ADR 002), so the
-        // node asks its OWN backend — a memoized `HEAD`/`HeadObject` — whether it
-        // holds the object named by this content hash. The probe is memoized
+        // node asks its OWN backend whether it publishes a verifying
+        // `{H}.sizeproof` for this content hash. The probe is memoized
         // (short negative TTL), so a foreign-hash flood costs at most one
         // backend round-trip per hash per negative-TTL window. Above the
         // cache-hit branch on purpose: a foreign blob already sitting in this
@@ -646,12 +646,14 @@ impl ClientHandler {
         // to the normal serve path. `Absent` (a genuine 404, or no origin
         // configured at all) is a real foreign-content answer, declined under
         // its own reason so the operator's metrics separate policy declines
-        // from real cache misses. `Fault` (a transport error or a timed-out
-        // `HEAD`) is NOT an absence, so it refuses for `InternalError`,
-        // matching the store-fault handling on the `has()` path below. Both
-        // sign `Declined`: this node will not serve the hash during this fetch.
+        // from real cache misses. `Fault` (a transport error, a permanent
+        // fault such as an HTTP 403, an open breaker, a timed-out walk or a
+        // proof that does not verify) is NOT an absence, so it refuses for
+        // `InternalError`, matching the store-fault handling on the `has()`
+        // path below. Both sign `Declined`: this node will not serve the hash
+        // during this fetch.
         if !self.relay_foreign_namespaces {
-            match self.cache.origin_probe_presence(hash).await {
+            match self.cache.origin_presence(hash).await {
                 decdn_cache::OriginPresence::Present(_) => {}
                 decdn_cache::OriginPresence::Absent => {
                     // The probe reads a withdrawn hash as absent. Keep the
@@ -797,9 +799,8 @@ impl ClientHandler {
             let mut fault_seen = false;
 
             // Own-origin serve-miss via the two decoupled legs. When the node's
-            // OWN configured fs/http/s3 origin can prove it serves `hash` — it
-            // proves the size AND publishes the {H}.obao4 outboard and serves
-            // ranges — the node holds the blob for the network's purposes: it
+            // OWN configured fs/http/s3 origin publishes a `{H}.sizeproof` that
+            // verifies, the node holds the blob for the network's purposes: it
             // answers `ok: true` with full coverage, whether or not the request
             // sets `pull_through`, and admits at the first proof. Then the local
             // pull leg fills the cache from origin beside the serve leg that
@@ -812,35 +813,36 @@ impl ClientHandler {
             // chunk groups, so a bounded request costs exactly its aligned span
             // in origin egress.
             //
-            // Before the response is signed, the node reads only what it can
-            // memoise per hash, so repeats of a hash reach the origin once per
-            // TTL and an open the payer never takes costs no egress in
-            // proportion to the blob:
-            // `origin_probe_presence` (a `HEAD` of the data object), the
-            // origin's `{H}.sizeproof` (ADR 005 § Bounded byte ranges: the node
-            // serves an origin blob only under a size its origin proves; the
-            // engine keeps a proof it read and remembers an origin that serves
-            // none), and `origin_outboard_published` (a `HEAD` of the
-            // `{H}.obao4` outboard). The outboard read and the range window run
-            // only after admission at the first proof, in
-            // `serve_via_backend_origin`; a range they find unusable refuses
-            // the stream before any chunk, and the next open of the hash
-            // degrades here.
+            // Before the response is signed, the node reads one object per
+            // hash, memoised for the probe TTL: the origin's `{H}.sizeproof`
+            // (ADR 005 § Pull-through). It states the size and proves
+            // it, and the engine keeps the proof for the response. The outboard
+            // and the range windows are read only after admission, in
+            // `serve_via_backend_origin`. The origin publishes `{H}`,
+            // `{H}.obao4` and `{H}.sizeproof` (ADR 037 § Origin-tier
+            // pull-through), so a missing or broken object there is an origin
+            // fault: a `StreamError` before any `ChunkData`.
             //
-            // Best-effort degrade (ADR 037 §"Fallback is always correct"): no
-            // published outboard => the buffered local populate below, for a
-            // request that pulls through, and `NotFound` for one that does not.
-            // No origin size or no proof of it => nothing is served from the
-            // origin.
-            // Once serviceable, `serve_via_backend_origin` claims the fill itself
+            // `serve_via_backend_origin` claims the fill itself
             // (`CacheEngine::claim_fill`) after admission: the first same-hash miss
             // OWNS the local origin pull; a concurrent one ATTACHES as an observer
             // and streams the same filling cache to its own client (no double
             // origin egress).
-            let mut origin_proven = false;
-            match self.cache.origin_probe_presence(hash).await {
+            match self.cache.origin_presence(hash).await {
+                // The memo says present but the kept proof cannot be read
+                // back: an origin fault, latched like any other (#1129).
                 decdn_cache::OriginPresence::Present(total)
-                    if self.cache.size_proof(hash, total).await.is_none() => {}
+                    if self.cache.size_proof(hash, total).await.is_none() =>
+                {
+                    tracing::warn!(
+                        %hash,
+                        total,
+                        "the origin presence memo says present but no size proof of that \
+                         size can be read back; treating it as an origin fault"
+                    );
+                    self.metrics.node_pull_through_error();
+                    fault_seen = true;
+                }
                 decdn_cache::OriginPresence::Present(_) if !self.attested(hash).await => {
                     // The own backend holds the blob, but this node holds no
                     // origin seat to attest it with, and no live attestation
@@ -850,52 +852,34 @@ impl ClientHandler {
                         .await;
                 }
                 decdn_cache::OriginPresence::Present(total) => {
-                    origin_proven = true;
-                    match self.cache.origin_outboard_published(hash, total).await {
-                        Ok(true) => {
-                            let adm = DeferredAdmission::new(
-                                req.clone(),
-                                ext,
-                                deployment,
-                                verified_client,
-                                lane_key,
-                                peer,
-                                rate_per_mb,
-                                total,
-                                request_class,
-                                client_node_id,
-                                unadmitted_slot.take(),
-                            );
-                            // Boxed: the serve future is large
-                            // (clippy::large_futures).
-                            return Box::pin(self.serve_via_backend_origin(
-                                &conn,
-                                send,
-                                recv,
-                                &req,
-                                hash,
-                                client_node_id,
-                                adm,
-                                total,
-                                rate_per_mb,
-                                FirstByteClock::new(request_decoded_at, admitted_at, request_class),
-                            ))
-                            .await;
-                        }
-                        // Size proven but no origin publishes the outboard, or
-                        // a serve found its ranges unusable. Degrade to the
-                        // buffered local populate below.
-                        Ok(false) => {}
-                        // A genuine origin fault while probing the outboard.
-                        // Latch it (#1129) so a later-tier miss reports
-                        // InternalError not NotFound, then fall through —
-                        // another source may still serve.
-                        Err(e) => {
-                            self.metrics.node_pull_through_error();
-                            tracing::warn!(%hash, error = %e.display_chain(), "own-origin outboard probe faulted; falling through");
-                            fault_seen = true;
-                        }
-                    }
+                    let adm = DeferredAdmission::new(
+                        req.clone(),
+                        ext,
+                        deployment,
+                        verified_client,
+                        lane_key,
+                        peer,
+                        rate_per_mb,
+                        total,
+                        request_class,
+                        client_node_id,
+                        unadmitted_slot.take(),
+                    );
+                    // Boxed: the serve future is large
+                    // (clippy::large_futures).
+                    return Box::pin(self.serve_via_backend_origin(
+                        &conn,
+                        send,
+                        recv,
+                        &req,
+                        hash,
+                        client_node_id,
+                        adm,
+                        total,
+                        rate_per_mb,
+                        FirstByteClock::new(request_decoded_at, admitted_at, request_class),
+                    ))
+                    .await;
                 }
                 // No origin holds the blob, or no origin is configured at all:
                 // nothing is served from the origin.
@@ -996,10 +980,9 @@ impl ClientHandler {
             // Every request shape — whole blob, bounded, resumed — takes the same
             // two-leg spine on its preferred tiers: the spine signs first and its
             // pull leg fetches only the requested span's missing chunk groups
-            // (ADR 037 §Origin-tier pull-through). The FALLBACK tiers below it
-            // (`try_local_populate`, the buffered pull-through) still import the
-            // whole blob before the size gate answers; they serve exactly the
-            // requested span at delivery.
+            // (ADR 037 §Origin-tier pull-through). The buffered pull-through
+            // below it imports the whole blob before the size gate answers; it
+            // serves exactly the requested span at delivery.
             // `authority` is this request's one answer to `pull_authorized`,
             // taken from the lane the funding gates resolved. Every tier below
             // reads it rather than the live registry, so the request sees one
@@ -1048,43 +1031,6 @@ impl ClientHandler {
                 }
             }
 
-            let mut locally_filled = false;
-
-            // Reactive LOCAL-origin populate (#1116). Before any node→node
-            // path, try to fill from the node's OWN configured fs/http/s3
-            // origin (`populate_local` never touches the paid `Peer` origin).
-            // This lets a cache-only operator (node→node disabled) reactively
-            // serve its own content, and — when node→node IS enabled — prefers
-            // the local origin over the paid peer window path for a whole-blob
-            // request the operator can satisfy itself. It imports the whole blob
-            // before the response, so only a request that pulls through reaches
-            // it. Gated on the SAME proven lane authority as the paid paths
-            // (`pull_authorized`): an S3 origin has egress cost, and the
-            // following delivery is billed per-voucher. A local miss leaves the
-            // blob absent and falls through to the node→node branches below,
-            // unchanged.
-            //
-            // A local HARD FAULT (#1129 — the operator's own S3/fs origin
-            // errored, rather than simply not having the blob) also falls
-            // through to the node→node branches: another source may legitimately
-            // still serve. But it is LATCHED in `fault_seen`, because if no later
-            // tier fills, the terminal refusal must report a degraded node
-            // (`InternalError`) rather than an empty one (`NotFound`). Every
-            // terminal MISS below therefore takes its reason from
-            // `FillOutcome::miss_reason` (via `MissRefusal::new`) and is sent
-            // through `respond_miss`. (The lane- and pool-class refusals — `UnknownLane`,
-            // `InsufficientDeposit` — keep their own reasons: they are
-            // client-attributable and would refuse regardless of origin
-            // health.)
-            if origin_proven
-                && let Some(timeout) = self.local_populate
-                && authority.is_some()
-            {
-                let local = self.try_local_populate(hash, timeout).await;
-                fault_seen |= local.is_fault();
-                locally_filled = local.is_filled();
-            }
-
             // Window-paced pull-through (#856, ADR 037) is the preferred path
             // when its provider is set: instead of buffering the whole
             // blob via `populate` and only THEN serving (fronting 100% of the
@@ -1098,11 +1044,7 @@ impl ClientHandler {
             // `[offset, offset + len)` and bills only the wire it delivers; the
             // pull leg pulls only `missing_ranges(offset, len)` upstream, so a
             // bounded or resumed request fronts exactly its span.
-            if locally_filled {
-                // The whole blob just filled from a local origin (#1116). Skip
-                // the node→node fill and fall through to the size gate +
-                // delivery.
-            } else if let Some(origin) = self.pull_through_origin.as_ref()
+            if let Some(origin) = self.pull_through_origin.as_ref()
                 && let Some((lk, ln)) = authority
             {
                 // Boxed: the serve future is large; keep it off the
@@ -1126,34 +1068,32 @@ impl ClientHandler {
                     FirstByteClock::new(request_decoded_at, admitted_at, request_class),
                 ))
                 .await;
-            } else {
-                // Buffered pull-through (#831): reached when no window provider
-                // is set, or when the request has no spend authority. This arm
-                // is where every unauthorized miss refuses on the `no_lane` path.
-                // A request not authorized to make this node spend, or a node
-                // with no pull-through configured, attempts nothing here, so this
-                // tier contributes no new information. The two keep separate
-                // paths: only the first is a remote peer's to trigger.
-                let (buffered, path) = match self.pull_through {
-                    _ if authority.is_none() => (FillOutcome::CleanMiss, MissPath::NoLane),
-                    Some(timeout) => (
-                        self.try_pull_through(hash, timeout).await,
-                        MissPath::BufferedMiss,
-                    ),
-                    None => (FillOutcome::CleanMiss, MissPath::NoPullThrough),
-                };
-                if !buffered.is_filled() {
-                    let refusal = MissRefusal::new(fault_seen || buffered.is_fault(), path);
-                    return self
-                        .respond_miss(&mut send, &req, refusal, rate_per_mb)
-                        .await;
-                }
             }
-            // The fill tiers land the blob, not an attestation for it: a
-            // buffered fill from this node's own origin signs none. The serving
-            // rule binds the landed blob as it binds a hit, so a seated origin
-            // signs its own here, and a node that can neither sign nor holds a
-            // live one refuses (ADR 005 § Serving rule).
+            // Buffered pull-through (#831): reached when no window provider
+            // is set, or when the request has no spend authority. This arm
+            // is where every unauthorized miss refuses on the `no_lane` path.
+            // A request not authorized to make this node spend, or a node
+            // with no pull-through configured, attempts nothing here, so this
+            // tier contributes no new information. The two keep separate
+            // paths: only the first is a remote peer's to trigger.
+            let (buffered, path) = match self.pull_through {
+                _ if authority.is_none() => (FillOutcome::CleanMiss, MissPath::NoLane),
+                Some(timeout) => (
+                    self.try_pull_through(hash, timeout).await,
+                    MissPath::BufferedMiss,
+                ),
+                None => (FillOutcome::CleanMiss, MissPath::NoPullThrough),
+            };
+            if !buffered.is_filled() {
+                let refusal = MissRefusal::new(fault_seen || buffered.is_fault(), path);
+                return self
+                    .respond_miss(&mut send, &req, refusal, rate_per_mb)
+                    .await;
+            }
+            // The fill tiers land the blob, not an attestation for it. The
+            // serving rule binds the landed blob as it binds a hit, so a seated
+            // origin signs its own here, and a node that can neither sign nor
+            // holds a live one refuses (ADR 005 § Serving rule).
             if !self.attested(hash).await {
                 return self
                     .respond_error(&mut send, &req, ServeRejectReason::Unattested, rate_per_mb)

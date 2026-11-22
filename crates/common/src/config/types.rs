@@ -343,7 +343,7 @@ pub struct PaymentChainConfig {
 /// Cache section of the config file.
 ///
 /// `deny_unknown_fields` is set so that a misplaced origin field (a flat
-/// `origin_url` / `origin_path` / `decompress` directly under `[cache]`)
+/// `origin_url` / `origin_path` directly under `[cache]`)
 /// gets a clear "unknown field" error at config load instead of a silent
 /// "no origin configured" surprise at the first cache miss. Origin
 /// settings live under the tagged `[cache.origin]` table — see
@@ -425,41 +425,28 @@ pub struct CacheConfig {
     /// "entry was ignored" surprise hours later when the operator
     /// discovers the blob got evicted anyway.
     pub pinned_hashes: Option<Vec<String>>,
-    /// Origin pull-through retry policy (#285, extended in #519).
-    /// Controls exponential backoff for transient HTTP / S3 /
-    /// filesystem errors *and* the body-phase retry strategy for
-    /// mid-stream `io::Error`s. Absent => defaults from
+    /// Origin retry policy (#285). Controls exponential backoff for
+    /// transient origin errors on the node-to-node `pull_through` fetch and
+    /// on each `{H}.obao4` and range-window read, each retried on its own.
+    /// The `{H}.sizeproof` presence read runs once (the presence memo is its
+    /// retry), and a rescan's `enumerate` is not retried.
+    /// Absent => defaults from
     /// [`decdn_config_types::RetryPolicy::default`] (3 retries, 100ms
-    /// initial backoff doubling to 10s cap, 10% jitter,
-    /// `buffered_max_bytes = 4 MiB`). `max_retries = 0` opts out and
-    /// makes one attempt with no retry; `buffered_max_bytes = 0`
-    /// independently disables the body-phase buffer path so all
-    /// body-phase failures route through the streaming abort+restart
-    /// path. Set once at startup; changes require a restart.
-    ///
-    /// **Body-phase retry trade-offs (#519):**
-    ///
-    /// - **Buffer-then-commit** applies when the origin's advertised
-    ///   `size_hint` is at or below `buffered_max_bytes`. The body
-    ///   drains into memory before the iroh-blobs commit, so failed
-    ///   attempts cost RAM (bounded by `buffered_max_bytes` per
-    ///   in-flight fetch) but leave no on-disk garbage.
-    /// - **Abort + restart** applies above the threshold or when
-    ///   `size_hint` is unknown. Each failed attempt strands up to
-    ///   `max_blob_size_mb` of partial-import bytes until iroh-blobs
-    ///   GC reclaims them at `cache.gc_interval_sec` cadence.
-    ///   Worst-case disk amplification per fetch is
-    ///   `(1 + max_retries) * max_blob_size_mb`.
+    /// initial backoff doubling to 10s cap, 10% jitter).
+    /// `max_retries = 0` opts out and makes one attempt with no retry.
+    /// Set once at startup; changes require a restart.
     ///
     /// `decdn_config_types::RetryPolicy` carries `#[serde(default)]` so
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
     /// the fields filled from defaults.
     pub origin_retry: Option<decdn_config_types::RetryPolicy>,
     /// Per-origin circuit-breaker policy (#963). Fronts each origin's
-    /// pull-through retry loop: after `failure_threshold` consecutive
-    /// origin-unavailable failures (transient errors that exhausted the
-    /// retry budget — NOT 404s or other permanent per-object errors) the
-    /// breaker trips OPEN and fast-fails every miss for `cooldown_ms`
+    /// `pull_through` fetch and its `{H}.sizeproof`, `{H}.obao4` and
+    /// range-window reads (not `enumerate`): after `failure_threshold`
+    /// consecutive origin-unavailable
+    /// failures (transient errors that exhausted the retry budget — NOT
+    /// 404s or other permanent per-object errors) the breaker trips OPEN
+    /// and fast-fails every read of that origin for `cooldown_ms`
     /// without incurring any retry/backoff, then admits
     /// `half_open_max_calls` trial pulls to probe recovery. Absent =>
     /// defaults from [`decdn_config_types::CircuitBreakerPolicy::default`]
@@ -500,11 +487,11 @@ pub struct CacheConfig {
     /// TTL, in seconds, for a memoised positive live-origin probe answer (#1130
     /// pt3). Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TTL_SEC`] (15). A
     /// request for a hash absent from the `fs`-enumeration ∪ pins index falls
-    /// back to a live `HEAD`/`HeadObject` against the http/s3 origin; a
+    /// back to a live `{H}.sizeproof` read against the http/s3 origin; a
     /// present-with-size answer is cached for this long so a non-pinned bucket
     /// object is discoverable without an origin round-trip on every request.
-    /// Shorter TTLs track origin deletions faster at the cost of more `HEAD`
-    /// traffic. See `origin_probe_negative_ttl_sec` for the absent-answer TTL.
+    /// Shorter TTLs track origin deletions faster at the cost of more
+    /// `{H}.sizeproof` reads. See `origin_probe_negative_ttl_sec` for the absent-answer TTL.
     pub origin_probe_ttl_sec: Option<u64>,
     /// TTL, in seconds, for a memoised negative (absent) live-origin probe
     /// answer (#1130 pt3). Absent =>
@@ -522,11 +509,13 @@ pub struct CacheConfig {
     /// Rejected unless `origin_probe_negative_ttl_sec <=
     /// origin_probe_fault_ttl_sec <= origin_probe_ttl_sec`.
     pub origin_probe_fault_ttl_sec: Option<u64>,
-    /// Per-request ceiling, in milliseconds, on the live-origin
-    /// `HEAD`/`HeadObject` (#1130 pt3). Absent =>
-    /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`] (2000). A slow origin
-    /// must never stall the serve hot path; on timeout the node does not
-    /// advertise the blob and memoises the fault for one fault TTL.
+    /// Ceiling, in milliseconds, on one live `{H}.sizeproof` walk of the
+    /// origin chain (#1130 pt3): one budget for every origin in turn, not per
+    /// origin. Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
+    /// (2000). A slow origin must never stall the serve hot path; on overrun
+    /// the node does not advertise the blob and memoises the fault for one
+    /// fault TTL, and the first origin's overrun counts against its circuit
+    /// breaker.
     pub origin_probe_timeout_ms: Option<u64>,
     /// Maximum distinct hashes held in the live-origin probe memo (#1130 pt3).
     /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`] (4096).
@@ -729,15 +718,16 @@ pub struct ServeEconomicsConfig {
 /// Origin backend selection (#437). Tagged on the inner `kind` field.
 ///
 /// `deny_unknown_fields` is set on the enum and on each variant's
-/// payload so that an operator typo (`decompres = "auto"` on the Http
-/// variant, for instance) fails at config load instead of silently
-/// no-opping.
+/// payload so that an operator typo (`pth = "..."` on the Fs variant, for
+/// instance) fails at config load instead of silently no-opping.
+///
+/// Every origin publishes each blob's data `{hex}`, its `{hex}.obao4`
+/// outboard and its `{hex}.sizeproof`, as `decdn origin import` writes them.
 ///
 /// ```toml
 /// [cache.origin]
 /// kind = "http"
 /// url = "https://origin.example/"
-/// decompress = "auto"          # optional; defaults to "auto"
 ///
 /// # — or —
 /// [cache.origin]
@@ -780,13 +770,6 @@ pub enum OriginConfig {
         /// Base URL; must be `http`/`https` and is path-normalized to
         /// end with `/` so `{base}.join(&hex)` produces `{base}/{hex}`.
         url: String,
-        /// How to handle `Content-Encoding` on the HTTP response
-        /// (#312). `"auto"` (default) decompresses gzip/zstd
-        /// transparently; `"strict"` refuses any non-identity
-        /// encoding. The BLAKE3 content-address is computed over the
-        /// canonical (decompressed) form, so `"strict"` is only safe
-        /// for origins guaranteed to serve already-canonical bytes.
-        decompress: Option<decdn_config_types::DecompressMode>,
     },
     /// Local filesystem origin rooted at `path`; blobs live at
     /// `{path}/{hex[0..2]}/{hex}`.
@@ -843,14 +826,6 @@ pub struct S3OriginConfig {
     /// chain (env vars, `~/.aws/credentials`, IAM role / instance
     /// profile).
     pub credentials: Option<S3Credentials>,
-    /// How to handle `Content-Encoding` on the S3 response (#804).
-    /// `"auto"` (default) decompresses gzip/zstd transparently;
-    /// `"strict"` refuses any non-identity encoding. The BLAKE3
-    /// content-address is computed over the canonical (decompressed)
-    /// form, so `"strict"` is only safe for origins guaranteed to serve
-    /// already-canonical bytes. Mirrors the HTTP origin's `decompress`
-    /// knob.
-    pub decompress: Option<decdn_config_types::DecompressMode>,
 }
 
 /// S3 credential source (#437). Tagged on the inner `source` field.

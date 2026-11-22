@@ -1,7 +1,7 @@
 //! Integration tests for `decdn origin import` (issue #1904).
 //!
 //! The strongest check runs the real cache reader against what the command
-//! wrote: a `decdn-cache` `FilesystemOrigin` must fetch the blob and, using the
+//! wrote: a `decdn-cache` `FilesystemOrigin` must read the blob back and, using the
 //! sibling `{hex}.obao4`, serve a verified byte range. That proves the outboard
 //! is the daemon-compatible `IROH_BLOCK_SIZE` encoding — the whole point of the
 //! command — not just that a file with the right name exists.
@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 
 use decdn_cache::range_pull::{align_range, encode_verified_range};
 use decdn_cache::{
-    CHUNK_GROUP_BYTES, FilesystemOrigin, Hash, Origin, OriginFetch, OriginRangeFetch,
-    OriginRangeRequest, OutboardFetch,
+    CHUNK_GROUP_BYTES, FilesystemOrigin, Hash, Origin, OriginRangeFetch, OriginRangeRequest,
+    OutboardFetch,
 };
 use decdn_cli::commands::origin::origin_import;
 use decdn_common::cli::OriginImportArgs;
@@ -112,13 +112,15 @@ fn single_file_import_is_readable_and_range_serves() {
             proof
         ));
 
-        // Whole-blob fetch round-trips the exact bytes.
-        let fetched = reader.fetch(hash, 1 << 30).await.unwrap();
-        let bytes = match fetched {
-            OriginFetch::Found { .. } => fetched.collect_to_bytes().await.unwrap().unwrap(),
-            other => panic!("expected Found, got {other:?}"),
+        // A range read of the whole span round-trips the exact bytes.
+        let whole = OriginRangeRequest {
+            fetch_start: 0,
+            fetch_end: size,
         };
-        assert_eq!(bytes.as_ref(), payload.as_slice());
+        match reader.fetch_range_data(hash, whole).await.unwrap() {
+            OriginRangeFetch::Ranged { data } => assert_eq!(data.as_ref(), payload.as_slice()),
+            OriginRangeFetch::NotFound => panic!("expected the whole span, got NotFound"),
+        }
 
         // A chunk-group-aligned range verifies against the written outboard —
         // this fails if the `.obao4` is a foreign / wrong-block-size encoding.
@@ -130,7 +132,7 @@ fn single_file_import_is_readable_and_range_serves() {
         let end = usize::try_from(3 * CHUNK_GROUP_BYTES).unwrap();
         let outboard = match reader.fetch_outboard(hash, 1 << 30).await.unwrap() {
             OutboardFetch::Found(outboard) => outboard,
-            other => panic!("expected the outboard, got {other:?}"),
+            OutboardFetch::NotFound => panic!("expected the outboard, got NotFound"),
         };
         match reader.fetch_range_data(hash, req).await.unwrap() {
             OriginRangeFetch::Ranged { data } => {
@@ -140,13 +142,13 @@ fn single_file_import_is_readable_and_range_serves() {
                 encode_verified_range(*hash.as_bytes(), &aligned, &data, outboard)
                     .expect("the range must verify against the written outboard");
             }
-            other => panic!("expected Ranged, got {other:?}"),
+            OriginRangeFetch::NotFound => panic!("expected Ranged, got NotFound"),
         }
         match reader.fetch_outboard(hash, 1 << 30).await.unwrap() {
             OutboardFetch::Found(outboard) => {
                 assert!(!outboard.is_empty(), "outboard must be served for a range");
             }
-            other => panic!("expected Found, got {other:?}"),
+            OutboardFetch::NotFound => panic!("expected Found, got NotFound"),
         }
     });
 }
@@ -351,9 +353,23 @@ fn directory_import_matches_dry_run_and_imports_manifest() {
         for e in entries {
             let hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
             let (hash, _) = hash_from_hex(hex);
-            match reader.fetch(hash, 1 << 30).await.unwrap() {
-                OriginFetch::Found { .. } => {}
-                other => panic!("blob {hex} not readable: {other:?}"),
+            // Each blob's size proof is readable, and a range of its whole
+            // stated size serves.
+            let object = reader
+                .fetch_size_proof(hash)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("blob {hex} has no size proof"));
+            let (size, _) = decdn_bao_range::parse_size_proof_object(&object).unwrap();
+            let whole = OriginRangeRequest {
+                fetch_start: 0,
+                fetch_end: size,
+            };
+            match reader.fetch_range_data(hash, whole).await.unwrap() {
+                OriginRangeFetch::Ranged { data } => {
+                    assert_eq!(u64::try_from(data.len()).unwrap(), size);
+                }
+                OriginRangeFetch::NotFound => panic!("blob {hex} not readable: NotFound"),
             }
         }
     });

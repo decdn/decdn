@@ -2,9 +2,9 @@
 //! pull-through, range admission, and pluggable admission and eviction
 //! policies.
 //!
-//! [`CacheEngine`] owns the store. On a cache miss it pulls from a configured
-//! [`Origin`] and verifies the bytes against their BLAKE3 hash before it
-//! stores or returns them. Pinned blobs, in-use holds, and the deny-sets are
+//! [`CacheEngine`] owns the store. On a cache miss it reads a configured
+//! [`Origin`] by range and verifies the bytes against their BLAKE3 hash before
+//! it stores or serves them. Pinned blobs, in-use holds, and the deny-sets are
 //! enforced by the engine itself, whatever policy is plugged in.
 //!
 //! # Entry points
@@ -12,7 +12,8 @@
 //! | You want to | Use |
 //! |---|---|
 //! | Open a store | [`CacheEngine::open`] and its variants |
-//! | Read a whole blob, pulling it from the origin on a miss | [`CacheEngine::get`], [`CacheEngine::populate`] |
+//! | Learn whether an origin holds a blob, and its proven size | [`CacheEngine::origin_presence`], [`CacheEngine::size_proof`] |
+//! | Fill a whole blob through the node-to-node origin | [`CacheEngine::populate`] |
 //! | Stream a verified sub-range from the origin, one window per draw | [`CacheEngine::origin_range_wire`] |
 //! | Export a stored range as the bao wire encoding | [`CacheEngine::export_bao_range_stream`] |
 //! | Admit a verified bao stream into the store | [`CacheEngine::admit_bao_stream`] |
@@ -77,9 +78,7 @@ pub use engine::{
     AdmitControl, AdmitEnd, CacheEngine, EvictionCandidates, EvictionPreview, InUse,
     OriginHeldReport, OriginPresence, PresentRanges, ServeAudit,
 };
-pub use error::{
-    CacheError, CacheResult, ErrorChain, OriginError, OriginPullError, SupportedEncoding,
-};
+pub use error::{CacheError, CacheResult, ErrorChain, OriginPullError};
 pub use eviction_driver::EvictionParams;
 pub use fill_session::{
     Demand, DemandSlot, DownstreamWatch, FillClaim, FillError, FillRegistry, FillSession, Frontier,
@@ -120,8 +119,8 @@ pub use serve_store::{EncodeStream, PresentRangeWatch, ServeStore};
 /// the iroh-blobs store hash — see the `hash_bridge` conversions.
 pub use decdn_config_types::Hash as LeafHash;
 pub use decdn_config_types::{
-    Bytes, CircuitBreakerPolicy, DEFAULT_USER_AGENT, DecompressMode, DeniedHashes, HashParseError,
-    OriginKind, OriginUrl, PinDiff, PinnedHashes, RetryPolicy, parse_origin_url, redact_for_log,
+    Bytes, CircuitBreakerPolicy, DEFAULT_USER_AGENT, DeniedHashes, HashParseError, OriginKind,
+    OriginUrl, PinDiff, PinnedHashes, RetryPolicy, parse_origin_url, redact_for_log,
 };
 
 /// Convert a config-vocabulary [`decdn_config_types::Hash`] into the

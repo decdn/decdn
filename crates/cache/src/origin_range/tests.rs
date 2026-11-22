@@ -88,6 +88,7 @@ async fn window_reader_reads_across_windows_and_fetches_each_once() {
         &aligned,
         Bytes::new(),
         None,
+        ReadGuard::none(),
         None,
     )
     .await

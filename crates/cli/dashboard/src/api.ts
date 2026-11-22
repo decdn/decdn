@@ -406,15 +406,18 @@ export interface NodeMetrics {
   uptime_seconds: number;
   active_connections: number;
   dispatch_in_flight: number;
-  cache_hits: number;
-  cache_misses: number;
-  cache_bytes_returned: number;
+  /** Paid serves answered from held bytes, complete and partial hits. */
+  serve_cache_hits: number;
+  /** Paid serves the node could not answer from held bytes. */
+  serve_cache_misses: number;
+  /** Bao wire bytes written to clients and downstream nodes. */
+  bytes_served: number;
   /** Micro-USDC in accepted vouchers not yet redeemed. */
   unredeemed_usdc: number;
   rpc_healthy: boolean;
   /** Null on the first scrape. */
   rates: NodeRates | null;
-  /** Hits over hits and misses since start; null before either. */
+  /** Serve hits over hits and misses since start; null before either. */
   hit_rate: number | null;
 }
 

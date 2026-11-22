@@ -536,7 +536,7 @@ impl HolderSnapshot {
 /// half is not taken wholesale — the store may hold leftover foreign content
 /// from before the toggle was set, and announcing it would advertise blobs the
 /// serve gate now declines. Each stored hash is instead put to
-/// `origin_probe_presence`, the same question the origin-only serve gate asks,
+/// `origin_presence`, the same question the origin-only serve gate asks,
 /// so the snapshot advertises exactly what this node would serve.
 ///
 /// That check is what recovers a node's *own* store-only content. The
@@ -579,7 +579,7 @@ pub(crate) async fn holder_snapshot(
                     hashes.insert(hash);
                     continue;
                 }
-                match cache.origin_probe_presence(hash).await {
+                match cache.origin_presence(hash).await {
                     decdn_cache::OriginPresence::Present(_) => {
                         hashes.insert(hash);
                     }
@@ -1331,7 +1331,7 @@ async fn attestation_for(
         && attestations.can_attest_own()
         && matches!(
             cache
-                .origin_probe_presence(iroh_blobs::Hash::from_bytes(*hash.as_bytes()))
+                .origin_presence(iroh_blobs::Hash::from_bytes(*hash.as_bytes()))
                 .await,
             decdn_cache::OriginPresence::Present(_)
         )

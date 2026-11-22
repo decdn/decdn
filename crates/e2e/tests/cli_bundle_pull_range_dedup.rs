@@ -596,6 +596,8 @@ async fn run_scattered_complement() -> anyhow::Result<()> {
         hashes == vec![whole_a, whole_b],
         "seeded blob hashes mismatch"
     );
+    // Every leg below counts as a cache hit, so the store holds both files.
+    node.warm(&chain, &hashes).await?;
     let provider_addr = node.operator_addr();
 
     let client_dir = tempfile::tempdir().context("client tempdir")?;
@@ -779,6 +781,10 @@ async fn run_striped_complement() -> anyhow::Result<()> {
         holder_x.operator_addr() != holder_y.operator_addr(),
         "the two holders must be distinct operators for the entry to admit both"
     );
+    // Every leg below counts as a cache hit, so each holder's store holds its
+    // files.
+    holder_x.warm(&chain, &hashes_x).await?;
+    holder_y.warm(&chain, &hashes_y).await?;
 
     let client_dir = tempfile::tempdir().context("client tempdir")?;
     #[cfg(unix)]

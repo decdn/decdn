@@ -7,7 +7,7 @@ use bao_tree::io::outboard::PreOrderMemOutboard;
 use bytes::Bytes;
 use decdn_bao_range::IROH_BLOCK_SIZE;
 use decdn_cache::{
-    CacheEngine, FillError, FillSession, Hash, Origin, OriginFetch, OriginKind, OriginPullError,
+    CacheEngine, FillError, FillSession, Hash, Origin, OriginKind, OriginPullError,
     OriginRangeFetch, OriginRangeRequest, OutboardFetch,
 };
 use decdn_client::{Cumulative, PoolLedger};
@@ -41,7 +41,6 @@ struct FakeOrigin {
     hash: Hash,
     data: Bytes,
     outboard: Bytes,
-    size: u64,
     mode: FakeMode,
 }
 
@@ -67,7 +66,6 @@ impl FakeOrigin {
             hash,
             data: Bytes::from(data.to_vec()),
             outboard,
-            size: data.len() as u64,
             mode: fake_mode,
         }
     }
@@ -76,27 +74,6 @@ impl FakeOrigin {
 impl Origin for FakeOrigin {
     fn kind(&self) -> OriginKind {
         OriginKind::Http
-    }
-
-    fn fetch(
-        &self,
-        hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        let result = if hash == self.hash {
-            Ok(OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(OriginFetch::NotFound)
-        };
-        Box::pin(async move { result })
-    }
-
-    fn size(
-        &self,
-        hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        let out = (hash == self.hash).then_some(self.size);
-        Box::pin(async move { Ok(out) })
     }
 
     fn fetch_outboard(
@@ -139,7 +116,7 @@ impl Origin for FakeOrigin {
                 None => OriginRangeFetch::NotFound,
             }
         } else {
-            OriginRangeFetch::Unsupported
+            OriginRangeFetch::NotFound
         };
         Box::pin(async move { Ok(result) })
     }
@@ -254,7 +231,7 @@ async fn local_pull_leg_full_miss_terminates_and_fills() -> anyhow::Result<()> {
     // The cache now holds the whole blob, byte-exact.
     let want = test_blob();
     assert_eq!(
-        engine.get(hash).await?.as_ref(),
+        engine.read_blob(hash).await?.as_ref(),
         want.as_slice(),
         "the local pull must fill the cache byte-exact"
     );

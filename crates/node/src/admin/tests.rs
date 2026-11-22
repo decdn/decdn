@@ -24,6 +24,18 @@ async fn test_cache() -> (CacheEngine, tempfile::TempDir) {
     (cache, tmp)
 }
 
+/// An `Http`-kind origin that holds nothing, so an engine reports one
+/// origin of that kind in its eviction preview. Tests seed the store with
+/// `CacheEngine::insert_blob`.
+#[derive(Debug)]
+struct StubOrigin;
+
+impl Origin for StubOrigin {
+    fn kind(&self) -> decdn_cache::OriginKind {
+        decdn_cache::OriginKind::Http
+    }
+}
+
 async fn state_with() -> (AdminState, tempfile::TempDir) {
     let (cache, tmp) = test_cache().await;
     let state = AdminState::new(
@@ -110,58 +122,18 @@ async fn health_returns_hex_node_id_and_nondecreasing_uptime() {
 }
 
 /// Evict round-trip: `admin_v1_evict` of a hex hash that's been pulled
-/// into the cache returns `was_present: true` and subsequent gets fail
+/// into the cache returns `was_present: true` and a subsequent fill fails
 /// with `NotFound`. Without this, a regression that no-op'd
 /// `admin_v1_evict` would leak through unit tests.
 #[tokio::test]
 async fn admin_evict_blocks_subsequent_serve() -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use std::future::Future;
-    use std::pin::Pin;
-
-    // Inline stub origin so we don't have to depend on a test-only
-    // `decdn-cache` export. Single-blob, hash matches payload.
-    #[derive(Debug)]
-    struct StubOrigin {
-        data: Bytes,
-        hash: Hash,
-    }
-    impl decdn_cache::Origin for StubOrigin {
-        fn kind(&self) -> decdn_cache::OriginKind {
-            decdn_cache::OriginKind::Http
-        }
-
-        fn fetch(
-            &self,
-            hash: Hash,
-            _max_bytes: u64,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            let result = if hash == self.hash {
-                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-            } else {
-                Ok(decdn_cache::OriginFetch::NotFound)
-            };
-            Box::pin(async move { result })
-        }
-    }
-
     let payload = b"admin evict";
-    let hash = Hash::new(payload);
     let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(StubOrigin {
-        data: Bytes::from(payload.to_vec()),
-        hash,
-    }) as Arc<dyn decdn_cache::Origin>;
-    let cache = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
+    let origin = Arc::new(StubOrigin) as Arc<dyn Origin>;
+    let cache = CacheEngine::open(tmp.path(), vec![origin], 1).await?;
 
     // Prime the cache with the blob so the evict has something to remove.
-    let _ = cache.get(hash).await?;
+    let hash = cache.insert_blob(payload.to_vec()).await?;
 
     let state = AdminState::new(
         [0u8; 32],
@@ -183,7 +155,7 @@ async fn admin_evict_blocks_subsequent_serve() -> anyhow::Result<()> {
     assert!(resp.was_present, "expected was_present=true");
     assert!(!resp.dry_run, "real evict must not set dry_run");
 
-    match cache.get(hash).await {
+    match cache.populate(hash).await {
         Err(CacheError::NotFound { .. }) => Ok(()),
         other => Err(anyhow::anyhow!(
             "expected NotFound after admin evict, got {other:?}"
@@ -248,49 +220,11 @@ async fn admin_evict_accepts_uppercase_0x_prefix() {
 /// matters).
 #[tokio::test]
 async fn admin_evict_dry_run_does_not_mutate() -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use std::future::Future;
-    use std::pin::Pin;
-
-    #[derive(Debug)]
-    struct StubOrigin {
-        data: Bytes,
-        hash: Hash,
-    }
-    impl decdn_cache::Origin for StubOrigin {
-        fn kind(&self) -> decdn_cache::OriginKind {
-            decdn_cache::OriginKind::Http
-        }
-
-        fn fetch(
-            &self,
-            hash: Hash,
-            _max_bytes: u64,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            let result = if hash == self.hash {
-                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-            } else {
-                Ok(decdn_cache::OriginFetch::NotFound)
-            };
-            Box::pin(async move { result })
-        }
-    }
-
     let payload = b"dry-run preview";
-    let hash = Hash::new(payload);
     let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(StubOrigin {
-        data: Bytes::from(payload.to_vec()),
-        hash,
-    }) as Arc<dyn decdn_cache::Origin>;
-    let cache = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-    let _ = cache.get(hash).await?;
+    let origin = Arc::new(StubOrigin) as Arc<dyn Origin>;
+    let cache = CacheEngine::open(tmp.path(), vec![origin], 1).await?;
+    let hash = cache.insert_blob(payload.to_vec()).await?;
 
     let state = AdminState::new(
         [0u8; 32],
@@ -312,7 +246,10 @@ async fn admin_evict_dry_run_does_not_mutate() -> anyhow::Result<()> {
 
     // Wire shape — every dry-run-only field is meaningful.
     assert!(resp.dry_run, "expected dry_run=true on response");
-    assert!(resp.was_present, "blob primed via get(); should be served");
+    assert!(
+        resp.was_present,
+        "blob primed via insert_blob; should be served"
+    );
     assert_eq!(
         resp.preview.size_bytes,
         Some(payload.len() as u64),
@@ -322,7 +259,7 @@ async fn admin_evict_dry_run_does_not_mutate() -> anyhow::Result<()> {
     );
     assert!(
         resp.preview.last_accessed_us_ago.is_some(),
-        "expected Some(last_accessed_us_ago) after get()"
+        "expected Some(last_accessed_us_ago) after insert_blob"
     );
     assert!(!resp.preview.pinned);
     assert!(
@@ -360,49 +297,11 @@ async fn admin_evict_dry_run_does_not_mutate() -> anyhow::Result<()> {
 /// the iroh-blobs store hasn't been GC'd yet (#518).
 #[tokio::test]
 async fn admin_evict_dry_run_after_real_evict_reports_already_evicted() -> anyhow::Result<()> {
-    use bytes::Bytes;
-    use std::future::Future;
-    use std::pin::Pin;
-
-    #[derive(Debug)]
-    struct StubOrigin {
-        data: Bytes,
-        hash: Hash,
-    }
-    impl decdn_cache::Origin for StubOrigin {
-        fn kind(&self) -> decdn_cache::OriginKind {
-            decdn_cache::OriginKind::Http
-        }
-
-        fn fetch(
-            &self,
-            hash: Hash,
-            _max_bytes: u64,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            let result = if hash == self.hash {
-                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-            } else {
-                Ok(decdn_cache::OriginFetch::NotFound)
-            };
-            Box::pin(async move { result })
-        }
-    }
-
     let payload = b"already-evicted preview";
-    let hash = Hash::new(payload);
     let tmp = tempfile::tempdir()?;
-    let origin = Arc::new(StubOrigin {
-        data: Bytes::from(payload.to_vec()),
-        hash,
-    }) as Arc<dyn decdn_cache::Origin>;
-    let cache = CacheEngine::open(tmp.path(), vec![origin as Arc<dyn Origin>], 1).await?;
-    let _ = cache.get(hash).await?;
+    let origin = Arc::new(StubOrigin) as Arc<dyn Origin>;
+    let cache = CacheEngine::open(tmp.path(), vec![origin], 1).await?;
+    let hash = cache.insert_blob(payload.to_vec()).await?;
     cache.evict(hash).await?;
 
     let state = AdminState::new(

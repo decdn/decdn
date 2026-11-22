@@ -58,9 +58,17 @@ pub(crate) struct Snapshot {
     pub uptime_seconds: u64,
     pub active_connections: u64,
     pub dispatch_in_flight: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub cache_bytes_returned: u64,
+    /// Paid serves the availability gate answered from locally held bytes:
+    /// `decdn_serve_cache_hit_total` (complete blob) plus
+    /// `decdn_serve_cache_partial_hit_total` (held chunk groups cover the
+    /// span). A partial hit serves without a fill, so it counts as a hit.
+    pub serve_cache_hits: u64,
+    /// Paid serves the availability gate could not answer from locally held
+    /// bytes (`decdn_serve_cache_miss_total`).
+    pub serve_cache_misses: u64,
+    /// Bao wire bytes the node wrote to clients and downstream nodes
+    /// (`decdn_bytes_served_total`).
+    pub bytes_served: u64,
     /// Raw USDC held in accepted vouchers not yet redeemed on-chain, refreshed
     /// once per redeemer self-tick (`decdn_unredeemed_usdc`).
     pub unredeemed_usdc: u64,
@@ -95,9 +103,10 @@ impl Snapshot {
             uptime_seconds: u("decdn_node_uptime_seconds"),
             active_connections: u("decdn_active_connections"),
             dispatch_in_flight: u("decdn_dispatch_in_flight"),
-            cache_hits: u("decdn_cache_hits_total"),
-            cache_misses: u("decdn_cache_misses_total"),
-            cache_bytes_returned: u("decdn_cache_bytes_returned_total"),
+            serve_cache_hits: u("decdn_serve_cache_hit_total")
+                .saturating_add(u("decdn_serve_cache_partial_hit_total")),
+            serve_cache_misses: u("decdn_serve_cache_miss_total"),
+            bytes_served: u("decdn_bytes_served_total"),
             unredeemed_usdc: u("decdn_unredeemed_usdc"),
             rpc_healthy: m.get("decdn_rpc_healthy").copied().unwrap_or(0.0) >= 0.5,
         }
@@ -110,11 +119,11 @@ impl Snapshot {
 /// (e.g. `format_rate_bytes(d.bytes)`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct SnapshotDelta {
-    /// Cache hits per second.
+    /// Serve-path cache hits per second.
     pub hits: f64,
-    /// Cache misses per second.
+    /// Serve-path cache misses per second.
     pub misses: f64,
-    /// Cache bytes returned per second.
+    /// Wire bytes served per second.
     pub bytes: f64,
 }
 
@@ -138,9 +147,9 @@ impl SnapshotDelta {
         #[allow(clippy::cast_precision_loss)]
         let d = |a: u64, b: u64| (a.saturating_sub(b)) as f64 / secs;
         Self {
-            hits: d(now.cache_hits, prev.cache_hits),
-            misses: d(now.cache_misses, prev.cache_misses),
-            bytes: d(now.cache_bytes_returned, prev.cache_bytes_returned),
+            hits: d(now.serve_cache_hits, prev.serve_cache_hits),
+            misses: d(now.serve_cache_misses, prev.serve_cache_misses),
+            bytes: d(now.bytes_served, prev.bytes_served),
         }
     }
 }
@@ -286,24 +295,28 @@ pub(crate) fn write_top_table(
     writeln!(
         w,
         "{:<35} {:>14} {:>12}",
-        "cache_hits_total", now.cache_hits, hits_rate
+        "serve_cache_hits_total", now.serve_cache_hits, hits_rate
     )?;
     writeln!(
         w,
         "{:<35} {:>14} {:>12}",
-        "cache_misses_total", now.cache_misses, miss_rate
+        "serve_cache_misses_total", now.serve_cache_misses, miss_rate
     )?;
 
-    let hit_rate_s = match hit_rate(now.cache_hits, now.cache_misses) {
+    let hit_rate_s = match hit_rate(now.serve_cache_hits, now.serve_cache_misses) {
         Some(r) => format!("{:.1}%", r * 100.0),
         None => "n/a".to_string(),
     };
-    writeln!(w, "{:<35} {:>14} {:>12}", "cache_hit_rate", hit_rate_s, "-")?;
     writeln!(
         w,
         "{:<35} {:>14} {:>12}",
-        "cache_bytes_returned_total",
-        format_bytes(now.cache_bytes_returned),
+        "serve_cache_hit_rate", hit_rate_s, "-"
+    )?;
+    writeln!(
+        w,
+        "{:<35} {:>14} {:>12}",
+        "bytes_served_total",
+        format_bytes(now.bytes_served),
         bytes_rate,
     )?;
     // Pending redemption: refreshed once per redeemer self-tick, so no
@@ -325,7 +338,7 @@ pub(crate) fn write_top_table(
 }
 
 /// Render a single snapshot as pretty JSON. The schema is hand-rolled
-/// so the public output shape (field names, ordering, `hit_rate` as
+/// so the public output shape (field names, ordering, the hit rate as
 /// a fraction in `[0, 1]` or null) is stable across internal
 /// `Snapshot` field reorderings.
 pub(crate) fn render_json_snapshot(s: &Snapshot) -> anyhow::Result<String> {
@@ -333,10 +346,10 @@ pub(crate) fn render_json_snapshot(s: &Snapshot) -> anyhow::Result<String> {
         "uptime_seconds": s.uptime_seconds,
         "active_connections": s.active_connections,
         "dispatch_in_flight": s.dispatch_in_flight,
-        "cache_hits_total": s.cache_hits,
-        "cache_misses_total": s.cache_misses,
-        "cache_bytes_returned_total": s.cache_bytes_returned,
-        "cache_hit_rate": hit_rate(s.cache_hits, s.cache_misses),
+        "serve_cache_hits_total": s.serve_cache_hits,
+        "serve_cache_misses_total": s.serve_cache_misses,
+        "bytes_served_total": s.bytes_served,
+        "serve_cache_hit_rate": hit_rate(s.serve_cache_hits, s.serve_cache_misses),
         // Raw micro-USDC (6 decimals) so downstream tooling gets the exact
         // integer the gauge exports; the human table renders it as dollars.
         "unredeemed_usdc_micro": s.unredeemed_usdc,

@@ -122,7 +122,7 @@ impl ClientHandler {
             return true;
         }
         if matches!(
-            self.cache.origin_probe_presence(hash).await,
+            self.cache.origin_presence(hash).await,
             decdn_cache::OriginPresence::Present(_)
         ) {
             if own && attestations.attest_own(bytes).is_some() {

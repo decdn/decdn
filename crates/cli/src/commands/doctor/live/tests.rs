@@ -35,7 +35,7 @@ fn handles_trailing_timestamp() {
 #[test]
 fn ignores_prefix_collision_series() {
     assert_eq!(
-        parse_cache_bytes("decdn_cache_bytes_total 999\ndecdn_cache_bytes_returned_total 5\n"),
+        parse_cache_bytes("decdn_cache_bytes_total 999\ndecdn_cache_bytes_limit 5\n"),
         None
     );
 }

@@ -39,7 +39,7 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   need: the TOML config schema and resolver, identity loading, the
   `AdminRpc` trait + DTOs, and clap argument structs. No runtime, no
   engine handles. The config-vocabulary value types it
-  is built from (`DecompressMode`, `RetryPolicy`, `OriginUrl`,
+  is built from (`RetryPolicy`, `OriginUrl`,
   `OriginKind`, `PinnedHashes`, `Hash`) and the `Hash` returned by
   `parse_hash_arg` live in the `decdn-config-types` leaf crate
   (serde + `url` only — no iroh-blobs, no AWS SDK). `decdn-common`

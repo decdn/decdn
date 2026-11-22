@@ -116,97 +116,6 @@ impl CacheError {
     pub fn display_chain(&self) -> ErrorChain<'_> {
         ErrorChain::new(self)
     }
-
-    /// Walk the source chain of [`Self::OriginError`] looking for an
-    /// [`OriginError`]. Returns `Some` when the failure originated in
-    /// the HTTP origin's encoding/decompression layer, even after
-    /// [`anyhow::Context::with_context`] wrappers were stacked on top —
-    /// `anyhow::Error::chain()` exposes every cause in the chain, and
-    /// the typed variant we want lives at the root.
-    ///
-    /// Tests assert on the typed variant via `matches!`; observability
-    /// code can switch on the variant rather than parsing `Display`
-    /// strings. Returns `None` for non-origin failures or origin failures
-    /// that didn't come from `HttpOrigin`'s decoder.
-    pub fn origin_error_kind(&self) -> Option<&OriginError> {
-        let Self::OriginError { source, .. } = self else {
-            return None;
-        };
-        source
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<OriginError>())
-    }
-}
-
-/// `Content-Encoding` values [`crate::origin::HttpOrigin`] knows how to
-/// decode. Used as the `encoding` field of
-/// [`OriginError::DecompressionFailed`] so that variant is structurally
-/// reachable only from genuine decoder failures — making
-/// `DecompressionFailed { encoding: "lol", … }` unrepresentable by
-/// construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SupportedEncoding {
-    /// `Content-Encoding: gzip` (and the legacy `x-gzip` alias).
-    Gzip,
-    /// `Content-Encoding: zstd`.
-    Zstd,
-}
-
-impl fmt::Display for SupportedEncoding {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Gzip => f.write_str("gzip"),
-            Self::Zstd => f.write_str("zstd"),
-        }
-    }
-}
-
-/// Errors raised by the [`crate::origin::HttpOrigin`] decompression layer.
-///
-/// Surfaced to the engine through the `anyhow::Error` source on
-/// [`CacheError::OriginError`] (the `Origin` trait returns `anyhow::Result`).
-/// Use [`CacheError::origin_error_kind`] to recover the typed variant —
-/// the chain walk works through any number of `with_context` wrappers.
-#[derive(Debug, Error)]
-pub enum OriginError {
-    /// The response advertised a `Content-Encoding` value the origin layer
-    /// does not understand. We refuse to silently pass the bytes through —
-    /// the BLAKE3 verify in the engine would fail, but with a confusing
-    /// "hash mismatch" message rather than a precise "your origin is using
-    /// an encoding I don't support" message.
-    ///
-    /// `encoding` is `Box<str>` rather than `String` to keep the variant
-    /// 16 bytes on a 64-bit target — error enums get cloned/passed
-    /// around the chain a lot, and the underlying buffer is never
-    /// resized after construction.
-    #[error("unsupported Content-Encoding: {encoding}")]
-    UnsupportedEncoding {
-        /// The raw header value the origin sent.
-        encoding: Box<str>,
-    },
-
-    /// The response carried a non-ASCII `Content-Encoding` byte sequence
-    /// that we refuse to interpret. RFC 9110 § 5.6.7 restricts coding
-    /// names to ASCII tokens; treating an arbitrary byte sequence as
-    /// "no encoding" would silently pass through what may be a real
-    /// (mis-cased / mis-typed) compression directive.
-    #[error("malformed Content-Encoding header (non-ASCII or unprintable)")]
-    MalformedEncoding,
-
-    /// Decompression of the response body failed mid-stream. Either the
-    /// origin sent a corrupt payload or an encoding mismatch slipped past
-    /// the header check (e.g. `Content-Encoding: gzip` but the bytes are
-    /// actually zstd). The `encoding` field is typed (closed set) so
-    /// nonsense values are unrepresentable — this variant is reachable
-    /// only from the gzip and zstd code paths.
-    #[error("failed to decompress {encoding} response body")]
-    DecompressionFailed {
-        /// The supported encoding whose decoder rejected the body.
-        encoding: SupportedEncoding,
-        /// Underlying decoder error.
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 /// Renders any error and each [`std::error::Error::source`] under it on one
@@ -241,11 +150,10 @@ impl fmt::Display for ErrorChain<'_> {
 /// Convenience result alias.
 pub type CacheResult<T> = std::result::Result<T, CacheError>;
 
-/// Outcome of a single [`crate::origin::Origin::fetch`] call, classified by
-/// whether a retry is appropriate. The cache engine's retry loop drives off
-/// this distinction — `Transient` failures are retried up to
-/// [`crate::RetryPolicy::max_retries`], `Permanent` failures surface to the
-/// caller immediately.
+/// A failed origin read, classified by whether a retry is appropriate. The
+/// cache engine's retry loop drives off this distinction — `Transient`
+/// failures are retried up to [`crate::RetryPolicy::max_retries`], `Permanent`
+/// failures surface to the caller immediately.
 ///
 /// Both variants carry an [`anyhow::Error`] so adapters keep their
 /// `with_context` chains intact. The retry loop, the circuit breaker and the
@@ -261,11 +169,12 @@ pub enum OriginPullError {
     #[error(transparent)]
     Transient(anyhow::Error),
 
-    /// A failure that won't be cured by retrying: HTTP 4xx (other than 404,
-    /// which maps to [`crate::origin::OriginFetch::NotFound`]),
-    /// encoding/decompression problems, size-cap breaches, or a
-    /// symlink escape, a dangling symlink or a permission denied on the
-    /// filesystem origin.
+    /// A failure that won't be cured by retrying: an HTTP 4xx (each read
+    /// answers a 404 as a missing object, and the HTTP outboard and data
+    /// reads answer a 403 as one too), an S3 `AccessDenied` or
+    /// `NoSuchBucket`, an object over its cap
+    /// or shorter than the requested span, or a symlink escape, a dangling
+    /// symlink or a permission denied on the filesystem origin.
     #[error(transparent)]
     Permanent(anyhow::Error),
 }

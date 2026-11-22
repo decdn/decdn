@@ -1,13 +1,13 @@
 //! A byte-bounded, least-recently-used memory cache of origin `{H}.obao4`
 //! outboards (ADR 037 § Range-scoped origin pull).
 //!
-//! An outboard is content-derived and `blob / 256` bytes. Every draw of a fill,
-//! and every serviceability probe of the hash, reads it from this cache, so the
-//! origin serves it once per hash while the entry stays cached.
+//! An outboard is content-derived and `blob / 256` bytes. Every draw of a fill
+//! reads it from this cache, so the origin serves it once per hash while the
+//! entry stays cached.
 //!
-//! The cache holds only outboards that passed the exact-length gate in
-//! [`crate::CacheEngine::origin_fetch_outboard_bytes`], each tagged with the
-//! origin that served it. A verify fault evicts the copy the failed draw used
+//! The cache holds only outboards that passed the engine's exact-length gate
+//! on the outboard read, each tagged with the origin that served it. A verify
+//! fault evicts the copy the failed draw used
 //! ([`OutboardCache::evict_if_same`]), so a bad copy is read again, not reused.
 //!
 //! [`OutboardCache`] is a cheap, cloneable handle. Every method takes the lock

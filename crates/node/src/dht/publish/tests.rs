@@ -365,12 +365,12 @@ fn seed_cold_start_schedules_every_hash_within_cold_start_window() {
 
 /// Single-blob stub origin.
 ///
-/// Three independent axes, because the real backends differ on exactly
-/// these: `fetch` is what puts a hash in the store; `size` is what
-/// `origin_probe_presence` asks (the ownership test); `enumerate` plus
-/// `size` is what puts it in the origin-held index. A filesystem origin
-/// does all three; a remote S3/R2/HTTP origin answers `size` but
-/// deliberately does not enumerate.
+/// Independent axes, because the real backends differ on exactly these:
+/// `fetch_size_proof` is what `origin_presence` asks (the ownership test);
+/// `enumerate` plus `fetch_size_proof` is what puts it in the origin-held
+/// index. A filesystem origin does both; a remote S3/R2/HTTP origin serves
+/// the size proof but deliberately does not enumerate. Tests put a hash in
+/// the store with `CacheEngine::insert_blob`.
 #[derive(Debug)]
 struct StubOrigin {
     data: bytes::Bytes,
@@ -391,9 +391,10 @@ struct StubAxes {
     /// `enumerate` lists the blob, which is what puts it in the origin-held
     /// index.
     enumerable: bool,
-    /// `size` confirms the blob — the ownership test.
+    /// `fetch_size_proof` serves the blob's verifying size proof — the
+    /// ownership test.
     answers_size: bool,
-    /// `size` returns a transport error instead of an answer, because a
+    /// `fetch_size_proof` returns a transport error instead of an answer, because a
     /// backend that is merely unreachable must not read as one that does not
     /// hold the object.
     faults_size: bool,
@@ -407,41 +408,26 @@ impl decdn_cache::Origin for StubOrigin {
         decdn_cache::OriginKind::Filesystem
     }
 
-    fn fetch(
+    fn fetch_size_proof(
         &self,
         hash: decdn_cache::Hash,
-        _max_bytes: u64,
     ) -> std::pin::Pin<
         Box<
-            dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
+            dyn Future<Output = Result<Option<bytes::Bytes>, decdn_cache::OriginPullError>>
                 + Send
                 + '_,
         >,
     > {
-        let result = if hash == self.hash {
-            Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(decdn_cache::OriginFetch::NotFound)
-        };
-        Box::pin(async move { result })
-    }
-
-    fn size(
-        &self,
-        hash: decdn_cache::Hash,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
-    > {
         if self.axes.faults_size {
             return Box::pin(async {
                 Err(decdn_cache::OriginPullError::Transient(anyhow::anyhow!(
-                    "synthetic HEAD outage"
+                    "synthetic size proof outage"
                 )))
             });
         }
-        let n = (self.axes.answers_size && hash == self.hash)
-            .then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
-        Box::pin(async move { Ok(n) })
+        let object =
+            (self.axes.answers_size && hash == self.hash).then(|| size_proof_object_of(&self.data));
+        Box::pin(async move { Ok(object) })
     }
 
     fn enumerate(
@@ -469,7 +455,14 @@ impl decdn_cache::Origin for StubOrigin {
     }
 }
 
-/// A filesystem-shaped origin: enumerates and answers `size`, so its blob
+/// The `{H}.sizeproof` object `decdn origin import` writes for `data`.
+fn size_proof_object_of(data: &[u8]) -> bytes::Bytes {
+    let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    let encoded = decdn_bao_range::encode_outboard(data, size).expect("encode the outboard");
+    bytes::Bytes::from(encoded.size_proof_object())
+}
+
+/// A filesystem-shaped origin: enumerates and serves its size proof, so its blob
 /// lands in the origin-held index.
 fn stub_origin(payload: &'static [u8], enumerable: bool) -> Arc<dyn decdn_cache::Origin> {
     Arc::new(StubOrigin {
@@ -555,8 +548,8 @@ async fn holder_snapshot_unions_store_and_origin_held() -> anyhow::Result<()> {
         16,
     )
     .await?;
-    cache.get(stored).await?;
-    cache.get(origin_held).await?;
+    cache.insert_blob(b"holder-stored".to_vec()).await?;
+    cache.insert_blob(b"holder-origin".to_vec()).await?;
     cache.rescan_origins().await;
 
     let snap = holder_snapshot(&cache, true).await;
@@ -588,8 +581,8 @@ async fn holder_snapshot_skips_foreign_store_content_under_origin_only() -> anyh
         16,
     )
     .await?;
-    cache.get(foreign).await?;
-    cache.get(own).await?;
+    cache.insert_blob(b"holder-foreign".to_vec()).await?;
+    cache.insert_blob(b"holder-own".to_vec()).await?;
     cache.rescan_origins().await;
 
     let snap = holder_snapshot(&cache, false).await;
@@ -630,8 +623,8 @@ async fn holder_snapshot_recovers_own_store_only_content_under_origin_only() -> 
         16,
     )
     .await?;
-    cache.get(mine).await?;
-    cache.get(theirs).await?;
+    cache.insert_blob(b"policy-remote-own".to_vec()).await?;
+    cache.insert_blob(b"policy-relayed".to_vec()).await?;
     cache.rescan_origins().await;
 
     // Neither hash is in the origin-held index: the remote origin does not
@@ -673,7 +666,7 @@ async fn holder_snapshot_reports_a_faulted_ownership_probe() -> anyhow::Result<(
         16,
     )
     .await?;
-    cache.get(unreachable).await?;
+    cache.insert_blob(b"policy-probe-fault".to_vec()).await?;
 
     let snap = holder_snapshot(&cache, false).await;
 
@@ -972,7 +965,7 @@ async fn cache_still_holds_reports_a_store_fault_as_unknown() -> anyhow::Result<
         16,
     )
     .await?;
-    cache.get(held).await?;
+    cache.insert_blob(b"held-store-fault".to_vec()).await?;
     // Close the store under the gate: the next `has` query faults.
     cache.shutdown().await?;
 
@@ -1153,7 +1146,6 @@ fn seed_cold_start_returns_only_newly_scheduled() {
 async fn lag_sweep_counts_only_newly_scheduled_hashes() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let already = decdn_cache::Hash::new(b"sweep-already");
-    let missing = decdn_cache::Hash::new(b"sweep-missing");
     let cache = decdn_cache::CacheEngine::open(
         tmp.path(),
         vec![
@@ -1163,8 +1155,8 @@ async fn lag_sweep_counts_only_newly_scheduled_hashes() -> anyhow::Result<()> {
         16,
     )
     .await?;
-    cache.get(already).await?;
-    cache.get(missing).await?;
+    cache.insert_blob(b"sweep-already".to_vec()).await?;
+    cache.insert_blob(b"sweep-missing".to_vec()).await?;
 
     let scheduler = RepublishScheduler::new();
     scheduler.schedule_steady(ContentHash::from_bytes(*already.as_bytes()));
@@ -1198,13 +1190,12 @@ async fn a_lag_arriving_mid_sweep_coalesces_and_counts() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
 
     let tmp = tempfile::tempdir()?;
-    let held = decdn_cache::Hash::new(b"coalesce");
     let cache =
         decdn_cache::CacheEngine::open(tmp.path(), vec![foreign_stub_origin(b"coalesce")], 16)
             .await?;
     // Commit a blob, so "no walk happened" is distinguishable from "a walk
     // happened and found nothing".
-    cache.get(held).await?;
+    cache.insert_blob(b"coalesce".to_vec()).await?;
     let scheduler = Arc::new(RepublishScheduler::new());
     let metrics = Arc::new(crate::metrics::Metrics::new());
     // Pre-claimed: stand in for a worker mid-walk without racing one.
@@ -1252,14 +1243,13 @@ async fn a_sweep_abandons_its_walk_once_shutdown_starts() -> anyhow::Result<()> 
     use std::sync::atomic::Ordering;
 
     let tmp = tempfile::tempdir()?;
-    let held = decdn_cache::Hash::new(b"shutdown-sweep");
     let cache = decdn_cache::CacheEngine::open(
         tmp.path(),
         vec![foreign_stub_origin(b"shutdown-sweep")],
         16,
     )
     .await?;
-    cache.get(held).await?;
+    cache.insert_blob(b"shutdown-sweep".to_vec()).await?;
 
     let scheduler = Arc::new(RepublishScheduler::new());
     let metrics = Arc::new(crate::metrics::Metrics::new());
@@ -1302,15 +1292,13 @@ async fn a_sweep_abandons_its_walk_once_shutdown_starts() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// `size` blocks on `gate`, then panics — the injection point for the
-/// walk-panic path. Under the origin-only policy the ownership probe is
-/// the only origin call a sweep makes, and `size` is that probe; the gate
-/// makes the panic's timing deterministic so a test can queue a second
-/// pass behind the first before either fires.
+/// `fetch_size_proof` blocks on `gate`, then panics — the injection point
+/// for the walk-panic path. Under the origin-only policy the ownership probe
+/// is the only origin call a sweep makes, and `fetch_size_proof` is that
+/// probe; the gate makes the panic's timing deterministic so a test can
+/// queue a second pass behind the first before either fires.
 #[derive(Debug)]
 struct PanickingSizeOrigin {
-    data: bytes::Bytes,
-    hash: decdn_cache::Hash,
     gate: Arc<tokio::sync::Semaphore>,
 }
 
@@ -1319,30 +1307,15 @@ impl decdn_cache::Origin for PanickingSizeOrigin {
         decdn_cache::OriginKind::Filesystem
     }
 
-    fn fetch(
-        &self,
-        hash: decdn_cache::Hash,
-        _max_bytes: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
-                + Send
-                + '_,
-        >,
-    > {
-        let result = if hash == self.hash {
-            Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-        } else {
-            Ok(decdn_cache::OriginFetch::NotFound)
-        };
-        Box::pin(async move { result })
-    }
-
-    fn size(
+    fn fetch_size_proof(
         &self,
         _hash: decdn_cache::Hash,
     ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
+        Box<
+            dyn Future<Output = Result<Option<bytes::Bytes>, decdn_cache::OriginPullError>>
+                + Send
+                + '_,
+        >,
     > {
         let gate = Arc::clone(&self.gate);
         Box::pin(async move {
@@ -1362,19 +1335,16 @@ async fn a_panicking_walk_consumes_the_queued_pass_and_releases_the_slot() -> an
 
     let tmp = tempfile::tempdir()?;
     let payload: &[u8] = b"panic-sweep";
-    let held = decdn_cache::Hash::new(payload);
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let cache = decdn_cache::CacheEngine::open(
         tmp.path(),
         vec![Arc::new(PanickingSizeOrigin {
-            data: bytes::Bytes::from_static(payload),
-            hash: held,
             gate: Arc::clone(&gate),
         })],
         16,
     )
     .await?;
-    cache.get(held).await?;
+    cache.insert_blob(payload.to_vec()).await?;
 
     let scheduler = Arc::new(RepublishScheduler::new());
     let metrics = Arc::new(crate::metrics::Metrics::new());
@@ -1572,7 +1542,7 @@ async fn an_oversized_blobs_record_coverage_is_cut_for_the_wire() -> anyhow::Res
     let tmp = tempfile::tempdir()?;
     let cache =
         decdn_cache::CacheEngine::open(tmp.path(), vec![stub_origin(payload, true)], 16).await?;
-    cache.get(hash).await?;
+    cache.insert_blob(payload.to_vec()).await?;
 
     let coverage = fetch_coverage(&cache, ContentHash::from_bytes(*hash.as_bytes())).await;
     assert!(coverage.covers(0), "the held blob is advertised");

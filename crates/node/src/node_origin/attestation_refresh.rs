@@ -202,9 +202,7 @@ impl Refresher {
     async fn fresher(&self, due: &RefreshDue) -> Option<Source> {
         if self.attestations.can_attest_own()
             && matches!(
-                self.cache
-                    .origin_probe_presence(Hash::from_bytes(due.hash))
-                    .await,
+                self.cache.origin_presence(Hash::from_bytes(due.hash)).await,
                 decdn_cache::OriginPresence::Present(_)
             )
             && self

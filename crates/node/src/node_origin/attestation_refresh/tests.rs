@@ -2,7 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{Origin, OriginFetch, OriginKind, OriginPullError};
+use bytes::Bytes;
+use decdn_cache::{Origin, OriginKind, OriginPullError};
 use decdn_protocol::MIN_ATTESTATION_TTL_SEC;
 
 use super::*;
@@ -15,31 +16,39 @@ const HOUR_US: u64 = 3_600_000_000;
 /// due whatever its jitter, while the attestation is still live.
 const AGED_US: u64 = 10 * HOUR_US;
 
-/// An origin backend that holds exactly `hash`.
+/// The one blob a [`Holds`] backend holds.
+const BLOB: &[u8] = &[7; 1_024];
+
+/// The content address of [`BLOB`].
+fn blob_hash() -> [u8; 32] {
+    *Hash::new(BLOB).as_bytes()
+}
+
+/// An origin backend that holds exactly its payload: it enumerates its hash and
+/// serves its verifying `{H}.sizeproof`.
 #[derive(Debug)]
-struct Holds(Hash);
+struct Holds(&'static [u8]);
 
 impl Origin for Holds {
-    fn fetch(
-        &self,
-        _hash: Hash,
-        _max_bytes: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<OriginFetch, OriginPullError>> + Send + '_>> {
-        Box::pin(async { Ok(OriginFetch::NotFound) })
-    }
-
-    fn size(
+    fn fetch_size_proof(
         &self,
         hash: Hash,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, OriginPullError>> + Send + '_>> {
-        let held = hash == self.0;
-        Box::pin(async move { Ok(held.then_some(1_024)) })
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, OriginPullError>> + Send + '_>> {
+        let object = (hash == Hash::new(self.0)).then(|| {
+            let size = u64::try_from(self.0.len()).unwrap();
+            Bytes::from(
+                decdn_bao_range::encode_outboard(self.0, size)
+                    .unwrap()
+                    .size_proof_object(),
+            )
+        });
+        Box::pin(async move { Ok(object) })
     }
 
     fn enumerate(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, OriginPullError>> + Send + '_>> {
-        let held = self.0;
+        let held = Hash::new(self.0);
         Box::pin(async move { Ok(vec![held]) })
     }
 
@@ -76,8 +85,8 @@ fn seated() -> SelfOrigin {
 
 #[tokio::test]
 async fn a_seated_origin_re_signs_its_own_content() {
-    let hash = [5; 32];
-    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(hash)));
+    let hash = blob_hash();
+    let backend: Arc<dyn Origin> = Arc::new(Holds(BLOB));
     let (r, _dir) = refresher(Some(seated()), vec![backend]).await;
     r.cache.rescan_origins().await;
     let aged = attest_at(hash, now_us() - AGED_US);
@@ -91,7 +100,7 @@ async fn a_seated_origin_re_signs_its_own_content() {
 #[tokio::test]
 async fn a_seated_origin_does_not_attest_what_its_backend_lacks() {
     let hash = [5; 32];
-    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes([6; 32])));
+    let backend: Arc<dyn Origin> = Arc::new(Holds(BLOB));
     let (r, _dir) = refresher(Some(seated()), vec![backend]).await;
     r.cache.rescan_origins().await;
     let aged = attest_at(hash, now_us() - AGED_US);
@@ -102,8 +111,8 @@ async fn a_seated_origin_does_not_attest_what_its_backend_lacks() {
 
 #[tokio::test]
 async fn a_refresh_with_no_source_retries_later() {
-    let hash = [5; 32];
-    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(hash)));
+    let hash = blob_hash();
+    let backend: Arc<dyn Origin> = Arc::new(Holds(BLOB));
     let (r, _dir) = refresher(None, vec![backend]).await;
     r.cache.rescan_origins().await;
     let aged = attest_at(hash, now_us() - AGED_US);
@@ -167,8 +176,8 @@ async fn an_attestation_of_a_blob_the_node_lacks_is_dropped_not_refreshed() {
 /// stays wanted while no DHT is wired to look it up.
 #[tokio::test]
 async fn a_wanted_hash_is_dropped_once_the_blob_is_gone() {
-    let held = [5; 32];
-    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(held)));
+    let held = blob_hash();
+    let backend: Arc<dyn Origin> = Arc::new(Holds(BLOB));
     let (r, _dir) = refresher(None, vec![backend]).await;
     r.cache.rescan_origins().await;
     r.attestations.want(held);
@@ -183,8 +192,8 @@ async fn a_wanted_hash_is_dropped_once_the_blob_is_gone() {
 /// origin returns. The lapse counts once.
 #[tokio::test]
 async fn an_expired_attestation_of_a_held_blob_stays_due_for_refresh() {
-    let hash = [5; 32];
-    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(hash)));
+    let hash = blob_hash();
+    let backend: Arc<dyn Origin> = Arc::new(Holds(BLOB));
     let (r, _dir) = refresher(None, vec![backend]).await;
     r.cache.rescan_origins().await;
     assert!(r.cache.origin_held_size(Hash::from_bytes(hash)).is_some());
@@ -205,8 +214,8 @@ async fn an_expired_attestation_of_a_held_blob_stays_due_for_refresh() {
 
 #[tokio::test]
 async fn an_unseated_node_never_self_signs_on_refresh() {
-    let hash = [5; 32];
-    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(hash)));
+    let hash = blob_hash();
+    let backend: Arc<dyn Origin> = Arc::new(Holds(BLOB));
     let stranger = SelfOrigin {
         signer: Arc::new(PrivateKeySigner::random()),
         ttl_sec: MIN_ATTESTATION_TTL_SEC,

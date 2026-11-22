@@ -18,19 +18,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use decdn_cache::{
-    Hash, HttpOrigin, Origin, OriginFetch, OriginRangeFetch, OriginRangeRequest, OutboardFetch,
-};
+use decdn_cache::{Hash, HttpOrigin, Origin, OriginRangeFetch, OriginRangeRequest, OutboardFetch};
 #[cfg(feature = "s3")]
 use decdn_cache::{S3Credentials, S3Origin, S3OriginConfig, parse_origin_url};
-use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-/// The object every response serves, in full or as the requested range.
-/// Large enough that a held response can split its body across two writes.
+/// The object every data or outboard response serves, in full or as the
+/// requested range. Large enough that a held response can split its body
+/// across two writes.
 const BODY: &[u8] = &[0x5A; 64 * 1024];
+
+/// The object every `.sizeproof` request gets: small enough to pass the size
+/// proof read's cap.
+const SIZE_PROOF_BODY: &[u8] = &[0x5A; 64];
 
 /// How long to let a finished leg hand its connection back to the pool
 /// before the next leg checks one out. hyper-util returns the connection on
@@ -43,10 +45,10 @@ const POOL_SETTLE: Duration = Duration::from_secs(1);
 /// headers timeout of its own.
 const LEG_DEADLINE: Duration = Duration::from_secs(10);
 
-/// A keep-alive HTTP/1.1 server. Every request reads the same object,
-/// [`BODY`], whatever the path: a `Range: bytes=a-b` request gets `206` and
-/// that slice, any other GET gets `200` and the whole object, and a HEAD gets
-/// the `200` headers alone.
+/// A keep-alive HTTP/1.1 server. A `.sizeproof` path reads
+/// [`SIZE_PROOF_BODY`]; every other path reads the same object, [`BODY`]: a
+/// `Range: bytes=a-b` request gets `206` and that slice, any other GET gets
+/// `200` and the whole object.
 struct KeepAliveServer {
     url: String,
     accepts: Arc<AtomicUsize>,
@@ -116,7 +118,7 @@ async fn serve_connection(
     let mut chunk = [0u8; 4096];
     loop {
         // Read up to the end of one request head. Every request here is a
-        // body-less GET or HEAD.
+        // body-less GET.
         let head_end = loop {
             if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 break i + 4;
@@ -129,16 +131,22 @@ async fn serve_connection(
         let head = String::from_utf8_lossy(buf.get(..head_end).unwrap_or(&[])).into_owned();
         buf.drain(..head_end);
         let index = requests.fetch_add(1, Ordering::SeqCst);
+        let request_line = head.lines().next().unwrap_or("");
+        let object = if request_line.contains(".sizeproof") {
+            SIZE_PROOF_BODY
+        } else {
+            BODY
+        };
         let (status, extra, body) = match requested_range(&head) {
-            Some((start, end)) => match BODY.get(start..=end) {
+            Some((start, end)) => match object.get(start..=end) {
                 Some(slice) => (
                     "206 Partial Content",
-                    format!("Content-Range: bytes {start}-{end}/{}\r\n", BODY.len()),
+                    format!("Content-Range: bytes {start}-{end}/{}\r\n", object.len()),
                     slice,
                 ),
                 None => return,
             },
-            None => ("200 OK", String::new(), BODY),
+            None => ("200 OK", String::new(), object),
         };
         let response_head = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}\
@@ -147,9 +155,6 @@ async fn serve_connection(
         );
         if sock.write_all(response_head.as_bytes()).await.is_err() {
             return;
-        }
-        if head.starts_with("HEAD ") {
-            continue;
         }
         let (first, rest) = body.split_at(body.len() / 2);
         if sock.write_all(first).await.is_err() {
@@ -191,15 +196,14 @@ async fn s3_origin(server: &KeepAliveServer) -> anyhow::Result<Arc<dyn Origin>> 
 /// Every origin operation that sends a request.
 #[derive(Debug, Clone, Copy)]
 enum Op {
-    /// [`Origin::fetch`]: a whole-object GET, body streamed.
-    Fetch,
     /// [`Origin::fetch_range_data`]: a ranged GET, body buffered. The
     /// own-origin serve-miss pull leg reads through this.
     Range,
     /// [`Origin::fetch_outboard`]: a GET of the sibling outboard, buffered.
     Outboard,
-    /// [`Origin::size`]: a HEAD.
-    Size,
+    /// [`Origin::fetch_size_proof`]: a GET of the sibling size proof,
+    /// buffered. The presence walk reads through this.
+    SizeProof,
 }
 
 /// The range [`Op::Range`] asks for: most of the object, so a held response
@@ -212,16 +216,6 @@ const RANGE: OriginRangeRequest = OriginRangeRequest {
 /// Run `op` to completion and check what it returned.
 async fn run_op(origin: &dyn Origin, op: Op, hash: Hash) -> anyhow::Result<()> {
     match op {
-        Op::Fetch => {
-            let OriginFetch::Found { mut stream, .. } = origin.fetch(hash, 1 << 30).await? else {
-                anyhow::bail!("fetch did not find the object");
-            };
-            let mut body = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                body.extend_from_slice(&chunk?);
-            }
-            anyhow::ensure!(body == BODY, "fetch got {} bytes", body.len());
-        }
         Op::Range => {
             let OriginRangeFetch::Ranged { data } = origin.fetch_range_data(hash, RANGE).await?
             else {
@@ -240,9 +234,12 @@ async fn run_op(origin: &dyn Origin, op: Op, hash: Hash) -> anyhow::Result<()> {
             };
             anyhow::ensure!(data.as_ref() == BODY, "outboard got {} bytes", data.len());
         }
-        Op::Size => {
-            let size = origin.size(hash).await?;
-            anyhow::ensure!(size == Some(u64::try_from(BODY.len())?), "size {size:?}");
+        Op::SizeProof => {
+            let proof = origin.fetch_size_proof(hash).await?;
+            anyhow::ensure!(
+                proof.as_deref() == Some(SIZE_PROOF_BODY),
+                "size proof {proof:?}"
+            );
         }
     }
     Ok(())
@@ -285,7 +282,7 @@ async fn leg_on_throwaway_runtime(
 }
 
 /// Leg A runs `opener` on its own runtime and opens the connection, then its
-/// runtime drops. Leg B runs a fetch on a new runtime and must reuse the
+/// runtime drops. Leg B runs a range read on a new runtime and must reuse the
 /// pooled connection: it lives on the runtime that built the origin, so A's
 /// runtime drop does not close it.
 async fn keep_alive_survives_a_dropped_pull_runtime(
@@ -297,7 +294,7 @@ async fn keep_alive_survives_a_dropped_pull_runtime(
     let hash = Hash::new(b"keep-alive-marker");
     leg_on_throwaway_runtime(Arc::clone(&origin), opener, hash).await?;
     tokio::time::sleep(POOL_SETTLE).await;
-    leg_on_throwaway_runtime(origin, Op::Fetch, hash).await?;
+    leg_on_throwaway_runtime(origin, Op::Range, hash).await?;
     anyhow::ensure!(
         server.accepts() == 1,
         "the second leg dialled a new connection instead of reusing the one {opener:?} \
@@ -307,7 +304,7 @@ async fn keep_alive_survives_a_dropped_pull_runtime(
     Ok(())
 }
 
-/// The #1673 shape. Leg A fetches, opening the connection, and its runtime
+/// The #1673 shape. Leg A reads a range, opening the connection, and its runtime
 /// stays up. Leg B runs `op` on the pooled connection, and the server holds
 /// B's response mid-body while A's runtime drops. B must still get every byte.
 async fn in_flight_request_survives_its_connection_openers_runtime_drop(
@@ -318,14 +315,14 @@ async fn in_flight_request_survives_its_connection_openers_runtime_drop(
     let origin = origin_for.build(&server).await?;
     let hash = Hash::new(b"in-flight-marker");
 
-    // Leg A: fetch on its own runtime, report, then keep the runtime alive
-    // until told to drop it.
+    // Leg A: read a range on its own runtime, report, then keep the runtime
+    // alive until told to drop it.
     let (a_done_tx, a_done_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
     let (drop_a_tx, drop_a_rx) = std::sync::mpsc::channel::<()>();
     let origin_a = Arc::clone(&origin);
     let leg_a = std::thread::spawn(move || -> anyhow::Result<()> {
         let rt = pull_runtime()?;
-        let _ = a_done_tx.send(run_leg(&rt, &*origin_a, Op::Fetch, hash));
+        let _ = a_done_tx.send(run_leg(&rt, &*origin_a, Op::Range, hash));
         let _ = drop_a_rx.recv();
         drop(rt);
         Ok(())
@@ -414,14 +411,13 @@ macro_rules! in_flight_tests {
 }
 
 keep_alive_tests! {
-    http_keep_alive_survives_a_dropped_fetch_runtime: Http, Fetch;
     http_keep_alive_survives_a_dropped_range_runtime: Http, Range;
     http_keep_alive_survives_a_dropped_outboard_runtime: Http, Outboard;
-    http_keep_alive_survives_a_dropped_size_runtime: Http, Size;
+    http_keep_alive_survives_a_dropped_size_proof_runtime: Http, SizeProof;
 }
 
 in_flight_tests! {
-    http_in_flight_fetch_survives_its_connection_openers_runtime_drop: Http, Fetch;
+    http_in_flight_outboard_survives_its_connection_openers_runtime_drop: Http, Outboard;
     http_in_flight_range_survives_its_connection_openers_runtime_drop: Http, Range;
 }
 
@@ -433,14 +429,13 @@ mod s3 {
     };
 
     keep_alive_tests! {
-        s3_keep_alive_survives_a_dropped_fetch_runtime: S3, Fetch;
         s3_keep_alive_survives_a_dropped_range_runtime: S3, Range;
         s3_keep_alive_survives_a_dropped_outboard_runtime: S3, Outboard;
-        s3_keep_alive_survives_a_dropped_size_runtime: S3, Size;
+        s3_keep_alive_survives_a_dropped_size_proof_runtime: S3, SizeProof;
     }
 
     in_flight_tests! {
-        s3_in_flight_fetch_survives_its_connection_openers_runtime_drop: S3, Fetch;
+        s3_in_flight_outboard_survives_its_connection_openers_runtime_drop: S3, Outboard;
         s3_in_flight_range_survives_its_connection_openers_runtime_drop: S3, Range;
     }
 }

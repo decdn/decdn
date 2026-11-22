@@ -613,15 +613,10 @@ async fn run_republish_lag_sweeps_the_cache_back_into_the_scheduler() -> anyhow:
 
     let payloads: [&'static [u8]; 4] = [b"lag-a", b"lag-b", b"lag-c", b"lag-d"];
     let cache_dir = tempfile::tempdir()?;
-    let origins: Vec<Arc<dyn decdn_cache::Origin>> =
-        payloads.iter().map(|p| stub_origin(p)).collect();
-    let cache = decdn_cache::CacheEngine::open(cache_dir.path(), origins, 16).await?;
-    let hashes: Vec<iroh_blobs::Hash> = payloads
-        .iter()
-        .map(|p| decdn_cache::Hash::new(*p))
-        .collect();
-    for h in &hashes {
-        cache.get(*h).await?;
+    let cache = decdn_cache::CacheEngine::open(cache_dir.path(), vec![stub_origin()], 16).await?;
+    let mut hashes: Vec<iroh_blobs::Hash> = Vec::new();
+    for p in payloads {
+        hashes.push(cache.insert_blob(p.to_vec()).await?);
     }
 
     // Overflow before the task starts polling: a receiver created ahead of
@@ -730,18 +725,14 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
 
     let cache_dir = tempfile::tempdir()?;
     let own = decdn_cache::Hash::new(b"policy-own");
-    let foreign = decdn_cache::Hash::new(b"policy-foreign");
     let cache = decdn_cache::CacheEngine::open(
         cache_dir.path(),
-        vec![
-            enumerable_stub_origin(b"policy-own"),
-            stub_origin(b"policy-foreign"),
-        ],
+        vec![enumerable_stub_origin(b"policy-own"), stub_origin()],
         16,
     )
     .await?;
-    cache.get(own).await?;
-    cache.get(foreign).await?;
+    cache.insert_blob(b"policy-own".to_vec()).await?;
+    cache.insert_blob(b"policy-foreign".to_vec()).await?;
     cache.rescan_origins().await;
 
     // Overflow before the receiver polls so `Lagged` is deterministic. Only
@@ -791,12 +782,13 @@ async fn sweep_scheduled_count(relay_foreign_namespaces: bool) -> anyhow::Result
     Ok(settled)
 }
 
-/// [`stub_origin`]'s enumerable twin: also answers `enumerate` and `size`, which
-/// is what puts the hash in the cache's origin-held index.
+/// [`stub_origin`]'s enumerable twin: also answers `enumerate` and serves the
+/// blob's `{H}.sizeproof`, which is what puts the hash in the cache's
+/// origin-held index.
 fn enumerable_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
     #[derive(Debug)]
     struct EnumerableStub {
-        data: bytes::Bytes,
+        size_proof: bytes::Bytes,
         hash: decdn_cache::Hash,
     }
 
@@ -805,33 +797,18 @@ fn enumerable_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin
             decdn_cache::OriginKind::Filesystem
         }
 
-        fn fetch(
+        fn fetch_size_proof(
             &self,
             hash: decdn_cache::Hash,
-            _max_bytes: u64,
         ) -> std::pin::Pin<
             Box<
-                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
+                dyn Future<Output = Result<Option<bytes::Bytes>, decdn_cache::OriginPullError>>
                     + Send
                     + '_,
             >,
         > {
-            let result = if hash == self.hash {
-                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-            } else {
-                Ok(decdn_cache::OriginFetch::NotFound)
-            };
-            Box::pin(async move { result })
-        }
-
-        fn size(
-            &self,
-            hash: decdn_cache::Hash,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<Option<u64>, decdn_cache::OriginPullError>> + Send + '_>,
-        > {
-            let n = (hash == self.hash).then(|| u64::try_from(self.data.len()).unwrap_or(u64::MAX));
-            Box::pin(async move { Ok(n) })
+            let object = (hash == self.hash).then(|| self.size_proof.clone());
+            Box::pin(async move { Ok(object) })
         }
 
         fn enumerate(
@@ -848,50 +825,28 @@ fn enumerable_stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin
         }
     }
 
+    let size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let encoded = decdn_bao_range::encode_outboard(payload, size).expect("encode the outboard");
     Arc::new(EnumerableStub {
-        data: bytes::Bytes::from_static(payload),
+        size_proof: bytes::Bytes::from(encoded.size_proof_object()),
         hash: decdn_cache::Hash::new(payload),
     })
 }
 
-/// Single-blob stub origin: `fetch` commits the payload into the store on
-/// `get`, which is all this file needs to build a non-empty cache.
-fn stub_origin(payload: &'static [u8]) -> Arc<dyn decdn_cache::Origin> {
+/// An origin that holds nothing: tests put a blob in the store with
+/// `CacheEngine::insert_blob`, so content reached through it is foreign relay
+/// traffic, not this node's own.
+fn stub_origin() -> Arc<dyn decdn_cache::Origin> {
     #[derive(Debug)]
-    struct StubOrigin {
-        data: bytes::Bytes,
-        hash: decdn_cache::Hash,
-    }
+    struct StubOrigin;
 
     impl decdn_cache::Origin for StubOrigin {
         fn kind(&self) -> decdn_cache::OriginKind {
             decdn_cache::OriginKind::Http
         }
-
-        fn fetch(
-            &self,
-            hash: decdn_cache::Hash,
-            _max_bytes: u64,
-        ) -> std::pin::Pin<
-            Box<
-                dyn Future<Output = Result<decdn_cache::OriginFetch, decdn_cache::OriginPullError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            let result = if hash == self.hash {
-                Ok(decdn_cache::OriginFetch::found_one_shot(self.data.clone()))
-            } else {
-                Ok(decdn_cache::OriginFetch::NotFound)
-            };
-            Box::pin(async move { result })
-        }
     }
 
-    Arc::new(StubOrigin {
-        data: bytes::Bytes::from_static(payload),
-        hash: decdn_cache::Hash::new(payload),
-    })
+    Arc::new(StubOrigin)
 }
 
 /// A deterministic `len`-byte blob and its pre-order outboard, keyed by root.

@@ -139,6 +139,7 @@ async fn run_global() -> anyhow::Result<()> {
     let chain = ChainFixture::launch().await?;
     let payload = vec![0x5Au8; 2 * MIB];
     let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
+    node.warm(&chain, &[hash]).await?;
     let admin = node.admin_client()?;
     let hash_key = to_b256(hash);
 
@@ -319,6 +320,7 @@ async fn run_removal_reversal() -> anyhow::Result<()> {
     let (node, hashes) = NodeFixture::launch_with_blobs(&chain, "US", &[&payload, &warmup]).await?;
     let hash = hashes[0];
     let warmup_hash = hashes[1];
+    node.warm(&chain, &[hash]).await?;
     let admin = node.admin_client()?;
     let hash_key = to_b256(hash);
 
@@ -416,6 +418,7 @@ async fn run_open_stream_interplay() -> anyhow::Result<()> {
     let chain = ChainFixture::launch().await?;
     let payload = vec![0x9Du8; 2 * MIB];
     let (node, hash) = NodeFixture::launch(&chain, "US", &payload).await?;
+    node.warm(&chain, &[hash]).await?;
     let admin = node.admin_client()?;
     let hash_key = to_b256(hash);
 
@@ -474,6 +477,8 @@ async fn run_regional() -> anyhow::Result<()> {
     let hash = us_hashes[0];
     let sentinel_hash = de_hashes[1];
     assert_eq!(de_hashes[0], hash, "shared payload must share a hash");
+    us_node.warm(&chain, &[hash]).await?;
+    de_node.warm(&chain, &[hash, sentinel_hash]).await?;
     let us_admin = us_node.admin_client()?;
     let de_admin = de_node.admin_client()?;
 
@@ -547,6 +552,7 @@ async fn run_scope_transition() -> anyhow::Result<()> {
     let payload = vec![0xE7u8; 2 * MIB];
     // The operator self-attests region DE and holds H.
     let (node, hash) = NodeFixture::launch(&chain, "DE", &payload).await?;
+    node.warm(&chain, &[hash]).await?;
     let admin = node.admin_client()?;
     assert!(evict_was_present(&admin, hash).await?, "node must hold H");
 

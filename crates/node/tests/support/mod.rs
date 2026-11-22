@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::signers::local::PrivateKeySigner;
-use decdn_cache::{CacheEngine, FilesystemOrigin, Hash};
+use decdn_cache::{CacheEngine, Hash};
 use decdn_common::config::ResolvedSecurity;
 use decdn_incentive::{LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore};
 use decdn_node::dispatch::ConnectionLimiter;
@@ -184,20 +184,32 @@ pub(crate) fn honest_bao_wire_range(
 }
 
 /// Seed `payload` into the filesystem origin at `root` as `decdn origin
-/// import` does with no outboard: the object at `{hex[0..2]}/{hex}` and its
-/// `{hex}.sizeproof` sibling, which proves the size the node states for it.
-/// Registers the payload ([`register_payload`]) and returns its hash.
+/// import` does: the object at `{hex[0..2]}/{hex}`, its `{hex}.obao4`
+/// pre-order outboard, and its `{hex}.sizeproof` sibling, which proves the
+/// size the node states for it. Registers the payload ([`register_payload`])
+/// and returns its hash.
 pub(crate) fn seed_origin_object(root: &std::path::Path, payload: &[u8]) -> anyhow::Result<Hash> {
     let hash = register_payload(payload);
     let encoded = decdn_bao_range::encode_outboard(payload, u64::try_from(payload.len())?)?;
     let shard = root.join(encoded.shard());
     std::fs::create_dir_all(&shard)?;
     std::fs::write(shard.join(&encoded.hash_hex), payload)?;
+    std::fs::write(shard.join(encoded.obao4_name()), &encoded.outboard)?;
     std::fs::write(
         shard.join(encoded.size_proof_name()),
         encoded.size_proof_object(),
     )?;
     Ok(hash)
+}
+
+/// The origin egress of one own-origin serve of the whole of `payload` from a
+/// cold cache: the `{hex}.obao4` outboard plus every data byte, as
+/// `decdn_cache_pull_through_bytes_total` meters it. The `{hex}.sizeproof`
+/// read is not metered.
+pub(crate) fn own_origin_egress(payload: &[u8]) -> anyhow::Result<u64> {
+    let size = u64::try_from(payload.len())?;
+    let encoded = decdn_bao_range::encode_outboard(payload, size)?;
+    Ok(size + u64::try_from(encoded.outboard.len())?)
 }
 
 /// Open an empty cache (no origins) in a fresh temp dir.
@@ -207,25 +219,26 @@ pub(crate) async fn empty_cache() -> anyhow::Result<(CacheEngine, tempfile::Temp
     Ok((cache, tmp))
 }
 
-/// Open a cache pre-seeded with `payload` (pulled+verified via a filesystem
-/// origin, then the origin dir is dropped). Returns the cache, blob hash, and
-/// the cache temp dir to keep alive.
+/// Fill `hash` through the engine's origin chain when the store lacks it, then
+/// read the whole blob back. A held blob is read with no origin call.
+#[allow(dead_code)] // not every test binary that links `support` reads blobs back
+pub(crate) async fn fetch_blob(
+    engine: &CacheEngine,
+    hash: Hash,
+) -> decdn_cache::CacheResult<bytes::Bytes> {
+    engine.populate(hash).await?;
+    engine.read_blob(hash).await
+}
+
+/// Open a cache (no origins) pre-seeded with `payload` as a whole blob.
+/// Returns the cache, blob hash, and the cache temp dir to keep alive.
 pub(crate) async fn cache_with_blob(
     payload: &[u8],
 ) -> anyhow::Result<(CacheEngine, Hash, tempfile::TempDir)> {
-    let origin_dir = tempfile::tempdir()?;
-    let hash = seed_origin_object(origin_dir.path(), payload)?;
-
     let cache_dir = tempfile::tempdir()?;
-    let origin = Arc::new(FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache = CacheEngine::open(
-        cache_dir.path(),
-        vec![origin as Arc<dyn decdn_cache::Origin>],
-        16,
-    )
-    .await?;
-    let _ = cache.get(hash).await?; // populate local store
-    drop(origin_dir);
+    let cache = CacheEngine::open(cache_dir.path(), vec![], 16).await?;
+    register_payload(payload);
+    let hash = cache.insert_blob(payload.to_vec()).await?;
     Ok((cache, hash, cache_dir))
 }
 

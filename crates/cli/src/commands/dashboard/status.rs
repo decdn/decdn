@@ -172,8 +172,8 @@ pub(super) struct NodeMetrics {
     pub(super) snapshot: Snapshot,
     /// Per-second rates since the scrape before; `None` on the first.
     pub(super) rates: Option<SnapshotDelta>,
-    /// Cache hits over hits and misses since the node started; `None` before
-    /// either.
+    /// Serve-path cache hits over hits and misses since the node started;
+    /// `None` before either.
     pub(super) hit_rate: Option<f64>,
 }
 
