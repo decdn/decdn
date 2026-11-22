@@ -2295,7 +2295,7 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
             // candidate is range-planned against a real holder's blocks rather
             // than reading as covering nothing. This is not the evidence-retention
             // the cache's module doc forbids — coverage is outside the
-            // `operator_sig` set and has no author to slash.
+            // `operator_sig` set, so it attributes nothing to anyone.
             coverage: provider.coverage.clone(),
             total_bytes_hint: provider.total_bytes_hint,
         });

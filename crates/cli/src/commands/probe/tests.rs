@@ -105,6 +105,12 @@ fn pretty_output_emits_labelled_lines_in_stable_order() {
     assert!(lines[5].starts_with("timestamp_us:"));
     assert!(lines[6].starts_with("rtt:"));
     assert!(lines[7].starts_with("operator_sig:"));
+    // Every value starts at column 17, so the rows read as one aligned table.
+    for line in lines.iter().take(8) {
+        let value_at_17 = line.get(..17).is_some_and(|label| label.ends_with(' '))
+            && line.get(17..).is_some_and(|value| !value.starts_with(' '));
+        assert!(value_at_17, "value must start at column 17: {line:?}");
+    }
     assert!(
         lines[6].contains("1.234 ms"),
         "pretty rtt: line keeps 3-decimal format, got {:?}",

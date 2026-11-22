@@ -195,7 +195,7 @@ pub(crate) fn write_probe_answer(
         writeln!(w, "coverage_blocks: {}", answer.coverage_blocks)?;
         writeln!(w, "timestamp_us:    {} (echoed ok)", answer.timestamp_us)?;
         writeln!(w, "rtt:             {:.3} ms", answer.rtt_ms)?;
-        writeln!(w, "operator_sig:       {operator_sig_hex}")
+        writeln!(w, "operator_sig:    {operator_sig_hex}")
     }
 }
 

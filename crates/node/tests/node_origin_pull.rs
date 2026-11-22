@@ -2784,7 +2784,7 @@ async fn an_origin_directory_entry_for_this_node_is_not_a_candidate() -> Result<
 
 /// A discovered provider with no resolvable operator address is skipped without
 /// tarnishing its reputation (payment-safety: never pay an address we can't
-/// resolve / verify a `operator_sig` against). Discovery drops it before any open,
+/// resolve / verify an `operator_sig` against). Discovery drops it before any open,
 /// the fetch is a clean `NotFound`, and no outcome is recorded.
 #[tokio::test(flavor = "multi_thread")]
 async fn node_origin_unresolvable_address_skips_without_scoring() -> Result<()> {

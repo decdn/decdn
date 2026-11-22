@@ -1532,9 +1532,9 @@ impl BlobSource for RefuseFirstOpenShortDeposit {
                     timestamp_us: 0,
                 };
                 // `open` retains the response as-is without re-validating the
-                // signature, so an EOA-length (65-byte) placeholder operator signature is
-                // enough: this test exercises the refusal's routing, not slash
-                // evidence.
+                // signature, so an EOA-length (65-byte) placeholder signature is
+                // enough: this test exercises the refusal's routing, not
+                // signature verification.
                 let resp = StreamResponse {
                     body,
                     operator_sig: vec![0u8; 65],

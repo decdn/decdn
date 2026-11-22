@@ -16042,8 +16042,8 @@ async fn an_open_on_a_hit_answers_its_quote_size_and_full_coverage() -> anyhow::
         "a hit covers every block"
     );
     anyhow::ensure!(resp_ext.consistent_with(&resp.body, 0, 0));
-    let stream_dom = StreamSigData::from_response_body(&resp.body);
-    let recovered = stream_dom.recover_signer(
+    let sig_data = StreamSigData::from_response_body(&resp.body);
+    let recovered = sig_data.recover_signer(
         &alloy::primitives::Signature::try_from(resp.operator_sig.as_slice())?,
         &stream_domain(),
     )?;

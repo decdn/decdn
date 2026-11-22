@@ -153,7 +153,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 - **Content integrity:** BLAKE3 hash verification on every received blob. A malicious node cannot serve corrupted data.
 - **Voucher binding:** EIP-712 signatures on vouchers are produced by a capability-authorized signer key. The owner controls how much it authorizes (the `spending_cap`) and — since it issues the capability — who may sign and until when (`expiry`).
-- **Rate commitment:** `StreamResponse` carries a `operator_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. The client signs that rate into each voucher as `chunk_price`, and the node refuses a voucher at another price ([ADR 005 § Rate self-enforcement](005-protocol.md#rate-self-enforcement)). The client protects itself.
+- **Rate commitment:** `StreamResponse` carries an `operator_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. The client signs that rate into each voucher as `chunk_price`, and the node refuses a voucher at another price ([ADR 005 § Rate self-enforcement](005-protocol.md#rate-self-enforcement)). The client protects itself.
 - **Node identity:** QUIC handshake authenticates the remote NodeId (Ed25519). The client knows it is communicating with the registered node.
 - **Payment pool state:** On-chain, publicly verifiable. The owner can always close and reclaim; a node can always redeem its lanes.
 
