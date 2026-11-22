@@ -302,6 +302,91 @@ fn unsigned_notfound_refusal_is_untouched() {
     assert_eq!(annotated.to_string(), want);
 }
 
+/// An open-stage `NotFound` the node signed at `rate_per_mb`, built the way
+/// the fetch path holds one: an `UpstreamRefused` whose `evidence()` is the
+/// signed response.
+fn signed_notfound(rate_per_mb: u64) -> anyhow::Error {
+    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_protocol::client::{StreamResponse, StreamResponseBody};
+
+    let body = StreamResponseBody {
+        hash: [7; 32],
+        ok: false,
+        rate_per_mb,
+        timestamp_us: 1_700_000_000_000_000,
+    };
+    let operator = PrivateKeySigner::random();
+    let sig = StreamSlashData::from_response_body(&body)
+        .sign(&operator, &capacity_bond_domain(1, Address::ZERO))
+        .unwrap();
+    let response = StreamResponse {
+        body,
+        slash_sig: sig.as_bytes().to_vec(),
+    };
+    anyhow::Error::new(UpstreamRefused::open_for_test(
+        response,
+        StreamError::NotFound,
+    ))
+}
+
+/// A pool context with `deposit − prior_amount` of headroom.
+fn ctx_with_headroom(deposit: u64, prior_amount: u64) -> PoolContext {
+    PoolContext {
+        deposit: U256::from(deposit),
+        prior_amount: U256::from(prior_amount),
+        ..ctx()
+    }
+}
+
+/// The branch the annotation exists for: a signed `NotFound` whose quoted
+/// rate prices one chunk above what the pool has left. The node collapses
+/// that refusal onto `NotFound`, so the context is the only place the
+/// operator learns the deposit is the cause.
+#[test]
+fn signed_notfound_above_the_headroom_names_the_deposit() {
+    let rate = 1_000;
+    let estimate = min_payment(decdn_protocol::client::CHUNK_BYTES, rate);
+    let headroom = estimate - U256::from(1u8);
+    let deposit = 10_000u64;
+    let prior = deposit - u64::try_from(headroom).unwrap();
+
+    let err = signed_notfound(rate);
+    let want_root = err.to_string();
+    let annotated = annotate_cache_miss(err, &ctx_with_headroom(deposit, prior));
+    let msg = annotated.to_string();
+    assert!(
+        msg.contains(&format!("remaining deposit ({headroom})")),
+        "names the remaining deposit: {msg}"
+    );
+    assert!(msg.contains("--working-deposit-micro-usdc"), "{msg}");
+    assert!(
+        annotated.downcast_ref::<UpstreamRefused>().is_some(),
+        "the typed refusal stays in the chain"
+    );
+    assert_eq!(annotated.root_cause().to_string(), want_root);
+}
+
+/// Enough headroom for the node's one-chunk reservation: the deposit is not
+/// the cause, so the refusal passes through untouched.
+#[test]
+fn signed_notfound_within_the_headroom_is_untouched() {
+    let rate = 1_000;
+    let estimate = u64::try_from(min_payment(decdn_protocol::client::CHUNK_BYTES, rate)).unwrap();
+    let err = signed_notfound(rate);
+    let want = err.to_string();
+    let annotated = annotate_cache_miss(err, &ctx_with_headroom(estimate, 0));
+    assert_eq!(annotated.to_string(), want);
+}
+
+/// A zero quoted rate prices nothing, so no deposit can fall short of it.
+#[test]
+fn signed_notfound_at_rate_zero_is_untouched() {
+    let err = signed_notfound(0);
+    let want = err.to_string();
+    let annotated = annotate_cache_miss(err, &ctx_with_headroom(0, 0));
+    assert_eq!(annotated.to_string(), want);
+}
+
 /// A refusal that is NOT `NotFound`, or a non-refusal failure, is never
 /// annotated: a larger deposit cannot fix it.
 #[test]

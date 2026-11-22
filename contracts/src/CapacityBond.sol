@@ -29,7 +29,8 @@ import { DeclaredMbpsHistoryLib } from "./DeclaredMbpsHistoryLib.sol";
 ///         TOKEN out at once; the bond backs the declared capacity tier
 ///         (ADR 026 § Capacity-bond curve) and the entry floor.
 /// @dev    The bond / unbond / node-registry primitives, plus:
-///           - `firstBondedAt[op]`  — set on first successful `bond` (ADR 036)
+///           - `firstBondedAt[op]`  — tenure start, stamped at entry and reset by
+///                                    an `unbond` below the floor (ADR 036)
 ///           - `regionPrev[op]` + `regionLastChanged[op]` + `updateRegion`
 ///                                    (ADR 030 § Node Region Self-Attestation)
 ///           - `declaredMbps[op]`   — operator-asserted capacity (ADR 026
@@ -166,9 +167,18 @@ contract CapacityBond is
     ///         the blacklist.
     mapping(address operator => bool) public blacklistEjected;
 
-    /// @notice First-bond-time stamp per operator (ADR 036 § Formula —
-    ///         `age_ramp` numerator). Set once on the first `bond` call that
-    ///         lifts the operator's `activeBond` above zero; never overwritten.
+    /// @notice Tenure start per operator (ADR 036 § Formula — `age_ramp`
+    ///         numerator): the timestamp of the entry transition that began the
+    ///         operator's current run of bonding at or above its floor. An entry
+    ///         is the `bond` call that lifts `activeBond` to the live `minBond`,
+    ///         or `registerNode`. A running tenure keeps its stamp through later
+    ///         bonds, partial unbonds that hold the floor, and `deregisterNode`.
+    ///         An `unbond` that leaves `activeBond` below
+    ///         `bondFloorAtActivation` resets it to 0. Zero while the operator
+    ///         holds no tenure.
+    /// @dev    Invariants: `_firstBondedAt[op] != 0` iff
+    ///         `bondFloorAtActivation[op] != 0`, and then
+    ///         `activeBond[op] >= bondFloorAtActivation[op]`.
     mapping(address operator => uint64) internal _firstBondedAt;
 
     /// @notice Operator-asserted serving capacity in Mbps (ADR 026
@@ -200,21 +210,23 @@ contract CapacityBond is
 
     /// @notice Global minimum active bond that gates ENTRY into the active set
     ///         (ADR 026 § Operator bond). `minBond` is non-retroactive: it is
-    ///         read live only at the entry transitions (`bond` reinstatement,
-    ///         `registerNode`), never for ongoing active status. Governance may
-    ///         tighten it as the network matures without purging the electorate
-    ///         — a raise applies to new entrants only. See
-    ///         `bondFloorAtActivation`.
+    ///         read live only at the entry transitions (`bond` entry and
+    ///         reinstatement, `registerNode`), never for ongoing active status.
+    ///         An operator whose `unbond` ends its tenure re-enters at the live
+    ///         value. Governance may tighten it as the network matures without
+    ///         purging the electorate — a raise applies to new entrants only.
+    ///         See `bondFloorAtActivation`.
     uint256 public minBond;
 
-    /// @notice Per-operator entry floor: the live `minBond` captured each time
-    ///         the operator's `activeBond` crosses UP through it in `bond`
-    ///         (ADR 026 § Minimum bond is non-retroactive). Ongoing active status
-    ///         (`isActive`) tests the active bond against THIS floor, not the
-    ///         live `minBond`, so a later `minBond` raise never de-activates an
-    ///         already-active operator. A re-crossing re-grandfathers at the
-    ///         then-current `minBond`. Zero until the operator first reaches
-    ///         `minBond`.
+    /// @notice Per-operator entry floor: the live `minBond` captured at each
+    ///         entry transition (`bond` up to the live `minBond`, or
+    ///         `registerNode`; ADR 026 § Minimum bond is non-retroactive).
+    ///         Ongoing active status (`isActive`) tests the active bond against
+    ///         THIS floor, not the live `minBond`, so a later `minBond` raise
+    ///         never de-activates an already-active operator. A re-entry
+    ///         re-grandfathers at the then-current `minBond`. Zero while the
+    ///         operator holds no tenure: before its first entry, and after an
+    ///         `unbond` below the floor resets it together with `firstBondedAt`.
     mapping(address operator => uint256) public bondFloorAtActivation;
 
     /// @notice Governable declared-capacity band (Mbps) enforced on
@@ -445,6 +457,12 @@ contract CapacityBond is
     // Bonding
     // -----------------------------------------------------------------
 
+    /// @notice Add `amount` to the caller's active bond. The bond that lifts the
+    ///         caller to the live `minBond` is an entry transition when the
+    ///         caller holds no tenure or sits below that `minBond`: it records
+    ///         the live `minBond` as `bondFloorAtActivation` and, when no tenure
+    ///         runs, stamps `firstBondedAt` with the block timestamp. A running
+    ///         tenure keeps its stamp.
     function bond(uint256 amount) external nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         IERC20(address(token)).safeTransferFrom(msg.sender, address(this), amount);
@@ -452,20 +470,16 @@ contract CapacityBond is
         uint256 newBalance = oldBalance + amount;
         activeBond[msg.sender] = newBalance;
 
-        // Grandfather the entry floor: capture the live `minBond` each time the
-        // operator crosses UP through it (ADR 026 § Minimum bond is
-        // non-retroactive). This is the entry transition — `registerNode` and
-        // the reinstatement gate below both require `activeBond >= minBond`, so
-        // any operator that can activate has crossed here and holds a floor.
-        // Ongoing active status (`isActive`) reads this floor, never the live
-        // `minBond`, so a later `minBond` raise is non-retroactive. Re-crossing
-        // after a full unbond re-grandfathers at the then-current `minBond`.
-        // The first crossing also starts the operator's tenure, never
-        // overwritten (ADR 036 § Behaviors that follow from the formula), so a
-        // dust bond cannot pre-age an address.
-        if (oldBalance < minBond && newBalance >= minBond) {
-            bondFloorAtActivation[msg.sender] = minBond;
-            if (_firstBondedAt[msg.sender] == 0) _firstBondedAt[msg.sender] = uint64(block.timestamp);
+        // Entry transition (ADR 026 § Minimum bond is non-retroactive). Ongoing
+        // active status (`isActive`) reads the recorded floor, never the live
+        // `minBond`, so a later `minBond` raise is non-retroactive. A dust bond
+        // below `minBond` records nothing, so it cannot pre-age an address. An
+        // operator with no tenure enters with the first bond that holds the
+        // live `minBond`, also when its balance already sat above a lowered
+        // `minBond`. A tenured operator that tops up through a raised `minBond`
+        // re-grandfathers at it and keeps its tenure.
+        if (newBalance >= minBond && (oldBalance < minBond || _firstBondedAt[msg.sender] == 0)) {
+            _recordEntry();
         }
 
         // A governance blacklist latch (ADR 011) blocks re-entry by re-bonding:
@@ -479,14 +493,30 @@ contract CapacityBond is
         emit Bonded(msg.sender, amount, newBalance);
     }
 
+    /// @dev Entry transition shared by `bond` and `registerNode`. Records the
+    ///      live `minBond` as the caller's floor and starts its tenure when none
+    ///      runs. Both callers hold `activeBond >= minBond` here, so the tenure
+    ///      invariant `firstBondedAt != 0 ⇒ activeBond >= bondFloorAtActivation
+    ///      > 0` holds after it.
+    function _recordEntry() private {
+        bondFloorAtActivation[msg.sender] = minBond;
+        if (_firstBondedAt[msg.sender] == 0) _firstBondedAt[msg.sender] = uint64(block.timestamp);
+    }
+
     /// @notice Withdraw `amount` of the active bond to the caller in this call.
     ///         The remaining active bond must still cover the declared capacity
     ///         tier (`bondRequired(declaredMbps)`); an operator that reduces its
     ///         bond below the tier declares a lower tier first, and a full exit
     ///         clears the tier with `deregisterNode` (registered) or
     ///         `declareMbps(0)` (inactive). A remainder below
-    ///         `bondFloorAtActivation` takes the operator out of the active set
-    ///         (`isActive`).
+    ///         `bondFloorAtActivation` ends the operator's tenure: it resets
+    ///         `firstBondedAt` and `bondFloorAtActivation` to 0, which takes the
+    ///         operator out of the active set (`isActive`). The next entry
+    ///         (`bond` up to the live `minBond`, or `registerNode`) records the
+    ///         live `minBond` as the floor and stamps a fresh `firstBondedAt`.
+    ///         Tenure thus measures continuous bonding at or above the floor,
+    ///         and bonding `minBond` and withdrawing it again cannot pre-age an
+    ///         address. A remainder at or above the floor keeps both.
     ///
     ///         This is a principal-exit path and is never pausable: pause halts
     ///         intake and serving, never an operator's exit (the client-side
@@ -510,6 +540,10 @@ contract CapacityBond is
         }
 
         activeBond[msg.sender] = remaining;
+        if (remaining < bondFloorAtActivation[msg.sender]) {
+            delete bondFloorAtActivation[msg.sender];
+            delete _firstBondedAt[msg.sender];
+        }
         IERC20(address(token)).safeTransfer(msg.sender, amount);
         emit Unbonded(msg.sender, amount, remaining);
     }
@@ -542,7 +576,7 @@ contract CapacityBond is
     ///
     ///         The exception is a blacklist-ejected operator: `registerNode`
     ///         reverts `OperatorEjected` no matter how they re-bond, so for them
-    ///         this is the only exit that exists.
+    ///         this is the only full exit.
     function declareMbps(uint256 mbps) external {
         // Checked before the band so a zero declaration from an inactive
         // operator skips BOTH gates: the band floor (bounded to
@@ -673,11 +707,13 @@ contract CapacityBond is
         nodeIdToAddress[nodeId] = msg.sender;
         addressToNodeId[msg.sender] = nodeId;
         bindingNonce[msg.sender] = usedBindingNonce + 1;
-        // registerNode is an activation transition gated on `activeBond >=
-        // minBond`, so the live `minBond` is the entry floor. A floor left by an
-        // earlier `bond()` crossing may sit above or below it after a `minBond`
-        // change; registration always records the live value.
-        bondFloorAtActivation[msg.sender] = minBond;
+        // registerNode is an entry transition gated on `activeBond >= minBond`,
+        // so the live `minBond` is the entry floor. A floor left by an earlier
+        // `bond()` entry may sit above or below it after a `minBond` change;
+        // registration always records the live value. It also starts the tenure
+        // of an operator that holds none, which happens when a lowered `minBond`
+        // let its standing balance pass this gate without a `bond()` entry.
+        _recordEntry();
         _writeNodeInfo(nodeId, multiaddrs, regionHint);
         _addToRegisteredSet(msg.sender);
 
@@ -917,9 +953,10 @@ contract CapacityBond is
     /// @notice Set the global entry minimum bond, within the fixed
     ///         `[MIN_BOND_FLOOR, MIN_BOND_CEILING]` (10K–1M TOKEN) rail
     ///         (ADR 026 § Operator bond). Non-retroactive in both directions:
-    ///         `minBond` gates only entry (`bond` reinstatement, `registerNode`),
-    ///         so a change applies to new entrants alone. Active operators keep
-    ///         the `bondFloorAtActivation` they entered under — governance may
+    ///         `minBond` gates only entry (`bond` entry and reinstatement,
+    ///         `registerNode`), so a change applies to new entrants and
+    ///         re-entrants alone. Active operators keep the
+    ///         `bondFloorAtActivation` they entered under — governance may
     ///         tighten the entry bar as the network matures without purging the
     ///         electorate, and a raise alone never de-activates an active
     ///         operator.
@@ -1052,8 +1089,11 @@ contract CapacityBond is
         // already-active operator (ADR 026 § Operator bond). `unbond` moves
         // the released amount out of `activeBond` at once, so a partial
         // unbond that retains the floor keeps the operator active, and one that
-        // drops below the floor de-activates it.
-        return _nodes[operator].active && activeBond[operator] >= bondFloorAtActivation[operator] && !ejected[operator];
+        // drops below the floor ends its tenure and resets the floor to 0. A
+        // zero floor marks an operator that holds no tenure, so it is inactive
+        // until its next entry, even while registered.
+        uint256 entryFloor = bondFloorAtActivation[operator];
+        return _nodes[operator].active && entryFloor != 0 && activeBond[operator] >= entryFloor && !ejected[operator];
     }
 
     /// @inheritdoc ICapacityBond

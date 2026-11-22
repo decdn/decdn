@@ -1498,7 +1498,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
 
 /// #1377: `open()` on a `body.ok == false` response that carries no error code
 /// is a protocol violation (the `validate` invariant was bypassed), so it does
-/// NOT produce a typed `UpstreamRefused` that a challenger could act on — it
+/// NOT produce a typed `UpstreamRefused` that a caller could act on — it
 /// surfaces as a plain error instead of laundering a malformed refusal.
 #[test]
 fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {

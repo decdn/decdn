@@ -981,8 +981,9 @@ async fn build_chain_and_handlers(
     let chain_sync_stop = CancellationToken::new();
     let mut chain_sync_tasks: Vec<crate::dht::capacity_bond_registry::RefreshTask> = Vec::new();
 
-    // One boot deadline for the three fail-closed chain bootstraps below — the
-    // registry, `usdc()` self-check and blacklist reads (#2159). Each
+    // One boot deadline for the four fail-closed chain bootstraps below (three
+    // when no `origin_assignment_address` is set) — the registry, origin-seat
+    // snapshot, `usdc()` self-check and blacklist reads (#2159). Each
     // retries its reads on transient provider errors and fails only on a
     // deterministic fault or once the shared deadline passes. The best-effort
     // fee-share reads retry on a capped sub-budget of it and fall back to the

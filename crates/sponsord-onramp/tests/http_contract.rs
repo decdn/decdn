@@ -285,8 +285,8 @@ fn expected() -> [(&'static str, String); 11] {
     [
         ("ONRAMP_URL", "https://up.example.org".into()),
         ("RELEASES", "https://github.com/decdn".into()),
-        ("DECDN_RELEASE", "v0.3.0".into()),
-        ("DECDN_VERSION", "0.3.0".into()),
+        ("DECDN_RELEASE", "v0.4.0".into()),
+        ("DECDN_VERSION", "0.4.0".into()),
         ("DECDN_SUMS_SHA256", "ab".repeat(32)),
         ("GOVERNANCE_CHAIN_ID", "11155111".into()),
         (

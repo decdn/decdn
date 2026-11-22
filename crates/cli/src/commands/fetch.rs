@@ -122,9 +122,8 @@ fn new_progress_bar() -> indicatif::ProgressBar {
 #[derive(Debug)]
 pub(crate) struct ResolvedChain {
     /// The governance chain and the payment pools the command can pay
-    /// through. The governance `capacity_bond` is `None` when neither the flag
-    /// nor `blockchain.capacity_bond_address` is set — only an error on the
-    /// discovery path, never on the explicit-node path.
+    /// through. The governance `capacity_bond` comes from the flag or
+    /// `blockchain.capacity_bond_address`, and resolving fails without it.
     pub(crate) config: ChainConfig,
     /// Where the command keeps its state, and the client's region. The data
     /// dir holds the buyer-pool redb store and (by default) the keystore. It

@@ -25,13 +25,21 @@
 //! and the re-onboarding phase requires `--mbps` when the chain no longer knows
 //! it.
 //!
+//! An operator that left the active set without deregistering (ejected, or
+//! displaced by `reclaimNodeId`) still has its tier, and `deregisterNode`
+//! reverts `NodeNotActive` for it. The unbond phase therefore clears that tier
+//! with `declareMbps(0)` before it withdraws, as `decdn node unbond --all` does
+//! for an inactive operator, and prints that tier in its receipt. A run
+//! that lands the clear and loses the withdrawal re-reads a zero tier and only
+//! withdraws on re-run.
+//!
 //! # The node id changes too
 //!
 //! Not a choice. `deregisterNode` deactivates but does **not** clear
 //! `nodeIdToAddress[nodeId]`, so the old address keeps the binding and
 //! `registerNode` from the new address reverts `NodeIdAlreadyBound`. The
 //! re-onboarding phase therefore generates a fresh node key, which is what the
-//! runbook's step 8 says to do.
+//! runbook's step 7 says to do.
 //!
 //! An operator who needs the *original* id back (for reputation continuity) has
 //! a two-step manual route this command does not automate: run `--key iroh` on
@@ -44,10 +52,10 @@
 //!
 //! # Why the key ordering is looser than the iroh path's
 //!
-//! The `iroh` path commits `node.secret` only after the bind confirms, because
-//! any window where the daemon serves under an unbound key is an unroutable
-//! node. Here that window does not exist: re-onboarding runs against an operator
-//! that has already deregistered and withdrawn, so it is not serving.
+//! The `iroh` path commits `node.secret` only after the bind confirms, so a
+//! lost or reverted bind never leaves the daemon on a key the chain has never
+//! seen. Here the daemon is not serving at all: re-onboarding runs against an
+//! operator that has already left the active set and withdrawn its bond.
 //! Committing a key up front is therefore safe — **but only if it is not
 //! necessarily a fresh one**:
 //! `reonboard` reuses whatever key is already on disk when nothing on chain
@@ -149,8 +157,17 @@ pub(crate) enum Phase {
     /// Still in the active set: leave it. Also the last moment the declared
     /// tier is readable, which is why it travels with the phase.
     Deregister { declared_mbps: u64 },
-    /// Deregistered with bond still posted: withdraw the whole bond.
-    Unbond { amount: U256 },
+    /// Out of the active set with bond still posted: withdraw the whole bond.
+    Unbond {
+        /// The whole active bond.
+        amount: U256,
+        /// The declared tier `declareMbps(0)` clears before the withdrawal, or
+        /// `None` when the tier is already 0. `Some` only for an operator that
+        /// left the active set without `deregisterNode` (ejected, or displaced
+        /// by `reclaimNodeId`): `unbond` reverts `BondBelowCurve` against a
+        /// standing tier, and `deregisterNode` cannot clear it for them.
+        clear_tier: Option<u64>,
+    },
     /// Bond fully exited: bond, declare, and register from the new address.
     Reonboard {
         new_operator: Address,
@@ -177,7 +194,9 @@ impl Phase {
     ///
     /// The two that do are the ones that cost something irreversible: leaving
     /// the active set, and spending TOKEN from a new address. `Unbond` only
-    /// returns the operator's own money, and `Complete` submits nothing —
+    /// returns the operator's own money (clearing first a tier its receipt
+    /// prints, for an operator that never deregistered), and `Complete` submits
+    /// nothing —
     /// prompting there would train the operator to confirm reflexively.
     const fn needs_confirmation(&self) -> bool {
         matches!(*self, Self::Deregister { .. } | Self::Reonboard { .. })
@@ -195,7 +214,8 @@ impl Phase {
 }
 
 /// Transaction hashes from a non-dry run; `None` for steps this phase did not
-/// reach.
+/// reach. `declare` holds the re-onboarding `declareMbps`, or the unbond
+/// phase's `declareMbps(0)`.
 #[derive(Default)]
 pub(crate) struct Outcome {
     pub(crate) deregister: Option<B256>,
@@ -218,8 +238,9 @@ pub(crate) struct Plan {
     pub(crate) phase: Phase,
     /// Bond still posted to the old address.
     pub(crate) active_bond: U256,
-    /// The old address's `firstBondedAt` — the age-ramp anchor this migration
-    /// destroys, and the number that makes the cost concrete.
+    /// The old address's `firstBondedAt`: the age-ramp anchor the unbond phase
+    /// clears, and the number that makes the cost concrete. It reads 0 once the
+    /// whole bond is withdrawn.
     pub(crate) first_bonded_at: u64,
 }
 
@@ -341,8 +362,13 @@ async fn select_phase<Q: Provider>(
         });
     }
     if st.active_bond > U256::ZERO {
+        // A deregistered operator has a zero tier. One that left the active set
+        // any other way still has one, and must clear it before `unbond` can
+        // release the whole bond: the same `all_target` decision
+        // `decdn node unbond --all` makes for an inactive operator.
         return Ok(Phase::Unbond {
             amount: st.active_bond,
+            clear_tier: (st.declared_mbps != 0).then_some(st.declared_mbps),
         });
     }
 
@@ -375,9 +401,10 @@ async fn select_phase<Q: Provider>(
         .or_else(|| (st.declared_mbps != 0).then_some(st.declared_mbps))
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "`deregisterNode` cleared the declared capacity tier, so it cannot be read back — \
-                 pass `--mbps <MBPS>` with the tier to declare on the new address (the deregister \
-                 phase printed the old one)."
+                "the declared capacity tier is cleared, so it cannot be read back — pass \
+                 `--mbps <MBPS>` with the tier to declare on the new address (the deregister \
+                 phase, or the unbond phase of an operator that never deregistered, printed \
+                 the old one)."
             )
         })?;
 
@@ -428,13 +455,25 @@ async fn execute<P: Provider + Clone>(
             )
             .await?;
         }
-        Phase::Unbond { amount } => {
+        Phase::Unbond { amount, clear_tier } => {
+            if clear_tier.is_some() {
+                chain_ctx::send(
+                    bond_contract.declareMbps(U256::ZERO),
+                    "declareMbps",
+                    Some(
+                        "declareMbps(0) is accepted only from an operator that is NOT in the \
+                         registered set; re-run this command to re-read the phase",
+                    ),
+                    &mut outcome.declare,
+                )
+                .await?;
+            }
             chain_ctx::send(
                 bond_contract.unbond(*amount),
                 "unbond",
                 Some(
-                    "the declared tier must already be cleared; run the deregister phase of this \
-                     command first",
+                    "the declared tier must be 0 and the active bond unchanged since this run \
+                     read them; re-run this command to re-read the phase",
                 ),
                 &mut outcome.unbond,
             )
@@ -520,7 +559,7 @@ async fn reonboard(
     // A node key. Committed before the transactions rather than after, because
     // `register::submit_registration` reads the key from disk and because —
     // unlike the iroh path — there is no serving node to strand: this operator
-    // has already deregistered and withdrawn.
+    // has already left the active set and withdrawn its bond.
     //
     // NOT unconditionally fresh: if a key is already on disk, reuse it when
     // nothing on chain claims it — that is what actually makes this phase
@@ -656,10 +695,10 @@ fn ensure_planned_operator(planned: Address, actual: Address) -> anyhow::Result<
 /// Refuse a `--new-keystore` that resolves to the SAME address this
 /// Ethereum-key migration is leaving.
 ///
-/// A same-address "migration" is not a mistake the contract catches for us —
-/// `firstBondedAt` is write-once and untouched by `deregisterNode`, so
-/// re-bonding the old address would not even reset the cost this path is
-/// supposed to incur, and reporting `phase=complete` against the address the
+/// A same-address "migration" is not a mistake the contract catches for us:
+/// re-bonding the old address after the full unbond is an ordinary bond. It
+/// pays the cost this path incurs (the full unbond clears `firstBondedAt`) and
+/// rotates nothing, and reporting `phase=complete` against the address the
 /// operator asked to leave would be actively misleading. Pure so the guard is
 /// testable without a chain.
 fn ensure_distinct_operator(old_operator: Address, new_operator: Address) -> anyhow::Result<()> {
@@ -693,6 +732,13 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
                  withdraw it, and once more with --new-keystore to re-onboard.",
                 p.active_bond,
             )?;
+            writeln!(
+                w,
+                "Withdrawing the whole bond clears this address's firstBondedAt ({}), so its \
+                 governance age-ramp ends. The new address's ramp starts at its own bond and \
+                 rebuilds to full weight over six months.",
+                p.first_bonded_at,
+            )?;
         }
         Phase::Reonboard {
             new_operator, mbps, ..
@@ -714,10 +760,9 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
             )?;
             writeln!(
                 w,
-                "firstBondedAt resets from {} to now, so the governance age-ramp restarts and \
-                 rebuilds to full weight over six months. Peer reputation against the old node id \
-                 is stranded.",
-                p.first_bonded_at,
+                "firstBondedAt resets to now: the new address's governance age-ramp starts at \
+                 this bond and rebuilds to full weight over six months. Peer reputation against \
+                 the old node id is stranded."
             )?;
             writeln!(
                 w,
@@ -763,6 +808,12 @@ pub(crate) fn write_plan(
         || o.declare.is_some()
         || o.register.is_some();
     let hex = |v: Option<B256>| v.map(|h| format!("{h:#x}"));
+    // The tier the unbond phase clears is the one input the re-onboarding phase
+    // cannot read back, so the receipt carries it.
+    let clear_tier = match p.phase {
+        Phase::Unbond { clear_tier, .. } => clear_tier,
+        _ => None,
+    };
     if json {
         let value = serde_json::json!({
             "submitted": submitted,
@@ -774,6 +825,7 @@ pub(crate) fn write_plan(
             "new_operator": p.phase.new_operator().map(|a| format!("{a:#x}")),
             "active_bond_base": p.active_bond.to_string(),
             "first_bonded_at": p.first_bonded_at,
+            "clear_tier_mbps": clear_tier,
             "new_node_id": hex(o.new_node_id),
             "deregister_tx": hex(o.deregister),
             "unbond_tx": hex(o.unbond),
@@ -793,6 +845,10 @@ pub(crate) fn write_plan(
     }
     writeln!(w, "active_bond_base={}", p.active_bond)?;
     writeln!(w, "first_bonded_at={}", p.first_bonded_at)?;
+    match clear_tier {
+        Some(mbps) => writeln!(w, "clear_tier_mbps={mbps}")?,
+        None => writeln!(w, "clear_tier_mbps=none")?,
+    }
     for (key, tx) in [
         ("new_node_id", o.new_node_id),
         ("deregister_tx", o.deregister),

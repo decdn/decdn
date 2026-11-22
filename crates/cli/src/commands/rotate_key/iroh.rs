@@ -12,15 +12,18 @@
 //! # Why the key file is committed last
 //!
 //! The command has two effects that must agree: a chain write (the binding) and
-//! a disk write (`node.secret`). Only one order is safe.
+//! a disk write (`node.secret`). Either order leaves the two disagreeing for a
+//! moment, so the order is chosen by what a failure leaves behind.
 //!
 //! Disk first would mean that a reverted or lost `bindNodeId` leaves the daemon
-//! holding a key nothing on chain points at — up, but **unroutable**, the
-//! exact fault this command exists to prevent. Chain first
-//! merely risks the inverse: the binding moved but the daemon still holds the
-//! old key, which is a plain outage (peers reject its announces, clients cannot
-//! find it) and is repaired by re-running with `--bind-existing`, or by
-//! restoring the `.bak` archive and binding that.
+//! holding a key the chain has never seen — up, but **unroutable**, with no
+//! binding for a retry to converge on. Chain first commits the key only after
+//! the `NodeIdBound` receipt, so a lost or reverted transaction leaves the old
+//! key in place, still bound or with its binding moved to the key this command
+//! parks. Either way a retry converges: re-run the rotation, re-run with
+//! `--bind-existing`, or restore the `.bak` archive and bind that. Between a
+//! successful bind and the restart the daemon still holds the old key, which is
+//! the outage the runbook's drain and stop already cover.
 //!
 //! So the new key is *staged* — generated into a temp file that
 //! [`decdn_common::identity::StagedNodeKey`] removes on drop — signed from

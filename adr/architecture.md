@@ -214,7 +214,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 | Rate-fixing cartel | Origin-backed nodes cap price; permissionless cache-only entry disciplines it | [ADR 003 § Rate-fixing cartel](003-payments.md#rate-fixing-cartel) |
 | Wash-trading for vote-buying | Fee cut on every self-dealt cycle taxes fabricated volume (protocol) | [ADR 036 § Threat Model](036-served-bytes-voting-weight.md#threat-model) |
 
-**Governance / dispute adversary** — wants to capture parameters.
+**Governance adversary** — wants to capture parameters.
 
 | Attack | Bounded by | Home |
 |---|---|---|

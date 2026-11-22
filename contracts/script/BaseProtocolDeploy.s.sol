@@ -601,12 +601,11 @@ abstract contract BaseProtocolDeploy is Script {
         }
     }
 
-    // Phase 4 — cross-contract peer roles + deployer-only state setters.
+    // Phase 4 — cross-contract peer role grants.
     //
-    // These calls all require the deployer to still hold `GOVERNANCE_ROLE` or
-    // `DEFAULT_ADMIN_ROLE` on the target. They are the last opportunity to
-    // configure mutable state before the handoff puts every setter behind the
-    // 48h Timelock.
+    // These grants all require the deployer to still hold the role's admin
+    // (`GOVERNANCE_ROLE` or `DEFAULT_ADMIN_ROLE`) on the target. They run before
+    // the handoff puts every grant behind the 48h Timelock.
     function _wireCrossContractRoles(DeployConfig memory cfg, Deployment memory d) internal {
         // ContentBlacklist ejects operators via CapacityBond on blacklist add.
         d.bond.grantRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist));

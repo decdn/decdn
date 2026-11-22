@@ -2000,6 +2000,7 @@ pub struct DecdnMetrics {
     pub blacklist_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
     /// chain read (the `PaymentPool` deployment preflight, the registry,
+    /// origin-seat snapshot (when `origin_assignment_address` is set),
     /// `usdc()` self-check and blacklist bootstraps, and the best-effort
     /// fee-share reads) after a transient error; one read can retry many
     /// times. The metrics listener serves before these reads, so the value

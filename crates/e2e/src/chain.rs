@@ -2147,12 +2147,6 @@ fn admin_address() -> anyhow::Result<Address> {
     Ok(signer.address())
 }
 
-/// The global-scope region key: `bytes32("GLOBAL")`.
-#[must_use]
-pub fn global_region() -> B256 {
-    B256::right_padding_from(b"GLOBAL")
-}
-
 /// Pack a region string (ISO 3166-1 alpha-2, or any ≤32-byte label) into the
 /// left-aligned, zero-padded `bytes32` key `ContentBlacklist` and
 /// `RegionScopeLib` use — matching Solidity's `bytes32("literal")`.

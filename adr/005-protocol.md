@@ -443,7 +443,7 @@ Every refusal scopes to the node that sent it, for the current fetch. A requeste
 
 **`Unfunded` is gated on a proven requester.** The node speaks `Unfunded` only to a requester that passed the lane-ownership proof or holds a verified signer binding. Any other requester gets `NotFound` for the same state. So a requester cannot tell "no such content" from "this pool cannot pay", and pool and signer state stay unmappable off the wire ([ADR 003 § Pool solvency](003-payments.md#pool-solvency-and-the-refundable-floor-m)).
 
-**A withdrawn blob.** A node withdraws a blob by an operator evict or by a quarantine of corrupt bytes, and a request for a withdrawn blob gets `Declined`. An `ok: true` answer followed by a later refusal is not a fault. Capacity eviction does not withdraw a blob while a stream on it is open ([§ Open-stream pin](#open-stream-pin)). A high rate of these refusals means that the operator evicts often, or that the store finds corrupt bytes.
+**A withdrawn blob gets `Declined`.** A node withdraws a blob by an operator evict or by a quarantine of corrupt bytes. An `ok: true` answer followed by a later refusal is not a fault. Capacity eviction does not withdraw a blob while a stream on it is open ([§ Open-stream pin](#open-stream-pin)). A high rate of these refusals means that the operator evicts often, or that the store finds corrupt bytes.
 
 #### `VoucherRejected` semantics
 

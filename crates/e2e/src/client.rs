@@ -26,10 +26,9 @@ use decdn_client::{
 };
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{BuyerPoolState, Deployment, SignedCapability, capacity_bond_domain};
-use decdn_protocol::client::{ClientMessage, StreamError, StreamResponse, WireCapability};
+use decdn_protocol::client::{StreamError, WireCapability};
 use decdn_protocol::{
-    ALPN_CLIENT, PoolAccount, StreamRequest, StreamRequestExt, decode_message,
-    encode_stream_request,
+    ALPN_CLIENT, PoolAccount, StreamRequest, StreamRequestExt, encode_stream_request,
 };
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
@@ -564,73 +563,6 @@ impl ClientFixture {
         Ok(frames)
     }
 
-    /// Capture the daemon's signed `StreamResponse { ok: true }` for a **held**
-    /// blob at a caller-chosen `timestamp_us` — real blacklist-violation evidence
-    /// once the hash is blacklisted (#1042).
-    ///
-    /// The node signs the open-stage `StreamResponse` (committing to deliver at
-    /// its *current* rate) before any voucher is exchanged, so this reads only
-    /// the first frame and never pays. Unlike [`Self::capture_delivery_wire`] the
-    /// timestamp is caller-controlled, so the caller knows exactly when the
-    /// evidence says the node served; unlike [`Self::refused_stream`] it requires
-    /// the node to actually deliver (`ok == true`) — a refusal here means the
-    /// blob was not held or the pool was not yet served, a setup failure.
-    pub async fn capture_delivery_response(
-        &self,
-        session: &PoolSession,
-        hash: Hash,
-        namespace_id: U256,
-        timestamp_us: u64,
-    ) -> anyhow::Result<StreamResponse> {
-        let conn = self
-            .endpoint
-            .connect(session.target.clone(), ALPN_CLIENT)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect for delivery capture: {e}"))?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::anyhow!("open_bi for delivery capture: {e}"))?;
-        let req = StreamRequest {
-            hash: *hash.as_bytes(),
-            namespace_id: namespace_id.to_be_bytes(),
-            payment_pool: session.payment_pool()?,
-            pool_id: session.ctx.pool_id.into(),
-            byte_offset: 0,
-            byte_len: 0,
-            timestamp_us,
-        };
-        let ext = session.request_ext();
-        let payload = encode_stream_request(&req, Some(&ext))
-            .context("encode delivery-capture StreamRequest")?;
-        decdn_protocol::write_frame(&mut send, &payload)
-            .await
-            .context("write delivery-capture StreamRequest")?;
-
-        let frame = tokio::time::timeout(
-            WIRE_TAP_FIRST_FRAME,
-            decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_STREAM_RESPONSE_FRAME),
-        )
-        .await
-        .context("delivery capture: node sent no open frame")?
-        .context("delivery capture: read frame")?;
-        conn.close(0u32.into(), b"delivery capture complete");
-
-        let (msg, _rest) = decode_message::<ClientMessage>(&frame)
-            .context("decode delivery-capture open frame")?;
-        match msg {
-            ClientMessage::StreamResponse(resp) => {
-                anyhow::ensure!(
-                    resp.body.ok,
-                    "delivery capture expected ok:true, got a refusal (error rides in the \
-                     trailing StreamResponseExt)"
-                );
-                Ok(resp)
-            }
-            _ => anyhow::bail!("delivery capture expected a StreamResponse open frame"),
-        }
-    }
-
     /// Open and fund a payment pool for `node`, self-issue the owner capability
     /// delegating spend to the buyer's own key, and pin the delivering provider
     /// (the node's operator) plus the ADR 005 client binding, returning the
@@ -774,83 +706,6 @@ impl ClientFixture {
         )
         .await
         .context("discovery open")
-    }
-
-    /// Run **one** paid-stream open against `node` on an already-open `pool_id`
-    /// and return the daemon's signed refusal (#1042).
-    ///
-    /// Errors unless the node refused up front with an `ok == false`
-    /// `StreamResponse` — a delivery, a transport failure, or a mid-stream
-    /// (unsigned) `StreamError` are all failures of the journey's setup, not
-    /// results, and are surfaced as such rather than silently yielding no
-    /// evidence.
-    ///
-    /// Why an *existing* pool rather than a fresh one: `serve_stream` resolves
-    /// the pool only *after* the blob-availability gate
-    /// (`handlers::client::dispatch`), so a `NotFound` refusal returns before the
-    /// lookup. Reusing a pool a successful [`Self::fetch`] already proved the node
-    /// serves removes the confound of an unresolved pool suppressing the fill
-    /// tiers. No voucher is exchanged on a refusal, so the zeroed lane watermark
-    /// cannot go stale here.
-    pub async fn refused_stream(
-        &self,
-        chain: &ChainFixture,
-        node: &NodeFixture,
-        pool_id: B256,
-        hash: Hash,
-        timestamp_us: u64,
-    ) -> anyhow::Result<decdn_protocol::client::StreamResponse> {
-        let ctx = self.pool_context(chain, node, pool_id)?;
-        let slash_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
-        let err = match stream_fetch_tracked(
-            &self.endpoint,
-            Self::target(node).await?,
-            &ctx,
-            &slash_domain,
-            node.operator_addr(),
-            *hash.as_bytes(),
-            // Refusal tap: the point is that the node refuses; no namespace routing.
-            decdn_protocol::client::NO_NAMESPACE,
-            0,
-            timestamp_us,
-            PullDeadlines::new(Duration::from_secs(30), Duration::from_secs(30), 4096)?,
-            0,
-            0,
-            &mut VoucherProgress::default(),
-        )
-        .await
-        {
-            Ok(bytes) => anyhow::bail!(
-                "expected a refusal, but the node delivered {} bytes",
-                bytes.len()
-            ),
-            Err(e) => e,
-        };
-        let Some(refused) = err.downcast_ref::<UpstreamRefused>() else {
-            // A voucher rejection here is a *different* finding than a wrong
-            // error type: it means the induced condition did not take — the node
-            // served the open stage, then rejected the replayed voucher this
-            // helper sends. Name that precisely (#1379), so a no-op eviction or an
-            // unexpectedly-present hash surfaces as "served when it should have
-            // refused" rather than "expected a typed refusal".
-            if let Some(rejected) = err.downcast_ref::<UpstreamVoucherRejected>() {
-                anyhow::bail!(
-                    "node served when it should have refused: the open stage \
-                     succeeded and the replayed voucher was rejected ({rejected})"
-                );
-            }
-            anyhow::bail!("expected a typed refusal, got: {err:#}");
-        };
-        // `evidence()` is `None` only for a mid-stream `StreamError` frame, which is
-        // unsigned and therefore useless as evidence — a setup failure here. #1377
-        // makes this the ONLY way to obtain the signed response, so an unsigned
-        // mid-stream refusal can no longer be mistaken for on-chain evidence.
-        refused.evidence().cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "refusal carried no signed StreamResponse (mid-stream {:?}?)",
-                refused.error()
-            )
-        })
     }
 
     /// The loopback dial target for `node`, at the identity it is serving under

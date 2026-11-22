@@ -125,6 +125,79 @@ fn headless_unbond_without_yes_refuses() {
     assert_eq!(decide_confirmation(true, true), Confirmation::Bypassed);
 }
 
+/// An `unbond` that may have taken effect outranks the `declareMbps` before
+/// it: an operator whose TOKEN may already be released must be told so, and
+/// told that a re-run of `--amount` releases the amount again.
+#[test]
+fn resume_hint_names_a_possibly_landed_unbond() {
+    let declare = B256::repeat_byte(0xc3);
+    let unbond = B256::repeat_byte(0xd4);
+    for declare_slot in [None, Some(declare)] {
+        let hint = resume_hint(&Outcome {
+            declare: declare_slot,
+            unbond: Some(unbond),
+        });
+        assert!(hint.contains(&format!("unbond tx {unbond:#x}")), "{hint}");
+        assert!(
+            !hint.contains(&format!("{declare:#x}")),
+            "must not name the earlier declare: {hint}"
+        );
+        assert!(hint.contains("may have taken effect"), "{hint}");
+        assert!(hint.contains("activeBond"), "{hint}");
+        assert!(hint.contains("Do NOT re-run until"), "{hint}");
+        assert!(
+            hint.contains("`--amount` releases that amount again"),
+            "{hint}"
+        );
+    }
+}
+
+/// A `declareMbps` with no recorded `unbond` leaves the unbond's fate open:
+/// the unbond may never have been sent, may have reverted, or may have been
+/// broadcast with an unknown outcome. The hint must not claim no TOKEN moved.
+#[test]
+fn resume_hint_after_a_declare_does_not_deny_a_release() {
+    let declare = B256::repeat_byte(0xc3);
+    let hint = resume_hint(&Outcome {
+        declare: Some(declare),
+        unbond: None,
+    });
+    assert!(
+        hint.contains(&format!("declareMbps tx {declare:#x}")),
+        "{hint}"
+    );
+    assert!(hint.contains("may have taken effect"), "{hint}");
+    assert!(
+        hint.contains("an unbond may still have been broadcast"),
+        "{hint}"
+    );
+    assert!(hint.contains("Do NOT re-run until"), "{hint}");
+    for forbidden in [
+        "NO TOKEN was released",
+        "no TOKEN was released",
+        "no transaction landed",
+        "on-chain state is unchanged",
+    ] {
+        assert!(
+            !hint.contains(forbidden),
+            "must not assert `{forbidden}`: {hint}"
+        );
+    }
+}
+
+/// With neither slot recorded, nothing is known to have taken effect, and the
+/// hint still points at the cause rather than calling the chain untouched.
+#[test]
+fn resume_hint_with_no_recorded_tx_says_nothing_took_effect() {
+    let hint = resume_hint(&Outcome::default());
+    assert!(
+        hint.contains("no transaction is recorded as having taken effect"),
+        "{hint}"
+    );
+    assert!(hint.contains("confirmed reverted"), "{hint}");
+    assert!(!hint.contains("on-chain state is unchanged"), "{hint}");
+}
+
 /// Plan-computation coverage against a mocked provider.
 ///
 /// `resolve_release` decides how much TOKEN moves. `--to-mbps`'s

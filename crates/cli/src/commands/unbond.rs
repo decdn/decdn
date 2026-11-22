@@ -77,17 +77,64 @@ pub async fn run(args: &cli::UnbondArgs, global_config: Option<&Path>) -> anyhow
     let result = execute(&bond, &plan, &mut outcome).await;
 
     let mut out = io::stdout().lock();
-    write_plan(&mut out, &plan, json, &outcome, false).context("failed to write result")?;
+    let write_result = write_plan(&mut out, &plan, json, &outcome, false);
     drop(out);
+    // A failed stdout write must never displace the chain error: under
+    // `decdn node unbond --json | head`, Rust ignores SIGPIPE and `writeln!`
+    // returns EPIPE, so `?`-ing this first would swallow the resume guidance
+    // below. Echo it to stderr (stdout is broken by hypothesis) and let the
+    // chain error win.
+    if let Err(err) = &write_result {
+        eprintln!("warning: failed to write unbond result to stdout: {err}");
+    }
+    result.with_context(|| resume_hint(&outcome))?;
+    write_result.context("failed to write result")?;
+    Ok(())
+}
 
-    result.with_context(|| match outcome.declare {
-        Some(tx) => format!(
-            "declareMbps ALREADY LANDED (tx {tx:#x}): the declared tier is now lowered, but \
-             NO TOKEN was released. Re-run the identical command to resume — it skips the \
-             declare and unbonds"
+/// Operator-facing guidance attached to a failed [`execute`], naming the latest
+/// step that may have taken effect.
+///
+/// Reads [`Outcome`] as [`chain_ctx::send`] populates it: `Some` means "may have
+/// taken effect" (confirmed success, or broadcast with an unreadable receipt),
+/// and `None` means "not recorded as applied" (never sent, a confirmed revert,
+/// or a send whose broadcast is unknown, which the cause below then says).
+///
+/// `unbond` returns the TOKEN in the same transaction, so a re-run is not
+/// harmless while one may be outstanding. alloy's nonce filler resolves against
+/// the *pending* block: a re-run while an `unbond` is in the mempool takes the
+/// next nonce, re-reads a stale `activeBond`, and submits a second `unbond`. For
+/// `--amount` that second transaction releases the same amount again.
+///
+/// Matched over both steps in the `bond` command's order: the later step wins,
+/// so an operator whose TOKEN may already be released is never told that only
+/// the tier moved.
+pub(crate) fn resume_hint(outcome: &Outcome) -> String {
+    match (outcome.unbond, outcome.declare) {
+        (Some(tx), _) => format!(
+            "unbond tx {tx:#x} may have taken effect — it was submitted, and if the error \
+             below is a receipt-fetch timeout rather than a revert its outcome is still \
+             unknown. If it mined, the released TOKEN is already back with this operator. \
+             Check `activeBond` and {tx:#x} before re-running. Do NOT re-run until {tx:#x} \
+             has settled: a re-run while it is pending takes the next nonce and submits a \
+             second unbond, and a re-run of `--amount` releases that amount again."
         ),
-        None => "no transaction landed; on-chain state is unchanged".to_string(),
-    })
+        (None, Some(tx)) => format!(
+            "declareMbps tx {tx:#x} may have taken effect — it was submitted, and if the \
+             error below is a receipt-fetch timeout rather than a revert its outcome is \
+             still unknown. If it mined, the declared tier is lowered. No unbond is \
+             recorded as having taken effect, but if the cause below says a send's outcome \
+             is unknown, an unbond may still have been broadcast: check this signer's \
+             pending and mined transactions and `activeBond`. Do NOT re-run until {tx:#x} \
+             has settled. A re-run of the identical command then skips the declare when the \
+             tier is already lowered and releases what is still bonded."
+        ),
+        (None, None) => "no transaction is recorded as having taken effect: either nothing \
+             was broadcast (a pre-flight gas estimate or a pre-flight check rejecting the \
+             call), or one was broadcast and confirmed reverted. Check the cause below for a \
+             tx hash, and the pending nonce, before re-running"
+            .to_string(),
+    }
 }
 
 /// How much the operator asked to release, normalised from the three mutually
@@ -153,8 +200,10 @@ pub(crate) struct Outcome {
 /// Read chain state and plan the release. Every *operator-controllable*
 /// precondition the contract enforces is checked here first, so an impossible
 /// request fails before any transaction is sent rather than as a raw revert.
-/// The exception is `whenNotPaused`, which is not pre-checked — a paused
-/// contract still surfaces as a revert from [`chain_ctx::send`].
+/// The exception is `whenNotPaused`, which is not pre-checked. `unbond` and
+/// `declareMbps(0)` are not pausable; only the non-zero `declareMbps` leg of
+/// `--to-mbps` can meet a pause, which then surfaces as a revert from
+/// [`chain_ctx::send`].
 pub(crate) async fn build_plan<P: Provider + Clone>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     operator: Address,
