@@ -30,11 +30,11 @@ use iroh_io::{AsyncSliceReader, AsyncStreamWriter};
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::error::{CacheError, CacheResult};
+use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
 use crate::outboard_cache::OutboardCache;
-use crate::retry::ReadGuard;
+use crate::retry::{ReadFailure, ReadGuard};
 
 /// The time budget for one origin read of the range-pull path — an outboard
 /// fetch or one data window. A read of `len` bytes gets
@@ -81,40 +81,54 @@ pub(crate) const RANGE_PULL_PERMIT_WARN_AFTER: Duration = Duration::from_secs(10
 /// channel holds at most this many chunk groups.
 const WIRE_CHANNEL_CAP: usize = 8;
 
-/// Run one origin read `fut` of `len` bytes of `hash`'s range-pull path under
-/// `budget`. A read past its budget is an origin transport fault
-/// ([`CacheError::OriginError`]), so the caller advances the origin chain or
-/// fails the fill as for any other transport fault; it also bumps
-/// `origin_range_timeouts`. `None` runs `fut` unbounded.
+/// Run one origin `read` of `len` bytes of `hash`'s range-pull path under
+/// `guard` (the origin's breaker and retry policy) and `budget`. The budget
+/// covers the read and every retry ([`ReadGuard::run`]). A read past its
+/// budget is an origin transport fault ([`CacheError::OriginError`]), so the
+/// caller advances the origin chain or fails the fill as for any other
+/// transport fault; it also bumps `origin_range_timeouts` and counts against
+/// the breaker. `None` runs the read unbounded.
 ///
 /// # Errors
 ///
-/// [`CacheError::OriginError`] when `fut` does not finish within its budget.
-pub(crate) async fn within_origin_timeout<F: Future>(
+/// [`CacheError::OriginError`] when the origin read fails, its breaker is
+/// open, or it does not finish within its budget.
+pub(crate) async fn guarded_origin_read<T, F, Fut>(
+    guard: &ReadGuard,
     budget: Option<OriginReadBudget>,
     len: u64,
     hash: Hash,
     what: &'static str,
     metrics: Option<&CacheMetrics>,
-    fut: F,
-) -> CacheResult<F::Output> {
-    let Some(budget) = budget else {
-        return Ok(fut.await);
-    };
-    let limit = budget.for_len(len);
-    tokio::time::timeout(limit, fut).await.map_err(|_| {
-        if let Some(m) = metrics {
-            m.origin_range_timeouts.inc();
-        }
-        CacheError::OriginError {
+    read: F,
+) -> CacheResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, OriginPullError>>,
+{
+    let limit = budget.map(|b| b.for_len(len));
+    let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
+    match guard.run(hash, deadline, read).await {
+        Ok(value) => Ok(value),
+        Err(ReadFailure::Origin(e)) => Err(CacheError::OriginError {
             hash,
-            source: anyhow::anyhow!(
-                "origin {what} of {len} bytes took longer than its {limit:?} budget \
-                 (cache.node_pull_stall_window_sec plus the size at \
-                 cache.node_pull_min_throughput_bps)"
-            ),
+            source: e.into_inner(),
+        }),
+        Err(ReadFailure::Deadline) => {
+            if let Some(m) = metrics {
+                m.origin_range_timeouts.inc();
+            }
+            let limit = limit.unwrap_or_default();
+            Err(CacheError::OriginError {
+                hash,
+                source: anyhow::anyhow!(
+                    "origin {what} of {len} bytes took longer than its {limit:?} budget \
+                     (cache.node_pull_stall_window_sec plus the size at \
+                     cache.node_pull_min_throughput_bps)"
+                ),
+            })
         }
-    })
+    }
 }
 
 /// The window spans `[start, end)` that cover an [`AlignedRange`], in order.
@@ -198,8 +212,8 @@ impl OriginRangeCursor {
     /// `outboard`, and fetch the first window. `Ok(None)` when this origin
     /// declines the first window, so the caller can advance the origin chain
     /// before it commits to this origin. Each window fetch runs under `budget`
-    /// ([`within_origin_timeout`]), and retries a transient fault within it
-    /// under `guard` ([`ReadGuard::run`]).
+    /// and under `guard`, which retries a transient fault within the budget
+    /// ([`guarded_origin_read`]).
     ///
     /// Meters every fetched window as `pull_through_bytes`. The outboard read
     /// is metered where it happens, in the engine's outboard fetch.
@@ -272,20 +286,17 @@ impl OriginRangeCursor {
             fetch_start: start,
             fetch_end: end,
         };
-        let data = match within_origin_timeout(
+        let data = match guarded_origin_read(
+            &self.guard,
             self.budget,
             end - start,
             self.hash,
             "range window fetch",
             self.metrics.as_deref(),
-            self.guard
-                .run(self.hash, || self.origin.fetch_range_data(self.hash, req)),
+            || self.origin.fetch_range_data(self.hash, req),
         )
         .await?
-        .map_err(|e| CacheError::OriginError {
-            hash: self.hash,
-            source: e.into_inner(),
-        })? {
+        {
             OriginRangeFetch::Ranged { data } => data,
             OriginRangeFetch::NotFound => {
                 return Ok(Some(WindowFetch::Declined { start, end }));

@@ -153,7 +153,7 @@ async fn read_guard_retries_a_transient_fault() {
     let guard = ReadGuard::new(None, instant(3), None);
     let calls = std::sync::atomic::AtomicU32::new(0);
     let got = guard
-        .run(Hash::new(b"flaky"), || {
+        .run(Hash::new(b"flaky"), None, || {
             let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async move {
                 if n < 2 {
@@ -179,13 +179,13 @@ async fn read_guard_keeps_an_exhausted_fault_transient_and_trips_the_breaker() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async { Err::<(), _>(OriginPullError::Transient(anyhow::anyhow!("down"))) }
     };
-    let first = guard.run(Hash::new(b"down"), read).await;
-    assert!(first.is_err_and(|e| e.is_transient()));
+    let first = guard.run(Hash::new(b"down"), None, read).await;
+    assert!(matches!(first, Err(ReadFailure::Origin(e)) if e.is_transient()));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     assert_eq!(breaker.state(), crate::circuit_breaker::BreakerState::Open);
 
-    let second = guard.run(Hash::new(b"down"), read).await;
-    assert!(second.is_err_and(|e| e.is_transient()));
+    let second = guard.run(Hash::new(b"down"), None, read).await;
+    assert!(matches!(second, Err(ReadFailure::Origin(e)) if e.is_transient()));
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         3,
@@ -201,15 +201,42 @@ async fn read_guard_returns_a_permanent_fault_at_once() {
     let guard = ReadGuard::new(Some(Arc::clone(&breaker)), instant(3), None);
     let calls = std::sync::atomic::AtomicU32::new(0);
     let got = guard
-        .run(Hash::new(b"broken"), || {
+        .run(Hash::new(b"broken"), None, || {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             async { Err::<(), _>(OriginPullError::Permanent(anyhow::anyhow!("403"))) }
         })
         .await;
-    assert!(got.is_err_and(|e| !e.is_transient()));
+    assert!(matches!(got, Err(ReadFailure::Origin(e)) if !e.is_transient()));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(
         breaker.state(),
         crate::circuit_breaker::BreakerState::Closed
+    );
+}
+
+/// A read that stalls past its deadline answers `Deadline` and counts as an
+/// unavailable origin, so a stalled origin trips its breaker; the next read
+/// short-circuits with no read.
+#[tokio::test]
+async fn read_guard_records_a_deadline_as_unavailable() {
+    let breaker = one_strike_breaker();
+    let guard = ReadGuard::new(Some(Arc::clone(&breaker)), instant(3), None);
+    let calls = std::sync::atomic::AtomicU32::new(0);
+    let stall = || {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending::<Result<(), OriginPullError>>()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    let first = guard.run(Hash::new(b"stall"), Some(deadline), stall).await;
+    assert!(matches!(first, Err(ReadFailure::Deadline)));
+    assert_eq!(breaker.state(), crate::circuit_breaker::BreakerState::Open);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    let second = guard.run(Hash::new(b"stall"), Some(deadline), stall).await;
+    assert!(matches!(second, Err(ReadFailure::Origin(e)) if e.is_transient()));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an open breaker reads nothing"
     );
 }

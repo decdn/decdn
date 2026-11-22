@@ -88,7 +88,9 @@ s3 = [
 # Self dev-dependency that turns on `test-util` for the library the
 # integration tests in `tests/` link, so they can seed a store with
 # `CacheEngine::insert_blob`. A cross-crate `cfg(test)` does not propagate.
-decdn-cache = { path = ".", features = ["test-util"] }
+# `default-features = false`, so a `--no-default-features` test build stays
+# the store-only build and does not turn `s3` back on.
+decdn-cache = { path = ".", default-features = false, features = ["test-util"] }
 # Shared RangedStore conformance suite, run against a concrete backend
 # (NodeRangedStore).
 decdn-bao-range = { workspace = true, features = ["test-util"] }

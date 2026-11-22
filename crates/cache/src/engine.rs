@@ -37,11 +37,11 @@ use crate::origin::{Origin, OriginFetch, OriginKind, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
 use crate::origin_range::{
     MAX_CONCURRENT_RANGE_PULLS, OriginRangeCursor, OriginRangeWire, OriginReadBudget,
-    RANGE_PULL_PERMIT_WARN_AFTER, within_origin_timeout,
+    RANGE_PULL_PERMIT_WARN_AFTER, guarded_origin_read,
 };
 use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
 use crate::range_pull::{AlignedRange, align_range_clamped};
-use crate::retry::{ReadGuard, TerminalFailure, run_with_retry_classified};
+use crate::retry::{ReadFailure, ReadGuard, TerminalFailure, run_with_retry_classified};
 use crate::size_proofs::{SIZE_PROOF_ENTRIES, SizeProofMemo};
 use crate::{from_store_hash, to_store_hash};
 
@@ -2299,74 +2299,73 @@ impl CacheEngine {
     ///
     /// Reads no data object and no outboard.
     async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> ChainProbe {
-        let walk = async {
-            let mut cause = None;
-            let mut kept_permanent_cause = false;
-            let mut any_transient = false;
-            for (ix, origin) in self.inner.origins.iter().enumerate() {
-                let read = self
-                    .read_guard(ix)
-                    .run(hash, || origin.fetch_size_proof(hash))
-                    .await;
-                let (fault, transient) = match read {
-                    Ok(Some(object)) => match verified_size_proof(hash, &object) {
-                        Some((size, proof)) => {
-                            return ChainProbe {
-                                presence: OriginPresence::Present(size),
-                                transient: false,
-                                cause: None,
-                                proof: Some(proof),
-                            };
-                        }
-                        None => (
-                            "its `{H}.sizeproof` does not verify against the hash; re-run \
-                             `decdn origin import` for the object"
-                                .to_owned(),
-                            false,
-                        ),
-                    },
-                    Ok(None) => continue,
-                    Err(e) => (format!("{e:#}"), e.is_transient()),
-                };
-                tracing::debug!(
-                    %hash,
-                    kind = ?origin.kind(),
-                    error = %fault,
-                    transient,
-                    "origin presence read faulted; checking remaining origins",
-                );
-                // Keep the first non-transient cause: it is the
-                // operator-actionable one, and a later origin's transient
-                // fault must not shadow it.
-                if !kept_permanent_cause {
-                    kept_permanent_cause = !transient;
-                    cause = Some(format!("{:?} origin: {fault}", origin.kind()));
-                }
-                any_transient |= transient;
-            }
-            match cause {
-                Some(cause) => ChainProbe {
-                    presence: OriginPresence::Fault,
-                    transient: any_transient,
-                    cause: Some(cause),
-                    proof: None,
-                },
-                None => ChainProbe {
-                    presence: OriginPresence::Absent,
-                    transient: false,
-                    cause: None,
-                    proof: None,
-                },
-            }
+        // A ceiling the origin overran says nothing about whether it would
+        // answer given longer, so treat it as the waitable kind.
+        let overran = || ChainProbe {
+            presence: OriginPresence::Fault,
+            transient: true,
+            cause: Some(format!("the origin chain walk overran {timeout:?}")),
+            proof: None,
         };
-        match tokio::time::timeout(timeout, walk).await {
-            Ok(outcome) => outcome,
-            // A ceiling the origin overran says nothing about whether it would
-            // answer given longer, so treat it as the waitable kind.
-            Err(_) => ChainProbe {
+        // One deadline for the whole chain, handed to each origin's guard, so
+        // an origin that stalls counts against its breaker.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut cause = None;
+        let mut kept_permanent_cause = false;
+        let mut any_transient = false;
+        for (ix, origin) in self.inner.origins.iter().enumerate() {
+            let read = self
+                .read_guard(ix)
+                .run(hash, Some(deadline), || origin.fetch_size_proof(hash))
+                .await;
+            let (fault, transient) = match read {
+                Ok(Some(object)) => match verified_size_proof(hash, &object) {
+                    Some((size, proof)) => {
+                        return ChainProbe {
+                            presence: OriginPresence::Present(size),
+                            transient: false,
+                            cause: None,
+                            proof: Some(proof),
+                        };
+                    }
+                    None => (
+                        "its `{H}.sizeproof` does not verify against the hash; re-run \
+                         `decdn origin import` for the object"
+                            .to_owned(),
+                        false,
+                    ),
+                },
+                Ok(None) => continue,
+                Err(ReadFailure::Origin(e)) => (format!("{e:#}"), e.is_transient()),
+                Err(ReadFailure::Deadline) => return overran(),
+            };
+            tracing::debug!(
+                %hash,
+                kind = ?origin.kind(),
+                error = %fault,
+                transient,
+                "origin presence read faulted; checking remaining origins",
+            );
+            // Keep the first non-transient cause: it is the
+            // operator-actionable one, and a later origin's transient
+            // fault must not shadow it.
+            if !kept_permanent_cause {
+                kept_permanent_cause = !transient;
+                cause = Some(format!("{:?} origin: {fault}", origin.kind()));
+            }
+            any_transient |= transient;
+        }
+        match cause {
+            Some(cause) => ChainProbe {
                 presence: OriginPresence::Fault,
-                transient: true,
-                cause: Some(format!("the origin chain walk overran {timeout:?}")),
+                transient: any_transient,
+                cause: Some(cause),
+                proof: None,
+            },
+            None => ChainProbe {
+                presence: OriginPresence::Absent,
+                transient: false,
+                cause: None,
                 proof: None,
             },
         }
@@ -3536,22 +3535,16 @@ impl CacheEngine {
         expected_len: u64,
     ) -> CacheResult<GatedOutboard> {
         let outboard_max = expected_len.saturating_add(64);
-        let fetched = within_origin_timeout(
+        let fetched = guarded_origin_read(
+            &self.read_guard(origin_ix),
             self.origin_read_budget(),
             expected_len,
             hash,
             "outboard fetch",
             self.inner.metrics.as_deref(),
-            self.read_guard(origin_ix)
-                .run(hash, || origin.fetch_outboard(hash, outboard_max)),
+            || origin.fetch_outboard(hash, outboard_max),
         )
-        .await
-        .and_then(|r| {
-            r.map_err(|e| CacheError::OriginError {
-                hash,
-                source: e.into_inner(),
-            })
-        });
+        .await;
         let ob = match fetched {
             Ok(OutboardFetch::Found(ob)) => ob,
             Ok(OutboardFetch::NotFound) => return Ok(GatedOutboard::Declined),

@@ -192,32 +192,55 @@ impl ReadGuard {
         Self::new(None, RetryPolicy::disabled(), None)
     }
 
-    /// Run `read` for `hash` under the breaker and the retry policy.
+    /// Run `read` for `hash` under the breaker and the retry policy, to
+    /// `deadline` (`None` runs unbounded).
     ///
-    /// An open breaker answers an [`OriginPullError::Transient`] at once,
-    /// with no read and no backoff. A transient fault is retried with
-    /// backoff ([`run_with_retry_classified`]). One that exhausts the budget
-    /// stays [`OriginPullError::Transient`], so a caller that waits out a
-    /// transient fault (the presence memo, the rescan carry-forward) still
-    /// can, and it counts toward the breaker's trip threshold. A permanent
-    /// fault returns at once and counts as a reachable origin.
-    pub(crate) async fn run<T, F, Fut>(&self, hash: Hash, read: F) -> Result<T, OriginPullError>
+    /// An open breaker answers [`ReadFailure::Origin`] with an
+    /// [`OriginPullError::Transient`] at once, with no read and no backoff. A
+    /// transient fault is retried with backoff ([`run_with_retry_classified`]).
+    /// One that exhausts the budget stays [`OriginPullError::Transient`], so a
+    /// caller that waits out a transient fault (the presence memo, the rescan
+    /// carry-forward) still can, and it counts toward the breaker's trip
+    /// threshold. A permanent fault returns at once and counts as a reachable
+    /// origin.
+    ///
+    /// `deadline` covers the read and every retry. A read still running at
+    /// the deadline is cut off and answers [`ReadFailure::Deadline`]. It
+    /// counts toward the trip threshold as an unavailable origin, so an
+    /// origin that stalls trips its breaker as one that errors does.
+    pub(crate) async fn run<T, F, Fut>(
+        &self,
+        hash: Hash,
+        deadline: Option<tokio::time::Instant>,
+        read: F,
+    ) -> Result<T, ReadFailure>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, OriginPullError>>,
     {
         let guard = match self.breaker.as_deref().map(OriginBreaker::acquire) {
             Some(Admission::ShortCircuit) => {
-                return Err(OriginPullError::Transient(anyhow::anyhow!(
-                    "the origin's circuit breaker is open after repeated failures; the node \
-                     reads it again after the cooldown (cache.circuit_breaker)"
+                return Err(ReadFailure::Origin(OriginPullError::Transient(
+                    anyhow::anyhow!(
+                        "the origin's circuit breaker is open after repeated failures; the \
+                         node reads it again after the cooldown (cache.circuit_breaker)"
+                    ),
                 )));
             }
             Some(Admission::Proceed(_state, guard)) => Some(guard),
             None => None,
         };
-        let (outcome, terminal) =
-            run_with_retry_classified(self.policy, self.metrics.as_ref(), hash, read).await;
+        let attempts = run_with_retry_classified(self.policy, self.metrics.as_ref(), hash, read);
+        let finished = match deadline {
+            Some(at) => tokio::time::timeout_at(at, attempts).await.ok(),
+            None => Some(attempts.await),
+        };
+        let Some((outcome, terminal)) = finished else {
+            if let Some(guard) = guard {
+                guard.record(OriginOutcome::Unavailable);
+            }
+            return Err(ReadFailure::Deadline);
+        };
         if let Some(guard) = guard {
             guard.record(match terminal {
                 Some(TerminalFailure::TransientExhausted) => OriginOutcome::Unavailable,
@@ -225,12 +248,22 @@ impl ReadGuard {
             });
         }
         match (outcome, terminal) {
-            (Err(e), Some(TerminalFailure::TransientExhausted)) => {
-                Err(OriginPullError::Transient(e.into_inner()))
-            }
-            (outcome, _) => outcome,
+            (Err(e), Some(TerminalFailure::TransientExhausted)) => Err(ReadFailure::Origin(
+                OriginPullError::Transient(e.into_inner()),
+            )),
+            (outcome, _) => outcome.map_err(ReadFailure::Origin),
         }
     }
+}
+
+/// Why a [`ReadGuard::run`] read failed.
+#[derive(Debug)]
+pub(crate) enum ReadFailure {
+    /// The origin answered with an error, or its breaker is open.
+    Origin(OriginPullError),
+    /// The read and its retries ran past the caller's deadline. A
+    /// waitable fault: the origin may answer given longer.
+    Deadline,
 }
 
 #[cfg(test)]
