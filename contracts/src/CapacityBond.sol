@@ -500,6 +500,9 @@ contract CapacityBond is
     ///      > 0` holds after it.
     function _recordEntry() private {
         bondFloorAtActivation[msg.sender] = minBond;
+        // Zero is the "no tenure" sentinel, not a timestamp that could be
+        // missed by a strict comparison.
+        // slither-disable-next-line incorrect-equality
         if (_firstBondedAt[msg.sender] == 0) _firstBondedAt[msg.sender] = uint64(block.timestamp);
     }
 
