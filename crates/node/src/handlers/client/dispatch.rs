@@ -424,9 +424,9 @@ impl ClientHandler {
         // Clock-skew gate (`crate::handlers::timestamp_skew`): every signed
         // `StreamResponseBody` on this stream — the serve, the window tiers,
         // and every `respond_error` refusal — echoes `req.timestamp_us` into
-        // the slash-evidence set (ADR 014 §1), which `SlashJudge` reads as
-        // the serve time, so the node signs only timestamps consistent with
-        // its own clock. Checked once here, directly on the decoded request:
+        // the EIP-712 signed set (ADR 005 § Signer binding), which a pull
+        // receipt carries as the approximate serve time, so the node signs
+        // only timestamps consistent with its own clock. Checked once here, directly on the decoded request:
         // everything signed later on this stream reuses this same request's
         // timestamp. A skewed request resets with NO signed response — a
         // `respond_error` would itself sign the echoed timestamp — mirroring
@@ -539,8 +539,8 @@ impl ClientHandler {
         // projection that only advances while the chain watchers reach the RPC.
         // Once the node has been unable to read the chain for longer than
         // `chain_staleness_grace_sec`, all of them silently pass on stale state,
-        // so a takedown that landed during the blind window would go unenforced
-        // and serving it is slashable. Refuse here, ABOVE those gates, rather
+        // so a takedown that landed during the blind window would go
+        // unenforced. Refuse here, ABOVE those gates, rather
         // than sign a `StreamResponse` the node can no longer vouch for. It
         // collapses to `NotFound`, so the client re-routes to a peer whose reads
         // are live. `None` (no blacklist watcher wired — dev/test) disables the

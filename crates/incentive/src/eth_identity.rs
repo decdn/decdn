@@ -2,8 +2,8 @@
 //! file into a live `alloy::signers::local::PrivateKeySigner`.
 //!
 //! Lives in `decdn-incentive` (per `appendix-poc-production-seams.md`
-//! §Seam 1) because the keystore surface is shared between nodes (slash
-//! signing, on-chain settlement) and clients (voucher signing per ADR 003
+//! §Seam 1) because the keystore surface is shared between nodes (stream
+//! response signing, on-chain settlement) and clients (voucher signing per ADR 003
 //! §EIP-712 Voucher Signature).
 //!
 //! Same security model as [`decdn_common::identity`] — the keystore file is

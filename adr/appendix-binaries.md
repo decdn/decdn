@@ -30,7 +30,7 @@ Adopt the dockerd shape. Two binaries, one shared support crate:
   easy to containerise, minimal supply-chain surface.
 - **`decdn`** (`crates/cli`, package `decdn-cli`) — single
   human-facing CLI. Carries every command anyone types: `probe`,
-  `get`, `gateway`, `dashboard`, `origin import`, `publish`, `pool`, `appeal`,
+  `get`, `gateway`, `dashboard`, `origin import`, `publish`, `pool`,
   `setup`, `key-gen`, `config {init,validate}`, and the `node`
   admin/on-chain subcommands (health, status, lanes, evict, reload,
   drain, top, lookup, register, deregister, bond, unbond,
@@ -106,10 +106,10 @@ own.
 The dashboard reads each source at a fixed rate. The number of open pages
 does not change the rate. It reads the pull records every second and the gateway every 2
 seconds. It reads the node's health, status and `/metrics` every 2
-seconds. It reads the node's lanes, earnings, buyer pools and slashes every
+seconds. It reads the node's lanes, earnings and buyer pools every
 15 seconds, because `lanes` can read the chain and `earnings` reads the
 whole settlement ledger. Each node read has its own result. A read that the
-node does not support (no slash detection, no buyer pool, no settlement
+node does not support (no buyer pool, no settlement
 ledger, no DHT) shows as not configured, not as an error.
 
 Each `decdn get` run writes one JSON file for itself, named

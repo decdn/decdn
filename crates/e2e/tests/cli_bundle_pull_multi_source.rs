@@ -456,8 +456,6 @@ fn bundle_get_argv(
         ),
         "--pool-rpc-url".into(),
         chain.rpc_url(),
-        "--slash-judge-address".into(),
-        format!("{}", chain.addrs().slash_judge),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),

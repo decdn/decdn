@@ -29,20 +29,16 @@ use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
-use alloy::sol_types::{SolEvent, SolValue};
+use alloy::sol_types::SolValue;
 use anyhow::Context;
-use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{
-    bind_node_id_domain, binding_signing_hash, node_register, register_node_signing_hash,
-    slash_judge_domain,
+    binding_signing_hash, capacity_bond_domain, node_register, register_node_signing_hash,
 };
 use decdn_node::chain_events::snapshot::SNAPSHOT_LAG_MARGIN_BLOCKS;
-use decdn_protocol::client::{StreamResponse, StreamResponseBody};
 
 use crate::bindings::{
-    AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, DecdnGovernor, Erc20,
-    ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry, SlashAppeal,
-    SlashJudge, SlashJudgeBlacklist, TimelockController,
+    AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, Erc20,
+    ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry,
 };
 
 /// The single chain id every anvil-e2e chain runs on: the one-time protocol
@@ -51,7 +47,7 @@ use crate::bindings::{
 /// A fixed value is what makes the state snapshot reusable. EIP-712 domain
 /// separators bind to `block.chainid`, so the fixture that loads the snapshot
 /// must run the same chain id the snapshot was deployed under, or every signed
-/// voucher / node-id bind / slash attestation the journeys build would verify
+/// voucher / node-id bind / stream signature the journeys build would verify
 /// against a different domain. It is also the chain id every Rust-side signer
 /// derives its domain from (see [`ChainFixture::chain_id`]).
 ///
@@ -142,7 +138,7 @@ const ANVIL_LISTENING: &str = "Listening on ";
 /// Deployed protocol contract addresses, read from the forge-script manifest.
 #[derive(Debug, Clone, Copy)]
 pub struct ContractAddrs {
-    /// `CapacityBond` — operator stake and slashing collateral.
+    /// `CapacityBond` — operator stake and the node registry.
     pub capacity_bond: Address,
     /// `PaymentPool` — the shared USDC pools clients fund and sellers redeem.
     pub payment_pool: Address,
@@ -150,10 +146,6 @@ pub struct ContractAddrs {
     pub fee_router: Address,
     /// `Token` — the TOKEN ERC-20 used for staking and governance.
     pub token: Address,
-    /// `SlashJudge` — adjudicates slash claims.
-    pub slash_judge: Address,
-    /// `SlashAppeal` — the operator's appeal surface against a slash.
-    pub slash_appeal: Address,
     /// `DecdnGovernor` — the on-chain governor that proposes through the
     /// timelock below.
     pub governor: Address,
@@ -161,8 +153,7 @@ pub struct ContractAddrs {
     /// after the `DeployProtocol` handoff, which renounces `DEFAULT_ADMIN_ROLE`
     /// to no one (#2028). The blacklist
     /// journeys drive governance actions by impersonating it (anvil), since the
-    /// deployer keeps no privileged roles; the G-NODE-05 grant executes through
-    /// it via a real Governor proposal.
+    /// deployer keeps no privileged roles.
     pub timelock: Address,
     /// `PublisherRegistry` — namespace ownership and its timelocked transfer
     /// (ADR 002). Publisher identity is implicit on first `createNamespace`;
@@ -722,7 +713,7 @@ impl ChainFixture {
             .call()
             .await
             .context("read currentTermsHash")?;
-        let domain = bind_node_id_domain(self.chain_id, self.addrs.capacity_bond);
+        let domain = capacity_bond_domain(self.chain_id, self.addrs.capacity_bond);
         let bind_hash = register_node_signing_hash(node_id, binding_nonce, terms_hash, &domain);
         let binding_sig = operator
             .sign_hash_sync(&bind_hash)
@@ -825,7 +816,7 @@ impl ChainFixture {
             .await
             .context("read registrationNonce")?;
 
-        let domain = bind_node_id_domain(self.chain_id, self.addrs.capacity_bond);
+        let domain = capacity_bond_domain(self.chain_id, self.addrs.capacity_bond);
         let bind_hash = binding_signing_hash(new_node_id, binding_nonce, &domain);
         let binding_sig = operator
             .sign_hash_sync(&bind_hash)
@@ -860,11 +851,9 @@ impl ChainFixture {
 
     /// The node id `operator` is bound to, or `B256::ZERO` when unbound.
     ///
-    /// Reads `addressToNodeId` rather than `nodeIdOf`, deliberately: this is the
-    /// exact mapping `SlashJudge._checkRegistered` resolves through, so an
-    /// assertion on it is an assertion about slashability. `nodeIdOf` returns
-    /// the same id but pairs it with a liveness flag that the slashing path
-    /// ignores.
+    /// Reads `addressToNodeId` rather than `nodeIdOf`, deliberately: the raw
+    /// binding is what a rotation swaps. `nodeIdOf` returns the same id but
+    /// pairs it with a liveness flag that has nothing to do with the binding.
     pub async fn node_id_of(&self, operator: Address) -> anyhow::Result<B256> {
         CapacityBond::new(self.addrs.capacity_bond, &self.admin)
             .addressToNodeId(operator)
@@ -877,13 +866,6 @@ impl ChainFixture {
     /// unbound. The inverse of [`Self::node_id_of`]: after a rotation the
     /// retired id reads back as `Address::ZERO`, which is what proves
     /// `bindNodeId` cleared the old mapping rather than merely adding a new one.
-    ///
-    /// Note this is **not** the read the slashing path performs.
-    /// `SlashJudge._checkRegistered(challengedNode, nodeId)` resolves the
-    /// challenged *address* through `nodeIdOf` and compares — it never does a
-    /// nodeId → address lookup. So a challenge citing a retired id against a
-    /// still-bound operator reverts `NodeIdMismatch`; `NodeNotRegistered` fires
-    /// only when the challenged address has no binding at all.
     pub async fn operator_of_node_id(&self, node_id: B256) -> anyhow::Result<Address> {
         CapacityBond::new(self.addrs.capacity_bond, &self.admin)
             .nodeIdToAddress(node_id)
@@ -1085,8 +1067,7 @@ impl ChainFixture {
         crate::ensure_mined(&receipt, "CctpSweepReceiver.receiveSweep")
     }
 
-    /// Current chain head `block.timestamp` (seconds). Also used to stamp
-    /// slash evidence strictly after a blacklist entry's `addedAt`.
+    /// Current chain head `block.timestamp` (seconds).
     pub async fn head_timestamp(&self) -> anyhow::Result<u64> {
         Ok(self
             .admin
@@ -1337,7 +1318,7 @@ impl ChainFixture {
 
     /// Advance chain time by `secs` and mine, so a test can step past a
     /// contract-side window (e.g. the ADR 011 compliance window before a
-    /// blacklist entry becomes slashable).
+    /// blacklist entry takes effect).
     pub async fn advance_time(&self, secs: u64) -> anyhow::Result<()> {
         let _: serde_json::Value = self
             .admin
@@ -1353,7 +1334,7 @@ impl ChainFixture {
     }
 
     /// `ContentBlacklist.complianceWindow()` — the ADR 011 grace between an
-    /// entry's `addedAt` and the moment it becomes slashable. Read rather than
+    /// entry's `addedAt` and the moment it takes effect. Read rather than
     /// hardcoded so a governance change to the default cannot silently turn
     /// these tests into no-ops.
     pub async fn compliance_window(&self) -> anyhow::Result<u64> {
@@ -1399,30 +1380,6 @@ impl ChainFixture {
             .await
             .context("updateRegion receipt")?;
         crate::ensure_mined(&receipt, "updateRegion")
-    }
-
-    /// `CapacityBond.unbondingOf(operator)` — the in-flight unbonding request
-    /// as `(amount, unlockAt)`; `amount == 0` means none. A non-zero amount
-    /// also makes `isActive` false for the whole window.
-    pub async fn unbonding_of(&self, operator: Address) -> anyhow::Result<(U256, u64)> {
-        let req = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
-            .unbondingOf(operator)
-            .call()
-            .await
-            .context("read unbondingOf")?;
-        Ok((req.amount, u64::try_from(req.unlockAt).unwrap_or(u64::MAX)))
-    }
-
-    /// Governable `CapacityBond.unbondingPeriod` (seconds; 14 days by
-    /// default). Read so unbond journeys warp by the live value rather than
-    /// hardcoding the default.
-    pub async fn unbonding_period(&self) -> anyhow::Result<u64> {
-        let secs = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
-            .unbondingPeriod()
-            .call()
-            .await
-            .context("read unbondingPeriod")?;
-        Ok(u64::try_from(secs).unwrap_or(u64::MAX))
     }
 
     /// `CapacityBond.activeBond(operator)` (TOKEN base units).
@@ -1511,36 +1468,6 @@ impl ChainFixture {
             .active)
     }
 
-    /// Governable `SlashAppeal.appealBond` (TOKEN base units).
-    pub async fn appeal_bond(&self) -> anyhow::Result<U256> {
-        SlashAppeal::new(self.addrs.slash_appeal, &self.admin)
-            .appealBond()
-            .call()
-            .await
-            .context("read appealBond")
-    }
-
-    /// `CapacityBond.slashedAtEpoch(operator)` — the ADR-036 vote-weight
-    /// watermark (0 = no standing slash).
-    pub async fn slashed_at_epoch(&self, operator: Address) -> anyhow::Result<u64> {
-        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
-            .slashedAtEpoch(operator)
-            .call()
-            .await
-            .context("read slashedAtEpoch")
-    }
-
-    /// `SlashAppeal` status for `slash_id` (0=None, 1=Open, 2=FastTracked,
-    /// 3=Resolved).
-    pub async fn appeal_status(&self, slash_id: U256) -> anyhow::Result<u8> {
-        let appeal = SlashAppeal::new(self.addrs.slash_appeal, &self.admin)
-            .getAppeal(slash_id)
-            .call()
-            .await
-            .context("read getAppeal")?;
-        Ok(appeal.status as u8)
-    }
-
     /// TOKEN balance of `who` (base units).
     pub async fn token_balance(&self, who: Address) -> anyhow::Result<U256> {
         Erc20::new(self.addrs.token, &self.admin)
@@ -1548,446 +1475,6 @@ impl ChainFixture {
             .call()
             .await
             .context("read TOKEN balance")
-    }
-
-    /// Make `hash` an enforceable GLOBAL blacklist entry: add it as governance
-    /// unless an entry already exists, then advance chain time past its
-    /// `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance Window).
-    /// Evidence stamped at the head afterwards post-dates the entry's
-    /// enforceability, so `SlashJudge` accepts it rather than reverting
-    /// `BlacklistAfterResponse`. The window comes off the entry, not a hardcoded
-    /// value, so a governance change to the default cannot turn this into a no-op.
-    pub async fn ensure_hash_enforceable(&self, hash: B256) -> anyhow::Result<()> {
-        let blacklist = ContentBlacklist::new(self.addrs.content_blacklist, &self.admin);
-        let mut entry = blacklist
-            .getHashEntry(global_region(), hash)
-            .call()
-            .await
-            .context("getHashEntry")?;
-        if entry.addedAt == 0 {
-            self.add_hash_global(hash).await?;
-            entry = blacklist
-                .getHashEntry(global_region(), hash)
-                .call()
-                .await
-                .context("getHashEntry after add")?;
-        }
-        // Evidence must sit strictly after `effectiveAt`; the margin keeps the
-        // head clear of the boundary.
-        let enforceable_at = entry.effectiveAt + 60;
-        let head = self.head_timestamp().await?;
-        if head < enforceable_at {
-            self.advance_time(enforceable_at - head).await?;
-        }
-        Ok(())
-    }
-
-    /// Add `hash` to the GLOBAL blacklist with `addedAt == added_at`, a chain
-    /// time before the current head, then put the chain clock back where it was.
-    ///
-    /// A daemon only signs a request timestamp near its own wall clock, and
-    /// `SlashJudge` only slashes a response stamped after the entry's
-    /// `effectiveAt`. A real daemon response is therefore admissible only once
-    /// the entry has been on chain for a full compliance window before the
-    /// response. A journey cannot wait out that window, so it backdates the
-    /// entry instead: anvil sets the clock back for the one block that adds it.
-    pub async fn add_hash_global_at(&self, hash: B256, added_at: u64) -> anyhow::Result<()> {
-        let head = self.head_timestamp().await?;
-        anyhow::ensure!(
-            added_at < head,
-            "a backdated entry must precede the head ({added_at} >= {head})"
-        );
-        self.set_chain_time(added_at).await?;
-        self.add_hash_global(hash).await?;
-        self.set_chain_time(head + 1).await
-    }
-
-    /// Set anvil's clock: the next block is stamped `secs` plus the time that
-    /// passes before it is mined. Unlike `evm_increaseTime`, it can move back.
-    async fn set_chain_time(&self, secs: u64) -> anyhow::Result<()> {
-        let _: serde_json::Value = self
-            .admin
-            .raw_request("anvil_setTime".into(), (secs,))
-            .await
-            .context("anvil_setTime")?;
-        Ok(())
-    }
-
-    /// Slash `operator` through a real `SlashJudge` blacklist-violation
-    /// commit-reveal challenge (#1032, G-NODE-05). Makes `blob_hash` an
-    /// enforceable blacklist entry ([`Self::ensure_hash_enforceable`]), signs the
-    /// operator's own self-incriminating `StreamResponse { ok: true }` for it at
-    /// the chain head with the operator's eth key over the `SlashJudge` EIP-712
-    /// domain, and reveals it as `challenger`
-    /// ([`Self::submit_blacklist_challenge`]). Returns the minted `slashId`.
-    pub async fn slash_operator_via_judge(
-        &self,
-        challenger: &PrivateKeySigner,
-        operator: &PrivateKeySigner,
-        node_id: B256,
-        blob_hash: B256,
-    ) -> anyhow::Result<U256> {
-        self.ensure_hash_enforceable(blob_hash).await?;
-
-        // Stamped at the head: after the entry's `effectiveAt`, and fresh
-        // against the evidence-age bound.
-        let body = StreamResponseBody {
-            hash: blob_hash.0,
-            ok: true,
-            rate_per_mb: 10,
-            timestamp_us: self.head_timestamp().await? * 1_000_000,
-        };
-        let domain = slash_judge_domain(self.chain_id, self.addrs.slash_judge);
-        let slash_sig = StreamSlashData::from_response_body(&body)
-            .sign(operator, &domain)
-            .context("sign stream evidence")?
-            .as_bytes()
-            .to_vec();
-        let evidence = StreamResponse { body, slash_sig };
-
-        self.submit_blacklist_challenge(
-            challenger,
-            operator.address(),
-            node_id,
-            &evidence,
-            B256::repeat_byte(0x99),
-        )
-        .await
-    }
-
-    /// Drive a `SlashJudge.submitBlacklistChallenge` commit-reveal from a signed
-    /// `StreamResponse`, forwarded verbatim — `slash_sig` included and never
-    /// re-signed. The evidence may be a real daemon capture (G-GOV-03, #1042) or
-    /// one signed in the test ([`Self::slash_operator_via_judge`]); a negative
-    /// case perturbs one field of a real capture and resubmits.
-    ///
-    /// Arms `challenger` with gas and the challenge bond, commits the evidence
-    /// under `salt`, matures the commitment past `MIN_REVEAL_DELAY`, and reveals.
-    /// `salt` is caller-supplied so two challenges in one journey cannot collide
-    /// on a commitment slot. The challenged blob is the evidence's own hash.
-    ///
-    /// Returns the minted `slashId`, checked to be a `Blacklist` slash on the
-    /// induced `evidenceHash`. An `Err` is the point of a negative case: a
-    /// challenge that fails verification reverts, and per
-    /// [ADR 014 § Bond Handling](https://github.com/decdn/decdn/blob/main/adr/014-on-chain-verification.md)
-    /// the bond is never transferred on a failed verification — assert the
-    /// challenger's TOKEN balance directly.
-    ///
-    /// **Side effect:** advances chain time ~65s on *every* call, including ones
-    /// that revert, to mature the commitment. Chain time only drifts *ahead* of
-    /// the wall clock here, so a daemon capture between challenges must NOT
-    /// anchor on [`Self::head_timestamp`] — the daemon refuses a timestamp more
-    /// than its clock-skew bound from the wall clock.
-    pub async fn submit_blacklist_challenge(
-        &self,
-        challenger: &PrivateKeySigner,
-        operator: Address,
-        node_id: B256,
-        evidence: &StreamResponse,
-        salt: B256,
-    ) -> anyhow::Result<U256> {
-        let bond = self.arm_challenger(challenger).await?;
-        anyhow::ensure!(bond > U256::ZERO, "challenge bond must be non-zero");
-        let ch_provider = self.provider_for(challenger);
-
-        // Rebuild the EIP-712 struct hash with the production signer's view of
-        // the wire body, so the commitment binds the exact message the reveal
-        // submits. evidenceHash = keccak256(abi.encode(uint8(Blacklist),
-        // challengedNode, streamStructHash)); `abi.encode(uint8 v)` right-aligns
-        // `v` in a 32-byte word — byte-identical to `uint256(v)`, which alloy's
-        // `SolValue` encodes. Going through the generated `sol!` enum rather
-        // than a literal keeps the ordinal pinned to the one declaration a
-        // Solidity reorder would have to touch; a stale literal would corrupt
-        // `evidenceHash` and surface as a misleading `NoCommitment()`.
-        let data = StreamSlashData::from_response_body(&evidence.body);
-        let offense = U256::from(SlashJudge::OffenseType::Blacklist as u8);
-        let evidence_hash = keccak256((offense, operator, data.struct_hash()).abi_encode());
-        let commitment = keccak256((evidence_hash, salt, challenger.address()).abi_encode());
-
-        let judge = SlashJudge::new(self.addrs.slash_judge, &ch_provider);
-        let commit = judge
-            .commitChallenge(commitment)
-            .send()
-            .await
-            .context("commitChallenge send")?
-            .get_receipt()
-            .await
-            .context("commitChallenge receipt")?;
-        crate::ensure_mined(&commit, "commitChallenge")?;
-
-        // Mature the commitment past MIN_REVEAL_DELAY (1 minute) with margin.
-        crate::time::increase_time(&self.admin, 65).await?;
-
-        let response_data = SlashJudge::StreamMsg {
-            hash: data.hash,
-            ok: data.ok,
-            ratePerMb: data.rate_per_mb,
-            timestampUs: data.timestamp_us,
-        }
-        .abi_encode();
-        let receipt = SlashJudgeBlacklist::new(self.addrs.slash_judge, &ch_provider)
-            .submitBlacklistChallenge(
-                operator,
-                node_id,
-                data.hash,
-                Bytes::from(response_data),
-                Bytes::from(evidence.slash_sig.clone()),
-                salt,
-            )
-            .send()
-            .await
-            .context("submitBlacklistChallenge send")?
-            .get_receipt()
-            .await
-            .context("submitBlacklistChallenge receipt")?;
-        crate::ensure_mined(&receipt, "submitBlacklistChallenge")?;
-
-        self.extract_slash_id(receipt.inner.logs(), evidence_hash)
-    }
-
-    /// Extract the `SlashJudge.Slashed` `slashId` from a reveal receipt's logs,
-    /// failing loudly on the pathologies an inline scan hides:
-    ///
-    ///  * a `Slashed` log emitted by `SlashJudge` whose body fails to decode is
-    ///    surfaced as the ABI mismatch it is, rather than swallowed by an
-    ///    `if let Ok(..)` that bails "emitted no Slashed event" and points at the
-    ///    contract when the cause is a stale hand-written binding;
-    ///  * the decoded `offenseType` must be `Blacklist` and the `evidenceHash`
-    ///    must be `evidence_hash`, pinning "slashed for the reason we induced"
-    ///    inside the fixture instead of leaving it to each journey.
-    ///
-    /// `CapacityBond.Slashed` is emitted in the same tx but under a different
-    /// address+topic0, so the filter never confuses the two.
-    fn extract_slash_id(
-        &self,
-        logs: &[alloy::rpc::types::Log],
-        evidence_hash: B256,
-    ) -> anyhow::Result<U256> {
-        let what = "submitBlacklistChallenge";
-        for log in logs {
-            if log.address() != self.addrs.slash_judge
-                || log.topic0() != Some(&SlashJudge::Slashed::SIGNATURE_HASH)
-            {
-                continue;
-            }
-            let ev = SlashJudge::Slashed::decode_log_data(&log.inner.data).with_context(|| {
-                format!("{what}: a SlashJudge Slashed log failed to decode (ABI drift?)")
-            })?;
-            // `OffenseType` (a generated `sol!` enum) derives neither
-            // `PartialEq` nor `Debug`, so compare the canonical u8
-            // discriminants — the same encoding folded into `evidenceHash`.
-            let got = ev.offenseType as u8;
-            let want = SlashJudge::OffenseType::Blacklist as u8;
-            anyhow::ensure!(
-                got == want,
-                "{what}: slashed for offenseType {got}, but induced {want}",
-            );
-            anyhow::ensure!(
-                ev.evidenceHash == evidence_hash,
-                "{what}: slashed on a different evidenceHash than the one induced",
-            );
-            return Ok(ev.slashId);
-        }
-        anyhow::bail!("{what} mined but emitted no SlashJudge Slashed event")
-    }
-
-    /// Governable `SlashJudge.challengeBond` (TOKEN base units) — pulled and
-    /// returned inside a successful reveal, and per ADR 014 § Bond Handling never
-    /// transferred at all when verification fails.
-    pub async fn challenge_bond(&self) -> anyhow::Result<U256> {
-        SlashJudge::new(self.addrs.slash_judge, &self.admin)
-            .challengeBond()
-            .call()
-            .await
-            .context("read challengeBond")
-    }
-
-    /// Fund `challenger` with gas + the `SlashJudge.challengeBond`, approved to
-    /// the judge, and return the bond amount. Any funded EOA may challenge; the
-    /// bond is pulled and returned inside the same reveal transaction.
-    async fn arm_challenger(&self, challenger: &PrivateKeySigner) -> anyhow::Result<U256> {
-        self.fund_eth(challenger.address(), 10).await?;
-        let bond = SlashJudge::new(self.addrs.slash_judge, &self.admin)
-            .challengeBond()
-            .call()
-            .await
-            .context("read challengeBond")?;
-        self.transfer_token(challenger.address(), bond).await?;
-        let approve = Erc20::new(self.addrs.token, &self.provider_for(challenger))
-            .approve(self.addrs.slash_judge, bond)
-            .send()
-            .await
-            .context("challenger token.approve send")?
-            .get_receipt()
-            .await
-            .context("challenger token.approve receipt")?;
-        crate::ensure_mined(&approve, "challenger token.approve")?;
-        Ok(bond)
-    }
-
-    /// `CapacityBond.escrowedTotal()` — TOKEN currently parked in slash escrow.
-    pub async fn escrowed_total(&self) -> anyhow::Result<U256> {
-        CapacityBond::new(self.addrs.capacity_bond, &self.admin)
-            .escrowedTotal()
-            .call()
-            .await
-            .context("read escrowedTotal")
-    }
-
-    /// `CapacityBond.slashRecords(slashId)` → `(operator, slashedAt, slashAmount)`.
-    pub async fn slash_record(&self, slash_id: U256) -> anyhow::Result<(Address, u64, U256)> {
-        let rec = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
-            .slashRecords(slash_id)
-            .call()
-            .await
-            .context("read slashRecords")?;
-        Ok((rec.operator, rec.slashedAt, rec.slashAmount))
-    }
-
-    /// Permissionless `CapacityBond.finalizeUnappealedSlash` — distributes an
-    /// escrowed slash whose 30-day filing window lapsed, 50% to the recorded
-    /// challenger and 50% burned. Sent by the admin EOA (the caller is not part
-    /// of the split; the challenger is read from the record).
-    pub async fn finalize_unappealed_slash(&self, slash_id: U256) -> anyhow::Result<()> {
-        let receipt = CapacityBond::new(self.addrs.capacity_bond, &self.admin)
-            .finalizeUnappealedSlash(slash_id)
-            .send()
-            .await
-            .context("finalizeUnappealedSlash send")?
-            .get_receipt()
-            .await
-            .context("finalizeUnappealedSlash receipt")?;
-        crate::ensure_mined(&receipt, "finalizeUnappealedSlash")
-    }
-
-    /// TOKEN `totalSupply()` — reads the burn leg of a 50/50 slash split, which
-    /// no account's balance reflects.
-    pub async fn token_total_supply(&self) -> anyhow::Result<U256> {
-        Erc20::new(self.addrs.token, &self.admin)
-            .totalSupply()
-            .call()
-            .await
-            .context("read TOKEN totalSupply")
-    }
-
-    /// Emergency-multisig `fastTrackAppeal`. The e2e deploy sets
-    /// `EMERGENCY_MULTISIG = DEPLOYER_ADDR` (anvil dev #0), so the deployer key
-    /// holds the role.
-    pub async fn fast_track_appeal(&self, slash_id: U256) -> anyhow::Result<()> {
-        let deployer: PrivateKeySigner = DEPLOYER_KEY.parse().context("parse deployer key")?;
-        let provider = self.provider_for(&deployer);
-        let receipt = SlashAppeal::new(self.addrs.slash_appeal, &provider)
-            .fastTrackAppeal(slash_id)
-            .send()
-            .await
-            .context("fastTrackAppeal send")?
-            .get_receipt()
-            .await
-            .context("fastTrackAppeal receipt")?;
-        crate::ensure_mined(&receipt, "fastTrackAppeal")
-    }
-
-    /// Grant a fast-tracked appeal through a real Governor proposal:
-    /// propose → (warp votingDelay) → castVote(For) → (warp votingPeriod) →
-    /// queue → (warp timelock minDelay) → execute, where the executed action is
-    /// `SlashAppeal.grantAppeal(slash_id)`. `voter` must already hold nonzero
-    /// vote weight at the proposal snapshot (ADR-036 served bytes × age ramp).
-    pub async fn governor_grant_appeal(
-        &self,
-        slash_id: U256,
-        voter: &PrivateKeySigner,
-    ) -> anyhow::Result<()> {
-        self.fund_eth(voter.address(), 10).await?;
-        let vp = self.provider_for(voter);
-        let gov = DecdnGovernor::new(self.addrs.governor, &vp);
-
-        // Build the grantAppeal call the Timelock will execute.
-        let appeal = SlashAppeal::new(self.addrs.slash_appeal, &vp);
-        let calldata = appeal.grantAppeal(slash_id).calldata().clone();
-        let targets = vec![self.addrs.slash_appeal];
-        let values = vec![U256::ZERO];
-        let calldatas = vec![calldata];
-        let description = format!("grant slash appeal {slash_id}");
-        let desc_hash = keccak256(description.as_bytes());
-
-        // Static call returns the proposalId the send will mint (deterministic
-        // hashProposal); trust it only after the send is mined.
-        let proposal_id = gov
-            .propose(
-                targets.clone(),
-                values.clone(),
-                calldatas.clone(),
-                description.clone(),
-            )
-            .call()
-            .await
-            .context("propose static call")?;
-        let propose = gov
-            .propose(
-                targets.clone(),
-                values.clone(),
-                calldatas.clone(),
-                description,
-            )
-            .send()
-            .await
-            .context("propose send")?
-            .get_receipt()
-            .await
-            .context("propose receipt")?;
-        crate::ensure_mined(&propose, "propose")?;
-
-        let voting_delay = gov.votingDelay().call().await.context("read votingDelay")?;
-        crate::time::increase_time(&self.admin, voting_delay.to::<u64>() + 2).await?;
-
-        let vote = gov
-            .castVote(proposal_id, 1) // 1 = For
-            .send()
-            .await
-            .context("castVote send")?
-            .get_receipt()
-            .await
-            .context("castVote receipt")?;
-        crate::ensure_mined(&vote, "castVote")?;
-
-        let voting_period = gov
-            .votingPeriod()
-            .call()
-            .await
-            .context("read votingPeriod")?;
-        crate::time::increase_time(&self.admin, voting_period.to::<u64>() + 2).await?;
-
-        let queue = gov
-            .queue(
-                targets.clone(),
-                values.clone(),
-                calldatas.clone(),
-                desc_hash,
-            )
-            .send()
-            .await
-            .context("queue send")?
-            .get_receipt()
-            .await
-            .context("queue receipt")?;
-        crate::ensure_mined(&queue, "queue")?;
-
-        let min_delay = TimelockController::new(self.addrs.timelock, &vp)
-            .getMinDelay()
-            .call()
-            .await
-            .context("read timelock minDelay")?;
-        crate::time::increase_time(&self.admin, min_delay.to::<u64>() + 2).await?;
-
-        let execute = gov
-            .execute(targets, values, calldatas, desc_hash)
-            .send()
-            .await
-            .context("execute send")?
-            .get_receipt()
-            .await
-            .context("execute receipt")?;
-        crate::ensure_mined(&execute, "execute")
     }
 }
 
@@ -2716,8 +2203,6 @@ fn read_manifest(path: &Path, payment: &Path) -> anyhow::Result<Manifest> {
         payment_pool,
         fee_router: get("FeeRouter")?,
         token: get("Token")?,
-        slash_judge: get("SlashJudge")?,
-        slash_appeal: get("SlashAppeal")?,
         governor: get("DecdnGovernor")?,
         timelock: get("TimelockController")?,
         publisher_registry: get("PublisherRegistry")?,

@@ -27,8 +27,7 @@ use iroh::endpoint::{ApplicationClose, ConnectionError, ReadError, VarInt, Write
 /// not fail to receive it — so it is no evidence of degradation. A consumer
 /// treats it the way it treats a handler-level `StreamError::NotFound`:
 /// suppress the `(peer, hash)` pair briefly and record no reputation outcome.
-/// Backpressure is respected, never punished (ADR 041 §Refusing is not
-/// slashable; ADR 013 says a peer receiving `0x10` MUST NOT treat it as a
+/// Backpressure is respected, never punished (ADR 013 says a peer receiving `0x10` MUST NOT treat it as a
 /// protocol error).
 ///
 /// Built only by `rate_limit_shed`; the fields are public so a consumer can

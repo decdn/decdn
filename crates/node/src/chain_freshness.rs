@@ -7,9 +7,10 @@
 //! During an RPC outage each of those guards silently passes on stale data: a
 //! takedown, a drained pool, or a spent capability that landed on-chain during
 //! the blind window is invisible, so the node keeps signing serve responses it
-//! can no longer vouch for. Serving a hash past its compliance window is
-//! slashable (ADR 011 § Slashing), and the offense is exactly a signed
-//! `StreamResponse{ok:true}` — the node produces its own evidence.
+//! can no longer vouch for. A node that serves a hash past its compliance
+//! window breaks the takedown it is bound to follow (ADR 011 § Compliance
+//! Window), and each `StreamResponse{ok:true}` it signs attributes that serve
+//! to its operator.
 //!
 //! [`ChainFreshness`] is the single backstop over that whole family: it holds
 //! the wall-clock time of the blacklist sync's last successful ledger poll and

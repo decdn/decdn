@@ -404,7 +404,7 @@ fn slot(wait: Duration) -> crate::CredentialSlot {
     }
     .sign(
         &signer,
-        &decdn_incentive::bind_node_id_domain(1, alloy::primitives::Address::ZERO),
+        &decdn_incentive::capacity_bond_domain(1, alloy::primitives::Address::ZERO),
     )
     .expect("sign");
     crate::CredentialSlot::new(std::sync::Arc::new(signer), capability)

@@ -697,7 +697,8 @@ pub struct NodeOriginDeps {
     pub buyer_pool: BuyerPool,
     /// This node's DHT id, the lookup requester.
     pub self_id: DhtNodeId,
-    /// EIP-712 domain verifying the delivery `slash_sig` (ADR 014 §1).
+    /// EIP-712 domain verifying the delivery `slash_sig` (ADR 005 § Signer
+    /// binding).
     pub slash_domain: Eip712Domain,
     /// `CapacityBond` EIP-712 bind domain (ADR 005). Used to sign the client
     /// identity binding this node attaches — over its OWN iroh `NodeId` with
@@ -1696,9 +1697,9 @@ fn cache_holders(deps: &NodeOriginDeps, target: DhtHash, ranked: &[Candidate]) {
     //
     // The triple plus the answer's UNSIGNED coverage and proven size is stored
     // — never the signed `StreamResponse` (its `slash_sig` is another node's
-    // slashable statement, and #1165's "no evidence retention" is that this
-    // cache must not become an evidence locker; coverage and size carry no
-    // such author), and never `reputation`, which `cached_candidates`
+    // signed statement, and #1165's "no signature retention" is that this
+    // cache holds none; coverage and size carry no such author), and never
+    // `reputation`, which `cached_candidates`
     // recomputes.
     deps.candidate_cache.insert(
         target,
@@ -2027,7 +2028,7 @@ async fn open_candidate(
         return Err(OpenDrop::NoAddress);
     };
     // The answer's `slash_sig` must recover to the peer's registered operator
-    // address (ADR 005 §Signer binding, ADR 014 §1). Selection reads the answer's
+    // address (ADR 005 § Signer binding). Selection reads the answer's
     // quote and then PAYS the winner, so an unrecovered signature would let a
     // node win on a rate it never committed to.
     let Some(provider_addr) = deps.addr_resolver.address_of(&peer) else {
@@ -2253,8 +2254,8 @@ async fn cached_candidates(deps: &NodeOriginDeps, target: DhtHash) -> Option<Vec
         // the local registry cache" before opening `cdn/client/v1`. The cold path
         // applies this inside `find_providers` (`filter_active_stakers`); the hit
         // path bypasses `find_providers`, so re-apply it here. `addr_resolver` is
-        // NOT this guard — the address binding survives ejection/unbonding (only
-        // deregistration clears it), which would otherwise let a node ejected inside the
+        // NOT this guard — the address binding survives ejection and unbonding
+        // (only deregistration clears it), which would otherwise let a node ejected inside the
         // TTL win a paid pull the cold path denies (#1223).
         //
         // NOTE: an origin from a populated `StaticOriginDirectory` (tests) that is
@@ -3604,7 +3605,7 @@ enum PullVerdict {
     /// final proof. Metered, logged and suppressed for the pair, never scored: the
     /// likelier cause is on this node, and the pair would only repeat the paid leg.
     LegNoProgress,
-    /// Everything else: a failed dial, a dropped connection, a bad slash signature, an
+    /// Everything else: a failed dial, a dropped connection, a bad stream signature, an
     /// unexpected frame. The residual — and the arm that actually scores a dead node.
     Unreachable,
 }

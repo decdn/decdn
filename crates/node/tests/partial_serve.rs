@@ -27,8 +27,7 @@ use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_rang
 use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, Hash, HttpOrigin, Origin};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
-    bind_node_id_domain, binding_signing_hash, signed_to_wire_voucher, slash_judge_domain,
-    voucher_domain,
+    binding_signing_hash, capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
 };
 use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
 use decdn_protocol::{ALPN_CLIENT, CHUNK_BYTES, MB_BYTES, encode_stream_request, write_frame};
@@ -48,13 +47,13 @@ const CHAIN_ID: u64 = 421_614;
 const RATE_PER_MB: u64 = 10;
 
 fn slash_dom() -> Eip712Domain {
-    slash_judge_domain(CHAIN_ID, Address::repeat_byte(0x11))
+    capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x11))
 }
 fn voucher_dom() -> Eip712Domain {
     voucher_domain(CHAIN_ID, Address::repeat_byte(0x34))
 }
 fn binding_dom() -> Eip712Domain {
-    bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
+    capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
 fn domains() -> HandlerDomains {
     HandlerDomains {

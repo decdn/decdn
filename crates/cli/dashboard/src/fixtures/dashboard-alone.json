@@ -73,10 +73,6 @@
     "pools": {
       "updated_unix_ms": null,
       "state": "waiting"
-    },
-    "slashes": {
-      "updated_unix_ms": null,
-      "state": "waiting"
     }
   }
 }

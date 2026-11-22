@@ -27,7 +27,7 @@ pub enum ReceiptCommand {
 ///
 /// Checks each node's signed answer (well-formed, accepting, on its lane's
 /// pool, for a hash the receipt lists, signed by the node under the
-/// `SlashJudge` domain the receipt names), the size of each entry an answer
+/// `CapacityBond` domain the receipt names), the size of each entry an answer
 /// covers, each voucher against the `PaymentPool` domain, each revealed
 /// preimage against its voucher's hash chain, and that every claim is the one
 /// its voucher proves and sits at or above the prior watermark. On a chain

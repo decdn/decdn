@@ -2,10 +2,10 @@ use alloy::primitives::{Address, keccak256};
 use alloy::signers::local::PrivateKeySigner;
 
 use super::*;
-use crate::slash_judge_domain;
+use crate::capacity_bond_domain;
 
 fn domain() -> Eip712Domain {
-    slash_judge_domain(421_614, Address::repeat_byte(0x44))
+    capacity_bond_domain(421_614, Address::repeat_byte(0x44))
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn every_signed_field_binds_the_signature() {
         ),
         "ttl"
     );
-    let other_domain = slash_judge_domain(1, Address::repeat_byte(0x44));
+    let other_domain = capacity_bond_domain(1, Address::repeat_byte(0x44));
     assert_ne!(
         recover_origin_attestation_signer([1; 32], &att, &other_domain),
         Ok(signer.address()),

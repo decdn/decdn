@@ -132,7 +132,8 @@ Every reason here traces to a real PR/issue/ADR. Quotes are from the commit/PR/A
   caps, TWAP machinery, six pinned events — all existed only because restitution flowed through a USDC
   reserve pool. Escrow slashed TOKEN in `CapacityBond`, refund on successful appeal → the entire dependent
   surface is gone. Re-homed to a lean `SlashAppeal`: "open/fastTrack/reject/grant/uphold/cleanup; TOKEN
-  appeal bonds only, no USDC/pool/swap/queue."
+  appeal bonds only, no USDC/pool/swap/queue." Then #2917 removed the base itself: with no slashable
+  offense left, `SlashJudge`, `SlashAppeal`, the escrow and the unbonding window all went together.
 - **Safety / insurance reserve** (ADR 033, retired). A 5% FeeRouter bucket, a standing USDC insurance pool
   with a payout queue and a TOKEN→USDC keeper swap, for incorrect-slash / downtime / "bad-data" incidents.
   → escrow-on-slash refund; "no pool needed." Recourse for undemonstrated harm belongs in DAO governance,

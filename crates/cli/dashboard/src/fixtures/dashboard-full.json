@@ -380,11 +380,6 @@
         ],
         "skipped": []
       }
-    },
-    "slashes": {
-      "updated_unix_ms": 1793000600000,
-      "state": "unconfigured",
-      "message": "slash detection is not configured"
     }
   }
 }

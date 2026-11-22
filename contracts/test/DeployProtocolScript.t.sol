@@ -10,12 +10,10 @@ import { BaseProtocolDeploy } from "../script/BaseProtocolDeploy.s.sol";
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
-import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { CctpSweepReceiver } from "../src/CctpSweepReceiver.sol";
-import { SlashJudge } from "../src/SlashJudge.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
@@ -97,7 +95,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(cfg.initialVetter, TEST_VETTER, "initialVetter");
         assertEq(cfg.timelockDelay, DEFAULT_TIMELOCK_DELAY, "timelockDelay");
         assertEq(cfg.minBond, DEFAULT_MIN_BOND, "minBond");
-        assertEq(cfg.unbondingPeriod, DEFAULT_UNBONDING_PERIOD, "unbondingPeriod");
         assertEq(cfg.multiaddrUpdateCooldown, DEFAULT_MULTIADDR_UPDATE_COOLDOWN, "multiaddrCooldown");
         assertEq(cfg.maxMultiaddrSize, DEFAULT_MAX_MULTIADDR_SIZE, "maxMultiaddrSize");
         assertEq(cfg.regionStabilityWindow, DEFAULT_REGION_STABILITY_WINDOW, "regionStability");
@@ -106,7 +103,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         // matches CapacityBond.EPOCH_LENGTH via the FeeRouter constructor check.
         assertEq(uint256(cfg.feeRouterEpochLength), uint256(FEE_ROUTER_EPOCH_LENGTH), "epochLen");
         assertEq(uint256(cfg.feeRouterWindowEpochs), uint256(DEFAULT_FEE_ROUTER_WINDOW_EPOCHS), "windowEpochs");
-        assertEq(cfg.slashAppealBond, DEFAULT_SLASH_APPEAL_BOND, "slashAppealBond");
 
         // The launch split is hard-coded in the script, not env-driven.
         assertEq(cfg.feeRouterRebateBps, LAUNCH_REBATE_BPS, "rebate");
@@ -161,14 +157,12 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         // mis-mapped reads obvious in the JSON output.
         d.token = Token(address(0x01));
         d.bond = CapacityBond(address(0x02));
-        d.slashAppeal = SlashAppeal(address(0x03));
         d.router = FeeRouter(address(0x04));
         d.blacklist = ContentBlacklist(address(0x05));
         d.registry = PublisherRegistry(address(0x06));
         d.timelock = TimelockController(payable(address(0x07)));
         d.governor = DecdnGovernor(payable(address(0x08)));
         d.sweepReceiver = CctpSweepReceiver(address(0x09));
-        d.slashJudge = SlashJudge(address(0x0A));
         d.originAssignment = OriginAssignment(address(0x0B));
         d.vettingPolicy = ManualVettingPolicy(address(0x0C));
     }
@@ -187,7 +181,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         string memory json = vm.readFile(_manifestPath(CHAIN_ID_WRITE));
         assertEq(json.readAddress(".contracts.Token"), address(0x01), "Token");
         assertEq(json.readAddress(".contracts.CapacityBond"), address(0x02), "CapacityBond");
-        assertEq(json.readAddress(".contracts.SlashAppeal"), address(0x03), "SlashAppeal");
         assertEq(json.readAddress(".contracts.FeeRouter"), address(0x04), "FeeRouter");
         assertEq(json.readAddress(".contracts.ContentBlacklist"), address(0x05), "ContentBlacklist");
         assertEq(json.readAddress(".contracts.PublisherRegistry"), address(0x06), "PublisherRegistry");
@@ -195,7 +188,8 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".contracts.DecdnGovernor"), address(0x08), "Governor");
         assertEq(json.readAddress(".contracts.CctpSweepReceiver"), address(0x09), "CctpSweepReceiver");
         assertFalse(vm.keyExistsJson(json, ".contracts.PaymentPool"), "no pool on the governance chain");
-        assertEq(json.readAddress(".contracts.SlashJudge"), address(0x0A), "SlashJudge");
+        assertFalse(vm.keyExistsJson(json, ".contracts.SlashJudge"), "no SlashJudge");
+        assertFalse(vm.keyExistsJson(json, ".contracts.SlashAppeal"), "no SlashAppeal");
         assertEq(json.readAddress(".contracts.OriginAssignment"), address(0x0B), "OriginAssignment");
         assertEq(json.readAddress(".contracts.ManualVettingPolicy"), address(0x0C), "ManualVettingPolicy");
         assertEq(json.readAddress(".contracts.BuybackBurner"), address(0), "BuybackBurner unwired");

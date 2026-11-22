@@ -114,11 +114,6 @@ async fn run() -> anyhow::Result<()> {
         Command::Publish(args) => {
             commands::publish::publish_dispatch(&args, config_path.as_deref()).await
         }
-        Command::Appeal(args) => match args.command {
-            cli::AppealCommand::Slash(slash) => {
-                commands::appeal::run(&slash, config_path.as_deref()).await
-            }
-        },
         Command::SelfUpdate(args) => commands::self_update::self_update(&args).await,
     };
     if let Some(pending) = pending {

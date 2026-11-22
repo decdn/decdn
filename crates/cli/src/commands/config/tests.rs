@@ -86,8 +86,6 @@ fn default_config_template_covers_every_wired_field() {
         origin_directory_negative_ttl_sec,
         origin_directory_cache_capacity,
         publisher_registry_address,
-        slash_judge_address,
-        slash_appeal_address,
         content_blacklist_address,
         content_blacklist_poll_interval_sec,
         chain_staleness_grace_sec,
@@ -141,8 +139,6 @@ fn default_config_template_covers_every_wired_field() {
             "publisher_registry_address =",
             publisher_registry_address.is_none(),
         ),
-        ("slash_judge_address =", slash_judge_address.is_none()),
-        ("slash_appeal_address =", slash_appeal_address.is_none()),
         (
             "content_blacklist_address =",
             content_blacklist_address.is_none(),
@@ -349,11 +345,9 @@ fn render_config_for_a_known_chain_is_runnable() {
     // equals the manifest exactly.
     let a = chain.addresses().expect("addresses");
     assert_eq!(bc.capacity_bond_address, Some(a.capacity_bond));
-    assert_eq!(bc.slash_judge_address, Some(a.slash_judge));
     assert_eq!(bc.content_blacklist_address, Some(a.content_blacklist));
     assert_eq!(bc.origin_assignment_address, Some(a.origin_assignment));
     assert_eq!(bc.publisher_registry_address, Some(a.publisher_registry));
-    assert_eq!(bc.slash_appeal_address, Some(a.slash_appeal));
     assert_eq!(bc.cctp_sweep_receiver_address, Some(a.cctp_sweep_receiver));
     assert_eq!(bc.cctp_iris_url.as_deref(), Some(chain.cctp_iris_url));
     assert_payment_chains(&bc, chain);
@@ -528,7 +522,6 @@ fn render_client_config_for_a_known_chain_bakes_addresses() {
     // Required by the daemon resolver — kept active so `config validate`
     // accepts the client file.
     assert_eq!(bc.capacity_bond_address, Some(a.capacity_bond));
-    assert_eq!(bc.slash_judge_address, Some(a.slash_judge));
     assert_eq!(bc.content_blacklist_address, Some(a.content_blacklist));
 
     // Still the trimmed shape: no daemon sections appear.

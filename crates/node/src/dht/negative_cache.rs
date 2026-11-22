@@ -9,7 +9,7 @@
 //! - holds at most 1024 entries with LRU eviction;
 //! - retains entries for 5 minutes (TTL anchored at insertion);
 //! - does NOT retain the answer's signature — purely a request-
-//!   suppression structure, not slashing evidence.
+//!   suppression structure, not a record of signed statements.
 //!
 //! The DHT iterative lookup ([`super::lookup`]) consumes
 //! [`NegativeCandidateCache::contains_active`] as the third ADR 022

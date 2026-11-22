@@ -45,11 +45,6 @@ alloy::sol! {
         function approve(address spender, uint256 amount) external returns (bool);
         function transfer(address to, uint256 amount) external returns (bool);
         function balanceOf(address account) external view returns (uint256);
-        // The burn leg of a 50/50 slash split (#1042) increases no account's
-        // balance, so a balance-diff assertion cannot see it — it is observable
-        // only as a `totalSupply` reduction (or as a `Transfer` to `address(0)`,
-        // which OZ `ERC20._burn` does still emit).
-        function totalSupply() external view returns (uint256);
     }
 
     /// `CapacityBond` operator-onboarding writes + activation reads.
@@ -70,8 +65,8 @@ alloy::sol! {
         function isActive(address operator) external view returns (bool);
         // Raw registered-set membership (#1359, G-NODE-06's exit leg). `active`
         // here is `_nodes[operator].active` alone — the flag `deregisterNode`
-        // gates on — unlike `isActive`, which also requires bond over `minBond`
-        // and no request in flight. Only `active` is read; the rest of the
+        // gates on — unlike `isActive`, which also requires bond over the
+        // operator's floor. Only `active` is read; the rest of the
         // struct is declared because the ABI decode needs the full shape.
         struct NodeInfo {
             bytes32 nodeId;
@@ -87,9 +82,8 @@ alloy::sol! {
         // Key-rotation surface (#1034, G-NODE-07). `bindNodeId` is the rebind
         // itself; the two raw mappings are what the journey asserts on, and
         // they are read directly rather than through `nodeIdOf`/`isActiveNode`
-        // because slashability keys on the binding alone — `SlashJudge`
-        // ignores `active`, so an assertion routed through a liveness-aware
-        // helper would not be testing what the slashing path reads.
+        // because a rotation swaps the binding alone — an assertion routed
+        // through a liveness-aware helper would not be testing the binding.
         function bindNodeId(bytes32 nodeId, bytes bindingSignature, bytes ed25519Signature) external;
         function nodeIdToAddress(bytes32 nodeId) external view returns (address);
         function addressToNodeId(address operator) external view returns (bytes32);
@@ -104,28 +98,9 @@ alloy::sol! {
         function activeBond(address operator) external view returns (uint256);
         function declaredMbps(address operator) external view returns (uint256);
         function minBond() external view returns (uint256);
-        // Unbonding-window reads (#1033, G-NODE-06). `unbondingOf` is the
-        // public `UnbondingRequest` mapping getter, whose static struct
-        // flattens to `(amount, unlockAt)`; a non-zero `amount` makes
-        // `isActive` false for the whole window.
-        function unbondingOf(address operator) external view returns (uint256 amount, uint256 unlockAt);
-        function unbondingPeriod() external view returns (uint256);
-        // Slash-appeal assertion reads (#1032, G-NODE-05). `slashedAtEpoch`
-        // is the ADR-036 vote-weight watermark cleared/recomputed on a granted
-        // appeal; `firstBondedAt` feeds the Governor age-ramp; `slashRecords`
-        // exposes the escrowed slash amount.
-        function slashedAtEpoch(address operator) external view returns (uint64);
+        // `firstBondedAt` feeds the Governor age-ramp; an iroh-key rotation
+        // keeps it and an Ethereum-key migration resets it (G-NODE-07).
         function firstBondedAt(address operator) external view returns (uint64);
-        function slashRecords(uint256 slashId)
-            external
-            view
-            returns (address operator, uint64 slashedAt, uint256 slashAmount);
-        // Escrow-on-slash finality (#1042, ADR 028 / ADR 026 § Slashing and burn):
-        // the slashed TOKEN is parked in `escrowedTotal` until the 30-day filing
-        // window lapses, then the permissionless `finalizeUnappealedSlash`
-        // distributes it 50% to the recorded challenger and 50% to the burn.
-        function escrowedTotal() external view returns (uint256);
-        function finalizeUnappealedSlash(uint256 slashId) external;
         // Onboarding negatives (#1030, G-NODE-01). Declared so a reverted
         // `registerNode` decodes to a *named* error rather than an opaque
         // selector, and so `crate::assert::expect_revert_anyhow` can match on
@@ -218,39 +193,6 @@ alloy::sol! {
         function isVetted(address publisher) external view returns (bool);
     }
 
-    /// `SlashJudge.submitBlacklistChallenge` — the blacklist-violation slash
-    /// entry point (ADR 014 §Blacklist violation), absent from the re-exported
-    /// production `SlashJudge` binding below (the daemon never submits
-    /// challenges). Bound at the `SlashJudge` address; `responseData` is a
-    /// signed `StreamResponse { ok: true }` (the production binding's
-    /// `StreamMsg`). `commitChallenge` / `challengeBond` come from the
-    /// production binding.
-    ///
-    /// The errors are declared so a reverted reveal decodes to a *named* error
-    /// rather than an opaque selector, and so
-    /// [`crate::assert::expect_revert_anyhow`] can match on `E::SELECTOR` —
-    /// compiler-checked against the ABI instead of hand-copied hex.
-    #[sol(rpc)]
-    contract SlashJudgeBlacklist {
-        /// The `slash_sig` did not recover to the challenged operator.
-        error InvalidResponseSignature();
-        /// The response is a signed refusal (`ok: false`), which delivers
-        /// nothing and so is never evidence of a served blacklisted blob.
-        error NotBlacklistViolation();
-        /// The evidence was already spent by an earlier slash: the dedup guard
-        /// that lives in `SlashJudge` itself, not `CapacityBond`.
-        error EvidenceAlreadyUsed(bytes32 evidenceHash);
-
-        function submitBlacklistChallenge(
-            address challengedNode,
-            bytes32 nodeId,
-            bytes32 blobHash,
-            bytes responseData,
-            bytes slashSig,
-            bytes32 salt
-        ) external;
-    }
-
     /// `ContentBlacklist` origin/operator blacklist writes (ADR 011 § Hash
     /// Evasion and Origin Blacklisting), absent from the re-exported production
     /// binding — the watcher only READS the `OriginBlacklistUpdated` /
@@ -299,80 +241,4 @@ alloy::sol! {
         function minDeposit() external view returns (uint64);
         function pauser() external view returns (address);
     }
-
-    /// `SlashAppeal` full lifecycle surface (ADR 028) the G-NODE-05 journey
-    /// drives: the operator files via `openSlashAppeal` (also exercised through
-    /// the `decdn appeal slash` CLI), the emergency multisig `fastTrackAppeal`s,
-    /// and the Governor `grantAppeal`s via a Timelock-executed proposal. The
-    /// production `decdn_incentive::slash_appeal` binding is operator-only; the
-    /// role-gated methods + status reads live here.
-    #[sol(rpc)]
-    contract SlashAppeal {
-        enum AppealStatus {
-            None,
-            Open,
-            FastTracked,
-            Resolved
-        }
-
-        struct Appeal {
-            address appellant;
-            address operator;
-            uint256 bond;
-            bytes32 evidenceBundleHash;
-            uint64 openedAt;
-            uint64 fastTrackedAt;
-            AppealStatus status;
-        }
-
-        function appealBond() external view returns (uint256);
-        function token() external view returns (address);
-        function lastAcceptedAppealAt(address operator) external view returns (uint64);
-        function getAppeal(uint256 slashId) external view returns (Appeal memory);
-        function openSlashAppeal(uint256 slashId, bytes32 evidenceBundleHash) external;
-        function fastTrackAppeal(uint256 slashId) external;
-        function grantAppeal(uint256 slashId) external;
-    }
-
-    /// `DecdnGovernor` proposal lifecycle (OZ Governor, timestamp clock) — the
-    /// G-NODE-05 grant runs propose → castVote → queue → execute, all against a
-    /// SlashAppeal.grantAppeal call executed by the Timelock.
-    #[sol(rpc)]
-    contract DecdnGovernor {
-        function propose(
-            address[] targets,
-            uint256[] values,
-            bytes[] calldatas,
-            string description
-        ) external returns (uint256 proposalId);
-        function castVote(uint256 proposalId, uint8 support) external returns (uint256 weight);
-        function queue(
-            address[] targets,
-            uint256[] values,
-            bytes[] calldatas,
-            bytes32 descriptionHash
-        ) external returns (uint256 proposalId);
-        function execute(
-            address[] targets,
-            uint256[] values,
-            bytes[] calldatas,
-            bytes32 descriptionHash
-        ) external payable returns (uint256 proposalId);
-        function state(uint256 proposalId) external view returns (uint8);
-        function votingDelay() external view returns (uint256);
-        function votingPeriod() external view returns (uint256);
-        function getVotes(address account, uint256 timepoint) external view returns (uint256);
-    }
-
-    /// `TimelockController` minimum delay — the G-NODE-05 grant must advance the
-    /// chain clock past this between `queue` and `execute`.
-    #[sol(rpc)]
-    contract TimelockController {
-        function getMinDelay() external view returns (uint256);
-    }
 }
-
-// Reuse the production `SlashJudge` binding (commit/reveal + `Slashed` + the
-// `StreamMsg` evidence struct) rather than re-declaring it — the same ABI the
-// daemon slash watcher decodes.
-pub use decdn_incentive::slash_judge::SlashJudge;

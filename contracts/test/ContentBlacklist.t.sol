@@ -342,7 +342,7 @@ contract ContentBlacklistTest is Test {
     }
 
     /// @notice The window is STAMPED, not derived. Lowering `complianceWindow`
-    ///         after an add must not retroactively pull the slash boundary
+    ///         after an add must not retroactively pull the effective boundary
     ///         forward under deliveries already served.
     function test_setComplianceWindow_doesNotRestampExistingEntries() public {
         vm.prank(admin);

@@ -16,7 +16,6 @@ import { LoopbackCctp } from "../testnet/LoopbackCctp.sol";
 import { Token } from "../src/Token.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
-import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 
@@ -75,7 +74,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
             bootstrapMultisig: address(0),
             minBond: 50_000e18,
-            unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
@@ -87,8 +85,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             feeRouterDeliveryFloor: 1,
             buybackBurner: address(0),
             cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
-            cctpTokenMessenger: address(cctp),
-            slashAppealBond: 1000e18
+            cctpTokenMessenger: address(cctp)
         });
     }
 
@@ -102,7 +99,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
         assertTrue(d.bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
         assertTrue(d.blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist gov");
-        assertTrue(d.slashAppeal.hasRole(GOVERNANCE_ROLE, tl), "slashAppeal gov");
         assertTrue(d.registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
     }
 
@@ -116,9 +112,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertFalse(d.router.hasRole(DEFAULT_ADMIN_ROLE, tl), "router admin master key");
         assertFalse(d.bond.hasRole(DEFAULT_ADMIN_ROLE, tl), "bond admin master key");
         assertFalse(d.blacklist.hasRole(DEFAULT_ADMIN_ROLE, tl), "blacklist admin master key");
-        assertFalse(d.slashAppeal.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashAppeal admin master key");
         assertFalse(d.registry.hasRole(DEFAULT_ADMIN_ROLE, tl), "registry admin master key");
-        assertFalse(d.slashJudge.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashJudge admin master key");
         assertFalse(d.originAssignment.hasRole(DEFAULT_ADMIN_ROLE, tl), "originAssignment admin master key");
         assertFalse(d.vettingPolicy.hasRole(DEFAULT_ADMIN_ROLE, tl), "vettingPolicy admin master key");
     }
@@ -130,13 +124,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     function test_roleMatrix_rotatableRolesAdminedByGovernance() public view {
         assertEq(d.bond.getRoleAdmin(d.bond.PAUSER_ROLE()), GOVERNANCE_ROLE, "bond pauser admin");
         assertEq(d.router.getRoleAdmin(d.router.PAUSER_ROLE()), GOVERNANCE_ROLE, "router pauser admin");
-        assertEq(d.slashJudge.getRoleAdmin(d.slashJudge.PAUSER_ROLE()), GOVERNANCE_ROLE, "judge pauser admin");
-        assertEq(d.slashAppeal.getRoleAdmin(d.slashAppeal.PAUSER_ROLE()), GOVERNANCE_ROLE, "appeal pauser admin");
-        assertEq(
-            d.slashAppeal.getRoleAdmin(d.slashAppeal.EMERGENCY_MULTISIG_ROLE()),
-            GOVERNANCE_ROLE,
-            "appeal emergency admin"
-        );
         assertEq(
             d.blacklist.getRoleAdmin(d.blacklist.EMERGENCY_MULTISIG_ROLE()),
             GOVERNANCE_ROLE,
@@ -183,22 +170,17 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertFalse(d.router.hasRole(GOVERNANCE_ROLE, dep), "router gov back door");
         assertFalse(d.bond.hasRole(GOVERNANCE_ROLE, dep), "bond gov back door");
         assertFalse(d.blacklist.hasRole(GOVERNANCE_ROLE, dep), "blacklist gov back door");
-        assertFalse(d.slashAppeal.hasRole(GOVERNANCE_ROLE, dep), "slashAppeal gov back door");
         assertFalse(d.registry.hasRole(GOVERNANCE_ROLE, dep), "registry gov back door");
 
         assertFalse(d.router.hasRole(DEFAULT_ADMIN_ROLE, dep), "router admin back door");
         assertFalse(d.bond.hasRole(DEFAULT_ADMIN_ROLE, dep), "bond admin back door");
         assertFalse(d.blacklist.hasRole(DEFAULT_ADMIN_ROLE, dep), "blacklist admin back door");
-        assertFalse(d.slashAppeal.hasRole(DEFAULT_ADMIN_ROLE, dep), "slashAppeal admin back door");
         assertFalse(d.registry.hasRole(DEFAULT_ADMIN_ROLE, dep), "registry admin back door");
 
         assertFalse(d.timelock.hasRole(DEFAULT_ADMIN_ROLE, dep), "timelock admin back door");
     }
 
     function test_roleMatrix_emergencyMultisigGrants() public view {
-        assertTrue(
-            d.slashAppeal.hasRole(d.slashAppeal.EMERGENCY_MULTISIG_ROLE(), emergencyMultisig), "slashAppeal emergency"
-        );
         assertTrue(d.blacklist.hasRole(d.blacklist.EMERGENCY_MULTISIG_ROLE(), emergencyMultisig), "blacklist emergency");
     }
 
@@ -209,8 +191,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     function test_roleMatrix_pauserIsEmergencyMultisig() public view {
         assertTrue(d.bond.hasRole(d.bond.PAUSER_ROLE(), emergencyMultisig), "bond pauser");
         assertTrue(d.router.hasRole(d.router.PAUSER_ROLE(), emergencyMultisig), "router pauser");
-        assertTrue(d.slashAppeal.hasRole(d.slashAppeal.PAUSER_ROLE(), emergencyMultisig), "slashAppeal pauser");
-        assertTrue(d.slashJudge.hasRole(d.slashJudge.PAUSER_ROLE(), emergencyMultisig), "slashJudge pauser");
     }
 
     // Holding PAUSER_ROLE is necessary but not sufficient — prove the deployed
@@ -236,7 +216,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // -----------------------------------------------------------------
 
     function test_crossContractWiring_capacityBondPeerRoles() public view {
-        assertTrue(d.bond.hasRole(d.bond.SLASH_APPEAL_ROLE(), address(d.slashAppeal)), "slashAppeal to bond appeal");
         assertTrue(d.bond.hasRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist)), "blacklist to bond eject");
     }
 
@@ -251,8 +230,6 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             "sweepReceiver messageTransmitter binding"
         );
         assertEq(d.sweepReceiver.tokenMessenger(), cfg.cctpTokenMessenger, "sweepReceiver tokenMessenger binding");
-        assertTrue(d.bond.hasRole(d.bond.SLASH_ROLE(), address(d.slashJudge)), "slashJudge holds SLASH_ROLE on bond");
-        assertEq(address(d.bond.slashJudge()), address(d.slashJudge), "bond slashJudge binding");
         assertEq(
             address(d.originAssignment.vettingPolicy()),
             address(d.vettingPolicy),
@@ -341,35 +318,29 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         _assertNoBackDoors(cfg2, d2);
     }
 
-    // Negative test: `_assertPeerRolesWired` must REVERT when the CapacityBond
-    // slashJudge binding does not match `d.slashJudge`. Proves the post-deploy
-    // BindingNotWired guard for the ADR-014 paired-invariant view is real, not a
+    // Negative test: `_assertPeerRolesWired` must REVERT when a peer role grant
+    // did not land. Proves the post-deploy PeerRoleNotWired guard is real, not a
     // no-op. Routed through an external wrapper because `vm.expectRevert` only
     // catches reverts at external-call boundaries.
     //
-    // `setSlashJudge` is set-once, so a mismatch cannot be forged by re-pointing a
-    // wired judge. Instead we grant every other peer role but leave the judge
-    // unwired (`address(0)`), which is the exact gap the guard exists to catch.
-    function test_assertPeerRolesWired_revertsWhenSlashJudgeUnwired() public {
+    // Every other peer role is granted; only the blacklist's BLACKLIST_ROLE on
+    // CapacityBond is skipped, which is the exact gap the guard exists to catch.
+    function test_assertPeerRolesWired_revertsWhenBlacklistEjectorUnwired() public {
         DeployConfig memory cfg2 = _testConfig();
         Deployment memory d2 = _deployTargets(cfg2, _deployTimelock(cfg2));
         _deployGovernor(cfg2, d2);
-        // Grant the peer roles `_assertPeerRolesWired` checks, but skip the one-time
-        // `setSlashJudge` wiring so `d2.bond.slashJudge()` stays `address(0)`. Deployer
-        // still holds the admin roles (handoff skipped).
+        // Deployer still holds the admin roles (handoff skipped).
         vm.startPrank(cfg2.deployer);
-        d2.bond.grantRole(d2.bond.SLASH_APPEAL_ROLE(), address(d2.slashAppeal));
-        d2.bond.grantRole(d2.bond.BLACKLIST_ROLE(), address(d2.blacklist));
         d2.blacklist.grantRole(d2.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg2.emergencyMultisig);
         d2.bond.grantRole(d2.bond.PAUSER_ROLE(), cfg2.emergencyMultisig);
         d2.router.grantRole(d2.router.PAUSER_ROLE(), cfg2.emergencyMultisig);
-        d2.slashAppeal.grantRole(d2.slashAppeal.PAUSER_ROLE(), cfg2.emergencyMultisig);
-        d2.slashJudge.grantRole(d2.slashJudge.PAUSER_ROLE(), cfg2.emergencyMultisig);
-        d2.bond.grantRole(d2.bond.SLASH_ROLE(), address(d2.slashJudge));
         vm.stopPrank();
         vm.expectRevert(
             abi.encodeWithSelector(
-                BaseProtocolDeploy.BindingNotWired.selector, address(d2.bond), address(d2.slashJudge), address(0)
+                BaseProtocolDeploy.PeerRoleNotWired.selector,
+                address(d2.bond),
+                d2.bond.BLACKLIST_ROLE(),
+                address(d2.blacklist)
             )
         );
         this.externalAssertPeerRolesWired(cfg2, d2);
@@ -440,9 +411,9 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         address tl = address(bd.timelock);
         assertTrue(bd.router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
         assertTrue(bd.bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
-        assertTrue(bd.slashJudge.hasRole(GOVERNANCE_ROLE, tl), "slashJudge gov");
+        assertTrue(bd.blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist gov");
         // DEFAULT_ADMIN_ROLE is renounced in both modes (#2028) — no master key.
-        assertFalse(bd.slashJudge.hasRole(DEFAULT_ADMIN_ROLE, tl), "slashJudge admin master key");
+        assertFalse(bd.blacklist.hasRole(DEFAULT_ADMIN_ROLE, tl), "blacklist admin master key");
         // And the multisig holds nothing directly, so it cannot bypass the delay.
         assertFalse(bd.router.hasRole(GOVERNANCE_ROLE, bootstrapMultisig), "multisig has no direct gov");
         assertFalse(bd.bond.hasRole(DEFAULT_ADMIN_ROLE, bootstrapMultisig), "multisig has no direct admin");
@@ -847,9 +818,8 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     }
 
     // ZeroAddress fail-fast checks in `_deployTargets`. One test per validated
-    // field — these guard against silent misconfiguration (e.g. SlashAppeal
-    // silently skipping the EMERGENCY_MULTISIG_ROLE grant when the multisig
-    // is zero, or ContentBlacklist granting that role to `address(0)`).
+    // field — these guard against silent misconfiguration (e.g. ContentBlacklist
+    // granting EMERGENCY_MULTISIG_ROLE to `address(0)` when the multisig is zero).
 
     function externalDeployTargets(DeployConfig calldata cfgIn) external returns (Deployment memory) {
         return _deployTargets(cfgIn, _deployTimelock(cfgIn));

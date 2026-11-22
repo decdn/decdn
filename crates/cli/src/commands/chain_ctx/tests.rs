@@ -144,7 +144,6 @@ fn flags_override_config() {
         eth_keystore: None,
         publisher_registry_address: None,
         origin_assignment_address: None,
-        slash_appeal_address: None,
         payment_chains: Vec::new(),
         cctp_sweep_receiver_address: None,
         cctp_iris_url: None,
@@ -167,7 +166,6 @@ fn config_fills_unset_flags() {
         eth_keystore: Some(PathBuf::from("/keys/ks.json")),
         publisher_registry_address: None,
         origin_assignment_address: None,
-        slash_appeal_address: None,
         payment_chains: Vec::new(),
         cctp_sweep_receiver_address: None,
         cctp_iris_url: None,
@@ -192,7 +190,6 @@ fn keystore_defaults_under_data_dir() {
         eth_keystore: None,
         publisher_registry_address: None,
         origin_assignment_address: None,
-        slash_appeal_address: None,
         payment_chains: Vec::new(),
         cctp_sweep_receiver_address: None,
         cctp_iris_url: None,
@@ -208,28 +205,6 @@ fn missing_required_fields_error() {
     let chain = empty_chain();
     let err = resolve(&chain, &FileConfig::default()).unwrap_err();
     assert!(err.to_string().contains("rpc_url not set"), "{err}");
-}
-
-#[test]
-fn resolve_appeal_parses_flag_address() {
-    let mut chain = empty_chain();
-    chain.common.rpc_url = Some("http://x".to_string());
-    let flag = FLAG_ADDR.to_string();
-    let r = resolve_appeal(&chain.common, Some(flag.as_str()), &FileConfig::default()).unwrap();
-    assert_eq!(r.slash_appeal_address, FLAG_ADDR);
-}
-
-#[test]
-fn resolve_appeal_rejects_zero_address() {
-    let mut chain = empty_chain();
-    chain.common.rpc_url = Some("http://x".to_string());
-    let zero = Address::ZERO.to_string();
-    let err =
-        resolve_appeal(&chain.common, Some(zero.as_str()), &FileConfig::default()).unwrap_err();
-    assert!(
-        err.to_string().contains("must not be the zero address"),
-        "{err}"
-    );
 }
 
 #[test]
@@ -331,7 +306,6 @@ fn resolve_publish_flag_beats_config() {
         eth_keystore: None,
         publisher_registry_address: Some(CONFIG_ADDR.to_string()),
         origin_assignment_address: Some(OA_ADDR.to_string()),
-        slash_appeal_address: None,
         payment_chains: Vec::new(),
         cctp_sweep_receiver_address: None,
         cctp_iris_url: None,

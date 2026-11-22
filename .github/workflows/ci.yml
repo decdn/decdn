@@ -692,13 +692,13 @@ jobs:
         working-directory: contracts
         run: forge build
       # The cross-layer `decdn-e2e` fixtures spawn the built `decdn-node`
-      # binary, and the slash-appeal journey additionally shells out to the
-      # user CLI `decdn` (package `decdn-cli`), so both must exist on disk
-      # before the journeys run.
+      # binary, and the CLI journeys additionally shell out to the user CLI
+      # `decdn` (package `decdn-cli`), so both must exist on disk before the
+      # journeys run.
       - name: Build daemon + CLI for cross-layer fixtures
         run: cargo build -p decdn-node -p decdn-cli
-      # Cross-layer journeys (smoke + G-NODE-04 blacklist compliance, #1031 +
-      # G-NODE-05 slash appeal, #1032).
+      # Cross-layer journeys (smoke, G-NODE-04 blacklist compliance #1031, the
+      # CLI journeys and the rest of `crates/e2e/tests`).
       # --test-threads 2: each journey runs its own anvil + forge deploy +
       # daemon(s); more at once oversubscribes the 4-core runner and turns
       # poll-based assertions flaky, so cap concurrency at two.

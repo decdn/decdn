@@ -679,11 +679,9 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
          # eth_keystore = \"~/.decdn/keystore.json\"   # defaults to <data_dir>/keystore.json\n\
          # --- Governance contracts (from deployments/{chain_id}.json) ---\n\
          capacity_bond_address       = \"{capacity_bond}\"\n\
-         slash_judge_address         = \"{slash_judge}\"\n\
          content_blacklist_address   = \"{content_blacklist}\"\n\
          origin_assignment_address   = \"{origin_assignment}\"\n\
          publisher_registry_address  = \"{publisher_registry}\"\n\
-         slash_appeal_address        = \"{slash_appeal}\"\n\
          cctp_sweep_receiver_address = \"{cctp_sweep_receiver}\"\n\
          cctp_iris_url               = \"{iris}\"\n\
          # Optional tuning knobs (economics, poll intervals) are commented in the\n\
@@ -693,11 +691,9 @@ fn render_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result
         chain_id = chain.chain_id,
         rpc = chain.public_rpc,
         capacity_bond = a.capacity_bond,
-        slash_judge = a.slash_judge,
         content_blacklist = a.content_blacklist,
         origin_assignment = a.origin_assignment,
         publisher_registry = a.publisher_registry,
-        slash_appeal = a.slash_appeal,
         cctp_sweep_receiver = a.cctp_sweep_receiver,
         iris = chain.cctp_iris_url,
         payment = render_payment_chains(chain)?,
@@ -734,18 +730,20 @@ fn render_payment_chains(chain: &known_chains::KnownChain) -> anyhow::Result<Str
 }
 
 /// Build the filled `[blockchain]` section for the client shape of a known
-/// chain. The client consumes `eth_keystore`, the buyer knobs and the payment
-/// chains; the governance contract addresses are daemon/operator keys the
-/// client ignores, kept active so the same file also passes `decdn config
-/// validate` (whose resolver requires `capacity_bond_address` and
-/// `slash_judge_address`).
+/// chain. The client consumes `eth_keystore`, the buyer knobs, the payment
+/// chains and `capacity_bond_address` (the registry it discovers nodes from
+/// and the domain every answer signs under); the other governance contract
+/// addresses are daemon/operator keys the client ignores, kept active so the
+/// same file also passes `decdn config validate` (whose resolver requires
+/// `content_blacklist_address`).
 fn render_client_blockchain_section(chain: &known_chains::KnownChain) -> anyhow::Result<String> {
     let a = chain.addresses()?;
     Ok(format!(
         "[blockchain]\n\
          # Baked in for {label} (governance chain {chain_id}) from the shipped\n\
          # deployment manifests (contracts/deployments/). The client pays on the\n\
-         # payment chains below; the governance contract addresses are\n\
+         # payment chains below and discovers and verifies nodes through\n\
+         # CapacityBond; the other governance contract addresses are\n\
          # daemon/operator keys it ignores, kept active so this file also passes\n\
          # `decdn config validate`. Ready to fetch as-is once the keystore exists\n\
          # (`decdn key-gen --output-dir ~/.decdn/client`) and holds USDC. Point each\n\
@@ -755,24 +753,21 @@ fn render_client_blockchain_section(chain: &known_chains::KnownChain) -> anyhow:
          # eth_keystore = \"~/.decdn/client/keystore.json\"   # defaults to <data_dir>/keystore.json\n\
          # buyer_working_deposit_micro_usdc = 10000000  # deposit when OPENING a pool and refill target; must be > 0; default 10 USDC\n\
          # buyer_max_approve = false          # exact deposit-sized USDC approvals (client default); true opts into an unlimited standing approval\n\
-         # --- Daemon/operator addresses (ignored by the client) ---\n\
+         # --- Node registry and signing domain ---\n\
          capacity_bond_address       = \"{capacity_bond}\"\n\
-         slash_judge_address         = \"{slash_judge}\"\n\
+         # --- Daemon/operator addresses (ignored by the client) ---\n\
          content_blacklist_address   = \"{content_blacklist}\"\n\
          origin_assignment_address   = \"{origin_assignment}\"\n\
          publisher_registry_address  = \"{publisher_registry}\"\n\
-         slash_appeal_address        = \"{slash_appeal}\"\n\
          cctp_sweep_receiver_address = \"{cctp_sweep_receiver}\"\n\
          {payment}",
         label = chain.label,
         chain_id = chain.chain_id,
         rpc = chain.public_rpc,
         capacity_bond = a.capacity_bond,
-        slash_judge = a.slash_judge,
         content_blacklist = a.content_blacklist,
         origin_assignment = a.origin_assignment,
         publisher_registry = a.publisher_registry,
-        slash_appeal = a.slash_appeal,
         cctp_sweep_receiver = a.cctp_sweep_receiver,
         payment = render_payment_chains(chain)?,
     ))
@@ -1002,17 +997,16 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 [blockchain]
 # rpc_url = ""                       # REQUIRED: governance-chain JSON-RPC URL
 # eth_keystore = "~/.decdn/keystore.json"
-# capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex
+# capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex; also the EIP-712 verifyingContract of stream and attestation signatures (ADR 005)
 # origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and the chain-backed origin directory for cache-miss pull-through fallback (ADR 022).
 # origin_directory_positive_ttl_sec = 300  # lazy origin directory: how long a resolved, non-empty getOrigins() set is served before a re-read; only consulted when origin_assignment_address is set; 0 disables caching; default 300s
 # origin_directory_negative_ttl_sec = 30   # lazy origin directory: how long "namespace has no origins" is cached — the DoS bound against permissionless/free namespace creation; only consulted when origin_assignment_address is set; 0 disables caching; default 30s
 # origin_directory_cache_capacity = 4096   # lazy origin directory: max distinct namespaces held (LRU eviction); only consulted when origin_assignment_address is set; default 4096
 # publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
-# slash_judge_address = ""           # REQUIRED: 0x-prefixed hex (EIP-712 verifyingContract, ADR 014)
 # content_blacklist_address = ""     # REQUIRED: 0x-prefixed hex; deployed ContentBlacklist (ADR 011/031). Absent => startup fails before any ALPN accepts; the zero address is rejected (it is a fail-open compliance trap).
 # content_blacklist_poll_interval_sec = 300  # blacklist mutation-ledger poll cadence (ADR 011); 1 to 300; default 300s
 # chain_staleness_grace_sec = 1800   # stop serving after this long without a successful chain read (ADR 011); guards deny-set/pool/signer-cap staleness; must be > 0; set large to opt out; default 1800s
-# chain_id = 421614                  # governance-chain EIP-712 chain id (slash, attestation, bind-node and pointer signatures); default Arbitrum Sepolia
+# chain_id = 421614                  # governance-chain EIP-712 chain id (stream, attestation, bind-node and pointer signatures); default Arbitrum Sepolia
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # receipt_poll_interval_ms = 7000    # pending-tx receipt polling cadence (#1011); default 7000ms, min 250ms (lower for a local anvil)
 # get_logs_max_block_span = 10000    # max blocks per eth_getLogs request of the CLI's chain scans (`decdn receipt settle`, `decdn node earnings --address`); set to your RPC provider's range limit; default 10000, must be > 0
@@ -1022,10 +1016,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
 # buyer_max_approve = true                       # unlimited USDC approval for PaymentPool (#744); node default true, decdn client default false (exact deposit-sized approval); set true on the client to opt into unlimited
 # pool_min_remaining_deposit_micro_usdc = 1000000 # refundable floor M the node keeps in reserve on a pool it serves (ADR 003 § Sizing); default 1 USDC
-# CLI-only [blockchain] keys — consumed by `decdn appeal` / the client, NOT the daemon.
+# CLI-only [blockchain] keys — consumed by the CLI, NOT the daemon.
 # They live here because [blockchain] denies unknown fields and a node's node.toml is
-# shared with those CLIs, so a config that drives them must still pass `config validate`.
-# slash_appeal_address = ""          # `decdn appeal slash` target (ADR 028)
+# shared with the CLI, so a config that drives them must still pass `config validate`.
 # cctp_sweep_receiver_address = ""   # governance-chain CctpSweepReceiver; `decdn node receive-sweeps` submits attested sweeps to it
 # cctp_iris_url = ""                 # Circle CCTP attestation service base URL for `decdn node receive-sweeps` (https://iris-api-sandbox.circle.com on testnets, https://iris-api.circle.com on mainnet)
 # Payment chains: one table per chain, after every other [blockchain] key (at

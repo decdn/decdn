@@ -25,9 +25,7 @@ use decdn_client::{
     stream_fetch_tracked,
 };
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{
-    BuyerPoolState, Deployment, SignedCapability, bind_node_id_domain, slash_judge_domain,
-};
+use decdn_incentive::{BuyerPoolState, Deployment, SignedCapability, capacity_bond_domain};
 use decdn_protocol::client::{ClientMessage, StreamError, StreamResponse, WireCapability};
 use decdn_protocol::{
     ALPN_CLIENT, PoolAccount, StreamRequest, StreamRequestExt, decode_message,
@@ -669,7 +667,7 @@ impl ClientFixture {
         // on-chain redemption, and attach the client identity binding (ties the
         // request to the lane's signer for reactive origin fill). The fixture's
         // one key owns the pool and signs its lanes.
-        let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
+        let bind_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
         let own_node_id = B256::from(*self.endpoint.id().as_bytes());
         let ctx = self_owned_lane_ctx(
             &opened.state,
@@ -686,7 +684,7 @@ impl ClientFixture {
             &bind_domain,
         )?);
 
-        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+        let slash_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
         // Pinned into the session at open time, at the identity the daemon is
         // serving under now. A session deliberately keeps that pin: its pool and
         // lane watermark belong to this connection, so it must not silently follow
@@ -761,7 +759,7 @@ impl ClientFixture {
         let placeholder =
             decdn_client::funding::predicted_pool_id(self.signer.address(), U256::ZERO);
         let ctx = self.pool_context(chain, node, placeholder)?;
-        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+        let slash_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
         decdn_client::discovery_open(
             &Connections::new(self.endpoint.clone()),
             &target,
@@ -803,7 +801,7 @@ impl ClientFixture {
         timestamp_us: u64,
     ) -> anyhow::Result<decdn_protocol::client::StreamResponse> {
         let ctx = self.pool_context(chain, node, pool_id)?;
-        let slash_domain = slash_judge_domain(chain.chain_id(), chain.addrs().slash_judge);
+        let slash_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
         let err = match stream_fetch_tracked(
             &self.endpoint,
             Self::target(node).await?,
@@ -914,7 +912,7 @@ impl ClientFixture {
             &voucher_dom,
         )
         .context("sign self capability")?;
-        let bind_domain = bind_node_id_domain(chain.chain_id(), chain.addrs().capacity_bond);
+        let bind_domain = capacity_bond_domain(chain.chain_id(), chain.addrs().capacity_bond);
         let own_node_id = B256::from(*self.endpoint.id().as_bytes());
         Ok(
             PoolContext::for_pool(&state, Arc::clone(&self.signer), voucher_dom)

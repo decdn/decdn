@@ -60,7 +60,7 @@ def _solidity_output(changed_paths: tuple[str, ...]) -> bool:
         (("contracts/src/DecdnToken.sol",), True),
         (("contracts/foundry.toml",), True),
         (("contracts/deployments/421614.json",), False),
-        (("crates/node/src/slash_watcher.rs",), False),
+        (("crates/node/src/binding_check.rs",), False),
         (("README.md",), False),
         ((".gitmodules",), True),
         ((".github/workflows/ci.yml",), True),

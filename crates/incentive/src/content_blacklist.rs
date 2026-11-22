@@ -11,7 +11,7 @@
 //!
 //! The write + `getHashEntry` surface is mirrored for the cross-layer e2e
 //! harness (`decdn-e2e`), which drives governance blacklist adds and reads
-//! `addedAt` to time the compliance / slashability windows.
+//! `addedAt` to time the compliance window.
 
 // The `sol!`-generated bindings include macro-emitted code that uses patterns
 // workspace clippy denies (raw indexing into ABI fixed-size byte arrays,
@@ -42,7 +42,7 @@ mod sol_types {
             /// failing loudly.
             ///
             /// `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance
-            /// Window) is the slashability boundary, NOT `addedAt`: an entry is
+            /// Window) is the compliance boundary, NOT `addedAt`: an entry is
             /// unenforceable during the grace period a node needs to learn of it.
             /// `emergency` + `category` carry the auto-expiry term for entries
             /// added by the emergency multisig.
@@ -108,9 +108,8 @@ mod sol_types {
             /// Every region key whose entries are in scope for `operator` right
             /// now: `GLOBAL` (always first), the declared region, and — while the
             /// ADR 030 ripening window is open — the previous one. One to three
-            /// keys. Resolved on-chain through the same internal the slash-
-            /// eligibility predicate uses, so the region packing and ripening
-            /// math cannot drift between the two.
+            /// keys. Resolved on-chain, so the node does not repeat the region
+            /// packing and ripening math.
             function getScopeRegions(address operator) external view returns (bytes32[] memory);
 
             /// Number of entries indexed under `region`. Companion to
@@ -172,7 +171,7 @@ mod sol_types {
             function getRegionalBody(bytes32 region) external view returns (RegionalBody memory);
 
             /// Grace (seconds) between a standard/regional add and the moment the
-            /// entry becomes slashable (ADR 011 § Compliance Window).
+            /// entry takes effect (ADR 011 § Compliance Window).
             function complianceWindow() external view returns (uint64);
 
             // -----------------------------------------------------------------
@@ -244,7 +243,7 @@ mod sol_types {
                 returns (EmergencyOrigin memory);
 
             /// Grace (seconds) between an emergency add and the moment the
-            /// entry becomes slashable.
+            /// entry takes effect.
             function emergencyComplianceWindow() external view returns (uint64);
         }
     }

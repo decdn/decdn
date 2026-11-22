@@ -18,9 +18,9 @@
 //! | Spend delegation | [`capability`] (the signed capability), [`capability_grant`] (its transferable `dcap1:` form) |
 //! | Lane state | [`lane`] (the seller's per-lane watermark), [`store`] (persistence traits and in-memory stores, the settlement ledger among them), [`earnings`] (sums over the ledger for `decdn node earnings`), [`deployment`] (which `PaymentPool` a state belongs to) |
 //! | Buyer bookkeeping | [`buyer_pool`] (the buyer's pools and lanes), `buyer_pool_table` and `buyer_pool_redb` (an on-disk `redb` store, behind the `buyer-store-core` and `redb` features) |
-//! | Response signatures | [`stream_sig`] (the `slash_sig` on stream responses and the `SlashJudge` domain), [`origin_attestation`] (origin attestations), [`bind_sig`] (client bindings), [`sig_canon`] (canonical `s`) |
+//! | Response signatures | [`stream_sig`] (the `slash_sig` on stream responses), [`origin_attestation`] (origin attestations), [`bind_sig`] (client bindings and the shared `CapacityBond` domain), [`sig_canon`] (canonical `s`) |
 //! | Keys | [`eth_identity`] (Web3 Secret Storage keystores and the `PrivateKeySigner` they load) |
-//! | Contract bindings | [`payment_pool`] (`PaymentPool`, `FeeRouter`, `CctpSweepReceiver`),[`capacity_bond`], [`node_register`], [`erc20`], [`slash_judge`], [`slash_appeal`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
+//! | Contract bindings | [`payment_pool`] (`PaymentPool`, `FeeRouter`, `CctpSweepReceiver`),[`capacity_bond`], [`node_register`], [`erc20`], [`origin_assignment`], [`publisher_registry`], [`content_blacklist`] |
 //! | Transactions | [`tx`] (send, await the receipt, fail on a revert), [`pool_open_error`] (`PaymentPool` revert decoding), [`log_scan`] (bounded `eth_getLogs` windows that learn a provider's range cap) |
 //!
 //! # Sign and verify a voucher
@@ -92,8 +92,6 @@ pub mod publisher_registry;
 pub mod rate;
 pub mod settlement_receipt;
 pub mod sig_canon;
-pub mod slash_appeal;
-pub mod slash_judge;
 pub mod store;
 pub mod stream_sig;
 #[cfg(feature = "test-util")]
@@ -103,7 +101,7 @@ pub mod voucher;
 
 pub use bind_sig::{
     BindError, CAPACITY_BOND_DOMAIN_NAME, CAPACITY_BOND_DOMAIN_VERSION, EPHEMERAL_BINDING_NONCE,
-    bind_node_id_domain, binding_signing_hash, register_node_signing_hash, verify_binding,
+    binding_signing_hash, capacity_bond_domain, register_node_signing_hash, verify_binding,
 };
 pub use buyer_pool::{
     AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore,
@@ -137,10 +135,7 @@ pub use store::{
     MemoryPoolStateStore, MemorySettlementLedger, PendingSettle, PendingSettleStore,
     PoolStateStore, SettlementKey, SettlementLedger, SettlementRecord, StoreError,
 };
-pub use stream_sig::{
-    SLASH_JUDGE_DOMAIN_NAME, SLASH_JUDGE_DOMAIN_VERSION, STREAM_RESPONSE_TYPEHASH, StreamSlashData,
-    StreamSlashError, slash_judge_domain,
-};
+pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSlashData, StreamSlashError};
 pub use voucher::{
     DOMAIN_NAME, DOMAIN_VERSION, SignedVoucher, Voucher, VoucherError, voucher_domain,
 };

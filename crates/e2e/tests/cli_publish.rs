@@ -28,8 +28,8 @@
 //! intentionally skip — they cover output formatting only, matching the
 //! `decdn node register` precedent.
 //!
-//! The CLI-binary lookup + config/keystore wiring mirror `slash_appeal.rs`'s
-//! `decdn appeal slash` driver: the `decdn publish` binary reads its
+//! The CLI-binary lookup + config/keystore wiring: the `decdn publish` binary
+//! reads its
 //! `[blockchain]` coordinates (rpc url, chain id, `PublisherRegistry` /
 //! `OriginAssignment` addresses, keystore path) from the node fixture's rendered
 //! `node.toml`, with the keystore password in `DECDN_KEYSTORE_PASSWORD`.
@@ -305,8 +305,7 @@ async fn seat_then_unseat<P: alloy::providers::Provider>(
 /// Run `decdn publish <args…> --config <config>` against the node fixture's
 /// rendered config + keystore, asserting a clean exit, and return the captured
 /// output. The `[blockchain]` coordinates all come from the config; the keystore
-/// password and the isolated `HOME` come from `decdn_command` (mirrors
-/// `slash_appeal.rs`).
+/// password and the isolated `HOME` come from `decdn_command`.
 async fn run_publish(node: &NodeFixture, args: &[&str]) -> anyhow::Result<std::process::Output> {
     let out = Command::from(decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?)
         .arg("publish")

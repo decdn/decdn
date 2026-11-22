@@ -51,7 +51,7 @@ fn bundle_receipt(chain_id: u64) -> PullReceipt {
     PullReceipt::new(
         ReceiptChain {
             chain_id,
-            slash_judge: Address::repeat_byte(0x22),
+            capacity_bond: Address::repeat_byte(0x22),
             payment_chain_id: chain_id,
             payment_pool: Address::repeat_byte(0x11),
         },
@@ -344,7 +344,7 @@ fn a_known_chain_pins_the_contract_addresses() {
     };
     assert_eq!(faults.len(), 2);
     receipt.chain.payment_pool = pool.parse().unwrap();
-    receipt.chain.slash_judge = addresses.slash_judge.parse().unwrap();
+    receipt.chain.capacity_bond = addresses.capacity_bond.parse().unwrap();
     assert_eq!(
         check_chain_against(&receipt.chain, Some(chain)).unwrap(),
         ChainCheck::Known(Vec::new())

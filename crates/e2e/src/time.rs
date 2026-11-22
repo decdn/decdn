@@ -1,5 +1,5 @@
 //! Anvil time control: advance the chain clock across dispute / compliance /
-//! timelock / unbond windows so journeys don't wait wall-clock seconds.
+//! timelock windows so journeys don't wait wall-clock seconds.
 
 use alloy::providers::Provider;
 use anyhow::Context;
@@ -33,8 +33,8 @@ pub async fn mine_blocks<P: Provider>(provider: &P, count: u64) -> anyhow::Resul
     Ok(())
 }
 
-/// Mine past a node's snapshot lag margin: a node pins its registry, seat and
-/// slash snapshots `SNAPSHOT_LAG_MARGIN_BLOCKS` below the head, so a daemon
+/// Mine past a node's snapshot lag margin: a node pins its registry and seat
+/// snapshots `SNAPSHOT_LAG_MARGIN_BLOCKS` below the head, so a daemon
 /// that boots after this call sees every transaction mined before it. Each
 /// block advances the chain clock by one second, as `anvil_mine` does.
 pub async fn mine_past_snapshot_margin<P: Provider>(provider: &P) -> anyhow::Result<()> {

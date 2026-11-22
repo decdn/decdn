@@ -15,9 +15,7 @@ import { RegionScopeLib } from "./RegionScopeLib.sol";
 ///         origin blacklist (ADR 011 § Content Takedown). Enforcement only:
 ///         entries are added by governance, by a registered regional body, or
 ///         by the emergency multisig, and are removed by the global-override
-///         slow path (`removeHashGlobal` / `removeHashRegional`). An operator
-///         slashed under an entry later found wrongful is made whole through
-///         `SlashAppeal` (ADR 028), a separate contract.
+///         slow path (`removeHashGlobal` / `removeHashRegional`).
 contract ContentBlacklist is AccessControl, ReentrancyGuard {
     using EnumerableSet for EnumerableSet.Bytes32Set;
     using EnumerableSet for EnumerableSet.AddressSet;
@@ -34,14 +32,14 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // Constants
     // -----------------------------------------------------------------
 
-    // ADR 011 § Compliance Window — an entry does NOT become slashable at
-    // `addedAt`; it becomes slashable at `effectiveAt = addedAt + window`. The
+    // ADR 011 § Compliance Window — an entry does NOT take effect at
+    // `addedAt`; it takes effect at `effectiveAt = addedAt + window`. The
     // grace exists because nodes learn of an entry by polling `mutationCount`
     // on an interval (at most 5 minutes, ADR 011 § Node Behavior):
-    // without it, a node serving a request microseconds before the add lands is
-    // slashable for a delivery it could not have known was prohibited. Both
-    // windows are governance-tunable inside the hardcoded [1 hour, 7 days]
-    // bounds the ADR fixes.
+    // without it, a node serving a request microseconds before the add lands
+    // would breach an entry it could not have known about. Both windows are
+    // governance-tunable inside the hardcoded [1 hour, 7 days] bounds the ADR
+    // fixes.
     uint64 internal constant COMPLIANCE_WINDOW_DEFAULT = 24 hours;
     uint64 internal constant EMERGENCY_COMPLIANCE_WINDOW_DEFAULT = 2 hours;
     uint64 internal constant COMPLIANCE_WINDOW_FLOOR = 1 hours;
@@ -152,7 +150,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ICapacityBondRegionView public immutable capacityBondRegion;
 
     /// @notice Grace between a standard or regional add and the moment the entry
-    ///         becomes slashable (ADR 011 § Compliance Window). Stamped onto
+    ///         takes effect (ADR 011 § Compliance Window). Stamped onto
     ///         `HashEntry.effectiveAt` at add time; changing it never moves the
     ///         boundary for entries already added. Bounded to
     ///         [COMPLIANCE_WINDOW_FLOOR, COMPLIANCE_WINDOW_CEILING].
@@ -162,7 +160,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         tighter, because an emergency entry is the unlawful-content path
     ///         and the network cannot wait a day. Same bounds as
     ///         `complianceWindow`, so governance cannot set an emergency window
-    ///         under an hour and slash nodes that had no poll cycle to see it.
+    ///         under an hour and bind nodes that had no poll cycle to see it.
     uint64 public emergencyComplianceWindow;
 
     // -----------------------------------------------------------------
@@ -172,18 +170,15 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice Per-(region, hash) entry. `region = GLOBAL_REGION` is the
     ///         global scope. `addedAt == 0` means "not blacklisted".
     /// @dev    Every field is statically sized: `getHashEntry` returns this
-    ///         struct and `IContentBlacklistHashView` / `SlashJudge` decode it
-    ///         as the ABI-identical flattened tuple on the hot slash-eligibility
-    ///         path. Keep it that way — the audit-trail `reason` string (ADR 011
-    ///         § Reason field) is stored out-of-band in `hashReason` precisely so
-    ///         it cannot perturb that tuple's shape, and any new field must be
-    ///         mirrored into `IContentBlacklistHashView` in the same order.
-    ///         Packs into one slot (8 + 8 + 1 + 1 = 18 bytes).
+    ///         struct, and off-chain readers decode it as a fixed tuple. The
+    ///         audit-trail `reason` string (ADR 011 § Reason field) is stored
+    ///         out-of-band in `hashReason` so it cannot perturb that tuple's
+    ///         shape. Packs into one slot (8 + 8 + 1 + 1 = 18 bytes).
     /// @dev    `effectiveAt` is STAMPED at add time from the window then in
     ///         force, never computed live from the current `complianceWindow`:
     ///         a live computation would let a governance window change
-    ///         retroactively move the slash boundary under deliveries already
-    ///         served.
+    ///         retroactively move the effective boundary under deliveries
+    ///         already served.
     struct HashEntry {
         uint64 addedAt;
         uint64 effectiveAt;
@@ -478,9 +473,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice Blacklist an origin operator address with no governance vote.
     ///         Same role and expiry semantics as `emergencyAdd`.
     /// @dev    Deliberately writes only the origin blacklist and does NOT eject
-    ///         from `CapacityBond`. Ejection is permanent and forces the
-    ///         operator's bond into unbonding (ADR 011 § Hash Evasion); pairing
-    ///         an irreversible consequence with a self-expiring entry would be
+    ///         from `CapacityBond`. Ejection takes the operator out of the active
+    ///         set until governance lifts it (ADR 011 § Hash Evasion); pairing
+    ///         a governance-only release with a self-expiring entry would be
     ///         incoherent. Permanent removal stays `addOperator`, governance-only.
     function emergencyAddOrigin(address operator, uint8 category, string calldata reason)
         external
@@ -615,9 +610,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     /// @notice True iff `hash` is a live blacklist entry IN SCOPE for `operator`
     ///         under the ADR 030 § Region-stability window ripening predicate:
     ///         global ∪ current-region ∪ (within ripening window) prev-region.
-    ///         Read-only companion to the `SlashJudge` slash-eligibility gate
-    ///         (which additionally anchors each leg to the served-response time);
-    ///         this answers "in scope right now".
+    ///         This answers "in scope right now".
     /// @dev    Reads the operator's region inputs from `CapacityBond` via
     ///         `regionScopeData` and evaluates the predicate with `RegionScopeLib`.
     function isHashBlacklistedForOperator(bytes32 hash, address operator) external view returns (bool) {
@@ -775,7 +768,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     // -----------------------------------------------------------------
 
     /// @notice Bind `body` to `region` and grant it `REGIONAL_BODY_ROLE`
-    ///         (ADR 016 § Post-Deployment, step 6).
+    ///         (ADR 016 § Post-Deployment, step 2).
     /// @dev    Attempts the ADR 011 § Signer non-overlap check on-chain: the
     ///         emergency multisig can suspend this body's
     ///         entries, so a shared signer would grade their own homework. Where
@@ -891,8 +884,8 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         MutationKind kind = emergency ? MutationKind.HASH_EMERGENCY_ADD : MutationKind.HASH_ADD;
         if (_isLive(region, hash)) {
             // A live entry keeps `addedAt` and `effectiveAt`: moving
-            // `effectiveAt` later would void slash evidence for serves made
-            // after the entry took effect. Re-adding under governance ratifies an
+            // `effectiveAt` later would reopen the grace window on an entry
+            // that is already in force. Re-adding under governance ratifies an
             // emergency entry into a permanent one (`emergency` back to false);
             // an emergency re-add may only escalate the category.
             if (!emergency) {

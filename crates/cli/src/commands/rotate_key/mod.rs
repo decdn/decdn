@@ -3,23 +3,20 @@
 //!
 //! The runbook's decision tree branches on *which* key is being rotated, and
 //! the branches share almost nothing: one is a single transaction that changes
-//! no economic state, the other moves the entire on-chain identity across a
-//! 14-day window. So `--key` selects a submodule rather than a code path
+//! no economic state, the other moves the entire on-chain identity to a new
+//! address and resets its governance age-ramp. So `--key` selects a submodule rather than a code path
 //! inside one function:
 //!
 //! - `iroh` — rebind the wire `NodeId` through `CapacityBond.bindNodeId`.
 //! - `eth` — migrate the Ethereum address: deregister → unbond → re-onboard.
 //!
 //! What they do share is the failure this command exists to prevent. A node
-//! whose local key is not the on-chain-bound one is **un-slashable**:
-//! `SlashJudge._checkRegistered(challengedNode, nodeId)` resolves the challenged
-//! *address* through `nodeIdOf` and requires the cited id to equal the bound
-//! one, so evidence gathered against the key the node is actually serving under
-//! reverts — `NodeIdMismatch` when the operator is bound to some other id,
-//! `NodeNotRegistered` when it is bound to none. Either way the challenge
-//! fails, which is a protocol fault rather than an outage: the node keeps
-//! serving and keeps getting paid while its bond is unreachable. No
-//! ordering of steps here may produce that state even transiently, which is
+//! whose local key is not the on-chain-bound one is **unroutable**: peers and
+//! clients resolve a serving node to its operator through the binding
+//! (`CapacityBond.nodeIdToAddress`), so a node serving under any other key gets
+//! no routed traffic and no client accepts its signed responses. The node looks
+//! healthy while it earns nothing. No ordering of steps here may produce that
+//! state even transiently, which is
 //! what fixes the sequencing in both submodules — the iroh path commits
 //! `node.secret` only after the bind confirms, and the eth path reads chain
 //! state to pick its phase instead of trusting a flag about what already ran.

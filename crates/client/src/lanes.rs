@@ -156,7 +156,7 @@ pub struct LaneDeps<'a, P> {
     /// The wallet-filled provider the open, top-up and allowance transactions
     /// go through.
     pub rpc: &'a P,
-    /// The `SlashJudge` domain every stream response verifies against.
+    /// The `CapacityBond` domain every stream response verifies against.
     pub slash_dom: &'a Eip712Domain,
     /// The buyer's own address: the pool owner on the self-owned path, the
     /// delegate signer on the delegated one. On the self-owned path it need not

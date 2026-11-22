@@ -8,10 +8,11 @@
 //! ```
 //!
 //! The signature is checked off-chain only, by the nodes that keep, serve and
-//! publish the hash. It uses the `SlashJudge` EIP-712 domain
-//! ([`crate::slash_judge_domain`]), which every node already holds and which
+//! publish the hash. It uses the `CapacityBond` EIP-712 domain
+//! ([`crate::capacity_bond_domain`]), which every node already holds and which
 //! binds the signature to one chain and one deployment. Its type name differs
-//! from `StreamResponse`, so neither signature verifies as the other.
+//! from every other type signed under that domain, so no other signature
+//! verifies as an attestation.
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature, U256};

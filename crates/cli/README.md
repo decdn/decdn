@@ -5,7 +5,7 @@ Part of [deCDN](https://github.com/decdn/decdn) — a decentralized CDN where no
 > **Status: early implementation.** deCDN runs a public testnet on Arbitrum Sepolia and is pre-mainnet. Wire formats, APIs and on-chain interfaces change without compatibility shims until mainnet.
 
 The user-facing `decdn` binary: `get`, `probe`, `node` administration, `key-gen`,
-`config`, `pool`, `publish`, `origin`, `appeal`, `gateway`, `dashboard` and
+`config`, `pool`, `publish`, `origin`, `gateway`, `dashboard` and
 `self-update` subcommands. `gateway` serves `decdn:` URIs over HTTP: to a browser from
 loopback, or with `--public-url` to anyone at a public origin, paid with the
 capabilities pool owners register to its delegate key; `dashboard` serves one local

@@ -356,7 +356,7 @@ export const POLL_MS = {
   gateway: 2_000,
   /** The node's health, status and metrics. */
   nodeFast: 2_000,
-  /** The node's lanes, earnings, pools and slashes. */
+  /** The node's lanes, earnings and pools. */
   nodeSlow: 15_000,
 } as const;
 
@@ -433,10 +433,4 @@ export function earningsRows(e: EarningsResponse): EarningsRow[] {
     });
   }
   return rows;
-}
-
-/** A slash's offense type by name (ADR 014), or its number. */
-export function offense(type: number): string {
-  if (type === 0) return "Blacklist";
-  return `Offense ${type}`;
 }

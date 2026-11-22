@@ -5,7 +5,7 @@
 //! - The pull records, every [`PULLS_EVERY`].
 //! - The gateway's `/_status`, every [`GATEWAY_EVERY`].
 //! - The node's health, status and `/metrics`, every [`NODE_FAST_EVERY`].
-//! - The node's lanes, earnings, buyer pools and slashes, every
+//! - The node's lanes, earnings and buyer pools, every
 //!   [`NODE_SLOW_EVERY`]: `lanes` may read the chain for a pool's owner, and
 //!   `earnings` reads the whole settlement ledger.
 
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use decdn_common::admin::{
     AdminRpcClient as _, BUYER_POOL_UNAVAILABLE_CODE, DHT_UNAVAILABLE_CODE,
-    EARNINGS_UNAVAILABLE_CODE, EarningsRequest, SLASH_DETECTION_UNAVAILABLE_CODE,
+    EARNINGS_UNAVAILABLE_CODE, EarningsRequest,
 };
 use jsonrpsee::core::client::Error as JsonRpcClientError;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
@@ -98,7 +98,6 @@ impl Sources {
                 lanes: Part::waiting(),
                 earnings: Part::waiting(),
                 pools: Part::waiting(),
-                slashes: Part::waiting(),
             }),
         }
     }
@@ -225,7 +224,7 @@ async fn poll_node_fast(
     }
 }
 
-/// Read the node's lanes, earnings, buyer pools and slashes every
+/// Read the node's lanes, earnings and buyer pools every
 /// [`NODE_SLOW_EVERY`].
 async fn poll_node_slow(sources: Arc<Sources>, admin: HttpClient, admin_url: String) {
     every(NODE_SLOW_EVERY, move || {
@@ -233,17 +232,15 @@ async fn poll_node_slow(sources: Arc<Sources>, admin: HttpClient, admin_url: Str
         let admin = admin.clone();
         let admin_url = admin_url.clone();
         async move {
-            let (lanes, earnings, pools, slashes) = tokio::join!(
+            let (lanes, earnings, pools) = tokio::join!(
                 admin.lanes(),
                 admin.earnings(EarningsRequest::default()),
                 admin.pools(),
-                admin.slashes(),
             );
             let mut node = write(&sources.node);
             node.lanes = part(&admin_url, SLOW_TIMEOUT, lanes);
             node.earnings = part(&admin_url, SLOW_TIMEOUT, earnings);
             node.pools = part(&admin_url, SLOW_TIMEOUT, pools);
-            node.slashes = part(&admin_url, SLOW_TIMEOUT, slashes);
         }
     })
     .await;
@@ -373,10 +370,7 @@ pub(super) fn part<T>(
         Err(JsonRpcClientError::Call(obj))
             if matches!(
                 obj.code(),
-                SLASH_DETECTION_UNAVAILABLE_CODE
-                    | BUYER_POOL_UNAVAILABLE_CODE
-                    | EARNINGS_UNAVAILABLE_CODE
-                    | DHT_UNAVAILABLE_CODE
+                BUYER_POOL_UNAVAILABLE_CODE | EARNINGS_UNAVAILABLE_CODE | DHT_UNAVAILABLE_CODE
             ) =>
         {
             Read::Unconfigured {

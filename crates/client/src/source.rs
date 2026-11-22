@@ -870,7 +870,7 @@ mod doubles {
             provider: Address::repeat_byte(provider),
             deposit,
             client_signer: Arc::new(signer),
-            voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+            voucher_domain: decdn_incentive::capacity_bond_domain(1, Address::ZERO),
             prior_bytes_delivered: U256::ZERO,
             prior_amount: U256::ZERO,
             client_binding: None,

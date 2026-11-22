@@ -425,17 +425,17 @@ fn check_chain_against(
             chain.payment_pool, chain.payment_chain_id
         ));
     }
-    let raw_judge = &addresses.slash_judge;
-    let slash_judge: Address = raw_judge.parse().with_context(|| {
+    let raw_bond = &addresses.capacity_bond;
+    let capacity_bond: Address = raw_bond.parse().with_context(|| {
         format!(
-            "this build's slash_judge for chain {} is not an address: {raw_judge:?}",
+            "this build's capacity_bond for chain {} is not an address: {raw_bond:?}",
             chain.chain_id
         )
     })?;
-    if slash_judge != chain.slash_judge {
+    if capacity_bond != chain.capacity_bond {
         faults.push(format!(
-            "slash_judge {} is not chain {}'s contract {slash_judge} in this build",
-            chain.slash_judge, chain.chain_id
+            "capacity_bond {} is not chain {}'s contract {capacity_bond} in this build",
+            chain.capacity_bond, chain.chain_id
         ));
     }
     Ok(ChainCheck::Known(faults))
@@ -457,7 +457,7 @@ fn receipt_faults(receipt: &PullReceipt) -> anyhow::Result<(Vec<String>, bool)> 
 /// The note for a chain this build does not know.
 fn unknown_chain_note(chain_id: u64) -> String {
     format!(
-        "chain {chain_id} is not one this build knows: its PaymentPool and SlashJudge \
+        "chain {chain_id} is not one this build knows: its PaymentPool and CapacityBond \
          addresses are unchecked"
     )
 }

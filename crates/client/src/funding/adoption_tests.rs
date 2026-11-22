@@ -1950,7 +1950,7 @@ async fn a_delegated_lane_resumes_from_its_delegate_record() -> anyhow::Result<(
         pool_id,
         expiry: u64::MAX,
     }
-    .sign(owner.as_ref(), &bind_node_id_domain(1, Address::ZERO))?;
+    .sign(owner.as_ref(), &capacity_bond_domain(1, Address::ZERO))?;
     let grant = CapabilityGrant::from_signed_capability(&signed);
     let lane = LaneKey {
         pool_id,
@@ -2015,8 +2015,7 @@ async fn delegated_ctx(
     let governance = crate::session::GovernanceChain {
         rpc_url: "http://config:8545".to_string(),
         chain_id: DEPLOYMENT.chain_id,
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: None,
+        capacity_bond: Address::repeat_byte(0x44),
     };
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .relay_mode(iroh::RelayMode::Disabled)
@@ -2168,7 +2167,7 @@ async fn an_unreadable_delegate_record_fails_the_lane_build_fatally() -> anyhow:
         pool_id: PoolId::repeat_byte(0x11),
         expiry: u64::MAX,
     }
-    .sign(owner.as_ref(), &bind_node_id_domain(1, Address::ZERO))?;
+    .sign(owner.as_ref(), &capacity_bond_domain(1, Address::ZERO))?;
     let grant = CapabilityGrant::from_signed_capability(&signed);
     let Err(err) = delegated_ctx(
         &UnreadableDelegateLanes::default(),

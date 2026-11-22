@@ -12,36 +12,24 @@ import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ER
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
-import { ICapacityBondSlashEscrow } from "./interfaces/ICapacityBondSlashEscrow.sol";
 import { ICapacityBondEjector } from "./interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondEpoch } from "./interfaces/ICapacityBondEpoch.sol";
 import { ICapacityBondRegionView } from "./interfaces/ICapacityBondRegionView.sol";
-import { ISlashJudgeEvidenceView } from "./interfaces/ISlashJudgeEvidenceView.sol";
 import { IEd25519Verifier } from "./interfaces/IEd25519Verifier.sol";
 import { BondMath } from "./BondMath.sol";
-import { SlashEscrowLib, SlashRecord } from "./SlashEscrowLib.sol";
 import { DeclaredMbpsHistoryLib } from "./DeclaredMbpsHistoryLib.sol";
 
 /// @title CapacityBond — operator-registry contract
-/// @notice Custodies operator TOKEN bond, executes the escrow-on-slash flow
-///         from ADR 026 § Slashing and burn (the slashed TOKEN is held in
-///         per-slashId escrow until the appeal window resolves, then either
-///         distributed 50% challenger / 50% burn or refunded to the operator
-///         on a successful appeal), exposes `epochLength()` so `FeeRouter` can
-///         prove at deploy time that both contracts agree on epoch length, is
-///         the registry for iroh-NodeId ↔ Ethereum-address
-///         bindings, and is the source of `firstBondedAt` / `slashedAtEpoch`
+/// @notice Custodies operator TOKEN bond, exposes `epochLength()` so
+///         `FeeRouter` can prove at deploy time that both contracts agree on
+///         epoch length, is the registry for iroh-NodeId ↔ Ethereum-address
+///         bindings, and is the source of `firstBondedAt` / `declaredMbpsAtEpoch`
 ///         for `DecdnGovernor`'s served-bytes voting weight per ADR 036.
+///         An operator withdraws bond in one `unbond` call, which pays the
+///         TOKEN out at once; the bond backs the declared capacity tier
+///         (ADR 026 § Capacity-bond curve) and the entry floor.
 /// @dev    The bond / unbond / node-registry primitives, plus:
 ///           - `firstBondedAt[op]`  — set on first successful `bond` (ADR 036)
-///           - `slashedAtEpoch[op]` — stamped in `slash()`, cleared by the
-///                                    `settleAppealGranted` escrow hook on a
-///                                    successful appeal (ADR 028 / 036)
-///           - escrow-on-slash: the slashed TOKEN is parked in `_slashRecords`
-///                                    (`escrowedTotal` accounting) until
-///                                    `finalizeUnappealedSlash` (no appeal) or
-///                                    one of the `SLASH_APPEAL_ROLE` settle
-///                                    hooks resolves it (ADR 028)
 ///           - `regionPrev[op]` + `regionLastChanged[op]` + `updateRegion`
 ///                                    (ADR 030 § Node Region Self-Attestation)
 ///           - `declaredMbps[op]`   — operator-asserted capacity (ADR 026
@@ -50,12 +38,11 @@ import { DeclaredMbpsHistoryLib } from "./DeclaredMbpsHistoryLib.sol";
 ///                                    `[minCapacityMbps, maxCapacityMbps]`
 ///                                    band; the bond-curve coupling
 ///                                    `activeBond ≥ k × Mbps^α` is enforced at
-///                                    `declareMbps` / `requestUnbond` /
+///                                    `declareMbps` / `unbond` /
 ///                                    `registerNode`, with `k`/`α`
 ///                                    governance-tunable via `setK` / `setAlpha`
 contract CapacityBond is
     ICapacityBond,
-    ICapacityBondSlashEscrow,
     ICapacityBondEjector,
     ICapacityBondEpoch,
     ICapacityBondRegionView,
@@ -71,36 +58,8 @@ contract CapacityBond is
     // -----------------------------------------------------------------
 
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
-    bytes32 public constant SLASH_ROLE = keccak256("SLASH_ROLE");
     bytes32 public constant BLACKLIST_ROLE = keccak256("BLACKLIST_ROLE");
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
-
-    /// @notice Authority to drive the escrow-on-slash appeal hooks
-    ///         (`markAppealOpen` / `settleAppealUpheld` / `settleAppealGranted`).
-    ///         Granted to the `SlashAppeal` contract (ADR 016 § Post-Deployment
-    ///         Initialization); consumed by the `SlashAppeal` state machine per
-    ///         ADR 028 § Contract surface.
-    bytes32 public constant SLASH_APPEAL_ROLE = keccak256("SLASH_APPEAL_ROLE");
-
-    // -----------------------------------------------------------------
-    // Slash schedule constants (ADR 026 § Slashing and burn)
-    // -----------------------------------------------------------------
-
-    uint256 internal constant BPS_DENOMINATOR = 10_000;
-    uint256 internal constant SLASH_BPS_TIER_1 = 500;
-    uint256 internal constant SLASH_BPS_TIER_2 = 1500;
-    uint256 internal constant SLASH_BPS_TIER_3 = 5000;
-    // The challenger/burn split at finality (ADR 026 § Slashing and burn — 50%
-    // challenger / 50% burn) now lives in `SlashEscrowLib`, alongside the
-    // distribution logic that consumes it.
-
-    /// @notice Window after a slash during which the operator may file an
-    ///         appeal (ADR 028 § Hard caps and frequency limits). Also gates
-    ///         the permissionless `finalizeUnappealedSlash` path: escrow can
-    ///         only be distributed as upheld once this window lapses with no
-    ///         appeal. Shared with `SlashAppeal` via `markAppealOpen`, which is
-    ///         the single on-chain enforcer of the filing deadline.
-    uint64 internal constant APPEAL_FILING_WINDOW = 30 days;
 
     // -----------------------------------------------------------------
     // Governable-parameter safety bounds
@@ -139,11 +98,6 @@ contract CapacityBond is
     uint256 internal constant ONE_GBPS_BOND_FLOOR = 10_000e18;
     uint256 internal constant ONE_GBPS_BOND_CEILING = 200_000e18;
 
-    // Governance bounds on `unbondingPeriod` per ADR 009 § CapacityBond curve
-    // and governance parameters (mirrored by ADR 016 and ADR 014).
-    uint256 internal constant UNBONDING_PERIOD_FLOOR = 7 days;
-    uint256 internal constant UNBONDING_PERIOD_CEILING = 60 days;
-
     uint256 internal constant MULTIADDR_COOLDOWN_CEILING = 1 days;
 
     uint256 internal constant MAX_MULTIADDR_SIZE_FLOOR = 64;
@@ -157,13 +111,13 @@ contract CapacityBond is
 
     /// @notice Canonical epoch length shared with `FeeRouter` (ADR 026 §
     ///         FeeRouter split, ADR 036 § Formula). Stored as a constant
-    ///         on this contract so `slashedAtEpoch` derives the same epoch
+    ///         on this contract so `declaredMbpsAtEpoch` derives the same epoch
     ///         index `FeeRouter` writes into `bytesPerEpoch`. Exposed via the
     ///         lowercase `epochLength()` accessor so `FeeRouter`'s
     ///         constructor can assert equality against the value the
     ///         deployer passes for `epochLength_` (closes the silent
-    ///         epoch-mis-anchor footgun where `DecdnGovernor._slashedInWindow`
-    ///         would compare incompatible epoch indices).
+    ///         epoch-mis-anchor footgun where `DecdnGovernor` would cap one
+    ///         epoch's bytes with another epoch's declared capacity).
     uint64 public constant EPOCH_LENGTH = 7 days;
 
     /// @notice Lowercase accessor for `EPOCH_LENGTH` — exists so
@@ -201,22 +155,15 @@ contract CapacityBond is
     // Storage — bonding
     // -----------------------------------------------------------------
 
-    struct UnbondingRequest {
-        uint256 amount;
-        uint256 unlockAt;
-    }
-
     mapping(address operator => uint256 amount) public activeBond;
-    mapping(address operator => UnbondingRequest) public unbondingOf;
-    mapping(address operator => uint32) public lifetimeOffenseCount;
     mapping(address operator => bool) public ejected;
 
     /// @notice Governance-blacklist ejection latch (ADR 011 § Hash Evasion and
     ///         Origin Blacklisting). Set by the `BLACKLIST_ROLE` `ejectNode`
-    ///         path and is independent of the recoverable slash auto-ejection
-    ///         (ADR 026): while set, `bond()` MUST NOT clear `ejected`, so a
-    ///         blacklisted operator cannot self-reinstate by re-bonding. Cleared
-    ///         only by `unEjectNode` when governance lifts the blacklist.
+    ///         path together with `ejected`: while set, `bond()` MUST NOT clear
+    ///         `ejected`, so a blacklisted operator cannot self-reinstate by
+    ///         re-bonding. Cleared only by `unEjectNode` when governance lifts
+    ///         the blacklist.
     mapping(address operator => bool) public blacklistEjected;
 
     /// @notice First-bond-time stamp per operator (ADR 036 § Formula —
@@ -224,25 +171,15 @@ contract CapacityBond is
     ///         lifts the operator's `activeBond` above zero; never overwritten.
     mapping(address operator => uint64) internal _firstBondedAt;
 
-    /// @notice Encoded slash-epoch stamp: `0` means "never slashed in the
-    ///         current window"; any non-zero value is `actualEpoch + 1`.
-    ///         The +1 offset exists so a genuine slash in epoch 0 (the first
-    ///         `EPOCH_LENGTH` after deploy) is not collapsed with the
-    ///         "unslashed" sentinel. Consumers MUST decode (`slashed - 1`)
-    ///         before doing epoch arithmetic. (ADR 036 § Slashing zero-out.)
-    mapping(address operator => uint64) internal _slashedAtEpoch;
-
     /// @notice Operator-asserted serving capacity in Mbps (ADR 026
     ///         § Capacity-bond curve). `declareMbps` enforces the governable
     ///         `[minCapacityMbps, maxCapacityMbps]` band, except that an
     ///         INACTIVE operator may declare 0 to release the tier (see the
     ///         implementation note below); the bond-curve
     ///         coupling `activeBond ≥ bondRequired(declaredMbps)` is enforced
-    ///         at the operator-initiated mutation sites (`declareMbps`,
-    ///         `requestUnbond`, `registerNode`). Slash paths intentionally do
-    ///         not re-enforce it — a penalized operator may fall under the
-    ///         curve and is auto-ejected below `bondFloorAtActivation / 2`.
-    /// @dev    Invariant: every write to this mapping emits `MbpsDeclared`.
+    ///         at every site that changes the bond or the tier (`declareMbps`,
+    ///         `unbond`, `registerNode`).
+    /// @dev   Invariant: every write to this mapping emits `MbpsDeclared`.
     ///         There are exactly two routes back to 0, split by whether the
     ///         operator is active: `deregisterNode` (active — it reverts
     ///         `NodeNotActive` otherwise) and `declareMbps(0)` (inactive — the
@@ -273,27 +210,12 @@ contract CapacityBond is
     /// @notice Per-operator entry floor: the live `minBond` captured each time
     ///         the operator's `activeBond` crosses UP through it in `bond`
     ///         (ADR 026 § Minimum bond is non-retroactive). Ongoing active status
-    ///         (`isActive`) and slash auto-ejection (`_maybeAutoEject`) test the
-    ///         active bond against THIS floor, not the live `minBond`, so a later
-    ///         `minBond` raise never de-activates or eases the ejection threshold
-    ///         of an already-active operator. A re-crossing after a full ejection
-    ///         re-grandfathers at the then-current `minBond`. Zero until the
-    ///         operator first reaches `minBond`.
+    ///         (`isActive`) tests the active bond against THIS floor, not the
+    ///         live `minBond`, so a later `minBond` raise never de-activates an
+    ///         already-active operator. A re-crossing re-grandfathers at the
+    ///         then-current `minBond`. Zero until the operator first reaches
+    ///         `minBond`.
     mapping(address operator => uint256) public bondFloorAtActivation;
-
-    uint256 public unbondingPeriod;
-
-    /// @notice SlashJudge view used to enforce the paired
-    ///         `maxEvidenceAgeUs < unbondingPeriod * 1e6` invariant on
-    ///         `setUnbondingPeriod` (ADR 014 § Interaction with unbonding period).
-    ///         Wired once post-deploy via `setSlashJudge` because SlashJudge is
-    ///         deployed after CapacityBond (deploy-order circular dependency), then
-    ///         fixed: the judge is not re-pointable. While unset
-    ///         (`address(0)`), `setUnbondingPeriod` applies only the live
-    ///         `[UNBONDING_PERIOD_FLOOR, UNBONDING_PERIOD_CEILING]` bound — the
-    ///         `[7d,60d]` window from ADR 014/009 (see the bounds' declaration
-    ///         note).
-    ISlashJudgeEvidenceView public slashJudge;
 
     /// @notice Governable declared-capacity band (Mbps) enforced on
     ///         `declareMbps`. Defaults: 10 Mbps floor, 200 Gbps (200_000 Mbps)
@@ -320,10 +242,9 @@ contract CapacityBond is
     ///         ripening predicate (*"a node is in scope iff the entry is global,
     ///         OR entry.region == regionHint, OR (block.timestamp -
     ///         regionLastChanged < REGION_STABILITY_WINDOW AND entry.region ==
-    ///         regionPrev)"*) at scope-test / slash-eligibility time. The
-    ///         predicate is enforced by `SlashJudge._checkBlacklistedBefore` and
-    ///         read by `ContentBlacklist.isHashBlacklistedForOperator`; both read
-    ///         this slot (with `regionLastChanged`) via `RegionScopeLib` off the
+    ///         regionPrev)"*) at scope-test time. The predicate is read by
+    ///         `ContentBlacklist.isHashBlacklistedForOperator`, which reads this
+    ///         slot (with `regionLastChanged`) via `RegionScopeLib` off the
     ///         aggregate `regionScopeData` getter.
     mapping(address operator => string) public regionPrev;
 
@@ -336,59 +257,6 @@ contract CapacityBond is
     /// @notice Cooldown enforced between `updateRegion` calls per ADR 030
     ///         (default 7 days; governable [3d, 30d]).
     uint256 public regionStabilityWindow;
-
-    // -----------------------------------------------------------------
-    // Storage — slash records (ADR 028 § Contract surface)
-    // -----------------------------------------------------------------
-
-    /// @notice The slash escrow lifecycle (`SlashStatus`) and the `SlashRecord`
-    ///         struct live in [`SlashEscrowLib`](SlashEscrowLib.sol) (file-level
-    ///         types) alongside the finality state machine extracted there to
-    ///         keep this contract under the EIP-170 size ceiling (issue #770).
-    ///         `Escrowed` → either `Upheld` (distributed 50/50) or `Reversed`
-    ///         (refunded). `AppealOpen` locks the escrow while the `SlashAppeal`
-    ///         state machine runs, so `finalizeUnappealedSlash` cannot race it.
-
-    /// @notice Monotonic slash counter — next slash receives this index, then
-    ///         `slashCounter` increments.
-    uint256 public slashCounter;
-
-    mapping(uint256 slashId => SlashRecord) internal _slashRecords;
-
-    /// @notice Per-operator append-only list of that operator's slashIds. Used
-    ///         to recompute the `slashedAtEpoch` watermark to the max epoch
-    ///         among still-standing (non-`Reversed`) slashes when a granted
-    ///         appeal reverses one — so reversing the most-recent slash falls
-    ///         the watermark back to an older slash that still stands rather
-    ///         than wrongly clearing it (ADR 036 § Slashing zero-out —
-    ///         multi-slash). Expected to stay small in practice — a slash drops
-    ///         active bond (auto-ejecting below `bondFloorAtActivation / 2`), so re-slashing
-    ///         costs the operator a fresh re-bond each cycle — but this is an
-    ///         economic deterrent, not a hard cap; the recompute scan reads from
-    ///         the tail and breaks at the first standing slash, so it is cheap
-    ///         even if the list is long.
-    mapping(address operator => uint256[]) internal _operatorSlashIds;
-
-    /// @notice Sum of all TOKEN currently held in slash escrow (status
-    ///         `Escrowed` or `AppealOpen`). Invariant anchor: the contract's
-    ///         TOKEN balance must cover `escrowedTotal` plus active bond and
-    ///         unbonding bond. Incremented in
-    ///         `slash()`, decremented at every terminal escrow transition.
-    uint256 public escrowedTotal;
-
-    /// @notice Combined slash-path paused-seconds accumulator (the single source
-    ///         of truth). Folds in this contract's own pauses plus, via
-    ///         `creditPauseTime`, `SlashAppeal`'s pauses, so every appeal window
-    ///         (filing here, review/ratification on `SlashAppeal`) extends by the
-    ///         same total and a pause on either contract never silently consumes
-    ///         a window (ADR 028 § Hard caps and frequency limits). Conservative: a pause that predates a slash
-    ///         still extends that slash's window, which only ever favors the
-    ///         operator.
-    uint64 public override pausedTotal;
-
-    /// @notice `block.timestamp` at which the current pause began; 0 when not
-    ///         paused.
-    uint64 internal _pausedAt;
 
     // -----------------------------------------------------------------
     // Storage — node registry (ADR 019 § Node Onboarding;
@@ -432,26 +300,15 @@ contract CapacityBond is
     // -----------------------------------------------------------------
 
     event Bonded(address indexed operator, uint256 amount, uint256 newActiveBond);
-    event UnbondingRequested(address indexed operator, uint256 amount, uint256 unlockAt, uint256 newActiveBond);
-    event Unbonded(address indexed operator, uint256 amount);
-    event Slashed(
-        address indexed operator,
-        address indexed challenger,
-        uint8 offenseType,
-        uint32 lifetimeOffenseCount,
-        uint256 slashAmount
-    );
-    event AutoEjected(address indexed operator, uint256 remainingBond);
+    /// @notice `amount` of TOKEN left the operator's active bond and went to
+    ///         the operator in the same `unbond` call.
+    event Unbonded(address indexed operator, uint256 amount, uint256 newActiveBond);
     event EjectedByBlacklist(address indexed operator);
     event BlacklistEjectionCleared(address indexed operator);
     event Reinstated(address indexed operator);
     event MinBondUpdated(uint256 oldValue, uint256 newValue);
     event KUpdated(uint256 oldValue, uint256 newValue);
     event AlphaUpdated(uint256 oldValue, uint256 newValue);
-    event UnbondingPeriodUpdated(uint256 oldValue, uint256 newValue);
-    /// @notice The SlashJudge was wired. Fires exactly once, at initial deploy
-    ///         wiring; the judge is fixed thereafter.
-    event SlashJudgeWired(address indexed judge);
     event MultiaddrUpdateCooldownUpdated(uint256 oldValue, uint256 newValue);
     event MaxMultiaddrSizeUpdated(uint256 oldValue, uint256 newValue);
     event RegionStabilityWindowUpdated(uint256 oldValue, uint256 newValue);
@@ -482,19 +339,8 @@ contract CapacityBond is
     // ADR 030 — region self-attestation.
     event RegionUpdated(bytes32 indexed nodeId, string oldRegion, string newRegion);
 
-    // ADR 036 — slash-zero-out lifecycle. `epoch == 0` signals the cleared /
-    // unslashed sentinel (the watermark recomputed to "no standing slash").
-    event SlashedAtEpochStamped(address indexed operator, uint64 epoch);
-
     // ADR 026 — declared capacity.
     event MbpsDeclared(address indexed operator, uint256 oldMbps, uint256 newMbps);
-
-    // ADR 028 — slash record minting + escrow lifecycle.
-    event SlashRecorded(uint256 indexed slashId, address indexed operator, uint64 slashedAt, uint256 slashAmount);
-    event SlashEscrowed(uint256 indexed slashId, address indexed operator, uint256 amount, uint64 appealWindowClose);
-    event SlashAppealOpened(uint256 indexed slashId, address indexed operator);
-    event SlashUpheld(uint256 indexed slashId, bool viaAppeal, uint256 challengerShare, uint256 burnShare);
-    event SlashReversed(uint256 indexed slashId, address indexed operator, uint256 refund);
 
     // -----------------------------------------------------------------
     // Errors
@@ -504,9 +350,6 @@ contract CapacityBond is
     error ZeroAmount();
     error ZeroNodeId();
     error InsufficientBond(uint256 requested, uint256 available);
-    error UnbondingInProgress();
-    error UnbondingNotComplete(uint256 unlockAt);
-    error NoUnbondingRequest();
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
     error DeclaredCapacityOutOfBand(uint256 mbps, uint256 floor, uint256 ceiling);
     error BondBelowCurve(uint256 bond, uint256 required);
@@ -531,36 +374,18 @@ contract CapacityBond is
     error NodeIdNotBound(bytes32 nodeId);
     error RegionHintTooLong(uint256 size, uint256 ceiling);
 
-    /// @dev `setUnbondingPeriod` would drop `unbondingPeriod * 1e6` to or below the
-    ///      live evidence-age ceiling, violating ADR 014's slash-before-withdraw
-    ///      invariant.
-    ///      Paired with `SlashJudge.EvidenceAgeExceedsUnbonding` (the other half).
-    error UnbondingBelowEvidenceAge(uint256 unbondingUs, uint256 maxEvidenceAgeUs);
-    /// @notice `setSlashJudge` was called after the judge was already wired. The
-    ///         judge is set once at deploy and then fixed; it is not re-pointable.
-    error SlashJudgeAlreadySet();
-
     // ADR 030
     error RegionCooldownActive(uint64 readyAt);
-
-    // ADR 028 — slash record lookup + escrow lifecycle
-    error UnknownSlash(uint256 slashId);
-    error SlashIndexOutOfRange(address operator, uint256 index, uint256 length);
-    error SlashNotEscrowed(uint256 slashId);
-    error SlashAppealNotOpen(uint256 slashId);
-    error FilingWindowStillOpen(uint64 readyAt);
-    error FilingWindowClosed(uint64 closedAt);
 
     // -----------------------------------------------------------------
     // Constructor
     // -----------------------------------------------------------------
 
-    /// @param token_                    TOKEN contract (must implement `burn`).
+    /// @param token_                    TOKEN contract.
     /// @param ed25519Verifier_          Verifier for `registerNode` ed25519 proof.
     /// @param admin                     Initial `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE`.
     /// @param minBond_                  Initial minimum active bond.
-    /// @param unbondingPeriod_          Initial unbonding period.
-    /// @param multiaddrUpdateCooldown_  Initial multiaddr-update cooldown.
+    /// @param multiaddrUpdateCooldown_ Initial multiaddr-update cooldown.
     /// @param maxMultiaddrSize_         Initial multiaddrs byte-length cap.
     /// @param regionStabilityWindow_    Initial region-update cooldown (default
     ///                                  7 days; bounded `[3d, 30d]`).
@@ -574,7 +399,6 @@ contract CapacityBond is
         IEd25519Verifier ed25519Verifier_,
         address admin,
         uint256 minBond_,
-        uint256 unbondingPeriod_,
         uint256 multiaddrUpdateCooldown_,
         uint256 maxMultiaddrSize_,
         uint256 regionStabilityWindow_,
@@ -584,7 +408,6 @@ contract CapacityBond is
             revert ZeroAddress();
         }
         _enforceMinBondBounds(minBond_);
-        _enforceUnbondingPeriodBounds(unbondingPeriod_);
         _enforceMultiaddrCooldownBounds(multiaddrUpdateCooldown_);
         _enforceMaxMultiaddrSizeBounds(maxMultiaddrSize_);
         _enforceRegionStabilityWindowBounds(regionStabilityWindow_);
@@ -592,7 +415,6 @@ contract CapacityBond is
         token = token_;
         ed25519Verifier = ed25519Verifier_;
         minBond = minBond_;
-        unbondingPeriod = unbondingPeriod_;
         multiaddrUpdateCooldown = multiaddrUpdateCooldown_;
         maxMultiaddrSize = maxMultiaddrSize_;
         regionStabilityWindow = regionStabilityWindow_;
@@ -635,20 +457,20 @@ contract CapacityBond is
         // non-retroactive). This is the entry transition — `registerNode` and
         // the reinstatement gate below both require `activeBond >= minBond`, so
         // any operator that can activate has crossed here and holds a floor.
-        // Ongoing active status (`isActive`) and slash auto-ejection read this
-        // floor, never the live `minBond`, so a later `minBond` raise is
-        // non-retroactive. Re-crossing after a full ejection re-grandfathers at
-        // the then-current `minBond`. The first crossing also starts the
-        // operator's tenure, never overwritten (ADR 036 § Behaviors that follow
-        // from the formula), so a dust bond cannot pre-age an address.
+        // Ongoing active status (`isActive`) reads this floor, never the live
+        // `minBond`, so a later `minBond` raise is non-retroactive. Re-crossing
+        // after a full unbond re-grandfathers at the then-current `minBond`.
+        // The first crossing also starts the operator's tenure, never
+        // overwritten (ADR 036 § Behaviors that follow from the formula), so a
+        // dust bond cannot pre-age an address.
         if (oldBalance < minBond && newBalance >= minBond) {
             bondFloorAtActivation[msg.sender] = minBond;
             if (_firstBondedAt[msg.sender] == 0) _firstBondedAt[msg.sender] = uint64(block.timestamp);
         }
 
-        // Slash auto-ejection (ADR 026) is recoverable by re-bonding, but a
-        // governance blacklist latch (ADR 011) is not — re-entry after a
-        // blacklist must go through `unEjectNode` first.
+        // A governance blacklist latch (ADR 011) blocks re-entry by re-bonding:
+        // re-entry after a blacklist goes through `unEjectNode` first, and the
+        // next bond that holds `minBond` then clears `ejected`.
         if (ejected[msg.sender] && !blacklistEjected[msg.sender] && newBalance >= minBond) {
             ejected[msg.sender] = false;
             emit Reinstated(msg.sender);
@@ -657,54 +479,39 @@ contract CapacityBond is
         emit Bonded(msg.sender, amount, newBalance);
     }
 
-    /// @notice Start the unbonding timer on part of the active bond. This is a
-    ///         principal-exit path and is never pausable: pause halts intake and
-    ///         serving, never an operator's exit (the client-side twin
-    ///         `PaymentPool.reclaim` is un-pausable for the same reason). Slash
-    ///         safety does not come from pause — the unbonding period keeps the
-    ///         queued amount exposed, and `slash` reaches bond sitting in the
-    ///         queue via `_reduceBondAtTier`, so a captured PAUSER cannot trap an
-    ///         honest operator's bond and pause buys a dishonest one no shelter.
-    function requestUnbond(uint256 amount) external nonReentrant {
+    /// @notice Withdraw `amount` of the active bond to the caller in this call.
+    ///         The remaining active bond must still cover the declared capacity
+    ///         tier (`bondRequired(declaredMbps)`); an operator that reduces its
+    ///         bond below the tier declares a lower tier first, and a full exit
+    ///         clears the tier with `deregisterNode` (registered) or
+    ///         `declareMbps(0)` (inactive). A remainder below
+    ///         `bondFloorAtActivation` takes the operator out of the active set
+    ///         (`isActive`).
+    ///
+    ///         This is a principal-exit path and is never pausable: pause halts
+    ///         intake and serving, never an operator's exit (the client-side
+    ///         twin `PaymentPool.reclaim` is un-pausable for the same reason), so
+    ///         a captured PAUSER cannot trap an operator's bond.
+    function unbond(uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
-        if (amount > activeBond[msg.sender]) {
-            revert InsufficientBond({ requested: amount, available: activeBond[msg.sender] });
+        uint256 available = activeBond[msg.sender];
+        if (amount > available) {
+            revert InsufficientBond({ requested: amount, available: available });
         }
-        if (unbondingOf[msg.sender].amount != 0) revert UnbondingInProgress();
 
-        activeBond[msg.sender] -= amount;
+        uint256 remaining = available - amount;
 
         // ADR 026 § Capacity-bond curve: the remaining active bond must still
-        // cover the operator's declared capacity. Operators reducing capacity
-        // must `declareMbps` down first. (No-op when no Mbps is declared, since
-        // `bondRequired(0) == 0`.)
+        // cover the operator's declared capacity. (No-op when no Mbps is
+        // declared, since `bondRequired(0) == 0`.)
         uint256 required = bondRequired(declaredMbps[msg.sender]);
-        if (activeBond[msg.sender] < required) {
-            revert BondBelowCurve({ bond: activeBond[msg.sender], required: required });
+        if (remaining < required) {
+            revert BondBelowCurve({ bond: remaining, required: required });
         }
 
-        uint256 unlockAt = block.timestamp + unbondingPeriod;
-        unbondingOf[msg.sender] = UnbondingRequest({ amount: amount, unlockAt: unlockAt });
-
-        emit UnbondingRequested(msg.sender, amount, unlockAt, activeBond[msg.sender]);
-    }
-
-    /// @notice Withdraw bond whose unbonding period has elapsed. This is a
-    ///         principal-exit path and is never pausable, matching
-    ///         `requestUnbond`: pause covers intake and serving only. The elapsed
-    ///         unbonding period is the sole gate on the released amount — the bond
-    ///         stayed slashable for the whole window, and any at-risk portion was
-    ///         already moved to escrow by `slash`, so what remains here is the
-    ///         operator's to withdraw whether the contract is paused or not.
-    function unbond() external nonReentrant {
-        UnbondingRequest memory req = unbondingOf[msg.sender];
-        if (req.amount == 0) revert NoUnbondingRequest();
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp < req.unlockAt) revert UnbondingNotComplete(req.unlockAt);
-
-        delete unbondingOf[msg.sender];
-        IERC20(address(token)).safeTransfer(msg.sender, req.amount);
-        emit Unbonded(msg.sender, req.amount);
+        activeBond[msg.sender] = remaining;
+        IERC20(address(token)).safeTransfer(msg.sender, amount);
+        emit Unbonded(msg.sender, amount, remaining);
     }
 
     /// @notice Self-attest serving capacity in Mbps (ADR 026 § Capacity-bond
@@ -723,36 +530,28 @@ contract CapacityBond is
     ///         tier as part of the exit.
     /// @dev    Without this branch the tier is unclearable from every state
     ///         `deregisterNode` cannot be called in — bonded-and-declared but
-    ///         never registered, auto-ejected by slashing, blacklist-ejected,
-    ///         or displaced by `reclaimNodeId` — so `requestUnbond`'s
-    ///         `bondRequired(declaredMbps)` floor outlives the registration it
-    ///         was sized for.
+    ///         never registered, blacklist-ejected, or displaced by
+    ///         `reclaimNodeId` — so `unbond`'s `bondRequired(declaredMbps)`
+    ///         floor outlives the registration it was sized for.
     ///
-    ///         Be precise about the size of that: this function has never
-    ///         enforced monotonicity, so such an operator could already declare
-    ///         DOWN to `minCapacityMbps` and unbond everything above
-    ///         `bondRequired(minCapacityMbps)`. The genuinely trapped residual
-    ///         was that floor-tier cost, NOT the whole bond — measured at
-    ///         199.7 of 20,252.7 TOKEN for an operator slashed to ejection from
-    ///         the 1 Gbps tier. What this branch buys is a one-step release that
-    ///         strands nothing, in place of a two-step tier-down that strands
-    ///         `bondRequired(minCapacityMbps)`.
+    ///         This function does not enforce monotonicity, so such an operator
+    ///         can also declare DOWN to `minCapacityMbps` and unbond everything
+    ///         above `bondRequired(minCapacityMbps)`. That two-step tier-down
+    ///         strands the floor-tier cost; this branch is a one-step release
+    ///         that strands nothing.
     ///
     ///         The exception is a blacklist-ejected operator: `registerNode`
     ///         reverts `OperatorEjected` no matter how they re-bond, so for them
     ///         this is the only exit that exists.
-    ///
-    ///         The bond released this way is exposed for the same unbonding
-    ///         window as any other exit — `_reduceBondAtTier` reaches bond
-    ///         sitting in the queue — so this shortens no exposure.
     function declareMbps(uint256 mbps) external {
         // Checked before the band so a zero declaration from an inactive
         // operator skips BOTH gates: the band floor (bounded to
         // `[MIN_CAPACITY_FLOOR_MBPS, MIN_CAPACITY_CEILING_MBPS]` by
         // `_enforceMinCapacityBounds`, so governance can never lower it to 0 and
-        // collapse this branch into the normal one) and the curve check, which a
-        // slashed operator can no longer meet. The release is an exit step, so
-        // like `requestUnbond` and `deregisterNode` it is not pausable.
+        // collapse this branch into the normal one) and the curve check, which
+        // an operator whose tier outgrew its bond (a `setK` / `setAlpha` raise)
+        // can no longer meet. The release is an exit step, so like `unbond` and
+        // `deregisterNode` it is not pausable.
         bool release = mbps == 0 && !_nodes[msg.sender].active;
         if (!release) {
             _requireNotPaused();
@@ -775,7 +574,7 @@ contract CapacityBond is
     ///         `bondRequired(Mbps) = kConstant × Mbps^alphaWad`. Off-chain
     ///         operators use this to size their bond before `declareMbps`; the
     ///         contract enforces `activeBond ≥ bondRequired(declaredMbps)` at
-    ///         `declareMbps` / `requestUnbond` / `registerNode`.
+    ///         `declareMbps` / `unbond` / `registerNode`.
     function bondRequired(uint256 mbps) public view returns (uint256) {
         return BondMath.bondRequired(mbps, kConstant, alphaWad);
     }
@@ -793,8 +592,8 @@ contract CapacityBond is
     ///         value for the ADR 030 § Region-stability window blacklist-scope
     ///         ripening predicate
     ///         ("the previous region's entries keep applying until the change
-    ///         ripens"), now enforced on-chain by `SlashJudge` and
-    ///         `ContentBlacklist` via the `regionScopeData` view (#800).
+    ///         ripens"), read on-chain by `ContentBlacklist` via the
+    ///         `regionScopeData` view (#800).
     /// @dev    Only the length ceiling is enforced here; `"GLOBAL"` and `""` are
     ///         accepted as region strings. `RegionScopeLib` is the canonical guard
     ///         that excludes them from the scope predicate (a GLOBAL/empty current
@@ -971,13 +770,13 @@ contract CapacityBond is
     ///         bond — deactivation and bond exit stay separate operations
     ///         (ADR 003 § Node Registry).
     /// @dev    Clears `declaredMbps`, which is what makes the full-exit path
-    ///         ADR 003 § Node Registry describes reachable: the `requestUnbond`
+    ///         ADR 003 § Node Registry describes reachable: the `unbond`
     ///         floor is `bondRequired(declaredMbps)`, so an operator that left
     ///         the tier standing would retain that much bond forever. This is
     ///         the ONLY route to 0 for a registered node — `declareMbps(0)` is
     ///         accepted only from an inactive caller (see `declaredMbps`), which
-    ///         a registered node by definition is not. The bond itself
-    ///         stays put and fully slashable; re-registering needs only
+    ///         a registered node by definition is not. The bond itself stays
+    ///         put until the operator calls `unbond`; re-registering needs only
     ///         `minBond` again, but the tier must be re-declared.
     ///
     ///         Not pausable: clearing `declaredMbps` is the step a registered
@@ -1077,186 +876,14 @@ contract CapacityBond is
     }
 
     // -----------------------------------------------------------------
-    // Slashing (SLASH_ROLE — held by SlashJudge)
-    // -----------------------------------------------------------------
-
-    function slash(address operator, address challenger, uint8 offenseType, bytes32 evidenceHash)
-        external
-        nonReentrant
-        whenNotPaused
-        onlyRole(SLASH_ROLE)
-        returns (uint256 slashId, uint256 totalSlash)
-    {
-        if (operator == address(0) || challenger == address(0)) revert ZeroAddress();
-
-        uint32 newCount = lifetimeOffenseCount[operator] + 1;
-        lifetimeOffenseCount[operator] = newCount;
-        uint256 tierBps = newCount == 1 ? SLASH_BPS_TIER_1 : newCount == 2 ? SLASH_BPS_TIER_2 : SLASH_BPS_TIER_3;
-
-        totalSlash = _reduceBondAtTier(operator, tierBps);
-        // Escrow-on-slash (ADR 028): nothing is transferred or burned here.
-        // The slashed TOKEN stays in this contract under `_slashRecords` until
-        // `finalizeUnappealedSlash` (no appeal) or a `SLASH_APPEAL_ROLE` settle
-        // hook resolves it. The challenger is recorded for the 50% leg paid at
-        // finality.
-        slashId = _mintSlashRecord(operator, challenger, totalSlash, offenseType, evidenceHash);
-        _stampSlash(operator, challenger, offenseType, totalSlash, newCount);
-    }
-
-    /// @dev Reduce active + unbonding bond at `tierBps` (active first, then
-    ///      unbonding, per ADR 003), writing back the balances `BondMath`
-    ///      derives. The arithmetic — including the defensive clip that caps a
-    ///      >100%-of-at-risk tier (the current ladder maxes at 50%) —
-    ///      lives in [`BondMath.reduceAtTier`](BondMath.sol) so it can be
-    ///      unit-tested without a full-contract harness.
-    function _reduceBondAtTier(address operator, uint256 tierBps) internal returns (uint256 slashAmount) {
-        uint256 newActive;
-        uint256 newUnbonding;
-        (slashAmount, newActive, newUnbonding) =
-            BondMath.reduceAtTier(activeBond[operator], unbondingOf[operator].amount, tierBps);
-        activeBond[operator] = newActive;
-        unbondingOf[operator].amount = newUnbonding;
-    }
-
-    /// @dev Allocate the next `slashId`, book the slashed TOKEN into the
-    ///      value-typed `escrowedTotal`, and persist the record + operator-list
-    ///      append + events via [`SlashEscrowLib.mint`](SlashEscrowLib.sol).
-    ///      The record lets `SlashAppeal.openSlashAppeal` validate appeals
-    ///      without trusting the appellant's `operator` claim (I2 fix), and pins
-    ///      the challenger + filing-window deadline for finality.
-    function _mintSlashRecord(
-        address operator,
-        address challenger,
-        uint256 totalSlashAmount,
-        uint8 offenseType,
-        bytes32 evidenceHash
-    ) internal returns (uint256 slashId) {
-        slashId = slashCounter;
-        unchecked {
-            slashCounter = slashId + 1;
-        }
-        escrowedTotal += totalSlashAmount;
-        SlashEscrowLib.mint(
-            _slashRecords,
-            _operatorSlashIds,
-            slashId,
-            operator,
-            challenger,
-            totalSlashAmount,
-            uint64(APPEAL_FILING_WINDOW),
-            offenseType,
-            evidenceHash
-        );
-    }
-
-    /// @dev Stamp `slashedAtEpoch`, fire auto-eject if post-slash active bond
-    ///      falls below `bondFloorAtActivation / 2`, and emit `Slashed`. Under escrow-on-
-    ///      slash no TOKEN moves here — distribution happens at finality.
-    function _stampSlash(address operator, address challenger, uint8 offenseType, uint256 totalSlash, uint32 newCount)
-        internal
-    {
-        // Store `actualEpoch + 1` so an epoch-0 slash is not confused with
-        // the "unslashed" sentinel. Decoders subtract 1.
-        _slashedAtEpoch[operator] = uint64(block.timestamp / EPOCH_LENGTH) + 1;
-        emit SlashedAtEpochStamped(operator, _slashedAtEpoch[operator]);
-
-        _maybeAutoEject(operator);
-
-        emit Slashed(operator, challenger, offenseType, newCount, totalSlash);
-    }
-
-    /// @dev Auto-eject if post-slash active bond fell below half the operator's
-    ///      grandfathered `bondFloorAtActivation`. Keyed to the entry floor, not
-    ///      the live `minBond`, so a `minBond` raise alone never ejects — only a
-    ///      real slash below `bondFloorAtActivation / 2` does. An operator that
-    ///      never crossed `minBond` holds no floor (`0`); it falls back to the
-    ///      live `minBond`, preserving the pre-entry eject threshold for that
-    ///      degenerate case (a zero-bond phantom slash) with nothing to
-    ///      grandfather.
-    function _maybeAutoEject(address operator) internal {
-        uint256 floor = bondFloorAtActivation[operator];
-        if (floor == 0) floor = minBond;
-        if (activeBond[operator] >= (floor / 2) || ejected[operator]) return;
-        ejected[operator] = true;
-        bytes32 nodeId = _ejectNodeEffects(operator);
-        emit AutoEjected(operator, activeBond[operator]);
-        if (nodeId != bytes32(0)) emit NodeAutoEjected(nodeId, activeBond[operator]);
-    }
-
-    // -----------------------------------------------------------------
-    // Escrow finality + appeal settle hooks (ADR 028 escrow-on-slash)
-    // -----------------------------------------------------------------
-
-    /// @notice Permissionless: distribute a slash whose filing window lapsed
-    ///         with no appeal. 50% to the recorded challenger, 50% burned.
-    ///         Reverts if the slash is not `Escrowed` or the window is still
-    ///         open (an opened appeal flips the status to `AppealOpen`, so this
-    ///         path can never race a live appeal). State machine in
-    ///         [`SlashEscrowLib`](SlashEscrowLib.sol); this wrapper holds the
-    ///         reentrancy guard / pause and books the `escrowedTotal` release.
-    function finalizeUnappealedSlash(uint256 slashId) external nonReentrant whenNotPaused {
-        escrowedTotal -= SlashEscrowLib.finalizeUnappealed(_slashRecords, token, slashId, slashCounter, pausedTotal);
-    }
-
-    /// @inheritdoc ICapacityBondSlashEscrow
-    function markAppealOpen(uint256 slashId) external override whenNotPaused onlyRole(SLASH_APPEAL_ROLE) {
-        SlashEscrowLib.markAppealOpen(_slashRecords, slashId, slashCounter, pausedTotal);
-    }
-
-    /// @inheritdoc ICapacityBondSlashEscrow
-    /// @dev Not `whenNotPaused`: `SlashAppeal` may unpause (and thus credit its
-    ///      pause time) independently of this contract's pause state, and the
-    ///      effect is purely additive to `pausedTotal` (only ever extends a
-    ///      window in the operator's favor), so it is safe to accept while
-    ///      paused.
-    function creditPauseTime(uint64 delta) external override onlyRole(SLASH_APPEAL_ROLE) {
-        pausedTotal += delta;
-    }
-
-    /// @inheritdoc ICapacityBondSlashEscrow
-    function settleAppealUpheld(uint256 slashId)
-        external
-        override
-        nonReentrant
-        whenNotPaused
-        onlyRole(SLASH_APPEAL_ROLE)
-    {
-        escrowedTotal -= SlashEscrowLib.settleUpheld(_slashRecords, token, slashId, slashCounter);
-    }
-
-    /// @inheritdoc ICapacityBondSlashEscrow
-    function settleAppealGranted(uint256 slashId)
-        external
-        override
-        nonReentrant
-        whenNotPaused
-        onlyRole(SLASH_APPEAL_ROLE)
-    {
-        // The library marks the record `Reversed`, recomputes the multi-slash
-        // zero-out watermark (ADR 036), and emits `SlashReversed`; the caller
-        // applies the value-typed escrow refund below.
-        (address operator, uint256 refund) = SlashEscrowLib.settleGranted(
-            _slashRecords, _operatorSlashIds, _slashedAtEpoch, slashId, slashCounter, EPOCH_LENGTH
-        );
-        escrowedTotal -= refund;
-
-        // A wrongly-slashed operator is made whole: the full escrowed bond is
-        // refunded liquid. The TOKEN backing it never left the contract.
-        if (refund != 0) IERC20(address(token)).safeTransfer(operator, refund);
-    }
-
-    // The multi-slash zero-out recompute lives in
-    // [`SlashEscrowLib._recomputeSlashedAtEpoch`](SlashEscrowLib.sol), invoked
-    // by `settleAppealGranted` via `SlashEscrowLib.settleGranted`.
-
-    // -----------------------------------------------------------------
     // Blacklist ejection
     // -----------------------------------------------------------------
 
     function ejectNode(address operator) external override onlyRole(BLACKLIST_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
-        // Set the governance latch UNCONDITIONALLY — an operator already
-        // slash-auto-ejected (`ejected == true`) would otherwise skip the
+        // Set the governance latch UNCONDITIONALLY — an operator still
+        // `ejected` from an earlier blacklist (latch cleared by `unEjectNode`,
+        // not yet reinstated by `bond`) would otherwise skip the
         // one-time-effects block below and never get latched, leaving the
         // self-reinstatement hole open.
         blacklistEjected[operator] = true;
@@ -1273,8 +900,8 @@ contract CapacityBond is
     /// @notice Release the governance-blacklist ejection latch when governance
     ///         lifts the blacklist (ADR 011). Clears only `blacklistEjected`;
     ///         the operator re-enters the active set through the normal re-bond
-    ///         path (`bond()` reinstatement then `registerNode`), so a still
-    ///         slash-deficient operator stays ejected. Idempotent.
+    ///         path (`bond()` reinstatement then `registerNode`), so an
+    ///         operator below `minBond` stays ejected. Idempotent.
     function unEjectNode(address operator) external override onlyRole(BLACKLIST_ROLE) {
         if (operator == address(0)) revert ZeroAddress();
         if (blacklistEjected[operator]) {
@@ -1294,8 +921,8 @@ contract CapacityBond is
     ///         so a change applies to new entrants alone. Active operators keep
     ///         the `bondFloorAtActivation` they entered under — governance may
     ///         tighten the entry bar as the network matures without purging the
-    ///         electorate, and a raise alone neither de-activates nor eases the
-    ///         slash-ejection threshold of any active operator.
+    ///         electorate, and a raise alone never de-activates an active
+    ///         operator.
     function setMinBond(uint256 newMinBond) external onlyRole(GOVERNANCE_ROLE) {
         _enforceMinBondBounds(newMinBond);
         uint256 oldMinBond = minBond;
@@ -1377,54 +1004,6 @@ contract CapacityBond is
         emit MaxCapacityMbpsUpdated(oldMax, newMax);
     }
 
-    /// @notice Wire the SlashJudge whose `maxEvidenceAgeUs` bounds how low
-    ///         `unbondingPeriod` may be set (ADR 014 § Interaction with unbonding
-    ///         period). Set once post-deploy (SlashJudge is deployed after this
-    ///         contract), then fixed: the judge is not re-pointable. A captured
-    ///         governance therefore cannot swap in a malicious judge to fabricate
-    ///         slashes. The zero address is rejected, and the paired invariant is
-    ///         re-checked at wiring.
-    function setSlashJudge(ISlashJudgeEvidenceView newSlashJudge) external onlyRole(GOVERNANCE_ROLE) {
-        if (address(slashJudge) != address(0)) revert SlashJudgeAlreadySet();
-        if (address(newSlashJudge) == address(0)) revert ZeroAddress();
-        // Reject a judge that would violate the paired invariant against the CURRENT
-        // unbonding period (ADR 014): maxEvidenceAgeUs MUST stay strictly below
-        // unbondingPeriod * 1e6, so the invariant holds the instant the judge is
-        // wired, not only after the next setUnbondingPeriod. `unbondingPeriod` is
-        // bounded [7d,60d] so the multiply cannot overflow.
-        uint256 unbondingUs = unbondingPeriod * 1_000_000;
-        // `maxEvidenceAgeUs()` is a view on the about-to-be-wired `slashJudge`; this
-        // setter is GOVERNANCE_ROLE-gated, so no reentrancy vector (aderyn FP).
-        // aderyn-ignore-next-line(reentrancy-state-change)
-        uint256 maxAgeUs = newSlashJudge.maxEvidenceAgeUs();
-        if (unbondingUs <= maxAgeUs) revert UnbondingBelowEvidenceAge(unbondingUs, maxAgeUs);
-        slashJudge = newSlashJudge;
-        emit SlashJudgeWired(address(newSlashJudge));
-    }
-
-    function setUnbondingPeriod(uint256 newPeriod) external onlyRole(GOVERNANCE_ROLE) {
-        _enforceUnbondingPeriodBounds(newPeriod);
-        // Paired cross-parameter invariant (ADR 014 § Interaction with unbonding
-        // period): the unbonding period (in microseconds) MUST stay strictly above
-        // the evidence-age ceiling, else a node could offend, unbond, and withdraw
-        // before evidence can be submitted. Mirrors SlashJudge._enforceUnbondingInvariant.
-        // Skipped until `slashJudge` is wired (deploy window); `newPeriod` is bounded
-        // [7d,60d] so `newPeriod * 1_000_000` cannot overflow.
-        ISlashJudgeEvidenceView judge = slashJudge;
-        if (address(judge) != address(0)) {
-            uint256 newPeriodUs = newPeriod * 1_000_000;
-            // `maxEvidenceAgeUs()` is a view on the governance-set `slashJudge`; this
-            // setter is GOVERNANCE_ROLE-gated, so the following state write is not a
-            // reentrancy vector (aderyn reentrancy-state-change FP).
-            // aderyn-ignore-next-line(reentrancy-state-change)
-            uint256 maxAgeUs = judge.maxEvidenceAgeUs();
-            if (newPeriodUs <= maxAgeUs) revert UnbondingBelowEvidenceAge(newPeriodUs, maxAgeUs);
-        }
-        uint256 oldPeriod = unbondingPeriod;
-        unbondingPeriod = newPeriod;
-        emit UnbondingPeriodUpdated(oldPeriod, newPeriod);
-    }
-
     function setMultiaddrUpdateCooldown(uint256 newCooldown) external onlyRole(GOVERNANCE_ROLE) {
         _enforceMultiaddrCooldownBounds(newCooldown);
         uint256 oldCooldown = multiaddrUpdateCooldown;
@@ -1459,22 +1038,6 @@ contract CapacityBond is
         _unpause();
     }
 
-    /// @dev Stamp the pause start so `_unpause` can accumulate the duration
-    ///      into `pausedTotal` (ADR 028 § Hard caps and frequency limits — window extension).
-    function _pause() internal override {
-        // forge-lint: disable-next-line(block-timestamp)
-        _pausedAt = uint64(block.timestamp);
-        super._pause();
-    }
-
-    /// @dev Accumulate the just-ended pause interval into `pausedTotal`.
-    function _unpause() internal override {
-        // forge-lint: disable-next-line(block-timestamp)
-        pausedTotal += uint64(block.timestamp) - _pausedAt;
-        _pausedAt = 0;
-        super._unpause();
-    }
-
     // -----------------------------------------------------------------
     // Views — bond / governor surface
     // -----------------------------------------------------------------
@@ -1486,8 +1049,8 @@ contract CapacityBond is
     function isActive(address operator) public view returns (bool) {
         // Ongoing active status tests the grandfathered `bondFloorAtActivation`,
         // not the live `minBond`: a `minBond` raise never de-activates an
-        // already-active operator (ADR 026 § Operator bond). `requestUnbond`
-        // moves the released amount out of `activeBond` at once, so a partial
+        // already-active operator (ADR 026 § Operator bond). `unbond` moves
+        // the released amount out of `activeBond` at once, so a partial
         // unbond that retains the floor keeps the operator active, and one that
         // drops below the floor de-activates it.
         return _nodes[operator].active && activeBond[operator] >= bondFloorAtActivation[operator] && !ejected[operator];
@@ -1498,62 +1061,9 @@ contract CapacityBond is
         return _firstBondedAt[operator];
     }
 
-    /// @notice The max epoch among the operator's standing slashes plus one,
-    ///         or 0 when none stands (the +1 keeps an epoch-0 slash distinct
-    ///         from "unslashed"). Set by `slash()`, recomputed by
-    ///         `settleAppealGranted`. An indexer read; `DecdnGovernor` reads the
-    ///         slash records instead (ADR 036 § Slashing zero-out).
-    function slashedAtEpoch(address operator) external view returns (uint64) {
-        return _slashedAtEpoch[operator];
-    }
-
     /// @inheritdoc ICapacityBond
     function declaredMbpsAtEpoch(address operator, uint64 epoch) external view override returns (uint256) {
         return DeclaredMbpsHistoryLib.atEpoch(_declaredMbpsHistory, operator, epoch, EPOCH_LENGTH);
-    }
-
-    /// @inheritdoc ICapacityBond
-    function slashRecords(uint256 slashId)
-        external
-        view
-        override
-        returns (address operator, uint64 slashedAt_, uint256 slashAmount)
-    {
-        if (slashId >= slashCounter) revert UnknownSlash(slashId);
-        SlashRecord memory r = _slashRecords[slashId];
-        return (r.operator, r.slashedAt, r.slashAmount);
-    }
-
-    /// @notice Full slash record including escrow status and the recorded
-    ///         challenger / filing-window deadline. Convenience view for
-    ///         indexers, keepers, and `SlashAppeal`.
-    function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory) {
-        if (slashId >= slashCounter) revert UnknownSlash(slashId);
-        return _slashRecords[slashId];
-    }
-
-    /// @notice How many slashes have ever been minted against `operator`.
-    /// @dev    Paired with `operatorSlashIdAt`, this is the enumeration that lets
-    ///         a consumer rebuild an operator's slash history from chain state
-    ///         instead of re-scanning the `Slashed` log tail from a block floor
-    ///         on every start. Deliberately two scalar getters rather than one
-    ///         `uint256[]` return: a dynamic-array getter costs several hundred
-    ///         bytes of ABI-encoding bytecode, and this contract sits close to
-    ///         the EIP-170 runtime ceiling. Lists are short in practice — a slash
-    ///         auto-ejects below `bondFloorAtActivation / 2`, so re-slashing an operator
-    ///         requires a fresh re-bond first.
-    function operatorSlashCount(address operator) external view returns (uint256) {
-        return _operatorSlashIds[operator].length;
-    }
-
-    /// @notice The `slashId` at `index` in `operator`'s append-only slash list.
-    /// @dev    Append-only and never reordered, so `index` is stable across calls
-    ///         and a caller may walk backwards from `operatorSlashCount` and stop
-    ///         at the first record whose appeal window has already closed.
-    function operatorSlashIdAt(address operator, uint256 index) external view returns (uint256) {
-        uint256[] storage ids = _operatorSlashIds[operator];
-        if (index >= ids.length) revert SlashIndexOutOfRange(operator, index, ids.length);
-        return ids[index];
     }
 
     // -----------------------------------------------------------------
@@ -1596,7 +1106,7 @@ contract CapacityBond is
     /// @notice Paginated read of the registered-operator set, with per-entry
     ///         activeness computed on-chain.
     /// @dev    Returns the raw `_registeredAddrs` page (every operator whose node
-    ///         record is registered, regardless of bond/unbonding/ejection) plus
+    ///         record is registered, regardless of bond or ejection) plus
     ///         a parallel `active[]` where `active[i] == isActive(page[i].ethAddress)`.
     ///         The two projections diverge on purpose: an operator whose bond sits
     ///         below its floor is `active[i] == false` but still present in `page` because it remains
@@ -1680,12 +1190,6 @@ contract CapacityBond is
             revert ParamOutOfBounds({
                 value: value, floor: MAX_CAPACITY_FLOOR_MBPS, ceiling: MAX_CAPACITY_CEILING_MBPS
             });
-        }
-    }
-
-    function _enforceUnbondingPeriodBounds(uint256 value) internal pure {
-        if (value < UNBONDING_PERIOD_FLOOR || value > UNBONDING_PERIOD_CEILING) {
-            revert ParamOutOfBounds({ value: value, floor: UNBONDING_PERIOD_FLOOR, ceiling: UNBONDING_PERIOD_CEILING });
         }
     }
 

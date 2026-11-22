@@ -158,9 +158,9 @@ pub struct DiscoveryPeer {
 /// Blockchain section of the config file.
 ///
 /// The section's own fields name the **governance chain**: the chain that runs
-/// `CapacityBond`, `SlashJudge`, `ContentBlacklist` and the other protocol
-/// contracts, whose chain id binds every slash, stream, attestation, bind-node
-/// and pointer signature. Payments run on one or more **payment
+/// `CapacityBond`, `ContentBlacklist` and the other protocol contracts, whose
+/// chain id binds every stream, attestation, bind-node and pointer
+/// signature. Payments run on one or more **payment
 /// chains**, each a `[[blockchain.payment_chains]]` entry naming its own RPC
 /// endpoint, chain id and the `PaymentPool` contracts this node accepts there
 /// ([`PaymentChainConfig`]).
@@ -183,7 +183,10 @@ pub struct BlockchainConfig {
     /// `https://iris-api.circle.com`. Optional; read only by the CLI command
     /// that submits attested sweeps, which defaults to the known target's.
     pub cctp_iris_url: Option<String>,
-    /// `CapacityBond` contract address.
+    /// `CapacityBond` contract address. Also the EIP-712 `verifyingContract`
+    /// for `StreamResponse` `slash_sig` signatures and origin attestations
+    /// (ADR 005 § Signer binding). Required: a wrong address silently produces
+    /// signatures no verifier accepts.
     pub capacity_bond_address: Option<String>,
     /// `OriginAssignment` contract address. Optional: when set, the node runs the
     /// chain-backed origin directory for node-to-node routing, resolving a
@@ -207,18 +210,6 @@ pub struct BlockchainConfig {
     /// it is the publish CLI's `namespace create` target and is not consumed by
     /// the node runtime.
     pub publisher_registry_address: Option<String>,
-    /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
-    /// `StreamResponse` `slash_sig` signatures (ADR 014
-    /// §1–2). Required: a wrong/zero address silently produces signatures no
-    /// verifier accepts, so resolution fails fast when it is missing rather
-    /// than defaulting.
-    pub slash_judge_address: Option<String>,
-    /// `SlashAppeal` contract address — the target for `decdn appeal slash`
-    /// (ADR 028). Consumed **only** by that CLI (via `chain_ctx::resolve_appeal`,
-    /// which validates it); the daemon accepts the key here — `[blockchain]`
-    /// denies unknown fields and a node's `node.toml` is shared with the CLI —
-    /// but does not resolve or use it.
-    pub slash_appeal_address: Option<String>,
     /// `ContentBlacklist` contract address. Required at node config resolution;
     /// startup completes the initial global + operator-scope replay before any
     /// ALPN accepts connections (ADR 011/019/031).
@@ -232,15 +223,14 @@ pub struct BlockchainConfig {
     /// serving (ADR 011 § Serving while chain-stale). While the blacklist
     /// sync cannot reach the RPC, every chain-derived serve guard — the
     /// deny-set, pool solvency, per-signer caps — answers from stale state, so a
-    /// takedown that lands during the outage would go unenforced and serving it
-    /// past the compliance window is slashable. Past this window the serve
-    /// path refuses rather than sign evidence the node can no longer
-    /// vouch for. Always evaluated (there is no on/off flag); set it large to
+    /// takedown that lands during the outage would go unenforced past the
+    /// compliance window. Past this window the serve path refuses rather than
+    /// sign responses the node can no longer vouch for. Always evaluated (there is no on/off flag); set it large to
     /// opt out. Absent => [`super::DEFAULT_CHAIN_STALENESS_GRACE_SEC`] (1800s /
     /// 30 min). Must not be `0` (that would refuse every serve). Only consulted
     /// when `content_blacklist_address` is set.
     pub chain_staleness_grace_sec: Option<u64>,
-    /// Governance-chain EIP-712 `chainId`, bound into every `slash_sig`,
+    /// Governance-chain EIP-712 `chainId`, bound into every stream response,
     /// attestation, bind-node and pointer domain separator. Absent =>
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia, the initial network
     /// target — matches the chain id bound on the runtime signer).

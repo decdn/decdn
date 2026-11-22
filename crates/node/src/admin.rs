@@ -24,8 +24,7 @@ use decdn_common::admin::{
     EarningsResponse, EvictPreview, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot,
     LanesResponse, POOL_STORE_ERROR_CODE, PendingRedeem, PoolEarnings, ProtocolShare,
     RELOAD_ERROR_CODE, RecordStoreHealth, ReloadResponse, RepublishHealth, RoutingHealth,
-    SLASH_DETECTION_UNAVAILABLE_CODE, SlashRecordDto, SlashesResponse, StatusResponse,
-    parse_hash_arg,
+    StatusResponse, parse_hash_arg,
 };
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::earnings::{last_settlement, sum_period};
@@ -130,10 +129,6 @@ pub struct AdminState {
     /// The SAME handle the buyer pool service records each balance read into.
     /// `None` reports no `pull_through`.
     buyer_wallet: Option<Arc<crate::buyer_pool::BuyerWallet>>,
-    /// Slash-detection handles backing `admin_v1_slashes` (#1032), attached via
-    /// [`AdminState::with_slash_detection`]. `None` (no `slash_judge_address`
-    /// wired / unit tests) → `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
-    slash_detection: Option<SlashStatusHandles>,
     /// Outcome of the bring-up node-id binding check (#1034), attached via
     /// [`AdminState::with_binding`]. Defaults to
     /// [`BindingReport::unknown`] — the honest answer for a state that was
@@ -295,18 +290,6 @@ impl std::fmt::Debug for LaneStatusHandles {
             )
             .finish_non_exhaustive()
     }
-}
-
-/// Read-only slash-detection handle the `admin_v1_slashes` handler snapshots
-/// (#1032). The shared in-memory store is populated by the slash watcher; the
-/// admin surface only reads it. Bundled into a struct so the
-/// `with_slash_detection` builder stays a single argument (and to leave room
-/// for future fields without churning the signature).
-#[derive(Debug, Clone)]
-pub struct SlashStatusHandles {
-    /// Detected slashes against this node's operator, appended in detection
-    /// order (deduped by `slashId`). Same handle the watcher writes to.
-    pub store: crate::slash_watcher::SlashStore,
 }
 
 /// Read-only DHT subsystem handles the `admin_v1_status` handler snapshots
@@ -471,7 +454,6 @@ impl AdminState {
             buyer_pools: None,
             buyer_wallet: None,
             earnings: None,
-            slash_detection: None,
             binding: BindingReport::unknown(),
             warming: None,
             staker_set: None,
@@ -569,16 +551,6 @@ impl AdminState {
     #[must_use]
     pub fn with_earnings(mut self, earnings: EarningsHandles) -> Self {
         self.earnings = Some(earnings);
-        self
-    }
-
-    /// Attach slash-detection handles so `admin_v1_slashes` can report slashes
-    /// against this node's operator (#1032). The production runtime calls this
-    /// once after `new` when a `slash_judge_address` is configured; without it,
-    /// `slashes` returns [`SLASH_DETECTION_UNAVAILABLE_CODE`].
-    #[must_use]
-    pub fn with_slash_detection(mut self, slash_detection: SlashStatusHandles) -> Self {
-        self.slash_detection = Some(slash_detection);
         self
     }
 
@@ -980,35 +952,6 @@ impl AdminRpcServer for AdminRpcImpl {
             lanes,
             redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
         })
-    }
-
-    async fn slashes(&self) -> RpcResult<SlashesResponse> {
-        let Some(handles) = self.state.slash_detection.as_ref() else {
-            return Err(ErrorObjectOwned::owned(
-                SLASH_DETECTION_UNAVAILABLE_CODE,
-                "slash detection is not wired on this node",
-                None::<()>,
-            ));
-        };
-        // Short read of an in-memory Vec — no await held. Poison-tolerant: a
-        // panicked writer must not wedge the read-only admin surface.
-        let guard = handles
-            .store
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Newest-first: the watcher appends in detection order.
-        let slashes = guard
-            .iter()
-            .rev()
-            .map(|s| SlashRecordDto {
-                slash_id: s.slash_id.to_string(),
-                offense_type: s.offense_type,
-                amount: s.amount.to_string(),
-                evidence_hash: format!("{:#x}", s.evidence_hash),
-                appeal_window_close: s.appeal_window_close,
-            })
-            .collect();
-        Ok(SlashesResponse { slashes })
     }
 
     async fn pools(&self) -> RpcResult<BuyerPoolsResponse> {

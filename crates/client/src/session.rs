@@ -20,17 +20,13 @@ pub struct GovernanceChain {
     /// The JSON-RPC endpoint of the governance chain: every registry read
     /// goes through it.
     pub rpc_url: String,
-    /// The governance chain id. The `SlashJudge` domain (discovery answers
-    /// and stream responses) and the `CapacityBond` domain (the client identity
-    /// binding) are built for it.
+    /// The governance chain id. The `CapacityBond` domain (discovery answers,
+    /// stream responses and the client identity binding) is built for it.
     pub chain_id: u64,
-    /// The `SlashJudge` whose domain every discovery answer and stream response
-    /// verifies against.
-    pub slash_judge: Address,
-    /// The `CapacityBond` registry discovery reads, and the domain of the
-    /// client identity binding. `None` disables both: the pull needs a pinned
-    /// node, and a node serves it only content it already holds.
-    pub capacity_bond: Option<Address>,
+    /// The `CapacityBond` registry discovery reads, and the `verifyingContract`
+    /// of the domain every discovery answer, stream response and client
+    /// identity binding signs under.
+    pub capacity_bond: Address,
 }
 
 /// One `PaymentPool` contract a pull can pay through, and the RPC endpoint of

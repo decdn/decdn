@@ -3,7 +3,7 @@
 //!
 //! One transaction. `CapacityBond.bindNodeId` deletes the old
 //! `nodeId → address` mapping and writes the new one in the same call, so the
-//! two ids swap slashability atomically and the operator is never unslashable
+//! two ids swap atomically and the operator always has exactly one bound id
 //! mid-rotation. Everything keyed on the Ethereum address — the bond, the
 //! declared tier, `firstBondedAt`, every open payment pool, and every
 //! voucher already signed against one — is untouched, because the address does
@@ -15,8 +15,8 @@
 //! a disk write (`node.secret`). Only one order is safe.
 //!
 //! Disk first would mean that a reverted or lost `bindNodeId` leaves the daemon
-//! holding a key nothing on chain points at — serving, earning, and
-//! **unslashable**, the exact fault this command exists to prevent. Chain first
+//! holding a key nothing on chain points at — up, but **unroutable**, the
+//! exact fault this command exists to prevent. Chain first
 //! merely risks the inverse: the binding moved but the daemon still holds the
 //! old key, which is a plain outage (peers reject its announces, clients cannot
 //! find it) and is repaired by re-running with `--bind-existing`, or by
@@ -37,14 +37,6 @@
 //! against the observed `NodeId`, so the new identity starts at the neutral
 //! default (ADR 008); the Kademlia routing position reseeds (ADR 022); and
 //! cached TLS session tickets are invalidated. All three recover on their own.
-//!
-//! One consequence is sharper than those and is disclosed separately, because
-//! neither the runbook nor `SlashJudge` surfaces it today: a slash challenge
-//! must cite the **currently bound** `nodeId`
-//! (`SlashJudge._checkRegistered` reverts `NodeIdMismatch` otherwise). Evidence
-//! gathered against the retired id is still valid — the `slash_sig` it carries
-//! is secp256k1 over the Ethereum address, which did not change — but it has to
-//! be submitted against the new id.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -228,7 +220,7 @@ fn gate_and_install(
     // load-bearing rather than ceremonial: it is the gate on replacing
     // `node.secret`. A receipt that mined without the log means the binding did
     // not move (or the deployed ABI drifted), and committing the key against it
-    // is precisely how the daemon ends up unslashable.
+    // is precisely how the daemon ends up unroutable.
     if let Err(err) = confirm_bound(receipt, plan.operator, plan.new_node_id, plan.capacity_bond) {
         // The transaction MINED, so this is not the harmless "nothing happened"
         // case: the binding may or may not have moved. Park the key rather than
@@ -607,7 +599,7 @@ async fn build_plan<P: Provider + Clone>(
         new_node_id,
         if bind_existing {
             " The local key and the on-chain binding already agree — this node is not in the \
-             un-slashable state `--bind-existing` repairs."
+             unroutable state `--bind-existing` repairs."
         } else {
             ""
         },
@@ -656,7 +648,7 @@ async fn build_plan<P: Provider + Clone>(
     // payload. NOT `register_node_signing_hash`: that typehash additionally
     // commits to `termsHash`, and rebinding deliberately does not re-accept
     // terms (ADR 019 § enforcement at registration only).
-    let domain = bind_sig::bind_node_id_domain(chain_id, cb_addr);
+    let domain = bind_sig::capacity_bond_domain(chain_id, cb_addr);
     let bind_hash = bind_sig::binding_signing_hash(new_node_id, binding_nonce, &domain);
     let binding_sig = signer.sign_hash_sync(&bind_hash)?.as_bytes().to_vec();
 
@@ -772,21 +764,14 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
         w,
         "Your bond, declared capacity, firstBondedAt, and every open payment pool are NOT \
          affected — all of them key on the Ethereum address, which does not change. Vouchers \
-         already signed against those pools still settle. The old and new node ids swap \
-         slashability in the same transaction, so there is no unslashable window."
+         already signed against those pools still settle. The old and new node ids swap in \
+         the same transaction, so there is no window without a bound node id."
     )?;
     writeln!(
         w,
         "Resets: peers score reputation against the observed node id, so the new identity starts \
          at the neutral default; the DHT routing position reseeds; cached TLS session tickets are \
          invalidated. All three recover without intervention."
-    )?;
-    writeln!(
-        w,
-        "A slash challenge must cite the node id bound AT SUBMISSION time, so any evidence you \
-         are about to submit against {} has to be re-submitted against {} instead — it is still \
-         valid, since the slash signature covers the Ethereum address.",
-        p.old_node_id, p.new_node_id,
     )?;
     if !p.active {
         writeln!(
@@ -800,8 +785,7 @@ pub(crate) fn write_disclosure(w: &mut dyn io::Write, p: &Plan) -> io::Result<()
         writeln!(
             w,
             "The current node key is archived alongside itself before the new one is installed. \
-             Keep the archive: slash evidence signed under the old identity stays submittable \
-             until it ages out."
+             Keep the archive: it is the rollback if the new key has to be undone."
         )?;
     }
     writeln!(

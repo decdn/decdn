@@ -78,14 +78,6 @@ pub enum NodeCommand {
     /// `CctpSweepReceiver.receiveSweep` once per message. A sweep already
     /// received, by this operator or another one in the batch, is skipped.
     ReceiveSweeps(ReceiveSweepsArgs),
-    /// Print every slash the node's watcher has detected against its own
-    /// operator via `admin_v1_slashes` (#1032, G-NODE-05): per slash the
-    /// `slashId`, offense type, amount, evidence digest, block, and the
-    /// 30-day appeal-window close time. Lets operators (or keeper scripts)
-    /// notice a slash and file `decdn appeal slash` within the window
-    /// without watching the chain directly. Same admin-URL resolution and
-    /// timeout semantics as `decdn node health`.
-    Slashes(SlashesArgs),
     /// Print the running node's buyer-side `PaymentPool` state via
     /// `admin_v1_pools` (#2078): every pool the node's buy leg tracks, the
     /// deposit it believes each holds, and the per-lane amount it has already
@@ -157,14 +149,12 @@ pub enum NodeCommand {
     /// rather than over-bonding. Run this before `decdn node register`. Pass
     /// `--dry-run` to print the plan without submitting.
     Bond(BondArgs),
-    /// Lower the on-chain bond via `CapacityBond.requestUnbond` + `unbond`
-    /// (ADR 026 § Capacity-bond curve) — the reverse of `decdn node bond`.
-    /// State-aware: with no request in flight it declares the tier down (if
-    /// needed) and starts the unbonding window; while one is maturing it
-    /// reports the unlock time and exits non-zero; once matured it withdraws.
-    /// The node goes INACTIVE only when the retained bond drops below the
-    /// operator's bond floor (the minBond in force when it activated).
-    /// Pass `--dry-run` to print the plan without submitting.
+    /// Lower the on-chain bond via `CapacityBond.unbond` (ADR 026
+    /// § Capacity-bond curve) — the reverse of `decdn node bond`. Declares the
+    /// tier down (if needed), then withdraws the released TOKEN to the
+    /// operator in the same run. The node goes INACTIVE only when the retained
+    /// bond drops below the operator's bond floor (the minBond in force when
+    /// it activated). Pass `--dry-run` to print the plan without submitting.
     Unbond(UnbondArgs),
     /// Leave the active node set on-chain via `CapacityBond.deregisterNode`
     /// (ADR 003 § Node Registry) — the reverse of `decdn node register`, and
@@ -172,10 +162,9 @@ pub enum NodeCommand {
     /// which is what releases the `bondRequired(declaredMbps)` floor that
     /// `decdn node unbond` enforces.
     ///
-    /// This does NOT return the bond: it stays deposited and fully slashable.
-    /// Follow with `decdn node unbond --all` to start the unbonding window,
-    /// then re-run it after the window to withdraw. Pass `--dry-run` to print
-    /// the plan without submitting.
+    /// This does NOT return the bond: it stays deposited. Follow with
+    /// `decdn node unbond --all` to withdraw it. Pass `--dry-run` to print the
+    /// plan without submitting.
     Deregister(DeregisterArgs),
     /// Rotate an operator key and keep the on-chain binding in step
     /// (`adr/appendix-operator-key-rotation.md`, #1034). `--key` chooses which
@@ -185,15 +174,15 @@ pub enum NodeCommand {
     /// `CapacityBond.bindNodeId`. One transaction, no downtime beyond a
     /// restart, and the Ethereum address — with the bond, the declared tier,
     /// `firstBondedAt`, and every lane funded against this operator — is untouched. The old
-    /// and new node ids swap slashability in the same block, so there is no
-    /// window in which the operator cannot be slashed.
+    /// and new node ids swap in the same block, so there is no window in which
+    /// the operator has no bound node id.
     ///
     /// `--key eth` moves the whole on-chain identity, because no rebinding API
-    /// exists for the address: deregister, wait out the full unbonding window,
-    /// withdraw, then re-bond and re-register from a new address.
-    /// `firstBondedAt` — and with it the governance age-ramp — resets. Like
-    /// `decdn node unbond`, the phase is read from chain state rather than
-    /// passed as a flag, so one command drives the whole window.
+    /// exists for the address: deregister, unbond, then re-bond and
+    /// re-register from a new address. `firstBondedAt` — and with it the
+    /// governance age-ramp — resets. The phase is read from chain state rather
+    /// than passed as a flag, so re-running the command resumes an interrupted
+    /// migration.
     ///
     /// Neither path restarts the daemon: the iroh key is not hot-reloadable,
     /// so drain (`decdn node drain`), stop, rotate, restart stays the
@@ -505,38 +494,6 @@ pub struct OperatorKeyArgs {
     pub json: bool,
 }
 
-/// `decdn node slashes` — list detected slashes against this node's
-/// operator via `admin_v1_slashes` (#1032). Same admin-URL resolution and
-/// timeout semantics as `decdn node health`.
-#[derive(Args, Debug)]
-pub struct SlashesArgs {
-    /// Base URL of the node's admin HTTP surface.
-    ///
-    /// Also read from `DECDN_ADMIN_URL` when unset; clap folds the env
-    /// var into this field. If still unset, the admin port is derived
-    /// from `observability.admin_port` in the config file (see
-    /// `--config`). Example: `http://127.0.0.1:9191`.
-    #[arg(long, value_name = "URL", env = "DECDN_ADMIN_URL")]
-    pub admin_url: Option<String>,
-
-    /// Path to the TOML config file used to derive the admin URL when
-    /// `--admin-url` / `DECDN_ADMIN_URL` are unset. Takes precedence
-    /// over the top-level `decdn --config`; if neither is set,
-    /// resolution falls through to `~/.decdn/node.toml` and then the
-    /// built-in default port.
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-
-    /// Emit the admin response body as JSON instead of the human-readable
-    /// summary + slash table.
-    #[arg(long)]
-    pub json: bool,
-
-    /// Roundtrip timeout in milliseconds.
-    #[arg(long, value_name = "MS", default_value_t = 5_000)]
-    pub timeout_ms: u64,
-}
-
 /// `decdn node pools` — read the node's buyer-side `PaymentPool` state via
 /// `admin_v1_pools` (#2078). Same admin-URL resolution and timeout semantics as
 /// `decdn node health`.
@@ -775,7 +732,7 @@ pub struct RegisterArgs {
 ///
 /// A `ValueEnum` with **no default**: the two paths differ by orders of
 /// magnitude in cost and are not interchangeable, so the operator names one.
-/// These are the operator's only two keys. There is no separate slash-sig
+/// These are the operator's only two keys. There is no separate stream
 /// signing key: an operator serves from the EOA it registered, so `slash_sig`
 /// is signed by the Ethereum key above. Serving from a smart account while a
 /// hot key signs `slash_sig` is unimplemented
@@ -790,8 +747,8 @@ pub enum RotateKeyTarget {
     Iroh,
     /// The secp256k1 Ethereum signing key. No rebinding API exists for the
     /// on-chain address, so this moves the whole identity: deregister →
-    /// unbond window → re-bond and re-register from a new address. Costs the
-    /// full unbonding window of downtime and resets `firstBondedAt`.
+    /// unbond → re-bond and re-register from a new address. Resets
+    /// `firstBondedAt`.
     #[value(name = "eth")]
     Eth,
 }
@@ -800,9 +757,10 @@ pub enum RotateKeyTarget {
 /// (`adr/appendix-operator-key-rotation.md`) as a command (#1034).
 ///
 /// Rotation is the one operator procedure where a half-completed run is worse
-/// than no run: a node whose local key is not the on-chain-bound one is
-/// **un-slashable**, which is a protocol-level fault, not merely an outage. So
-/// both paths order their steps to make that state unreachable — the iroh path
+/// than no run: a node whose local key is not the on-chain-bound one serves
+/// under a node id no client can tie to an operator, so no client accepts its
+/// responses. So both paths
+/// order their steps to make that state unreachable — the iroh path
 /// commits `node.secret` only after `bindNodeId` confirms, and the eth path
 /// reads chain state to pick its next phase rather than trusting a flag.
 ///
@@ -822,7 +780,7 @@ pub struct RotateKeyArgs {
     /// generating a fresh one.
     ///
     /// Two jobs, both from the runbook's § Failure modes and rollback: repair a
-    /// node whose `node.secret` was replaced by hand (leaving it un-slashable),
+    /// node whose `node.secret` was replaced by hand (leaving it unbound),
     /// and roll back a rotation by re-binding a restored `.bak` archive. Since
     /// nothing is generated, nothing is archived — this only submits the
     /// transaction.
@@ -831,11 +789,10 @@ pub struct RotateKeyArgs {
 
     /// (`--key eth`) Keystore holding the NEW Ethereum key to migrate onto.
     /// Required to reach the re-onboarding phase; the earlier phases
-    /// (deregister, unbond request, window wait, withdraw) all run against the
-    /// current keystore and do not need it. Passing it earlier is still useful:
-    /// the address is validated against the one being migrated away from on
-    /// every invocation, so a same-address mistake is caught on the first run
-    /// rather than after the unbonding window.
+    /// (deregister, unbond) run against the current keystore and do not need
+    /// it. Passing it earlier is still useful: the address is validated
+    /// against the one being migrated away from on every invocation, so a
+    /// same-address mistake is caught before the old address exits.
     ///
     /// Both keystores are unlocked from the same password source
     /// (`DECDN_KEYSTORE_PASSWORD`, then `--keystore-password-file`, then a
@@ -900,19 +857,14 @@ pub struct BondArgs {
     pub chain: ChainArgs,
 }
 
-/// `decdn node unbond` — lower the bond via `CapacityBond.requestUnbond` +
-/// `unbond` (ADR 026 § Capacity-bond curve). One command covers all three
-/// phases of the window; which one runs is read from chain state, not from a
-/// flag. A run that lost its `requestUnbond` after `declareMbps` landed resumes
-/// on re-run, the way [`BondArgs`] converges; once `requestUnbond` HAS landed a
-/// re-run with an amount flag is a deliberate error, since the request can no
-/// longer be changed.
+/// `decdn node unbond` — lower the bond via `CapacityBond.unbond` (ADR 026
+/// § Capacity-bond curve). The released TOKEN returns to the operator in the
+/// same run. A run that lost its `unbond` after `declareMbps` landed resumes
+/// on re-run, the way [`BondArgs`] converges.
 ///
-/// The amount flags apply only when starting a request — passing one while a
-/// request is already in flight is an error rather than a silent no-op. All
-/// three are mutually exclusive; exactly one is required to start a request.
+/// The three amount flags are mutually exclusive; exactly one is required.
 #[derive(Args, Debug)]
-#[command(group(ArgGroup::new("unbond_amount").args(["to_mbps", "all", "amount"]).multiple(false)))]
+#[command(group(ArgGroup::new("unbond_amount").args(["to_mbps", "all", "amount"]).required(true).multiple(false)))]
 pub struct UnbondArgs {
     /// Reduce the declared capacity tier to MBPS and release the surplus
     /// bond. The released amount is derived from the on-chain
@@ -950,10 +902,9 @@ pub struct UnbondArgs {
     #[arg(long, value_name = "BASE_UNITS")]
     pub amount: Option<u128>,
 
-    /// Skip the interactive confirmation. Required when *starting* a request
-    /// from a non-interactive shell, since that deactivates the node for the
-    /// full window; the withdrawal phase never prompts. The consequences are
-    /// printed either way — this suppresses the prompt, not the warning.
+    /// Skip the interactive confirmation. Required from a non-interactive
+    /// shell. The consequences are printed either way — this
+    /// suppresses the prompt, not the warning.
     #[arg(long = "yes", short = 'y')]
     pub yes: bool,
 
@@ -972,7 +923,7 @@ pub struct UnbondArgs {
 /// [`UnbondArgs`] has: deregistration is a single transaction that either
 /// applies or reverts `NodeNotActive`.
 ///
-/// It is nonetheless at least as consequential as starting an unbonding window,
+/// It is nonetheless at least as consequential as an unbond below the floor,
 /// which is why it carries the same `--yes` gate: it drops the node from the
 /// active set, bumps `registrationNonce[nodeId]` (invalidating any
 /// previously-signed registration signature), and clears the declared tier, so
@@ -1056,8 +1007,8 @@ pub struct LookupArgs {
     /// and nothing is paid. The opens sign under a throwaway key made for
     /// this run, so no keystore, buyer store or payment pool is needed. Each
     /// answer must verify against the node's registered operator address
-    /// under the `SlashJudge` (`--slash-judge-address` or
-    /// `blockchain.slash_judge_address`). Candidates that don't answer, or
+    /// under the `CapacityBond` domain (`--capacity-bond-address` or
+    /// `blockchain.capacity_bond_address`). Candidates that don't answer, or
     /// whose answer does not verify, are kept at the end (rather than
     /// dropped) with no RTT. Without this flag, no node is opened and
     /// candidates carry no RTT.
@@ -1068,12 +1019,6 @@ pub struct LookupArgs {
     /// exchange. Ignored without `--probe`.
     #[arg(long, value_name = "MS", default_value_t = 5_000)]
     pub timeout_ms: u64,
-
-    /// `SlashJudge` contract address (0x hex): the domain each `--probe`
-    /// answer's signature verifies under. Overrides
-    /// `blockchain.slash_judge_address`. Ignored without `--probe`.
-    #[arg(long, value_name = "0xADDR")]
-    pub slash_judge_address: Option<String>,
 
     // `--json` is supplied by the flattened `ChainArgs` (`CommonChainArgs.json`);
     // declaring it here too would collide (clap requires unique arg names).

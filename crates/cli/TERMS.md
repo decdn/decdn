@@ -50,8 +50,8 @@ compliance or non-compliance does not alter yours.
 ## 5. Consequences of breach
 
 If you breach these terms, the network's governance may act against your node
-under the content-takedown and slashing rules — including blacklisting and
-ejection — and you remain subject to enforcement by the authorities of your
+under the content-takedown rules — including blacklisting and ejection —
+and you remain subject to enforcement by the authorities of your
 own jurisdiction. The on-chain record of your acceptance is evidence that you
 were on notice of these duties; it is not evidence that you performed them.
 
@@ -63,8 +63,8 @@ time to time, not only the version you accepted when you registered. The
 network records the version you assented to at registration; a later
 governance-adopted revision applies to your continued operation of a node,
 whether or not you re-record your acceptance on-chain. If you do not wish to be
-bound by a revision, your remedy is to stop operating your node and exit under
-the unbonding process.
+bound by a revision, your remedy is to stop operating your node, deregister it
+and withdraw your bond.
 
 ## Operator guidance (not part of these terms)
 

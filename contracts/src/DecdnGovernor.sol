@@ -11,7 +11,6 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
-import { SlashRecord, SlashStatus } from "./SlashEscrowLib.sol";
 import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 
 /// @title DecdnGovernor
@@ -20,8 +19,7 @@ import { IFeeRouter } from "./interfaces/IFeeRouter.sol";
 ///         epoch's bytes capped at the operator's declared capacity
 ///         (`CapacityBond.declaredMbpsAtEpoch` × `epochLength` × 125_000), then
 ///         bounded by the `voteCapBps` share cap and scaled by `age_ramp(firstBondedAt)`.
-///         Weight is zeroed if the operator is slashed in-window. Proposals execute
-///         through a 48h `TimelockController`.
+///         Proposals execute through a 48h `TimelockController`.
 /// @dev    `VotingEscrow` and `IVotes`/IERC-5805 are intentionally NOT used —
 ///         voting weight is derived from `FeeRouter` epoch accounting, not
 ///         from per-account checkpoint structures. See ADR 036 § Formula.
@@ -216,8 +214,7 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         return (total * PROPOSAL_THRESHOLD_NUMERATOR) / PROPOSAL_THRESHOLD_DENOMINATOR;
     }
 
-    /// @dev ADR 036 § Formula. Returns 0 if the operator was slashed inside the
-    ///      trailing window; otherwise `min(Σ_e min(bytesPerEpoch(e),
+    /// @dev ADR 036 § Formula. Returns `min(Σ_e min(bytesPerEpoch(e),
     ///      declaredMbpsAtEpoch(e) × epochLength × 125_000), voteCapBps × total
     ///      / 10_000) × age_ramp / 1e18`.
     function _getVotes(
@@ -230,39 +227,11 @@ contract DecdnGovernor is Governor, GovernorCountingSimple, GovernorTimelockCont
         override
         returns (uint256)
     {
-        if (_slashedInWindow(account, timepoint)) return 0;
         uint256 capped = _cappedServed(account, timepoint);
         if (capped == 0) return 0;
         uint256 ramp =
             _ageRampScaled(capacityBond.firstBondedAt(account), timepoint, ageRampMonthsAt(timepoint.toUint48()));
         return (capped * ramp) / RAMP_SCALE;
-    }
-
-    /// @dev True iff `account` has a standing (not appeal-reversed) slash with
-    ///      `slashedAt` in `[start of the byte window, timepoint]`. Every slash
-    ///      record is checked, so a later slash cannot hide an earlier one, and
-    ///      a slash in the in-progress epoch zeroes snapshots taken after it. A
-    ///      slash after `timepoint` never zeroes that snapshot (#847).
-    function _slashedInWindow(address account, uint256 timepoint) internal view returns (bool) {
-        (uint64 endEpoch, bool hasElapsed) = _endEpoch(timepoint);
-        // No fully-elapsed epoch yet ⇒ the byte window is empty, so there is
-        // nothing to zero. Keeps the slash window aligned with the byte window.
-        if (!hasElapsed) return false;
-        uint64 n = feeRouter.windowEpochsAt(timepoint.toUint48());
-        // Clamp identically to `_cappedServed` and `FeeRouter.bytesInWindow` so
-        // the slash window can never span more epochs than the byte window it
-        // must track, even if `windowEpochsAt` returns an out-of-bound value.
-        if (n > MAX_WINDOW_EPOCHS) n = MAX_WINDOW_EPOCHS;
-        uint64 windowStart = endEpoch + 1 > n ? endEpoch + 1 - n : 0;
-        uint256 windowStartTime = uint256(windowStart) * feeRouter.epochLength();
-        // Newest first. Records are appended in slash order, so the walk stops
-        // at the first slash before the window.
-        for (uint256 i = capacityBond.operatorSlashCount(account); i > 0; i--) {
-            SlashRecord memory r = capacityBond.getSlashRecord(capacityBond.operatorSlashIdAt(account, i - 1));
-            if (r.slashedAt < windowStartTime) return false;
-            if (r.slashedAt <= timepoint && r.status != SlashStatus.Reversed) return true;
-        }
-        return false;
     }
 
     function _cappedServed(address account, uint256 timepoint) internal view returns (uint256) {

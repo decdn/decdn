@@ -23,7 +23,7 @@ const BINDING: Record<BindingStatus, { value: string; hint: string }> = {
   },
   mismatch: {
     value: "⛔ Mismatch",
-    hint: "The operator is bound to another key: a slash cannot reach this node. decdn node rotate-key repairs it",
+    hint: "The operator is bound to another key: peers do not route to this node. decdn node rotate-key repairs it",
   },
   unbound: {
     value: "⚠ Unbound",
@@ -52,7 +52,7 @@ export function nodeTiles(
       {
         label: "Active staker",
         value: health.registry_active ? "Yes" : "⚠ No",
-        hint: "In the on-chain active set: peers route only to a node they can slash",
+        hint: "In the on-chain active set: peers route only to active nodes",
       },
       {
         label: "Uptime",

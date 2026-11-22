@@ -440,7 +440,7 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         }
         .sign(
             &PrivateKeySigner::random(),
-            &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+            &decdn_incentive::capacity_bond_domain(1, Address::ZERO),
         )?;
         Ok(crate::Credential {
             signer: Arc::new(signer.clone()),
@@ -459,7 +459,6 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         1,
         Address::repeat_byte(0x33),
         Address::repeat_byte(0x44),
-        None,
     );
     let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
     let deployment = pool.deployment;
@@ -508,7 +507,7 @@ async fn a_delegated_slot_counts_its_keys_earlier_spend_from_the_delegate_lanes(
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.governance.slash_judge);
+    let slash_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
     let connections = crate::Connections::new(ep.clone());
     let writes = crate::ordered_writes::OrderedWrites::default();
     let funding = crate::funding::RunFunding::default();
@@ -762,8 +761,7 @@ async fn each_pass_pays_the_holders_routed_to_its_pool() -> anyhow::Result<()> {
         GovernanceChain {
             rpc_url: "http://gov:8545".to_string(),
             chain_id: 1,
-            slash_judge: Address::repeat_byte(0x44),
-            capacity_bond: None,
+            capacity_bond: Address::repeat_byte(0x44),
         },
         vec![pool_a.clone(), pool_b.clone()],
     )?;
@@ -785,7 +783,7 @@ async fn each_pass_pays_the_holders_routed_to_its_pool() -> anyhow::Result<()> {
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::slash_judge_domain(1, chain.governance.slash_judge);
+    let slash_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
     let connections = crate::Connections::new(ep.clone());
     let writes = crate::ordered_writes::OrderedWrites::default();
     let funding = crate::funding::RunFunding::default();
@@ -938,7 +936,7 @@ impl LaneFixture {
         }
         .sign(
             &PrivateKeySigner::random(),
-            &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+            &decdn_incentive::capacity_bond_domain(1, Address::ZERO),
         )?;
         let slot = crate::CredentialSlot::new(Arc::new(delegate), capability)?;
         let chain = crate::session::test_support::one_chain(
@@ -946,7 +944,6 @@ impl LaneFixture {
             1,
             Address::repeat_byte(0x33),
             Address::repeat_byte(0x44),
-            None,
         );
         let (pool, passes) = crate::session::test_support::first_pass(&chain)?;
         let dir = tempfile::tempdir()?;
@@ -982,7 +979,7 @@ impl LaneFixture {
             region: None,
             region_allowlist: Vec::new(),
         };
-        let slash_dom = decdn_incentive::slash_judge_domain(1, chain.governance.slash_judge);
+        let slash_dom = decdn_incentive::capacity_bond_domain(1, chain.governance.capacity_bond);
         let voucher_dom = pool.deployment.voucher_domain();
         Ok(Self {
             _dir: dir,

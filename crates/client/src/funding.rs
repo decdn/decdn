@@ -19,7 +19,7 @@ use anyhow::Context as _;
 use decdn_incentive::buyer_pool::{AdvanceOutcome, BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::payment_pool::{PaymentPool, newest_solvent_owned_pool};
 use decdn_incentive::tx::RECEIPT_TIMEOUT;
-use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, bind_node_id_domain};
+use decdn_incentive::{CapabilityGrant, Deployment, LaneKey, PoolId, capacity_bond_domain};
 use iroh::Endpoint;
 use tokio_util::sync::CancellationToken;
 
@@ -1121,20 +1121,15 @@ where
 /// itself around [`open_or_reuse_pool`] — can attach the same binding outside
 /// that critical section.
 ///
-/// The binding domain is the governance chain's `CapacityBond`. No binding
-/// when `governance.capacity_bond` is unset — see [`build_pool_ctx`]'s docs
-/// for why that is silent.
+/// The binding domain is the governance chain's `CapacityBond`.
 pub(crate) fn attach_client_binding(
     ctx: PoolContext,
     governance: &GovernanceChain,
     endpoint: &Endpoint,
 ) -> anyhow::Result<PoolContext> {
-    let Some(capacity_bond) = governance.capacity_bond else {
-        return Ok(ctx);
-    };
     ctx.bind_endpoint(
         endpoint,
-        &bind_node_id_domain(governance.chain_id, capacity_bond),
+        &capacity_bond_domain(governance.chain_id, governance.capacity_bond),
     )
 }
 

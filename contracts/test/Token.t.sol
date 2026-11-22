@@ -55,7 +55,7 @@ contract TokenTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Burn semantics (the 20% burn leg of slashing depends on this)
+    // Burn semantics (BuybackBurner's burn of bought-back TOKEN depends on this)
     // -----------------------------------------------------------------
 
     function test_burn_reducesTotalSupplyAndBalance() public {

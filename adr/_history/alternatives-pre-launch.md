@@ -4,7 +4,7 @@
 >
 > Neither the numeric `adrs.pdf` nor the reading-order `adrs-book.pdf` build includes this file, and the ADR bodies intentionally do **not** link to it — there is no `## Alternatives Considered` stub or breadcrumb in any ADR. Readers approaching the protocol get the canonical spec; this archive is browsed directly, by the per-ADR sections below.
 >
-> **Related: retired full ADRs.** Full ADRs that were accepted, then retired when a later spec superseded the underlying mechanism, live as standalone files alongside this one — a different artifact category than the rejected-pre-launch-alternative entries below. Current retirees: [`015-zero-rtt.md`](015-zero-rtt.md), retired by the protocol simplification audit (QUIC 0-RTT dropped; every connection now completes a full handshake); [`032-safety-reserve-appeals-contract.md`](032-safety-reserve-appeals-contract.md) and [`033-safety-insurance-reserve.md`](033-safety-insurance-reserve.md), both retired by the SafetyReserve removal (the appeal state machine moved to the standalone `SlashAppeal` contract, and restitution became escrow-on-slash); and [`034-gauge-boost-voting-escrow.md`](034-gauge-boost-voting-escrow.md) and [`035-delegator-pool.md`](035-delegator-pool.md), both retired by the v2.1 work-token rewrite (replaces the ve-gauge model with the `CapacityBond` lock-to-capacity curve). Each retired file has a top-of-file retirement banner with the canonical pointer; original bodies are preserved verbatim.
+> **Related: retired full ADRs.** Full ADRs that were accepted, then retired when a later spec superseded the underlying mechanism, live as standalone files alongside this one — a different artifact category than the rejected-pre-launch-alternative entries below. Current retirees: [`014-on-chain-verification.md`](014-on-chain-verification.md) and [`028-slashing-appeals.md`](028-slashing-appeals.md), both retired by the slashing retirement (no slashing remains; the `StreamResponse` signature scheme moved to [ADR 005 § Signer binding](../005-protocol.md#signer-binding) under the `CapacityBond` EIP-712 domain); [`015-zero-rtt.md`](015-zero-rtt.md), retired by the protocol simplification audit (QUIC 0-RTT dropped; every connection now completes a full handshake); [`032-safety-reserve-appeals-contract.md`](032-safety-reserve-appeals-contract.md) and [`033-safety-insurance-reserve.md`](033-safety-insurance-reserve.md), both retired by the SafetyReserve removal (the appeal state machine moved to the standalone `SlashAppeal` contract, and restitution became escrow-on-slash); and [`034-gauge-boost-voting-escrow.md`](034-gauge-boost-voting-escrow.md) and [`035-delegator-pool.md`](035-delegator-pool.md), both retired by the v2.1 work-token rewrite (replaces the ve-gauge model with the `CapacityBond` lock-to-capacity curve). Each retired file has a top-of-file retirement banner with the canonical pointer; original bodies are preserved verbatim.
 
 Sections below are anchored by source ADR. Cross-references back to each source use relative paths (`../NNN-name.md`).
 
@@ -27,7 +27,7 @@ ADR 010 had proposed a token-agnostic `PaymentChannel` with a governance-managed
 
 ## ADR 014 — Slash Signature Scheme
 
-Source: [ADR 014 § 1 — Slash Signatures (secp256k1 EIP-712)](../014-on-chain-verification.md#slash-signatures--secp256k1-eip-712).
+Source: [ADR 014 § 1 — Slash Signatures (secp256k1 EIP-712)](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712) (retired; the signature scheme now lives in [ADR 005 § Signer binding](../005-protocol.md#signer-binding)).
 
 The alternatives below are scoped to the choice of signature scheme used for on-chain slash evidence. The chosen design — secp256k1 EIP-712 `slash_sig` verified via `ecrecover` — is documented in ADR 014 § 1. (The original draft also retained an Ed25519 wire signature alongside `slash_sig`; this redundancy was removed pre-launch — see [#408](https://github.com/decdn/decdn/issues/408).)
 
@@ -212,7 +212,7 @@ Rejected. Scatters the PoC/production boundary into every crate, making it hard 
 
 ## ADR 028 — Slashing Appeals
 
-Source: [ADR 028 — Slashing Appeals and Dispute Escalation](../028-slashing-appeals.md).
+Source: [ADR 028 — Slashing Appeals and Dispute Escalation](028-slashing-appeals.md) (retired).
 
 - **ve-Governor-only path (no multisig fast-track).** Rejected: ~9-day minimum governance latency (7d voting + 48h timelock per [ADR 009](../009-governance.md#production-operator-weighted-dao-governance)) is too slow for an operator who needs working-capital relief during an active business. The multisig fast-track + ratification structure is borrowed exactly from [ADR 011 § Regional Governance Bodies](../011-content-takedown.md#regional-governance-bodies) for the same reason.
 - **Dedicated arbitration committee.** Rejected: introduces a new on-chain governance body, a new election mechanism, and a new attack surface, none of which is justified by the appeal volume the protocol expects (single-digit appeals per quarter at PoC scale, low-tens at production scale).

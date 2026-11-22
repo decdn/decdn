@@ -257,17 +257,16 @@ fn expand_env_substitutes_string_field() -> anyhow::Result<()> {
 }
 
 #[test]
-fn expand_env_substitutes_slash_judge_address() -> anyhow::Result<()> {
+fn expand_env_substitutes_capacity_bond_address() -> anyhow::Result<()> {
     // Regression for the wiring line in `expand_env`: a `${VAR}` in
-    // blockchain.slash_judge_address must be expanded before
+    // blockchain.capacity_bond_address must be expanded before
     // `parse_contract_address`, like the other contract-address fields.
     let home = home_str()?;
     let mut cfg = FileConfig {
         blockchain: Some(types::BlockchainConfig {
             origin_assignment_address: None,
             publisher_registry_address: None,
-            slash_judge_address: Some("${HOME}/judge".to_string()),
-            slash_appeal_address: None,
+            capacity_bond_address: Some("${HOME}/judge".to_string()),
             content_blacklist_address: None,
             ..Default::default()
         }),
@@ -277,8 +276,8 @@ fn expand_env_substitutes_slash_judge_address() -> anyhow::Result<()> {
     let got = cfg
         .blockchain
         .as_ref()
-        .and_then(|b| b.slash_judge_address.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("slash_judge_address missing"))?;
+        .and_then(|b| b.capacity_bond_address.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("capacity_bond_address missing"))?;
     anyhow::ensure!(got == format!("{home}/judge"), "got: {got}");
     Ok(())
 }
@@ -1260,7 +1259,6 @@ fn blockchain_toml(rest: &str) -> String {
          rpc_url = \"https://gov.example/rpc\"\n\
          chain_id = 11155111\n\
          capacity_bond_address = \"{GOOD_ADDR}\"\n\
-         slash_judge_address = \"{GOOD_ADDR}\"\n\
          content_blacklist_address = \"{GOOD_ADDR}\"\n\
          {rest}"
     )
@@ -1285,7 +1283,6 @@ fn empty_blockchain_cli() -> BlockchainArgs {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: None,
-        slash_judge_address: None,
         content_blacklist_address: None,
         chain_id: None,
     }
@@ -4103,7 +4100,6 @@ fn run_subcommand_args_are_wired_to_decdn_env_vars() {
             "publisher_registry_address",
             "DECDN_PUBLISHER_REGISTRY_ADDRESS",
         ),
-        ("slash_judge_address", "DECDN_SLASH_JUDGE_ADDRESS"),
         (
             "content_blacklist_address",
             "DECDN_CONTENT_BLACKLIST_ADDRESS",
@@ -4169,7 +4165,6 @@ fn resolve_blockchain_names_correct_field_for_bad_address() -> anyhow::Result<()
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some("0xNOTHEX".to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -4201,7 +4196,6 @@ fn resolve_blockchain_origin_directory_unset_resolves_to_none() -> anyhow::Resul
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -4221,7 +4215,6 @@ fn resolve_blockchain_origin_directory_both_set_resolves_to_some() -> anyhow::Re
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -4244,7 +4237,6 @@ fn resolve_blockchain_lone_origin_assignment_resolves() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -4267,7 +4259,6 @@ fn resolve_blockchain_lone_publisher_registry_resolves() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -4397,7 +4388,6 @@ fn resolve_blockchain_fails_when_keystore_missing() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -4427,7 +4417,6 @@ fn resolve_blockchain_fails_when_cli_keystore_override_missing() -> anyhow::Resu
         eth_keystore: Some(bogus),
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -4456,7 +4445,6 @@ fn resolve_blockchain_rejects_directory_as_keystore() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -4496,7 +4484,6 @@ fn empty_blockchain_args() -> crate::cli::run::BlockchainArgs {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     }
@@ -5138,7 +5125,6 @@ fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5155,8 +5141,6 @@ fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         chain_id: None,
         ..Default::default()
@@ -5190,8 +5174,6 @@ fn resolve_blockchain_uses_file_rpc_url_when_cli_absent() -> anyhow::Result<()> 
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         chain_id: None,
         ..Default::default()
@@ -5217,7 +5199,6 @@ fn resolve_blockchain_errors_when_rpc_url_missing() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5242,7 +5223,6 @@ fn resolve_blockchain_errors_when_capacity_bond_address_missing() -> anyhow::Res
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5258,31 +5238,6 @@ fn resolve_blockchain_errors_when_capacity_bond_address_missing() -> anyhow::Res
 }
 
 #[test]
-fn resolve_blockchain_errors_when_slash_judge_address_missing() -> anyhow::Result<()> {
-    let dir = data_dir_with_keystore()?;
-    let cli = BlockchainArgs {
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: Some("https://example/rpc".to_string()),
-        eth_keystore: None,
-        keystore_password_file: None,
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: None,
-        content_blacklist_address: None,
-        chain_id: None,
-    };
-    let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-        anyhow::bail!("expected error when slash_judge_address missing");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("slash_judge_address"),
-        "error should mention slash_judge_address: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
 fn resolve_blockchain_errors_when_content_blacklist_address_missing() -> anyhow::Result<()> {
     let dir = data_dir_with_keystore()?;
     let cli = BlockchainArgs {
@@ -5292,7 +5247,6 @@ fn resolve_blockchain_errors_when_content_blacklist_address_missing() -> anyhow:
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5308,35 +5262,10 @@ fn resolve_blockchain_errors_when_content_blacklist_address_missing() -> anyhow:
 }
 
 #[test]
-fn resolve_blockchain_rejects_zero_slash_judge_address() -> anyhow::Result<()> {
-    let dir = data_dir_with_keystore()?;
-    let cli = BlockchainArgs {
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: Some("https://example/rpc".to_string()),
-        eth_keystore: None,
-        keystore_password_file: None,
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some("0x0000000000000000000000000000000000000000".to_string()),
-        content_blacklist_address: None,
-        chain_id: None,
-    };
-    let Err(err) = resolve_blockchain(&cli, None, dir.path()) else {
-        anyhow::bail!("expected error for zero slash_judge_address");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("slash_judge_address") && msg.contains("zero address"),
-        "error should reject the zero address: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
 fn resolve_blockchain_rejects_zero_content_blacklist_address() -> anyhow::Result<()> {
     // The zero address is a fail-open compliance trap: every scope check
     // reverts, nothing is evicted, and the operator believes the watcher
-    // is active. Must be rejected like `slash_judge_address`.
+    // is active. Must be rejected like `capacity_bond_address`.
     let dir = data_dir_with_keystore()?;
     let cli = BlockchainArgs {
         origin_assignment_address: None,
@@ -5345,7 +5274,6 @@ fn resolve_blockchain_rejects_zero_content_blacklist_address() -> anyhow::Result
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some("0x0000000000000000000000000000000000000000".to_string()),
         chain_id: None,
     };
@@ -5370,7 +5298,6 @@ fn resolve_blockchain_rejects_zero_capacity_bond_address() -> anyhow::Result<()>
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some("0x0000000000000000000000000000000000000000".to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5398,7 +5325,6 @@ fn resolve_blockchain_rejects_zero_origin_assignment_address() -> anyhow::Result
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5423,7 +5349,6 @@ fn resolve_blockchain_rejects_zero_publisher_registry_address() -> anyhow::Resul
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5449,7 +5374,6 @@ fn resolve_blockchain_rejects_zero_content_blacklist_poll_interval() -> anyhow::
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5478,7 +5402,6 @@ fn resolve_blockchain_rejects_zero_chain_id() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: Some(0),
     };
@@ -5506,7 +5429,6 @@ fn resolve_blockchain_treats_empty_string_rpc_url_as_missing() -> anyhow::Result
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5531,7 +5453,6 @@ fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Resul
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5548,8 +5469,6 @@ fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Resul
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         chain_id: None,
         ..Default::default()
@@ -5576,7 +5495,6 @@ fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5593,8 +5511,6 @@ fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         chain_id: None,
         ..Default::default()
@@ -5620,12 +5536,10 @@ fn resolve_blockchain_rejects_zero_redeem_interval() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
     let file = types::BlockchainConfig {
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         redeem_interval_secs: Some(0),
         ..Default::default()
     };
@@ -5650,7 +5564,6 @@ fn resolve_blockchain_applies_default_redeem_interval_when_absent() -> anyhow::R
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5669,12 +5582,10 @@ fn resolve_blockchain_rejects_redeem_interval_above_grace_margin() -> anyhow::Re
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
     let file = types::BlockchainConfig {
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS + 1),
         ..Default::default()
     };
@@ -5699,12 +5610,10 @@ fn resolve_blockchain_accepts_redeem_interval_at_grace_margin() -> anyhow::Resul
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
     let file = types::BlockchainConfig {
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         redeem_interval_secs: Some(MAX_REDEEM_INTERVAL_SECS),
         ..Default::default()
     };
@@ -5723,12 +5632,10 @@ fn resolve_blockchain_rejects_zero_redeem_max_vouchers_per_tx() -> anyhow::Resul
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
     let file = types::BlockchainConfig {
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         redeem_max_vouchers_per_tx: Some(0),
         ..Default::default()
     };
@@ -5754,7 +5661,6 @@ fn resolve_blockchain_applies_default_redeem_max_vouchers_per_tx_when_absent() -
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5776,7 +5682,6 @@ fn resolve_blockchain_applies_default_pool_floor_when_absent() -> anyhow::Result
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5798,13 +5703,11 @@ fn resolve_blockchain_threads_explicit_pool_floor() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
     let file = types::BlockchainConfig {
         pool_min_remaining_deposit_micro_usdc: Some(2_500_000),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         ..Default::default()
     };
@@ -5824,7 +5727,6 @@ fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5841,8 +5743,6 @@ fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         chain_id: None,
         ..Default::default()
@@ -5862,7 +5762,6 @@ fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5879,8 +5778,6 @@ fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         chain_id: None,
         ..Default::default()
@@ -5906,7 +5803,6 @@ fn resolve_blockchain_applies_default_watchdog_interval_when_absent() -> anyhow:
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5928,7 +5824,6 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
@@ -5945,8 +5840,6 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: Some(0),
         buyer_max_approve: None,
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         chain_id: None,
         ..Default::default()
@@ -5972,7 +5865,6 @@ fn buyer_working_deposit_defaults_when_absent() -> anyhow::Result<()> {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -5993,14 +5885,11 @@ fn resolve_blockchain_rejects_receipt_poll_interval_below_minimum() -> anyhow::R
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: None,
         chain_id: None,
     };
     let file = types::BlockchainConfig {
         receipt_poll_interval_ms: Some(MIN_RECEIPT_POLL_INTERVAL_MS - 1),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         ..Default::default()
     };
@@ -6028,7 +5917,6 @@ fn resolve_blockchain_applies_default_receipt_poll_interval_when_absent() -> any
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
@@ -6055,14 +5943,11 @@ fn resolve_blockchain_accepts_min_and_in_range_receipt_poll_interval() -> anyhow
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     };
     let at_min = types::BlockchainConfig {
         receipt_poll_interval_ms: Some(MIN_RECEIPT_POLL_INTERVAL_MS),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         ..Default::default()
     };
@@ -6074,8 +5959,6 @@ fn resolve_blockchain_accepts_min_and_in_range_receipt_poll_interval() -> anyhow
 
     let in_range = types::BlockchainConfig {
         receipt_poll_interval_ms: Some(1000),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
-        slash_appeal_address: None,
         content_blacklist_address: None,
         ..Default::default()
     };
@@ -6092,7 +5975,6 @@ fn blacklist_poll_cli() -> BlockchainArgs {
         eth_keystore: None,
         keystore_password_file: None,
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        slash_judge_address: Some(GOOD_ADDR.to_string()),
         content_blacklist_address: Some(GOOD_ADDR.to_string()),
         chain_id: None,
     }
@@ -6578,7 +6460,6 @@ region = "USA"
 [blockchain]
 payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [cache]
 cache_size_mb = 100
@@ -6657,7 +6538,6 @@ fn resolve_config_missing_rpc_url_emits_no_parse_cascade() -> anyhow::Result<()>
 [blockchain]
 payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 "#;
     let dir = data_dir_with_keystore()?;
     let path = write_minimal_toml(&dir, body)?;
@@ -6682,13 +6562,12 @@ slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 }
 
 #[test]
-fn resolve_config_malformed_slash_judge_emits_no_zero_address_cascade() -> anyhow::Result<()> {
-    // Cascade guard: a slash_judge_address that fails to parse
+fn resolve_config_malformed_capacity_bond_emits_no_zero_address_cascade() -> anyhow::Result<()> {
+    // Cascade guard: a capacity_bond_address that fails to parse
     // records the parse/checksum problem and skips the zero-address
     // check (the empty placeholder must not also emit "must not be
-    // the zero address"). The address is set via CLI args because
-    // `empty_blockchain_args` defaults `slash_judge_address` to a
-    // valid one (CLI > file), so a TOML value would be ignored.
+    // the zero address"). The address is set via CLI args, which
+    // override the valid TOML value (CLI > file).
     let body = r#"
 [blockchain]
 rpc_url = "https://example/rpc"
@@ -6699,18 +6578,18 @@ capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
     let dir = data_dir_with_keystore()?;
     let path = write_minimal_toml(&dir, body)?;
     let mut args = run_args_with_data_dir(dir.path());
-    args.blockchain.slash_judge_address = Some("0xnothex".to_string());
+    args.blockchain.capacity_bond_address = Some("0xnothex".to_string());
     let Err(err) = resolve_config(Some(&path), &args) else {
-        anyhow::bail!("expected resolve_config to fail on bad slash_judge_address");
+        anyhow::bail!("expected resolve_config to fail on bad capacity_bond_address");
     };
     let msg = format!("{err:#}");
     assert!(
         msg.contains("configuration has 1 problem(s):"),
-        "bad slash_judge must be the only problem (no zero-addr cascade): {msg}"
+        "bad capacity_bond must be the only problem (no zero-addr cascade): {msg}"
     );
     assert!(
-        msg.contains("slash_judge_address"),
-        "error should name slash_judge_address: {msg}"
+        msg.contains("capacity_bond_address"),
+        "error should name capacity_bond_address: {msg}"
     );
     assert!(
         !msg.contains("must not be the zero address"),
@@ -6734,7 +6613,6 @@ fn resolve_config_missing_home_dir_emits_no_keystore_cascade() -> anyhow::Result
 rpc_url = "https://example/rpc"
 payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 "#;
     let dir = TempDir::new()?;
     let path = write_minimal_toml(&dir, body)?;
@@ -6773,7 +6651,6 @@ region = "USA"
 rpc_url = "https://example/rpc"
 payment_chains = [{ rpc_url = "https://payment.example/rpc", chain_id = 84532, payment_pools = ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"] }]
 capacity_bond_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
-slash_judge_address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
 
 [[cache.origins]]
 kind = "http"

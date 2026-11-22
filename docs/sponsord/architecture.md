@@ -35,7 +35,7 @@ That is why:
 1. **Install.** `curl …/decdn.sh | sh -s -- get decdn:<hash>/` (or `decdn.ps1`)
    runs the script the onramp serves, with the onramp URL, the pinned
    `decdn` release and the download profile baked in: the governance chain
-   (chain id, RPC URL, `CapacityBond`, `SlashJudge`) and the payment chain
+   (chain id, RPC URL, `CapacityBond`) and the payment chain
    (chain id, RPC URL, `PaymentPool`). The onramp takes the payment chain id
    and pool from the daemon's `GET /v1/info` at startup, and the rest from
    its own configuration. The script downloads

@@ -838,14 +838,13 @@ struct ChainHandlers<P: Provider + Clone + 'static> {
     slash_domain: alloy::dyn_abi::Eip712Domain,
     bind_domain: alloy::dyn_abi::Eip712Domain,
     staker_set: Arc<dyn StakerSet>,
-    /// Stops the governance chain's refresh loops: registry, slash, origin
-    /// seats and blacklist. Cancelled once, late in shutdown (after
+    /// Stops the governance chain's refresh loops: registry, origin seats and
+    /// blacklist. Cancelled once, late in shutdown (after
     /// `router.shutdown`), because the registry's staker set gates DHT
     /// admission through drain.
     chain_sync_stop: CancellationToken,
     /// The refresh loop tasks.
     chain_sync_tasks: Vec<tokio::task::JoinHandle<()>>,
-    slash_store: crate::slash_watcher::SlashStore,
     node_address_resolver: Option<Arc<dyn crate::dht::NodeAddressResolver>>,
     serve_rate_limiter: Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>,
     dht_rate_limiter: Arc<DhtRateLimiter>,
@@ -921,7 +920,7 @@ struct SettlementWiring<P: Provider + Clone> {
 }
 
 /// Middle phase of [`run`] (#1253): parse the chain contract addresses and
-/// EIP-712 domains, take the `CapacityBond` registry / slash / origin-seat /
+/// EIP-712 domains, take the `CapacityBond` registry / origin-seat /
 /// blacklist boot snapshots with their refresh loops, and construct the client
 /// and DHT handlers plus the seller-side [`PoolSettlementService`]. Borrows [`Infra`]; the buyer-side
 /// provider/store construction and the background tasks belong to
@@ -933,18 +932,6 @@ async fn build_chain_and_handlers(
     reload_state: &RuntimeReloadState,
     infra: &Infra,
 ) -> anyhow::Result<ChainHandlers<impl Provider + Clone + 'static>> {
-    // SlashJudge EIP-712 domain for stream `slash_sig` (ADR 014 §1–2). Parsed
-    // through the shared zero-address guard (#1219) for a uniform "every daemon
-    // contract address is non-zero" invariant. `resolve_blockchain` already
-    // rejects a zero or malformed `slash_judge_address` at config load, so here
-    // the guard is defense-in-depth rather than the sole check.
-    let slash_judge_addr = parse_nonzero_address(
-        &cfg.blockchain.slash_judge_address,
-        "blockchain.slash_judge_address",
-    )?;
-    let slash_domain =
-        decdn_incentive::slash_judge_domain(cfg.blockchain.chain_id, slash_judge_addr);
-
     // Chain-backed active-staker set. Bootstrap failure is fatal on a
     // deterministic fault or once its retries are exhausted (see the boot
     // budget below): an
@@ -961,6 +948,13 @@ async fn build_chain_and_handlers(
         &cfg.blockchain.capacity_bond_address,
         "blockchain.capacity_bond_address",
     )?;
+    // The `CapacityBond` EIP-712 domain the stream `slash_sig` and the origin
+    // attestations sign under (ADR 005 § Signer binding). Parsed through the
+    // shared zero-address guard (#1219); `resolve_blockchain` already rejects
+    // a zero or malformed `capacity_bond_address` at config load, so here the
+    // guard is defense-in-depth rather than the sole check.
+    let slash_domain =
+        decdn_incentive::capacity_bond_domain(cfg.blockchain.chain_id, capacity_bond_addr);
     // Mandatory for paid delivery. Config resolution rejects absence; this
     // runtime guard preserves fail-closed behavior for directly constructed
     // `ResolvedConfig` values as well.
@@ -971,7 +965,7 @@ async fn build_chain_and_handlers(
             .context("missing mandatory blockchain.content_blacklist_address")?,
         "blockchain.content_blacklist_address",
     )?;
-    // Governance-chain providers: the bond, slash, blacklist, registry and
+    // Governance-chain providers: the bond, blacklist, registry and
     // origin-seat reads. Every pool read and transaction uses its own payment
     // chain's providers ([`PoolInfra::providers`]).
     let providers = ProviderFactory::new(
@@ -987,8 +981,8 @@ async fn build_chain_and_handlers(
     let chain_sync_stop = CancellationToken::new();
     let mut chain_sync_tasks: Vec<crate::dht::capacity_bond_registry::RefreshTask> = Vec::new();
 
-    // One boot deadline for the four fail-closed chain bootstraps below — the
-    // registry, slash, `usdc()` self-check and blacklist reads (#2159). Each
+    // One boot deadline for the three fail-closed chain bootstraps below — the
+    // registry, `usdc()` self-check and blacklist reads (#2159). Each
     // retries its reads on transient provider errors and fails only on a
     // deterministic fault or once the shared deadline passes. The best-effort
     // fee-share reads retry on a capped sub-budget of it and fall back to the
@@ -1036,24 +1030,6 @@ async fn build_chain_and_handlers(
     // DHT admission), which forces the shared stop to the LATE point in
     // shutdown.
     chain_sync_tasks.push(registry.refresh);
-
-    // Slash detection (#1032, G-NODE-05): enumerate this operator's
-    // still-appealable slashes from `CapacityBond` and re-read them on a
-    // cadence, so a slash surfaces over `admin_v1_slashes` (+ the
-    // `decdn_slashes_detected_total` metric) and the operator can file `decdn
-    // appeal slash` in time. The boot enumeration retries on the shared boot
-    // budget, like the CapacityBond registry bootstrap above.
-    let (slash_store, slash_refresh) = crate::slash_watcher::bootstrap(
-        providers.read_only(receipt_poll_interval),
-        capacity_bond_addr,
-        infra.eth_signer.address(),
-        Arc::clone(&infra.node_metrics),
-        &boot,
-        chain_sync_stop.clone(),
-    )
-    .await
-    .context("bootstrap slash detection")?;
-    chain_sync_tasks.push(slash_refresh);
 
     // NodeId → bonded operator address resolver for node-to-node pulls (#831),
     // produced by the same CapacityBond bootstrap as the staker set above and
@@ -1233,8 +1209,8 @@ async fn build_chain_and_handlers(
     ));
 
     // Bring-up self-check: is the key we are about to serve under the one bound
-    // to this operator on-chain? A node that answers "no" is UNSLASHABLE
-    // (`SlashJudge` resolves the accused through `nodeIdOf`), and nothing else
+    // to this operator on-chain? A node that answers "no" is UNROUTABLE (peers
+    // and clients resolve its operator through the binding), and nothing else
     // in the runtime would notice — so the check is here rather than left to an
     // operator to think of. Advisory: it never blocks startup, because a daemon
     // that refused to boot on a transient RPC failure could not be used to run
@@ -1247,8 +1223,8 @@ async fn build_chain_and_handlers(
     )
     .await;
 
-    let bind_domain =
-        decdn_incentive::bind_node_id_domain(cfg.blockchain.chain_id, capacity_bond_addr);
+    // Client bindings sign under the same `CapacityBond` domain.
+    let bind_domain = slash_domain.clone();
 
     // Node→node pull-through deps (#831/#856/#821), all gated on
     // `node_to_node_pull_through_enabled`. Computed as `Option`s here so the handler's
@@ -1495,7 +1471,7 @@ async fn build_chain_and_handlers(
     // whose hash is blacklisted in scope for this operator, which cascades to
     // DHT-announce suppression (the republisher's `is_evicted` gate), open
     // refusal, and delivery refusal — the node's only local
-    // protection against the slash for serving blacklisted content.
+    // protection against serving blacklisted content.
     // `blacklist_ready_rx` gates the ALPN router below on that first snapshot.
     let (blacklist_ready_tx, blacklist_ready_rx) = oneshot::channel();
     let blacklist_sync = crate::blacklist_watcher::bootstrap(
@@ -1559,7 +1535,6 @@ async fn build_chain_and_handlers(
         staker_set,
         chain_sync_stop,
         chain_sync_tasks,
-        slash_store,
         node_address_resolver,
         serve_rate_limiter,
         dht_rate_limiter,
@@ -2319,14 +2294,9 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         // Pull-through and the buyer wallet for `admin_v1_status` (#2603): the
         // SAME handle the buyer pool service records each balance read into.
         .with_buyer_wallet(Arc::clone(&buyer_wallet))
-        // Slash-detection introspection for `admin_v1_slashes` (#1032). Shares
-        // the in-memory store the watcher appends to — read-only here.
-        .with_slash_detection(admin::SlashStatusHandles {
-            store: Arc::clone(&ch.slash_store),
-        })
         // Bring-up node-id binding check (#1034), already logged during
         // `build_chain_and_handlers`. Surfacing it here too is what lets an
-        // operator (or the G-NODE-07 journey) detect the unslashable state
+        // operator (or the G-NODE-07 journey) detect the unroutable state
         // without scraping the daemon's log for a WARN line.
         .with_binding(ch.binding_report)
         // Operator eth address for `admin_v1_status` (#1906). The loaded eth
@@ -2555,7 +2525,7 @@ struct ShutdownHandles<P: Provider + Clone + 'static> {
     bucket_refresh_stop_tx: oneshot::Sender<()>,
     admin_stop_tx: Option<oneshot::Sender<()>>,
     rpc_watchdog: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
-    /// Stops the governance-chain refresh loops (registry, slash, origin seats,
+    /// Stops the governance-chain refresh loops (registry, origin seats,
     /// blacklist). Cancelled once, late (after `router.shutdown`), because the
     /// registry's staker set gates DHT admission through drain — see the cancel
     /// site in [`shutdown`].
@@ -3245,7 +3215,7 @@ async fn load_eth_signer(cfg: &ResolvedConfig) -> anyhow::Result<PrivateKeySigne
         .await
         .map_err(|e| anyhow::anyhow!("keystore decrypt task panicked: {e}"))??;
     // Bind the signer to the governance chain id, the chain id of the
-    // `slash_sig` EIP-712 domain (see the slash domain build). Raw EIP-712
+    // `CapacityBond` EIP-712 domain (see the `slash_domain` build). Raw EIP-712
     // `sign_hash_sync` does not consult the bound chain id. Every wallet
     // provider rebinds its clone to its own chain's id
     // (`ProviderFactory::wallet`), so a payment-chain transaction is signed

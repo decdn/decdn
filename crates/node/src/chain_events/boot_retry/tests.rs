@@ -245,9 +245,9 @@ async fn an_empty_call_return_is_permanent() {
     let provider = ProviderBuilder::new().connect_mocked_client(asserter);
     let bond = CapacityBond::new(alloy::primitives::Address::repeat_byte(0x11), provider);
 
-    let err = super::super::timed(None, "pausedTotal", bond.pausedTotal().call())
+    let err = super::super::timed(None, "minBond", bond.minBond().call())
         .await
-        .context("pausedTotal")
+        .context("minBond")
         .unwrap_err();
     assert!(
         err.chain().any(|c| matches!(

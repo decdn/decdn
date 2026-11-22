@@ -6,7 +6,6 @@
 //! or starting any tasks. The daemon's own clap shell lives in
 //! `crates/node/src/main.rs` and is not part of this module.
 
-pub mod appeal;
 pub mod byte_size;
 pub mod common;
 pub mod config_cmd;
@@ -27,7 +26,6 @@ pub mod self_update;
 pub mod setup;
 pub mod whoami;
 
-pub use appeal::{AppealArgs, AppealCommand, AppealSlashArgs};
 pub use byte_size::parse_byte_size;
 pub use common::{
     CommonChainArgs, ConfigPathSource, GovernanceChainArgs, LogFormat, PoolSelectArgs,
@@ -42,8 +40,8 @@ pub use key_gen::KeyGenArgs;
 pub use node::{
     BondArgs, ChainArgs, DeregisterArgs, DoctorArgs, DrainArgs, EarningsArgs, EvictArgs,
     HealthArgs, LanesArgs, LookupArgs, NodeArgs, NodeCommand, OperatorKeyArgs, PoolsArgs,
-    ReceiveSweepsArgs, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget, SlashesArgs,
-    StatusArgs, SweepArgs, TopArgs, UnbondArgs, UpdateMultiaddrsArgs, UpdateRegionArgs,
+    ReceiveSweepsArgs, RegisterArgs, ReloadArgs, RotateKeyArgs, RotateKeyTarget, StatusArgs,
+    SweepArgs, TopArgs, UnbondArgs, UpdateMultiaddrsArgs, UpdateRegionArgs,
 };
 pub use origin::{OriginArgs, OriginCommand, OriginImportArgs};
 pub use pool::{
@@ -161,8 +159,6 @@ pub enum Command {
     /// Content is bound to a namespace off-chain at fetch time, so there is no
     /// per-hash on-chain claim.
     Publish(PublishArgs),
-    /// File a slash appeal, posting the appeal bond (ADR 028).
-    Appeal(AppealArgs),
     /// Replace this binary with the latest signed release. The release's
     /// `SHA256SUMS.minisig` must verify against a minisign key this build
     /// embeds; a binary in a cargo bin directory (`cargo install`,

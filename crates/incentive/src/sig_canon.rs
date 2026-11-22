@@ -3,7 +3,7 @@
 //! On-chain `OpenZeppelin` `ECDSA.tryRecover` rejects high-`s` signatures with
 //! `InvalidSignatureS`; alloy's `recover_address_from_prehash` silently
 //! normalizes and accepts them. That asymmetry lets a signer produce a voucher
-//! (or slash signature) that verifies off-chain but reverts on-chain, leaving
+//! (or stream response signature) that verifies off-chain but reverts on-chain, leaving
 //! accrued value unsettleable. We reject high-`s` at acceptance time so the
 //! off-chain accept-set matches the on-chain verifiable-set.
 

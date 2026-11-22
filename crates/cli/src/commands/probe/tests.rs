@@ -181,7 +181,7 @@ fn probe_fetch_args_carry_its_flags_and_default_the_rest() {
         "http://127.0.0.1:8545",
         "--pool",
         "eip155:84532:0x0000000000000000000000000000000000000003",
-        "--slash-judge-address",
+        "--capacity-bond-address",
         "0x0000000000000000000000000000000000000002",
         "--keystore",
         "/tmp/buyer.json",
@@ -208,7 +208,7 @@ fn probe_fetch_args_carry_its_flags_and_default_the_rest() {
         Some("eip155:84532:0x0000000000000000000000000000000000000003")
     );
     assert_eq!(
-        common.slash_judge_address.as_deref(),
+        common.capacity_bond_address.as_deref(),
         Some("0x0000000000000000000000000000000000000002")
     );
     assert_eq!(

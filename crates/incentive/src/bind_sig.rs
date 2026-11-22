@@ -79,10 +79,14 @@ mod sol_types {
 use sol_types::BindNodeId as BindNodeIdSol;
 use sol_types::RegisterNode as RegisterNodeSol;
 
-/// Construct the EIP-712 domain used to verify `BindNodeId` signatures for a
-/// given `CapacityBond` deployment.
+/// Construct the `CapacityBond` EIP-712 domain for a given deployment.
+///
+/// Every operator signature shares it: `BindNodeId` and `RegisterNode` here,
+/// the `StreamResponse` signature ([`crate::stream_sig`]) and the
+/// `OriginAttestation` ([`crate::origin_attestation`]). Each signs a distinct
+/// type name, so no signature verifies as another type.
 #[must_use]
-pub fn bind_node_id_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
+pub fn capacity_bond_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
     eip712_domain! {
         name: CAPACITY_BOND_DOMAIN_NAME,
         version: CAPACITY_BOND_DOMAIN_VERSION,

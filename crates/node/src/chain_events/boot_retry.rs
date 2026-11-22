@@ -1,8 +1,8 @@
 //! In-process retry for the boot-time chain reads (#2159).
 //!
-//! `build_chain_and_handlers` runs four fail-closed chain bootstraps in
-//! sequence: the `CapacityBond` registry snapshot, the slash-detection
-//! enumeration, the `PaymentPool` `usdc()` self-check and the `ContentBlacklist`
+//! `build_chain_and_handlers` runs three fail-closed chain bootstraps in
+//! sequence: the `CapacityBond` registry snapshot, the `PaymentPool` `usdc()`
+//! self-check and the `ContentBlacklist`
 //! deny-set enumeration with its enforcement pass. Each one must succeed before
 //! the node serves, and a boot is only as likely to succeed as the product of
 //! its reads. A single transient provider error therefore must not end the
@@ -10,7 +10,7 @@
 //! fails only on a deterministic fault or once the shared boot deadline passes.
 //!
 //! The best-effort fee-share reads (`fee_shares::seed_from_chain`) run between
-//! the slash and `usdc()` reads. They retry the same way but fall back to the
+//! the registry and `usdc()` reads. They retry the same way but fall back to the
 //! floor share instead of failing boot, and they run on a short sub-budget
 //! (`BootRetry::capped`) so a flapping provider cannot spend the deadline the
 //! later fail-closed reads need.
@@ -184,7 +184,7 @@ impl BootRetry {
 /// - an `alloy::contract::Error` or a `TransportError` is classified by the
 ///   classifier the client's registry discovery shares
 ///   ([`is_permanent_contract_error`], [`is_permanent_rpc_error`]). The block
-///   read that opens the registry, slash, seat and blacklist bootstraps keeps
+///   read that opens the registry, seat and blacklist bootstraps keeps
 ///   its typed cause, so this covers it too.
 ///
 /// An error with no typed cause is transient. That covers a

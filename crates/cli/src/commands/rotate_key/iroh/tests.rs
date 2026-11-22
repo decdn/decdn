@@ -325,18 +325,9 @@ fn disclosure_says_the_bond_and_pools_survive() {
     assert!(s.contains("NOT affected"), "{s}");
     assert!(s.contains("still settle"), "names the voucher case: {s}");
     assert!(
-        s.contains("no unslashable window"),
+        s.contains("no window without a bound node id"),
         "the atomicity is the point: {s}"
     );
-}
-
-/// The challenger-side hazard is not in the runbook and not enforced
-/// anywhere in the CLI, so the disclosure is the only place an operator
-/// with evidence in flight can learn it.
-#[test]
-fn disclosure_warns_about_evidence_citing_the_old_node_id() {
-    let s = disclosure(&plan(true, true));
-    assert!(s.contains("re-submitted against"), "{s}");
 }
 
 /// The archive note describes an effect that only happens on the generating

@@ -1,4 +1,5 @@
 use super::*;
+use crate::capacity_bond_domain;
 use alloy::primitives::address;
 use alloy::signers::local::PrivateKeySigner;
 
@@ -13,7 +14,7 @@ fn sample_data() -> StreamSlashData {
 
 fn sample_domain() -> Eip712Domain {
     // Arbitrum Sepolia chain id; address is a deterministic test fixture.
-    slash_judge_domain(
+    capacity_bond_domain(
         421_614,
         address!("0000000000000000000000000000000000001234"),
     )
@@ -37,9 +38,9 @@ fn round_trip_sign_verify() -> anyhow::Result<()> {
 }
 
 #[test]
-fn high_s_stream_slash_signature_rejected() -> anyhow::Result<()> {
-    // High-`s` slash evidence verifies off-chain but fails at the on-chain
-    // `SlashJudge`; reject it so collected evidence stays settleable (#836).
+fn high_s_stream_signature_rejected() -> anyhow::Result<()> {
+    // Reject the high-`s` twin so each response has one accepted signature
+    // encoding (#836).
     let signer = PrivateKeySigner::random();
     let domain = sample_domain();
     let data = sample_data();
@@ -49,7 +50,7 @@ fn high_s_stream_slash_signature_rejected() -> anyhow::Result<()> {
     let twin = crate::sig_canon::high_s_twin(&sig);
     anyhow::ensure!(
         data.recover_signer(&twin, &domain) == Err(StreamSlashError::InvalidSignature),
-        "high-s stream slash twin must be rejected as InvalidSignature"
+        "high-s stream signature twin must be rejected as InvalidSignature"
     );
     Ok(())
 }
@@ -73,11 +74,11 @@ fn wrong_signer_address_rejected() -> anyhow::Result<()> {
 #[test]
 fn different_chain_id_rejected() -> anyhow::Result<()> {
     let signer = PrivateKeySigner::random();
-    let domain_a = slash_judge_domain(
+    let domain_a = capacity_bond_domain(
         421_614,
         address!("0000000000000000000000000000000000001234"),
     );
-    let domain_b = slash_judge_domain(1, address!("0000000000000000000000000000000000001234"));
+    let domain_b = capacity_bond_domain(1, address!("0000000000000000000000000000000000001234"));
     let data = sample_data();
 
     let sig = data.sign(&signer, &domain_a)?;
@@ -92,11 +93,11 @@ fn different_chain_id_rejected() -> anyhow::Result<()> {
 #[test]
 fn different_verifying_contract_rejected() -> anyhow::Result<()> {
     let signer = PrivateKeySigner::random();
-    let domain_a = slash_judge_domain(
+    let domain_a = capacity_bond_domain(
         421_614,
         address!("0000000000000000000000000000000000001234"),
     );
-    let domain_b = slash_judge_domain(
+    let domain_b = capacity_bond_domain(
         421_614,
         address!("0000000000000000000000000000000000005678"),
     );
@@ -145,19 +146,18 @@ fn tampered_fields_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Lock the EIP-712 type hash to the exact ADR 014 wording and to the
-/// pinned [`STREAM_RESPONSE_TYPEHASH`] digest the Solidity suite also
-/// asserts. If this breaks, either the ADR changed or the `sol!` macro's
-/// canonical encoding shifted — both warrant a coordinated update with the
-/// `SlashJudge` contract and its deployment manifests.
+/// Lock the EIP-712 type hash to the exact ADR 005 wording and to the
+/// pinned [`STREAM_RESPONSE_TYPEHASH`] digest. If this breaks, either the ADR
+/// changed or the `sol!` macro's canonical encoding shifted — both break
+/// every verifier that runs the other version.
 #[test]
-fn stream_response_type_hash_matches_adr_014() -> anyhow::Result<()> {
+fn stream_response_type_hash_matches_adr_005() -> anyhow::Result<()> {
     use alloy::primitives::keccak256;
     let canonical: &[u8] =
         b"StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)";
     anyhow::ensure!(
         keccak256(canonical) == STREAM_RESPONSE_TYPEHASH,
-        "pinned STREAM_RESPONSE_TYPEHASH does not match the ADR 014 type string"
+        "pinned STREAM_RESPONSE_TYPEHASH does not match the ADR 005 type string"
     );
     let actual = StreamResponseSol::eip712_type_hash(&sample_data().to_sol());
     anyhow::ensure!(
@@ -170,7 +170,7 @@ fn stream_response_type_hash_matches_adr_014() -> anyhow::Result<()> {
 /// Independently reconstruct the EIP-712 signing digest from the canonical
 /// `0x1901 || domainSeparator || hashStruct` preimage and pin it against
 /// `signing_hash`. Unlike a self-consistent sign→recover, this proves the
-/// struct field encoding and domain binding match the on-chain `SlashJudge`
+/// struct field encoding and domain binding match the canonical EIP-712
 /// computation — a real drift guard, not a tautology.
 #[test]
 fn signing_hash_matches_eip712_canonical() -> anyhow::Result<()> {
@@ -221,7 +221,7 @@ fn from_response_body_maps_fields() {
     assert_eq!(StreamSlashData::from_response_body(&body), sample_data());
 }
 
-/// Lock the `SlashJudge` domain separator to the canonical EIP-712 form.
+/// Lock the `CapacityBond` domain separator to the canonical EIP-712 form.
 #[test]
 fn domain_separator_matches_eip712_canonical() -> anyhow::Result<()> {
     use alloy::primitives::{U256, keccak256};
@@ -233,14 +233,14 @@ fn domain_separator_matches_eip712_canonical() -> anyhow::Result<()> {
     let chain_id: u64 = 421_614;
     let verifying = address!("0000000000000000000000000000000000001234");
 
-    let domain = slash_judge_domain(chain_id, verifying);
+    let domain = capacity_bond_domain(chain_id, verifying);
     let actual = domain.separator();
 
     let expected = keccak256(
         (
             domain_typehash,
-            keccak256(SLASH_JUDGE_DOMAIN_NAME.as_bytes()),
-            keccak256(SLASH_JUDGE_DOMAIN_VERSION.as_bytes()),
+            keccak256(crate::CAPACITY_BOND_DOMAIN_NAME.as_bytes()),
+            keccak256(crate::CAPACITY_BOND_DOMAIN_VERSION.as_bytes()),
             U256::from(chain_id),
             verifying,
         )

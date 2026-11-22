@@ -451,14 +451,13 @@ async fn a_pinned_fetch_with_a_known_size_opens_nothing() {
 }
 
 /// A chain no test reaches: the pinned open verifies answers against its
-/// slash domain and reads nothing else from it.
+/// `CapacityBond` domain and reads nothing else from it.
 fn offline_chain() -> ChainConfig {
     crate::session::test_support::one_chain(
         "http://127.0.0.1:1".to_owned(),
         31_337,
         Address::repeat_byte(0x01),
         Address::repeat_byte(0x02),
-        None,
     )
 }
 
@@ -994,7 +993,7 @@ fn spec<'a>(conns: &'a Connections, ctx: &'a PoolContext, max_rate_per_mb: u64) 
 }
 
 fn open_domain() -> alloy::sol_types::Eip712Domain {
-    decdn_incentive::slash_judge_domain(31_337, Address::repeat_byte(0x02))
+    decdn_incentive::capacity_bond_domain(31_337, Address::repeat_byte(0x02))
 }
 
 fn served_blob() -> Vec<u8> {
@@ -1399,7 +1398,7 @@ async fn a_pinned_open_asks_pull_through_and_keeps_its_stream() -> anyhow::Resul
     let blob = served_blob();
     let hash = *blake3::hash(&blob).as_bytes();
     let chain = offline_chain();
-    let domain = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
+    let domain = capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
     let node = FakeNode::spawn(
         Answer::Serve {
             blob: blob.clone(),

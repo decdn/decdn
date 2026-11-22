@@ -130,7 +130,6 @@ const MINIMAL_CONFIG: &str = r#"
 [blockchain]
 rpc_url = "http://127.0.0.1:8545"
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
-slash_judge_address = "0x0000000000000000000000000000000000000003"
 content_blacklist_address = "0x0000000000000000000000000000000000000004"
 
 [[blockchain.payment_chains]]

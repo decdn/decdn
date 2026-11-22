@@ -6,8 +6,8 @@
 //! cargo run -p decdn-client --example bundle -- <bundle-hash-hex> <output-dir>
 //! ```
 //!
-//! The governance chain comes from `DECDN_RPC_URL`, `DECDN_CHAIN_ID`,
-//! `DECDN_SLASH_JUDGE` and `DECDN_CAPACITY_BOND`. The payment pool comes from
+//! The governance chain comes from `DECDN_RPC_URL`, `DECDN_CHAIN_ID` and
+//! `DECDN_CAPACITY_BOND`. The payment pool comes from
 //! `DECDN_PAYMENT_RPC_URL`, `DECDN_PAYMENT_CHAIN_ID` and `DECDN_PAYMENT_POOL`.
 //! The local state lives in `DECDN_DATA_DIR`. The delegate is the keystore at
 //! `DECDN_KEYSTORE` (password in `DECDN_KEYSTORE_PASSWORD`) with the `dcap1:`
@@ -60,8 +60,7 @@ async fn main() -> Result<()> {
         GovernanceChain {
             rpc_url: var("DECDN_RPC_URL")?,
             chain_id: var("DECDN_CHAIN_ID")?.parse()?,
-            slash_judge: var("DECDN_SLASH_JUDGE")?.parse()?,
-            capacity_bond: Some(var("DECDN_CAPACITY_BOND")?.parse()?),
+            capacity_bond: var("DECDN_CAPACITY_BOND")?.parse()?,
         },
         vec![PaymentPoolChain {
             rpc_url: var("DECDN_PAYMENT_RPC_URL")?,

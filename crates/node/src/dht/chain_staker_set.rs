@@ -8,7 +8,7 @@
 //!
 //! The cached set is the parallel `active[]` that
 //! `CapacityBond.getRegisteredNodes()` computes per entry — the full `isActive`
-//! predicate: registered, bond ≥ minBond, no unbonding, not ejected. The
+//! predicate: registered, bond ≥ the operator's floor, not ejected. The
 //! registry re-reads it every five minutes, and early when a lookup here misses
 //! (a node that registered since the last read), at most once per minute.
 //!

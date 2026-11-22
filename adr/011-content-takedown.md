@@ -15,7 +15,7 @@ No existing ADR addressed either question. This ADR establishes:
 2. Regional governance bodies for jurisdiction-scoped takedowns
 3. Node behavior when a hash or origin is blacklisted
 4. An emergency fast-path for time-critical removals
-5. The slashing regime for non-compliance
+5. The consequence of non-compliance
 6. The known limitations of hash-based blacklisting and the mitigations available
 7. A governance-controlled positive authority for origin assignment (`OriginAssignment`) — a swappable vetting policy decides which wallets may seat origins, and a vetted publisher then seats origins for its own namespaces instantly; namespace 0 (`namespaceId == 0`) has no authorized origins — built on the publisher/namespace identity primitive defined in [ADR 002](002-content-addressing.md#publisher-identity-and-namespaces)
 
@@ -23,7 +23,7 @@ No existing ADR addressed either question. This ADR establishes:
 
 Content governance over origins has two symmetric authorities, both DAO-controlled:
 
-- **Negative authority — `ContentBlacklist`.** Removes hashes and operators via two governance paths: a global path (network-wide removal) and a regional path (jurisdiction-scoped removal via a designated regional governance body). Nodes must evict blacklisted content and stop announcing it within a defined compliance window; serving a blacklisted hash after the compliance window is a slashable offense. Origin nodes that repeatedly source blacklisted content can themselves be blacklisted by NodeId or operator address, independent of any specific hash — the primary mitigation for hash evasion via trivial re-encoding.
+- **Negative authority — `ContentBlacklist`.** Removes hashes and operators via two governance paths: a global path (network-wide removal) and a regional path (jurisdiction-scoped removal via a designated regional governance body). Nodes must evict blacklisted content and stop announcing it within a defined compliance window. An operator that keeps serving blacklisted content can be blacklisted and ejected ([§ Hash Evasion and Origin Blacklisting](#hash-evasion-and-origin-blacklisting)). Origin nodes that repeatedly source blacklisted content can themselves be blacklisted by NodeId or operator address, independent of any specific hash — the primary mitigation for hash evasion via trivial re-encoding.
 - **Positive authority — `OriginAssignment`.** Authorizes specific operators to act as origins for specific namespaces (defined in [ADR 002 § Publisher Identity and Namespaces](002-content-addressing.md#publisher-identity-and-namespaces)). A swappable vetting policy decides which publisher wallets may seat origins; the vetted publisher then picks its own origins from the bonded operator set with no further governance action. Namespace 0 (`namespaceId == 0`) has no authorized origins — content under it is served best-effort from cache/DHT per [ADR 002 § Retrieval by namespace](002-content-addressing.md#retrieval-by-namespace). `ContentBlacklist` and `OriginAssignment` integrate via runtime checks with lazy storage cleanup — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist).
 
 Each node also maintains a local denylist for operator-initiated removal without waiting for governance.
@@ -104,9 +104,8 @@ interface IContentBlacklist {
     // global ∪ one named region, and the full per-operator predicate of
     // § Regional Scope (global ∪ current region ∪ previous region while a region
     // change is unripened), which reads the operator's region fields from
-    // CapacityBond. The per-operator view is the serve-time counterpart of the
-    // slash-eligibility gate in ADR 014 § Blacklist violation — same three legs,
-    // evaluated at block.timestamp rather than at a served response.
+    // CapacityBond. The per-operator view evaluates the three legs at
+    // block.timestamp.
     function isHashBlacklisted(bytes32 blake3Hash) external view returns (bool);
     function isHashBlacklistedInRegion(bytes32 blake3Hash, bytes32 region) external view returns (bool);
     function isHashBlacklistedForOperator(bytes32 blake3Hash, address operator) external view returns (bool);
@@ -134,8 +133,8 @@ struct BlacklistEntry {
     uint256 effectiveAt;      // addedAt + the compliance window in force AT ADD TIME
                               // (emergencyComplianceWindow for emergency adds).
                               // Stamped, never derived: a later governance change
-                              // to the window must not move the slash boundary
-                              // under deliveries already served.
+                              // to the window must not move the compliance
+                              // deadline under deliveries already served.
     bytes32 region;           // packed region key; bytes32("GLOBAL") for global
     string  reason;           // free-form, e.g. "DMCA-2026-001", "CSAM", "DSA-DE-001"
     bool    emergency;        // true if added via emergency multisig path
@@ -165,7 +164,7 @@ struct Mutation {             // kind, at and expiresAt share one storage slot
 >
 > A region key is the region string packed left-aligned and zero-padded into `bytes32`, matching Solidity's own `bytes32("literal")` packing. Two sentinels are reserved: `bytes32("GLOBAL")` marks a global entry, and `bytes32(0)` is *unset* — never a valid region. `addHashRegional`, `removeHashRegional`, and `registerRegionalBody` all reject both sentinels, so a regional body can neither reach a global entry nor write against an unset key.
 >
-> `bytes32` rather than a narrower `bytes2` — the key must be comparable against the value scope matching reads, which is the operator's **on-chain `regionHint`**, and `CapacityBond` caps that field at 16 bytes, not 2 (`MAX_REGION_HINT_BYTES`; [ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation) is where the slash path performs the comparison). The on-chain `regionHint` is the only region the scope check reads, and it can hold values wider than a two-byte ISO 3166-1 alpha-2 code, so a two-byte entry key could not represent every region the registry admits. A `bytes32` key is also topic-native, which is what lets `HashBlacklisted` / `HashRemoved` index `region` directly. The `BlacklistEntry` layout is the struct above.
+> `bytes32` rather than a narrower `bytes2` — the key must be comparable against the value scope matching reads, which is the operator's **on-chain `regionHint`**, and `CapacityBond` caps that field at 16 bytes, not 2 (`MAX_REGION_HINT_BYTES`; `isHashBlacklistedForOperator` performs the comparison). The on-chain `regionHint` is the only region the scope check reads, and it can hold values wider than a two-byte ISO 3166-1 alpha-2 code, so a two-byte entry key could not represent every region the registry admits. A `bytes32` key is also topic-native, which is what lets `HashBlacklisted` / `HashRemoved` index `region` directly. The `BlacklistEntry` layout is the struct above.
 
 ### Emergency auto-expiry
 
@@ -205,13 +204,13 @@ Regional bodies acting in good faith can still issue entries that are later cont
 
 For a **single disputed entry**, the removal functions are the recourse, and the two scopes are not interchangeable. `removeHashGlobal` (global entries) is restricted to `GOVERNANCE_ROLE`, which DecdnGovernor proposals reach via the standard timelock; it routes to `_removeHashRegional(GLOBAL_REGION, …)` and so cannot touch a regional entry. `removeHashRegional` is restricted to `REGIONAL_BODY_ROLE`, reverts on the `GLOBAL_REGION` sentinel, and additionally requires the caller to be that region's currently-registered, unsuspended body — so it is a *regional body's* unilateral power, and governance reaches a regional entry only by replacing the body (`deregisterRegionalBody` then `registerRegionalBody`). Both append a remove record to the mutation ledger, emit `HashRemoved` and drop the entry from the enumerable membership, so nodes pick the removal up on their next ledger poll.
 
-For a **systemically misbehaving body**, `suspendRegionalBody` bars that body from writing, subject to governance ratification within 14 days. Two properties matter operationally and pull in opposite directions: it retracts nothing — every entry already issued stays live, enforceable and slashable — and because `_requireActiveBodyFor` gates removals as well as additions, it also *blocks* the body from taking its own entries down. Suspension is therefore the right tool against a body issuing bad entries and the wrong one against a body refusing to remove them; for the latter, replace the body (see [§ Regional Governance Bodies](#regional-governance-bodies)).
+For a **systemically misbehaving body**, `suspendRegionalBody` bars that body from writing, subject to governance ratification within 14 days. Two properties matter operationally and pull in opposite directions: it retracts nothing — every entry already issued stays live and enforceable — and because `_requireActiveBodyFor` gates removals as well as additions, it also *blocks* the body from taking its own entries down. Suspension is therefore the right tool against a body issuing bad entries and the wrong one against a body refusing to remove them; for the latter, replace the body (see [§ Regional Governance Bodies](#regional-governance-bodies)).
 
-Operators slashed under an entry later removed by either route seek restitution through [ADR 028](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation), which lists blacklist offenses as appealable. That is a separate contract with its own bond and adjudication, and it is the only appeal surface the protocol carries: there is no second, content-policy appeal state machine layered on top of the blacklist itself. A per-entry interim-relief primitive — multisig-suspend plus governor-ratify on one `(hash, region)` — is worth revisiting at the governance vote that registers the first regional body, since until a body exists the adjudicator and the issuer of a contested entry would be the same key.
+The removal functions are the only dispute surface for an entry: no separate content-policy dispute process sits on top of the blacklist. A per-entry interim-relief primitive — multisig-suspend plus governor-ratify on one `(hash, region)` — is worth revisiting at the governance vote that registers the first regional body, since until a body exists the adjudicator and the issuer of a contested entry would be the same key.
 
 ## Compliance Window
 
-One rule governs every path: an entry becomes slashable at `effectiveAt = addedAt + window`, where `window` is the parameter for the path that added it. Serving before `effectiveAt` is never an offense.
+One rule governs every path: a node must comply with an entry by `effectiveAt = addedAt + window`, where `window` is the parameter for the path that added it. Serving before `effectiveAt` is never non-compliance.
 
 | Path | `window` | Parameter |
 |------|----------|-----------|
@@ -223,9 +222,9 @@ The emergency path is deliberately one-way with respect to governance: `emergenc
 
 The 24-hour window accounts for nodes that are offline or have a long poll interval. The 2-hour emergency window is tight enough to matter for active illegal content while giving online nodes time to act. The emergency multisig blacklist path is permanent (no sunset): it discharges an ongoing legal duty to remove unlawful content. Under the capability-split sunset, only the protocol-wide pause expires at 12 months, not this path — see [ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig).
 
-Both windows are governable parameters sharing one set of hardcoded bounds: minimum 1 hour, maximum 7 days. The floor is what keeps the emergency path honest — governance cannot compress the window below a single default poll cycle and slash nodes for content they had no opportunity to learn about.
+Both windows are governable parameters sharing one set of hardcoded bounds: minimum 1 hour, maximum 7 days. The floor is what keeps the emergency path honest — governance cannot compress the window below a single default poll cycle and hold nodes to a deadline for content they had no opportunity to learn about.
 
-`effectiveAt` is stamped onto the entry at add time from the window then in force. Changing a window therefore affects only subsequent adds; it can neither retroactively expose already-served deliveries to a slash nor retroactively immunize them. A re-add of a live entry is idempotent for the stamps: it keeps `addedAt` and `effectiveAt`, updates the reason, and either ratifies an emergency entry (clears `emergency`) or escalates its category. Only an entry that is absent or has lapsed is stamped afresh. `SlashJudge` anchors its slash-eligibility comparison to `effectiveAt`, not `addedAt`.
+`effectiveAt` is stamped onto the entry at add time from the window then in force. Changing a window therefore affects only subsequent adds; it can neither retroactively make already-served deliveries non-compliant nor retroactively make them compliant. A re-add of a live entry is idempotent for the stamps: it keeps `addedAt` and `effectiveAt`, updates the reason, and either ratifies an emergency entry (clears `emergency`) or escalates its category. Only an entry that is absent or has lapsed is stamped afresh.
 
 ### One-hour removal orders
 
@@ -239,15 +238,15 @@ Hash-based blacklisting covers only exact copies of a blob. A one-byte change pr
 
 **The protocol's primary response is origin blacklisting.** If an origin-backed node repeatedly sources blacklisted content — whether the same blob or trivially re-encoded variants — governance can blacklist the operator's Ethereum address. `ContentBlacklist.addOperator()` calls `CapacityBond.ejectNode(operatorAddress)` via a cross-contract call; the `CapacityBond` grants the `ContentBlacklist` contract address the `BLACKLIST_ROLE`, permitting this call. A blacklisted origin:
 
-- **Ejected from `CapacityBond`** — emits `EjectedByBlacklist`, sets the permanent `blacklistEjected` latch, and (when the operator had a registered node) sets `active = false` and emits `NodeAutoEjected` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)). The node-deactivation effects follow the same code path as bond-shortfall auto-ejection ([ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn))
+- **Ejected from `CapacityBond`** — emits `EjectedByBlacklist`, sets the permanent `blacklistEjected` latch, and (when the operator had a registered node) sets `active = false` and emits `NodeAutoEjected` ([ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh)).
 - **Effectively removed from every namespace's authorized origin set** at runtime; consumers of `getOrigins` drop a blacklisted operator, and storage cleanup is lazy and permissionless via `pruneInactiveOrigin` once the operator-level blacklist ejects it from `CapacityBond` — see [§ Interaction with ContentBlacklist](#interaction-with-contentblacklist)
-- **Remaining bond enters forced unbonding** — the standard unbonding window applies (14 days default per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve), governable [7, 60] days). Bond remains slashable during unbonding
+- **Bond stays in place** — ejection does not move the bond. The operator withdraws it with `unbond`, which returns the TOKEN at once ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 - **Address banned while blacklisted** — cannot register new nodes under the same Ethereum address unless governance removes the blacklist entry via `removeOperator(operatorAddress)`. Re-entry otherwise requires a new identity funded with a fresh capacity bond (`bond = k × Mbps^α`; ≈50,000 TOKEN for a 1 Gbps entry tier at default `k=12.6`, `α=1.2` per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 - **The operator's registered NodeId leaves the registry active set** — the `NodeAutoEjected` event removes it, so peers stop discovering and dialing it, and the `cdn/dht/v1` STORE path rejects its records ([ADR 022 § STORE Flow](022-content-discovery.md#store-flow-cache-event--dht-publish))
 
-> **Two ejection causes, one master gate.** `CapacityBond.ejected` is set by both recoverable slash auto-ejection (bond fell below `minBond/2`; [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) and permanent governance blacklisting, but governance blacklisting additionally sets a separate `blacklistEjected` latch. `bond()` reinstatement clears `ejected` *only* when `blacklistEjected` is unset — so a blacklisted operator **cannot self-reinstate by re-bonding** above `minBond`. Lifting the blacklist is a governance action: `removeOperator` calls `CapacityBond.unEjectNode`, which clears the latch only; the operator then re-enters through the normal re-bond path (a fresh `bond()` reaching `minBond`, then `registerNode`). A purely slash-ejected operator (no blacklist) remains recoverable by re-bonding as before.
+> **One ejection cause, two flags.** `ejectNode` is the only path that sets `CapacityBond.ejected`, and it also sets a separate `blacklistEjected` latch. `bond()` reinstatement clears `ejected` *only* when `blacklistEjected` is unset — so a blacklisted operator **cannot self-reinstate by re-bonding** above `minBond`. Lifting the blacklist is a governance action: `removeOperator` calls `CapacityBond.unEjectNode`, which clears the latch only; the operator then re-enters through the normal re-bond path (a `bond()` that holds `minBond`, then `registerNode`).
 
-> **Ejection vs. slashing.** Origin blacklisting triggers ejection (forced unbonding of remaining bond), *not* the escalating slash schedule: the bond is not burned, it is returned after the unbonding period assuming no separate slashable offense occurs during unbonding. By contrast, *serving* a blacklisted hash after the compliance window is a slashable offense under the escalating schedule in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn), where the bond is partially burned and the challenger rewarded. A node operator can face both: slashing for serving blacklisted content, followed by origin blacklisting and ejection if the behavior persists.
+> **Ejection is the protocol consequence.** A node that serves a blacklisted hash after the compliance window faces operator blacklisting and ejection when the behavior persists. Ejection removes the node from the active set. It does not burn or seize the bond. The operator's legal exposure under its own jurisdiction is the other consequence, and it sits outside the protocol.
 
 This raises re-upload-evasion cost from trivial (change a byte) to significant — the operator must fund and register a new identity with a fresh capacity bond — so repeat evasion becomes progressively more expensive.
 
@@ -346,7 +345,7 @@ interface IOriginAssignment {
     // Permissionless storage cleanup for operators that have left the active
     // set. Reverts unless CapacityBond.isActive(operator) is false — so a caller
     // cannot grief by naming a still-active operator. This reaches every exit:
-    // unbond, deregister, slash-ejection, and operator-level blacklist (which
+    // unbond, deregister, and operator-level blacklist (which
     // ejects from CapacityBond). Callable by anyone — the contract performs the
     // isActive lookup itself rather than trusting the caller. Storage hygiene,
     // not security: consumers already skip an inactive or blacklisted operator
@@ -478,7 +477,7 @@ The node applies every record in order. It does not filter records by region or 
 - The body kinds set the body state of the record's region: the body address in `key`, and for `BODY_SUSPEND` the moment an unratified suspension lapses in `expiresAt`.
 - `COMPLIANCE_WINDOW_SET` and `EMERGENCY_COMPLIANCE_WINDOW_SET` carry the new window in seconds in `key`.
 
-The index stores no body per hash, and needs none. A body change alters who can write entries for a region. It does not alter which entries are live: entries stay live and slashable through suspension and deregistration ([§ Regional Governance Bodies](#regional-governance-bodies)). A compliance-window change moves only the `effectiveAt` of later adds. So the body and window records change no deny answer, and the node can apply them without a change to its hash index.
+The index stores no body per hash, and needs none. A body change alters who can write entries for a region. It does not alter which entries are live: entries stay live and enforceable through suspension and deregistration ([§ Regional Governance Bodies](#regional-governance-bodies)). A compliance-window change moves only the `effectiveAt` of later adds. So the body and window records change no deny answer, and the node can apply them without a change to its hash index.
 
 A hash present in a region outside the node's scope does not affect a deny answer, because the node evaluates scope at lookup. Because each record is a full overwrite, a record that a snapshot already reflects leaves the index correct. An add and a remove of the same key between two polls leave the entry count unchanged, but they move the ledger by two records, so the node applies both.
 
@@ -500,7 +499,7 @@ When a node receives a new blacklisted hash, it must, **in order**:
 2. **Stop serving** — reject any new `StreamRequest` for the hash immediately, returning `Declined` ([§ StreamRequest Response](#streamrequest-response))
 3. **Evict from cache** — delete the blob from local storage within the compliance window
 
-The publish-first ordering is critical: continuing to serve a blacklisted hash after the compliance window is a blacklist-violation slashing offense ([ADR 014 § SlashJudge Contract](014-on-chain-verification.md#slashjudge-contract)), and a signed response for that hash is dispositive evidence. Disk eviction can be async; DHT-record and serve suppression must be synchronous.
+The publish-first ordering is critical: continuing to serve a blacklisted hash after the compliance window is non-compliance ([§ Hash Evasion and Origin Blacklisting](#hash-evasion-and-origin-blacklisting)), and the node's signed response for that hash attributes the serve to it ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). Disk eviction can be async; DHT-record and serve suppression must be synchronous.
 
 When a node receives a blacklisted origin address, it additionally stops accepting any `StreamRequest` whose pool is owned by that operator address, and removes all of that origin's NodeIds from its local registry-derived node view.
 
@@ -508,21 +507,21 @@ In-flight streams for a blacklisted hash — or on a pool funded by a newly blac
 
 ### Serving while chain-stale
 
-Every serve-path guard that enforces on-chain state reads a local projection. The deny-set, the pool-solvency check, and the per-signer capability cap all advance only while the node's chain reads reach the RPC. During an RPC outage each guard passes on stale state. A takedown, a drained pool, or a spent capability that lands on-chain during the outage is invisible to the node. The node keeps signing stream responses it can no longer vouch for. Serving a hash past its compliance window is slashable, and the offense is a signed `StreamResponse{ok:true}` — the node produces its own evidence.
+Every serve-path guard that enforces on-chain state reads a local projection. The deny-set, the pool-solvency check, and the per-signer capability cap all advance only while the node's chain reads reach the RPC. During an RPC outage each guard passes on stale state. A takedown, a drained pool, or a spent capability that lands on-chain during the outage is invisible to the node. The node keeps signing stream responses it can no longer vouch for. Serving a hash past its compliance window is non-compliance, and the node signs a `StreamResponse{ok:true}` that attributes the serve to it.
 
 The node bounds this exposure with a grace window. It records the wall-clock time of the last successful blacklist ledger poll. The blacklist is governance-chain state, so the clock follows the governance-chain reads. When the node has been unable to reach the chain for longer than `chain_staleness_grace_sec`, the serve path refuses new requests, discovery opens included. The serve refusal is `NotFound`, which is reputation-benign, so a client re-routes to a peer whose chain reads are live. The node can answer differently once its chain reads recover, so the refusal does not remove it from the client's candidates. This is the runtime counterpart of the boot readiness gate: the boot gate keeps every listener shut until the first enumeration completes, and the staleness gate stops the same signed surfaces when the chain reads go stale after boot.
 
 The signal is the successful poll *tick*, not the last ledger record. A quiet chain appends no records for long periods. Keying on records would take a node dark on any quiet period. A successful tick stamps the clock, including a tick where `mutationCount` did not move. The boot enumeration stamps it too, so a node that has just vetted its deny-set is never treated as stale.
 
-The grace window is one operator-local value, always evaluated. There is no separate on/off flag. An operator who accepts the stale-serving risk sets the window large. The default is 30 minutes, which sits inside the one-hour compliance-window floor, so a node stops serving before an outage-hidden takedown can cross into slashable territory, while a short RPC blip never takes the node dark. A value of `0` is rejected at config resolution: a zero grace refuses every serve. This gate is distinct from the RPC connectivity watchdog, which only reports reachability to a metric and gates nothing. The window is a node risk preference, not a governance parameter, so it carries no on-chain surface.
+The grace window is one operator-local value, always evaluated. There is no separate on/off flag. An operator who accepts the stale-serving risk sets the window large. The default is 30 minutes, which sits inside the one-hour compliance-window floor, so a node stops serving before an outage-hidden takedown can pass its compliance deadline, while a short RPC blip never takes the node dark. A value of `0` is rejected at config resolution: a zero grace refuses every serve. This gate is distinct from the RPC connectivity watchdog, which only reports reachability to a metric and gates nothing. The window is a node risk preference, not a governance parameter, so it carries no on-chain surface.
 
 A node with no chain configured (development and test) runs no blacklist sync, so the runtime wires no freshness clock and the gate is inactive. This is the same fail-open shape the pool-solvency guards use when no chain is present.
 
 ### Regional Scope
 
-A node applies only blacklist entries that are global or match its declared region (`node.region` in config). Entries for other regions are ignored. Nodes are not required to enforce takedowns outside their declared jurisdiction — regional compliance is the operator's legal obligation for their own node. A region change does not take effect for blacklist-scope or slash-eligibility purposes until it has been stable for `REGION_STABILITY_WINDOW`: during that window the node remains in scope for its previous region's entries in addition to the new region's, and `updateRegion` itself reverts before the window elapses (see [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window)). This forecloses a reactive flip out of a region the moment an entry lands.
+A node applies only blacklist entries that are global or match its declared region (`node.region` in config). Entries for other regions are ignored. Nodes are not required to enforce takedowns outside their declared jurisdiction — regional compliance is the operator's legal obligation for their own node. A region change does not take effect for blacklist scope until it has been stable for `REGION_STABILITY_WINDOW`: during that window the node remains in scope for its previous region's entries in addition to the new region's, and `updateRegion` itself reverts before the window elapses (see [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window)). This forecloses a reactive flip out of a region the moment an entry lands.
 
-Node region is self-reported and unverified at the protocol level. **Production posture:** self-attested regions are accepted at face value per [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation); the IP-geolocation oracle / third-party attestation path was considered and rejected. Reactive misdeclaration (flipping region after an entry lands) is foreclosed by the stability window above. A pre-positioned misdeclaration (a region declared false from registration) is *not* prevented by the protocol and, for a region-scoped entry, leaves the operator out of scope under [§ Slashing](#slashing) — the backstops are the operator's legal exposure under their actual jurisdiction's content law plus the continuous reputation penalty for latency-vs.-claim contradictions ([ADR 001 § Consequences](001-network.md#consequences)), the canonical soft mitigation. See [ADR 030 § Misdeclaration is operator legal exposure, not a protocol offense](030-node-region-self-attestation.md#misdeclaration-is-operator-legal-exposure-not-a-protocol-offense) for the full decomposition.
+Node region is self-reported and unverified at the protocol level. **Production posture:** self-attested regions are accepted at face value per [ADR 030](030-node-region-self-attestation.md#adr-030-node-region-self-attestation); the IP-geolocation oracle / third-party attestation path was considered and rejected. Reactive misdeclaration (flipping region after an entry lands) is foreclosed by the stability window above. A pre-positioned misdeclaration (a region declared false from registration) is *not* prevented by the protocol and, for a region-scoped entry, leaves the operator out of scope under [§ Regional Scope](#regional-scope) — the backstops are the operator's legal exposure under their actual jurisdiction's content law plus the continuous reputation penalty for latency-vs.-claim contradictions ([ADR 001 § Consequences](001-network.md#consequences)), the canonical soft mitigation. See [ADR 030 § Misdeclaration is operator legal exposure, not a protocol offense](030-node-region-self-attestation.md#misdeclaration-is-operator-legal-exposure-not-a-protocol-offense) for the full decomposition.
 
 ### Local Denylist
 
@@ -551,26 +550,6 @@ The lists are hot-reloadable (`decdn node reload` / SIGHUP), which is load-beari
 A node refuses a blacklisted hash, and a request whose pool owner is a blacklisted origin, with `Declined` ([ADR 005 § Open-time refusal classes](005-protocol.md#open-time-refusal-classes)). The same code covers the governance blacklist, the local denylist, the on-chain origin blacklist, the local origin denylist, and a blob the operator withdrew with no blacklist entry behind it (a manual `decdn node evict`, or a stored-corruption quarantine, [ADR 040](040-cache-policy.md#pinning-durable-operator-evict-and-the-open-stream-pin-stay-engine-enforced)). A client able to tell these sources apart could map an operator's private legal exposure by sending requests. The distinction survives only in the operator's own metrics (`decdn_serve_stream_rejected_hash_denied_total` for the local list, `…_chain_hash_denied_total` for a governance entry), which no client can read.
 
 A client removes the refusing node for this hash for the rest of the fetch, and tries other nodes. A local entry binds only that node. A client does not end the fetch on the refusal, even for an origin entry: a node's local origin denylist binds only that node, and the wire does not tell it apart from the on-chain list. When every candidate refuses `Declined`, the fetch ends early with "no node will serve this" ([ADR 039 § Failure handling](039-multi-source-parallel-fetch.md#failure-handling-reassign-only-tail)).
-
-## Slashing
-
-Serving a blacklisted hash after the compliance window is a slashable offense, subject to the escalating schedule in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). Repeated offenses trigger cumulative bond loss; nodes whose bond drops below 50% of the minimum are auto-ejected. A single offense slashes at most 50% of the bond — the top tier of the fixed ladder in [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn). The standard 100 TOKEN challenge bond from [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) applies.
-
-### Slash evidence
-
-The challenger submits:
-
-- The `blake3Hash`
-- A `StreamResponse` with `ok: true` for the blacklisted hash, timestamped after the compliance window. On-chain verification uses the `slash_sig` scheme from [ADR 014 § Slash Signatures — secp256k1 EIP-712](014-on-chain-verification.md#slash-signatures--secp256k1-eip-712): the EIP-712 secp256k1 `slash_sig` is verified via `ecrecover` and the recovered address mapped to the node's identity via `CapacityBond.nodeIdOf`. This is the only evidence path. The answer to a discovery open is the same signed `StreamResponse`, so it is evidence too. Client-signed vouchers alone are NOT sufficient — vouchers do not contain the hash and the `pool_id → hash` binding is not on-chain verifiable.
-- The `BlacklistEntry.effectiveAt` timestamp showing the compliance window had passed
-
-The `ContentBlacklist` contract verifies that `effectiveAt` is in the past relative to the delivery timestamp and that the hash is still on the blacklist. If the hash was subsequently removed, the slash is invalid.
-
-Regional slash eligibility: a node is only slashable for serving a hash it was in-scope to remove — a node that declared region `US` is not slashable for serving a hash blacklisted only by the EU regional body. "In-scope" here is the same three-leg predicate as [§ Regional Scope](#regional-scope), including the post-`updateRegion` stability window — but for the punitive slash path the ripening window is evaluated at the served `responseTs`, not at challenge-submission time (see [ADR 030 § Region-stability window](030-node-region-self-attestation.md#region-stability-window) item 2, the canonical specification). A node that had changed region within `REGION_STABILITY_WINDOW` of the serve remains slashable under its previous region's entries, so a region flip cannot shed slash exposure for an entry that was live in the prior region before the serve — nor can stalling the challenge until the change ripens evade it.
-
-### Grace period for offline nodes
-
-A slash requires an active challenger submitting evidence of a post-window delivery. Nodes that reconnect, sync the blacklist, and evict before serving any content are safe.
 
 ## Consequences
 

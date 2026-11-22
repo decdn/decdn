@@ -6,7 +6,6 @@
 //! a remote node.
 
 pub(crate) mod activity;
-pub mod appeal;
 pub mod bond;
 pub mod bundle_pull;
 pub(crate) mod buyer_store;

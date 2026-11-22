@@ -13,7 +13,7 @@ use super::{
 const MB: u64 = decdn_protocol::MB_BYTES;
 
 fn domain() -> alloy::sol_types::Eip712Domain {
-    decdn_incentive::bind_node_id_domain(1, Address::ZERO)
+    decdn_incentive::capacity_bond_domain(1, Address::ZERO)
 }
 
 fn capability(signer: &PrivateKeySigner, spending_cap: u64, expiry: u64) -> SignedCapability {

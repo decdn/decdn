@@ -11,7 +11,6 @@ import { DecdnGovernor } from "../src/DecdnGovernor.sol";
 import { FeeRouter } from "../src/FeeRouter.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
-import { SlashAppeal } from "../src/SlashAppeal.sol";
 import { PublisherRegistry } from "../src/PublisherRegistry.sol";
 import { Token } from "../src/Token.sol";
 
@@ -36,7 +35,7 @@ contract LifecycleUSDC is ERC20 {
 /// @notice `DecdnGovernor.t.sol` deliberately skips the production governance
 ///         path and only exercises vote-weight math against mocks. This file
 ///         deploys the real `FeeRouter`, `CapacityBond`, `ContentBlacklist`,
-///         `SlashAppeal`, `PublisherRegistry`, `DecdnGovernor`, and
+///         `PublisherRegistry`, `DecdnGovernor`, and
 ///         `TimelockController`, hands off `GOVERNANCE_ROLE` on every target
 ///         to the Timelock to mirror the production deploy ordering (issue
 ///         #694 supplies the deploy script), and asserts that each setter's
@@ -66,8 +65,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     uint256 internal constant TIMELOCK_DELAY = 48 hours;
 
     uint256 internal constant MIN_BOND = 50_000e18;
-    uint256 internal constant UNBONDING_PERIOD = 7 days;
-    uint256 internal constant SLASH_APPEAL_BOND = 1000e18;
 
     // -----------------------------------------------------------------
     // Deployments
@@ -78,7 +75,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     MockEd25519Verifier internal ed25519;
     CapacityBond internal bond;
     FeeRouter internal router;
-    SlashAppeal internal slashAppeal;
     ContentBlacklist internal blacklist;
     PublisherRegistry internal registry;
     TimelockController internal timelock;
@@ -125,7 +121,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
             bootstrapMultisig: address(0),
             minBond: MIN_BOND,
-            unbondingPeriod: UNBONDING_PERIOD,
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
@@ -141,14 +136,12 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             feeRouterDeliveryFloor: 1,
             buybackBurner: address(0xBB),
             cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
-            cctpTokenMessenger: address(cctp),
-            slashAppealBond: SLASH_APPEAL_BOND
+            cctpTokenMessenger: address(cctp)
         });
 
         Deployment memory d = _runFullDeploy(cfg);
         token = d.token;
         bond = d.bond;
-        slashAppeal = d.slashAppeal;
         router = d.router;
         blacklist = d.blacklist;
         registry = d.registry;
@@ -244,7 +237,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertTrue(router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
         assertTrue(bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
         assertTrue(blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist gov");
-        assertTrue(slashAppeal.hasRole(GOVERNANCE_ROLE, tl), "slashAppeal gov");
         assertTrue(registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
 
         // DEFAULT_ADMIN_ROLE is renounced to no one at deploy end (#2028): it is
@@ -254,7 +246,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertFalse(router.hasRole(defaultAdmin, tl), "router admin master key");
         assertFalse(bond.hasRole(defaultAdmin, tl), "bond admin master key");
         assertFalse(blacklist.hasRole(defaultAdmin, tl), "blacklist admin master key");
-        assertFalse(slashAppeal.hasRole(defaultAdmin, tl), "slashAppeal admin master key");
         assertFalse(registry.hasRole(defaultAdmin, tl), "registry admin master key");
 
         // Test contract must NOT retain either role on any target — closes the
@@ -262,13 +253,11 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertFalse(router.hasRole(GOVERNANCE_ROLE, address(this)), "router gov back door");
         assertFalse(bond.hasRole(GOVERNANCE_ROLE, address(this)), "bond gov back door");
         assertFalse(blacklist.hasRole(GOVERNANCE_ROLE, address(this)), "blacklist gov back door");
-        assertFalse(slashAppeal.hasRole(GOVERNANCE_ROLE, address(this)), "slashAppeal gov back door");
         assertFalse(registry.hasRole(GOVERNANCE_ROLE, address(this)), "registry gov back door");
 
         assertFalse(router.hasRole(defaultAdmin, address(this)), "router admin back door");
         assertFalse(bond.hasRole(defaultAdmin, address(this)), "bond admin back door");
         assertFalse(blacklist.hasRole(defaultAdmin, address(this)), "blacklist admin back door");
-        assertFalse(slashAppeal.hasRole(defaultAdmin, address(this)), "slashAppeal admin back door");
         assertFalse(registry.hasRole(defaultAdmin, address(this)), "registry admin back door");
 
         assertFalse(timelock.hasRole(defaultAdmin, address(this)), "timelock admin back door");
@@ -469,21 +458,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             address(bond),
             abi.encodeCall(CapacityBond.setMinBond, (bad)),
             abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, bad, 10_000e18, 1_000_000e18)
-        );
-    }
-
-    function test_lifecycle_CapacityBond_setUnbondingPeriod_happy() public {
-        _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setUnbondingPeriod, (14 days)));
-        assertEq(bond.unbondingPeriod(), 14 days);
-    }
-
-    function test_lifecycle_CapacityBond_setUnbondingPeriod_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(bond),
-            abi.encodeCall(CapacityBond.setUnbondingPeriod, (61 days)),
-            abi.encodeWithSelector(
-                CapacityBond.ParamOutOfBounds.selector, uint256(61 days), uint256(7 days), uint256(60 days)
-            )
         );
     }
 
@@ -699,25 +673,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             address(blacklist),
             abi.encodeCall(ContentBlacklist.registerRegionalBody, (REGION_DE, address(0), multisig)),
             abi.encodeWithSelector(ContentBlacklist.ZeroAddress.selector)
-        );
-    }
-
-    // =================================================================
-    // SlashAppeal
-    // =================================================================
-
-    function test_lifecycle_SlashAppeal_setAppealBond_happy() public {
-        _runLifecycle(address(slashAppeal), abi.encodeCall(SlashAppeal.setAppealBond, (uint256(5000e18))));
-        assertEq(slashAppeal.appealBond(), 5000e18);
-    }
-
-    function test_lifecycle_SlashAppeal_setAppealBond_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(slashAppeal),
-            abi.encodeCall(SlashAppeal.setAppealBond, (uint256(50e18))),
-            abi.encodeWithSelector(
-                SlashAppeal.ParamOutOfBounds.selector, uint256(50e18), uint256(100e18), uint256(10_000e18)
-            )
         );
     }
 

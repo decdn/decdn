@@ -59,7 +59,7 @@ pub(super) enum ResetCause {
     /// The request's `timestamp_us` was beyond the clock-skew bound
     /// (`TIMESTAMP_SKEW`, ADR 013 §Application Error Codes). Reset with no signed response,
     /// because every signed body echoes that timestamp into the
-    /// slash-evidence set.
+    /// EIP-712 signed set.
     TimestampSkew,
     /// The first request could not be read: a timeout, a peer reset or lost
     /// connection, a length prefix above `MAX_CLIENT_CONTROL_FRAME`, or a frame

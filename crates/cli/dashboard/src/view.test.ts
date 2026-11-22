@@ -18,7 +18,6 @@ import {
   livePulls,
   gatewayShapeProblem,
   nodeView,
-  offense,
   partNote,
   partValue,
   pools,
@@ -536,7 +535,6 @@ function node(
     lanes: waiting,
     earnings: waiting,
     pools: waiting,
-    slashes: waiting,
     ...overrides,
   };
 }
@@ -668,13 +666,5 @@ describe("earningsRows", () => {
       "Since the ledger started",
       "Since 2026-10-26",
     ]);
-  });
-});
-
-describe("offense", () => {
-  it("names the known offenses and numbers the rest", () => {
-    expect(offense(0)).toBe("Blacklist");
-    expect(offense(1)).toBe("Offense 1");
-    expect(offense(4)).toBe("Offense 4");
   });
 });

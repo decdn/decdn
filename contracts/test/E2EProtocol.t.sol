@@ -79,7 +79,6 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             // Direct-to-Timelock handoff; the ADR 009 bootstrap phase is opt-in.
             bootstrapMultisig: address(0),
             minBond: MIN_BOND,
-            unbondingPeriod: 14 days,
             multiaddrUpdateCooldown: 0,
             maxMultiaddrSize: 1024,
             regionStabilityWindow: 7 days,
@@ -93,8 +92,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             feeRouterDeliveryFloor: 1,
             buybackBurner: address(0),
             cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
-            cctpTokenMessenger: address(cctp),
-            slashAppealBond: 1000e18
+            cctpTokenMessenger: address(cctp)
         });
         d = _runFullDeploy(cfg);
 

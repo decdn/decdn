@@ -151,7 +151,7 @@ pub struct Args {
     pub daemon_token_file: Option<PathBuf>,
 
     /// Public JSON-RPC endpoint end users' `decdn` reads the governance
-    /// chain through: the chain of the `CapacityBond` and the `SlashJudge`.
+    /// chain through: the chain of the `CapacityBond`.
     #[arg(long, env = "ONRAMP_GOVERNANCE_RPC_URL")]
     pub governance_rpc_url: String,
     /// EIP-155 id of the governance chain.
@@ -162,13 +162,9 @@ pub struct Args {
     #[arg(long, env = "ONRAMP_POOL_RPC_URL")]
     pub pool_rpc_url: String,
     /// `CapacityBond` contract address on the governance chain, for node
-    /// discovery.
+    /// discovery and the domain node signatures verify under.
     #[arg(long, env = "ONRAMP_CAPACITY_BOND_ADDR")]
     pub capacity_bond: Address,
-    /// `SlashJudge` contract address on the governance chain, handed to
-    /// `decdn` when set.
-    #[arg(long, env = "ONRAMP_SLASH_JUDGE_ADDR")]
-    pub slash_judge: Option<Address>,
 
     /// Cap requested for each capability, in micro-USDC; unset takes the
     /// daemon's maximum.
@@ -280,11 +276,8 @@ pub struct OnrampConfig {
     /// (`ONRAMP_POOL_RPC_URL`).
     pub pool_rpc_url: String,
     /// `CapacityBond` contract address handed to end users for node
-    /// discovery (`ONRAMP_CAPACITY_BOND_ADDR`).
+    /// discovery and signature checks (`ONRAMP_CAPACITY_BOND_ADDR`).
     pub capacity_bond: Address,
-    /// `SlashJudge` contract address handed to `decdn`; `None` leaves it out
-    /// of the profile (`ONRAMP_SLASH_JUDGE_ADDR`).
-    pub slash_judge: Option<Address>,
     /// Cap requested for each capability; `None` takes the daemon maximum.
     pub spending_cap: Option<MicroUsdc>,
     /// TTL requested for each capability; `None` takes the daemon maximum.
@@ -399,7 +392,6 @@ impl OnrampConfig {
             governance_chain_id: args.governance_chain_id,
             pool_rpc_url: script_safe_url("ONRAMP_POOL_RPC_URL", &args.pool_rpc_url)?,
             capacity_bond: args.capacity_bond,
-            slash_judge: args.slash_judge,
             spending_cap: args.spending_cap,
             ttl_secs: args.ttl_secs,
             turnstile,

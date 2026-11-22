@@ -15,7 +15,6 @@ import { NodeEarnings } from "./components/NodeEarnings";
 import { NodeHealth } from "./components/NodeHealth";
 import { NodeLanes } from "./components/NodeLanes";
 import { NodePools } from "./components/NodePools";
-import { NodeSlashes } from "./components/NodeSlashes";
 import { Empty, Group } from "./components/Panel";
 import { RecentPulls } from "./components/RecentPulls";
 import { SectionBoundary } from "./components/SectionBoundary";
@@ -264,7 +263,6 @@ function NodeGroup(props: { node: NodeSection; now: number }) {
       <NodeEarnings part={n.earnings} stale={slow(n.earnings)} />
       <NodeLanes part={n.lanes} stale={slow(n.lanes)} />
       <NodePools part={n.pools} stale={slow(n.pools)} />
-      <NodeSlashes part={n.slashes} stale={slow(n.slashes)} />
     </Group>
   );
 }

@@ -82,7 +82,6 @@ pub async fn build(
         governance_chain_id: cfg.governance_chain_id,
         governance_rpc_url: cfg.governance_rpc_url.clone(),
         capacity_bond: cfg.capacity_bond,
-        slash_judge: cfg.slash_judge,
         pool_chain_id: info.chain_id,
         pool_rpc_url: cfg.pool_rpc_url.clone(),
         payment_pool: info.payment_pool,

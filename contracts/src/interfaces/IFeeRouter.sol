@@ -49,8 +49,8 @@ interface IFeeRouter {
     function windowEpochsAt(uint48 timepoint) external view returns (uint64);
 
     /// @notice Constructor-immutable epoch length. Equals
-    ///         `CapacityBond.epochLength()` (7 days), so `slashedAtEpoch` and
-    ///         `bytesPerEpoch` index the same epochs.
+    ///         `CapacityBond.epochLength()` (7 days), so `declaredMbpsAtEpoch`
+    ///         and `bytesPerEpoch` index the same epochs.
     function epochLength() external view returns (uint64);
 
     // ─── Split and pricing (ADR 016 § Tunable Economics) ──────────────

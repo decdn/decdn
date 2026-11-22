@@ -43,8 +43,6 @@ import type {
   RecordStoreHealth,
   RepublishHealth,
   RoutingHealth,
-  SlashesResponse,
-  SlashRecordDto,
   Status,
   StatusResponse,
   UnreadableRecord,
@@ -62,7 +60,6 @@ import {
   gatewayShapeProblem,
   livePulls,
   nodeView,
-  partNote,
   poolRows,
   recentPulls,
   unreadableView,
@@ -239,7 +236,6 @@ const NODE_BASE = {
   lanes: true,
   earnings: true,
   pools: true,
-  slashes: true,
 } as const;
 const NODE: Variants<NodeSection> = {
   waiting: NODE_BASE,
@@ -365,15 +361,6 @@ const BUYER_LANE: Keys<BuyerLaneSnapshot> = {
   last_amount_micro_usdc: true,
   last_bytes_delivered: true,
 };
-const SLASHES: Keys<SlashesResponse> = { slashes: true };
-const SLASH: Keys<SlashRecordDto> = {
-  slash_id: true,
-  offense_type: true,
-  amount: true,
-  evidence_hash: true,
-  block_number: true,
-  appeal_window_close: true,
-};
 
 function keysOf(value: unknown): string[] {
   expect(value, "an object").toBeTypeOf("object");
@@ -486,10 +473,6 @@ function expectNode(n: NodeSection) {
       pool.lanes.forEach((l) => expectShape(l, BUYER_LANE, "pool lanes[]"));
     }
   });
-  expectPart(n.slashes, "node.slashes", (s) => {
-    expectShape(s, SLASHES, "slashes");
-    s.slashes.forEach((x) => expectShape(x, SLASH, "slashes[]"));
-  });
 }
 
 /**
@@ -565,10 +548,6 @@ describe("the dashboard's /_status fixtures", () => {
     expect(s.pulls.unreadable[0]?.error).toContain("missing field");
     expect(s.pulls.error).toBeNull();
     expect(nodeView(s.node).line).toBeNull();
-    expect(partNote(s.node.slashes)).toEqual({
-      text: "slash detection is not configured",
-      alert: false,
-    });
     expect(
       s.node.earnings.state === "ok" &&
         earningsRows(s.node.earnings.value).map((r) => r.label),

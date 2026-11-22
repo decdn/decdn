@@ -319,8 +319,6 @@ fn topup_fetch_argv_with_deposits(
         chain.rpc_url(),
         "--capacity-bond-address".into(),
         format!("{}", chain.addrs().capacity_bond),
-        "--slash-judge-address".into(),
-        format!("{}", chain.addrs().slash_judge),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),

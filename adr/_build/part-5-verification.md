@@ -4,7 +4,7 @@
 
 # Chapter 5 — Verification & enforcement
 
-How protocol violations are detected, adjudicated, and punished. The slashing schedule itself lives in the tokenomics chapter; this is the evidence and adjudication path — on-chain verification, reputation, content takedown, and the appeal surfaces that bound emergency-multisig discretion.
+How the network responds to misbehavior. Each client verifies bytes and signatures itself, each node scores its peers locally, and governance blacklists content and can eject a non-compliant operator — reputation, content takedown, and region self-attestation.
 
 ```{=typst}
 #pagebreak()

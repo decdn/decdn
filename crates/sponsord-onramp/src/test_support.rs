@@ -56,7 +56,6 @@ pub fn test_config() -> OnrampConfig {
         governance_chain_id: TEST_GOVERNANCE_CHAIN_ID,
         pool_rpc_url: "https://rpc.example".into(),
         capacity_bond: Address::repeat_byte(0x33),
-        slash_judge: None,
         spending_cap: None,
         ttl_secs: None,
         gate: GateKind::Turnstile,

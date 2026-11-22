@@ -153,8 +153,7 @@ fn chain_against(
         format!("http://{}", rpc.local_addr()?),
         1,
         Address::repeat_byte(0x33),
-        Address::repeat_byte(0x44),
-        Some(Address::repeat_byte(0x55)),
+        Address::repeat_byte(0x55),
     );
     let site = PullSite {
         data_dir: data_dir.to_path_buf(),
@@ -5145,7 +5144,7 @@ fn scripted_holder(
             provider: Address::repeat_byte(provider),
             deposit: alloy::primitives::U256::from(u128::MAX),
             client_signer: Arc::new(PrivateKeySigner::random()),
-            voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+            voucher_domain: decdn_incentive::capacity_bond_domain(1, Address::ZERO),
             prior_bytes_delivered: alloy::primitives::U256::ZERO,
             prior_amount: alloy::primitives::U256::ZERO,
             client_binding: None,

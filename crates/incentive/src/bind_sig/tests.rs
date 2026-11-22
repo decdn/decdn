@@ -4,7 +4,7 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 
 fn sample_domain() -> Eip712Domain {
-    bind_node_id_domain(
+    capacity_bond_domain(
         421_614,
         address!("0000000000000000000000000000000000001234"),
     )

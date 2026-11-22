@@ -7,7 +7,6 @@ fn plan(phase: Phase) -> Plan {
         chain_id: 31337,
         phase,
         active_bond: U256::from(50_000u64),
-        unbonding_period: 14 * 86_400,
         first_bonded_at: 1_700_000_000,
     }
 }
@@ -109,16 +108,9 @@ fn submitted_is_true_for_every_transaction_slot() {
             },
         ),
         (
-            "request",
+            "unbond",
             Outcome {
-                request: Some(h),
-                ..Outcome::default()
-            },
-        ),
-        (
-            "withdraw",
-            Outcome {
-                withdraw: Some(h),
+                unbond: Some(h),
                 ..Outcome::default()
             },
         ),
@@ -218,25 +210,11 @@ fn reonboard_disclosure_names_the_fresh_node_id_and_the_carry_over_route() {
 #[test]
 fn only_the_costly_phases_prompt() {
     assert!(Phase::Deregister { declared_mbps: 1 }.needs_confirmation());
-    assert!(
-        Phase::Request {
-            amount: U256::from(1u64)
-        }
-        .needs_confirmation()
-    );
     assert!(reonboard_phase().needs_confirmation());
 
     assert!(
-        !Phase::Withdraw {
+        !Phase::Unbond {
             amount: U256::from(1u64)
-        }
-        .needs_confirmation()
-    );
-    assert!(
-        !Phase::Waiting {
-            amount: U256::from(1u64),
-            unlock_at: 10,
-            now: 1
         }
         .needs_confirmation()
     );
@@ -249,46 +227,13 @@ fn only_the_costly_phases_prompt() {
 }
 
 #[test]
-fn waiting_reports_the_remaining_window_and_submits_nothing() {
-    let s = rendered(
-        &plan(Phase::Waiting {
-            amount: U256::from(50_000u64),
-            unlock_at: 1_000_000 + 3 * 86_400,
-            now: 1_000_000,
-        }),
-        false,
-        &Outcome::default(),
-        false,
-    );
-    assert!(s.contains("phase=waiting"), "{s}");
-    assert!(s.contains(&format!("remaining_secs={}", 3 * 86_400)), "{s}");
-    assert!(s.contains("submitted=false"), "{s}");
-}
-
-/// `remaining_secs` describes the waiting phase only; a non-zero value on
-/// any other phase would read as "still blocked" to a polling wrapper.
-#[test]
-fn remaining_secs_is_zero_off_the_waiting_phase() {
-    for phase in [
-        Phase::Deregister { declared_mbps: 1 },
-        Phase::Withdraw {
-            amount: U256::from(1u64),
-        },
-        reonboard_phase(),
-    ] {
-        let s = rendered(&plan(phase), false, &Outcome::default(), false);
-        assert!(s.contains("remaining_secs=0"), "{s}");
-    }
-}
-
-#[test]
 fn json_carries_the_phase_and_every_tx_slot() {
     let outcome = Outcome {
-        withdraw: Some(B256::repeat_byte(0xAB)),
+        unbond: Some(B256::repeat_byte(0xAB)),
         ..Outcome::default()
     };
     let s = rendered(
-        &plan(Phase::Withdraw {
+        &plan(Phase::Unbond {
             amount: U256::from(50_000u64),
         }),
         true,
@@ -302,14 +247,14 @@ fn json_carries_the_phase_and_every_tx_slot() {
     );
     assert_eq!(
         v.get("phase").and_then(serde_json::Value::as_str),
-        Some("withdraw")
+        Some("unbond")
     );
     assert_eq!(
         v.get("submitted").and_then(serde_json::Value::as_bool),
         Some(true)
     );
     assert_eq!(
-        v.get("withdraw_tx").and_then(serde_json::Value::as_str),
+        v.get("unbond_tx").and_then(serde_json::Value::as_str),
         Some(format!("{:#x}", B256::repeat_byte(0xAB)).as_str())
     );
     assert!(
@@ -324,12 +269,12 @@ fn json_carries_the_phase_and_every_tx_slot() {
     );
 }
 
-/// A withdrawal that only returns money still has to be distinguishable
+/// An unbond that only returns money still has to be distinguishable
 /// from a preview, the way every other command's receipt is.
 #[test]
 fn dry_run_is_distinguishable_from_a_failed_send() {
     let dry = rendered(
-        &plan(Phase::Withdraw {
+        &plan(Phase::Unbond {
             amount: U256::from(1u64),
         }),
         false,
@@ -338,7 +283,7 @@ fn dry_run_is_distinguishable_from_a_failed_send() {
     );
     assert!(dry.contains("submitted=false dry_run=true"), "{dry}");
     let failed = rendered(
-        &plan(Phase::Withdraw {
+        &plan(Phase::Unbond {
             amount: U256::from(1u64),
         }),
         false,

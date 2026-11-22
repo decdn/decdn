@@ -8,11 +8,10 @@ pragma solidity 0.8.28;
 ///         runs from the operator's `regionLastChanged` stamp, which callers
 ///         pass in directly as `effective`.
 /// @dev    Every function is `internal`, so the library inlines into its
-///         consumers (`SlashJudge`, `ContentBlacklist`) rather than deploying
-///         separately. This keeps the predicate logic — and the string-packing
-///         assembly — entirely out of `CapacityBond`'s near-EIP-170-ceiling
-///         runtime bytecode (`CapacityBond` never imports this library). Mirrors
-///         the `BondMath.reduceAtTier` extraction rationale.
+///         consumer (`ContentBlacklist`) rather than deploying separately. This
+///         keeps the predicate logic — and the string-packing assembly —
+///         entirely out of `CapacityBond`'s runtime bytecode (`CapacityBond`
+///         never imports this library).
 library RegionScopeLib {
     /// @notice Pack a region string into a left-aligned, zero-padded `bytes32`,
     ///         matching Solidity's `bytes32("literal")` packing so the result
@@ -58,13 +57,9 @@ library RegionScopeLib {
     /// @param regionPrev   Operator's previous region (string; "" if never changed).
     /// @param nowTs        The instant the ripening window is measured at, in
     ///                     **seconds** (same unit as `block.timestamp` and
-    ///                     `effective`/`window`). The read-path caller
+    ///                     `effective`/`window`). The caller
     ///                     (`ContentBlacklist`) passes `block.timestamp` ("what
-    ///                     should I serve now"); the slash-path caller
-    ///                     (`SlashJudge`) passes the served `responseTs` floored
-    ///                     to seconds (`uint64(responseTsUs / 1_000_000)`, "was
-    ///                     this past serve in scope") — ADR 030 § Region-stability
-    ///                     window item 2 (#801). Callers MUST NOT pass μs here:
+    ///                     should I serve now"). Callers MUST NOT pass μs here:
     ///                     a μs `nowTs` makes `elapsed` ~1e6× too large and
     ///                     silently mis-scopes the window.
     /// @param effective    The `effectiveSince` stamp for the operator.
@@ -77,19 +72,14 @@ library RegionScopeLib {
     /// @return prevApplies True iff the ripening window is still open AND `prevKey`
     ///                     is a distinct, non-empty, non-GLOBAL region.
     /// @dev Centralizes the GLOBAL/empty exclusions, the window check, and the
-    ///      `prev != current` dedup so `SlashJudge` and `ContentBlacklist` cannot
-    ///      drift. Each caller layers its own liveness predicate (response-anchored
-    ///      `_liveBefore` vs. point-in-time `_isLive`) over the returned keys.
-    ///      For the read-path (`block.timestamp`) caller, `effective` is always a
-    ///      past stamp (timestamps increase monotonically per block), so `elapsed`
-    ///      equals `nowTs - effective`. For the slash-path caller `nowTs` is the
-    ///      served `responseTs` in seconds (`responseTsUs / 1_000_000`), which CAN
-    ///      precede `effective` whenever the operator
-    ///      changed region *after* serving (the common evasion case): the saturating
-    ///      guard for `nowTs < effective` then yields `elapsed == 0`, conservatively
-    ///      treating the serve as "before the change ripened" so the prev (serve-time)
-    ///      region stays in scope — exactly the intended slash semantics, not merely
-    ///      a defensive underflow guard. `regionPrev == ""` packs to
+    ///      `prev != current` dedup in one place. The caller layers its own
+    ///      liveness predicate (point-in-time `_isLive`) over the returned keys.
+    ///      For a `block.timestamp` caller, `effective` is always a past stamp
+    ///      (timestamps increase monotonically per block), so `elapsed` equals
+    ///      `nowTs - effective`. For a `nowTs` that precedes `effective`, the
+    ///      saturating guard yields `elapsed == 0`, which treats the instant as
+    ///      "before the change ripened" and keeps the prev region in scope.
+    ///      `regionPrev == ""` packs to
     ///      `bytes32(0)` (never a real key, since `addHashRegional` rejects it), so
     ///      an empty prev never applies.
     function scopedRegions(

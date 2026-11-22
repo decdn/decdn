@@ -701,11 +701,6 @@ fn fill_chain_defaults(common: &mut ClientFetchArgs, file: &FileConfig) -> anyho
         );
         common.payment.pool_rpc_url = Some(payment.public_rpc.to_owned());
     }
-    if common.slash_judge_address.is_none()
-        && bc.and_then(|b| b.slash_judge_address.as_ref()).is_none()
-    {
-        common.slash_judge_address = Some(addresses.slash_judge);
-    }
     if common.capacity_bond_address.is_none()
         && bc.and_then(|b| b.capacity_bond_address.as_ref()).is_none()
     {

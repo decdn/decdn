@@ -807,7 +807,7 @@ fn registry_failure_falls_back_to_the_store() {
         warning.contains("rpc down"),
         "the warning names the cause, not just the symptom: {warning}"
     );
-    assert!(warning.contains("deactivated or slashed"));
+    assert!(warning.contains("deactivated or ejected"));
     assert!(
         warning.contains("identity up to"),
         "the warning names the staleness of the fallback identities: {warning}"

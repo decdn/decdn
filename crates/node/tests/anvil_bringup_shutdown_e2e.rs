@@ -305,11 +305,10 @@ async fn run_deploy_script(
 struct DeployedAddrs {
     payment_pool: Address,
     capacity_bond: Address,
-    slash_judge: Address,
     content_blacklist: Address,
 }
 
-/// Read the three governance contract addresses the node runtime needs from
+/// Read the two governance contract addresses the node runtime needs from
 /// the deploy manifest (`deployments/<chainId>.json`, `contracts` map), beside
 /// the `payment_pool` the payment-chain deploy returned.
 fn read_manifest(path: &Path, payment_pool: Address) -> anyhow::Result<DeployedAddrs> {
@@ -317,7 +316,6 @@ fn read_manifest(path: &Path, payment_pool: Address) -> anyhow::Result<DeployedA
     Ok(DeployedAddrs {
         payment_pool,
         capacity_bond: get("CapacityBond")?,
-        slash_judge: get("SlashJudge")?,
         content_blacklist: get("ContentBlacklist")?,
     })
 }
@@ -382,7 +380,6 @@ fn build_config(
             // gas-funded-but-otherwise-inert) node's boot path chain-write-free.
             buyer_max_approve: false,
             pool_min_remaining_deposit_micro_usdc: 1_000_000,
-            slash_judge_address: addrs.slash_judge.to_string(),
             content_blacklist_address: Some(addrs.content_blacklist.to_string()),
             content_blacklist_poll_interval_sec: 600,
             chain_staleness_grace_sec: 1800,
