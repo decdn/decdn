@@ -4,8 +4,9 @@
 //! signature (`slash_sig`) over its frozen signed field set. The signature
 //! makes the response attributable to a registered node: the requester checks
 //! that it recovers to the operator bound to the serving `NodeId` (ADR 005
-//! § Signer binding). Pull receipts read the signed `timestamp_us` as the
-//! approximate serve time.
+//! § Signer binding). Pull receipts carry the signed `timestamp_us`: the
+//! requester's timestamp, which the node echoes unchanged once it finds it
+//! within its clock-skew bound.
 //!
 //! `hash` is a request-context field (from the `StreamRequest`); in this
 //! implementation's wire shape it is echoed back in

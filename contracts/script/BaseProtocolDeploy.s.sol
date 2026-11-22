@@ -603,9 +603,13 @@ abstract contract BaseProtocolDeploy is Script {
 
     // Phase 4 — cross-contract peer role grants.
     //
-    // These grants all require the deployer to still hold the role's admin
-    // (`GOVERNANCE_ROLE` or `DEFAULT_ADMIN_ROLE`) on the target. They run before
-    // the handoff puts every grant behind the 48h Timelock.
+    // These grants all require the deployer to still hold the role's admin on
+    // the target, so they run before the phase-5 handoff. After it, a role's
+    // fate follows its admin. `BLACKLIST_ROLE` on CapacityBond is admin'd by
+    // `DEFAULT_ADMIN_ROLE`, which phase 5 renounces, so that grant freezes.
+    // `EMERGENCY_MULTISIG_ROLE` on ContentBlacklist and `PAUSER_ROLE` on
+    // CapacityBond and FeeRouter are admin'd by `GOVERNANCE_ROLE`, so they stay
+    // rotatable behind the 48h Timelock.
     function _wireCrossContractRoles(DeployConfig memory cfg, Deployment memory d) internal {
         // ContentBlacklist ejects operators via CapacityBond on blacklist add.
         d.bond.grantRole(d.bond.BLACKLIST_ROLE(), address(d.blacklist));
@@ -632,8 +636,8 @@ abstract contract BaseProtocolDeploy is Script {
     }
 
     /// @dev Subclasses (e.g. GovernanceLifecycleTest) override this to wire
-    ///      test-only state before the handoff puts the role-grant surface
-    ///      behind the Timelock. No-op in production.
+    ///      test-only state while the deployer still holds every role admin,
+    ///      before the phase-5 handoff. No-op in production.
     function _postWiringHook(DeployConfig memory cfg, Deployment memory d) internal virtual { }
 
     // Phase 5 — role handoff to Timelock, then DEFAULT_ADMIN_ROLE renounced (#2028).

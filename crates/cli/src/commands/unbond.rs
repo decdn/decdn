@@ -11,7 +11,11 @@
 //!
 //! - The node stays active while the retained bond covers its floor and
 //!   leaves the active set at once when it does not, which is why a terminal
-//!   run confirms first.
+//!   run confirms first. An unbond below the floor also ends the operator's
+//!   tenure: it clears `firstBondedAt` and the recorded floor, so the
+//!   governance age ramp restarts at the next entry. A registered operator
+//!   whose recorded floor is already 0 holds no tenure and is already
+//!   inactive; a bond back to `minBond` re-enters.
 //! - `unbond`'s floor is `bondRequired(declaredMbps)` — the curve, NOT
 //!   `minBond`. So the contract permits unbonding into an inactive state. The
 //!   three amount flags pick deliberately different floors: `--to-mbps` keeps
@@ -131,8 +135,11 @@ pub(crate) fn resume_hint(outcome: &Outcome) -> String {
         ),
         (None, None) => "no transaction is recorded as having taken effect: either nothing \
              was broadcast (a pre-flight gas estimate or a pre-flight check rejecting the \
-             call), or one was broadcast and confirmed reverted. Check the cause below for a \
-             tx hash, and the pending nonce, before re-running"
+             call), or one was broadcast and confirmed reverted. But if the cause below says \
+             a send's outcome is unknown, an unbond may have been broadcast: check this \
+             signer's pending and mined transactions and `activeBond` before re-running, \
+             because a re-run of `--amount` releases that amount again. Otherwise check the \
+             cause below for a tx hash, and the pending nonce, before re-running"
             .to_string(),
     }
 }
@@ -182,11 +189,65 @@ pub(crate) struct Plan {
     pub(crate) prior: U256,
     /// Currently declared capacity tier (Mbps).
     pub(crate) declared_mbps: u64,
-    /// True when the retained bond would sit below the operator's floor
-    /// (`bondFloorAtActivation`, or the live `minBond` for an operator that
-    /// never activated), i.e. the node leaves the active set and cannot return
-    /// without re-bonding.
-    pub(crate) below_floor: bool,
+    /// Where the retained bond leaves the operator against its floor.
+    pub(crate) standing: Standing,
+}
+
+/// Where an unbond leaves the operator against its bond floor
+/// (`bondFloorAtActivation`, or the live `minBond` for an operator that is not
+/// registered and holds no recorded floor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// The retained bond covers the floor, so the node stays active.
+    Covered,
+    /// The retained bond sits below the floor. The node leaves the active set
+    /// and cannot return without re-bonding, and the unbond ends the tenure:
+    /// it clears `firstBondedAt` and the recorded floor, which restarts the
+    /// governance age ramp at the next entry.
+    BelowFloor,
+    /// A registered operator whose recorded floor is 0. An earlier unbond
+    /// below the floor ended its tenure, so the node is already inactive and
+    /// this unbond changes nothing about that. A bond back to `minBond`
+    /// re-enters.
+    NoTenure,
+}
+
+impl Standing {
+    /// Classify the retained bond against the operator's floor.
+    ///
+    /// `registered` is registered-set membership (`_nodes[operator].active`).
+    /// A registration is an entry, so a registered operator with a recorded
+    /// floor of 0 has had its tenure ended by an unbond. An operator that is
+    /// not registered and has no recorded floor is held to the live
+    /// `minBond`, the floor a registration would record.
+    pub(crate) fn of(
+        registered: bool,
+        recorded_floor: U256,
+        min_bond: U256,
+        retained: U256,
+    ) -> Self {
+        let floor = if recorded_floor != U256::ZERO {
+            recorded_floor
+        } else if registered {
+            return Self::NoTenure;
+        } else {
+            min_bond
+        };
+        if retained < floor {
+            Self::BelowFloor
+        } else {
+            Self::Covered
+        }
+    }
+
+    /// Wire label for the receipt.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Covered => "covered",
+            Self::BelowFloor => "below_floor",
+            Self::NoTenure => "no_tenure",
+        }
+    }
 }
 
 /// Transaction hashes from a non-dry run; `None` for steps that were skipped
@@ -215,18 +276,13 @@ pub(crate) async fn build_plan<P: Provider + Clone>(
     let declared = bond.declaredMbps(operator).call().await.with_context(ctx)?;
     let min_bond = bond.minBond().call().await.with_context(ctx)?;
     // `isActive` tests the grandfathered floor, which a `minBond` change since
-    // activation leaves in place; an operator that never activated would
-    // record the live `minBond` on registering.
+    // the tenure began leaves in place. A floor of 0 means no tenure runs;
+    // `Standing::of` reads that against registered-set membership.
     let recorded_floor = bond
         .bondFloorAtActivation(operator)
         .call()
         .await
         .with_context(ctx)?;
-    let floor = if recorded_floor == U256::ZERO {
-        min_bond
-    } else {
-        recorded_floor
-    };
     // Loud, not saturating: `declared_mbps` gates `tier_step`, so a silent
     // clamp to `u64::MAX` would make that guard accept ANY `--to-mbps`. The
     // contract's own `maxCapacityMbps` ceiling (1e6) guarantees this fits, so
@@ -261,7 +317,7 @@ pub(crate) async fn build_plan<P: Provider + Clone>(
         declare_to,
         prior,
         declared_mbps,
-        below_floor: retained < floor,
+        standing: Standing::of(active, recorded_floor, min_bond, retained),
     })
 }
 
@@ -369,7 +425,7 @@ async fn resolve_release<P: Provider + Clone>(
             // That is independent of `minBond`, not below it — with the deployed
             // `k`/`α` the curve crosses above `minBond` around 1000 Mbps, so
             // whether this leaves the operator inactive is tier-dependent and is
-            // what `below_floor` reports.
+            // what `Standing` reports.
             let retained = curve_floor(target).await?;
             let release = prior.saturating_sub(retained);
             anyhow::ensure!(
@@ -469,9 +525,10 @@ pub(crate) const fn decide_confirmation(yes: bool, interactive: bool) -> Confirm
 }
 
 /// Confirm before the first send. An unbond can cost the operator active-set
-/// membership when the retained bond is below its floor, and that is not
-/// obvious from the flags alone, so the consequences are always disclosed,
-/// and a terminal run additionally waits for `y`.
+/// membership and its tenure when the retained bond is below its floor, and
+/// that is not obvious from the flags alone, so the consequences are always
+/// disclosed ([`write_disclosure`]), and a terminal run additionally waits for
+/// `y`.
 ///
 /// `--yes` suppresses the *prompt*, never the disclosure. A scripted
 /// `--all --yes` can leave the node permanently inactive; "don't ask" must not
@@ -486,23 +543,7 @@ fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
     let decision = decide_confirmation(yes, interactive);
 
     let mut err = io::stderr().lock();
-    writeln!(
-        err,
-        "About to release {} base units to this operator (retaining {}).",
-        plan.release, plan.retained,
-    )?;
-    if plan.below_floor {
-        writeln!(
-            err,
-            "The retained bond is below this operator's bond floor, so the node becomes \
-             INACTIVE now and stays inactive until it re-bonds."
-        )?;
-    } else {
-        writeln!(
-            err,
-            "The retained bond covers this operator's bond floor, so the node stays active."
-        )?;
-    }
+    write_disclosure(&mut err, plan)?;
 
     match decision {
         // Disclosed above; the operator asked not to be asked.
@@ -522,6 +563,34 @@ fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
             anyhow::ensure!(answer == "y" || answer == "yes", "unbond cancelled.");
             Ok(())
         }
+    }
+}
+
+/// The consequences of the planned unbond, pure so the wording is pinned by a
+/// test.
+pub(crate) fn write_disclosure(w: &mut dyn io::Write, plan: &Plan) -> io::Result<()> {
+    writeln!(
+        w,
+        "About to release {} base units to this operator (retaining {}).",
+        plan.release, plan.retained,
+    )?;
+    match plan.standing {
+        Standing::Covered => writeln!(
+            w,
+            "The retained bond covers this operator's bond floor, so the node stays active."
+        ),
+        Standing::BelowFloor => writeln!(
+            w,
+            "The retained bond is below this operator's bond floor, so the node becomes \
+             INACTIVE now and stays inactive until it re-bonds. This unbond also ends the \
+             tenure: it clears firstBondedAt, which restarts the governance age ramp at the \
+             next entry."
+        ),
+        Standing::NoTenure => writeln!(
+            w,
+            "This operator is already inactive (no tenure): its recorded bond floor is 0. \
+             Re-bond to minBond to re-enter."
+        ),
     }
 }
 
@@ -551,7 +620,8 @@ pub(crate) fn write_plan(
             "release_base": p.release.to_string(),
             "retained_bond_base": p.retained.to_string(),
             "declare_to_mbps": p.declare_to,
-            "below_floor": p.below_floor,
+            "below_floor": p.standing == Standing::BelowFloor,
+            "standing": p.standing.label(),
             "declare_tx": tx_hex(o.declare.as_ref()),
             "unbond_tx": tx_hex(o.unbond.as_ref()),
         });
@@ -567,7 +637,8 @@ pub(crate) fn write_plan(
         Some(mbps) => writeln!(w, "declare_to_mbps={mbps}")?,
         None => writeln!(w, "declare_to_mbps=none")?,
     }
-    writeln!(w, "below_floor={}", p.below_floor)?;
+    writeln!(w, "below_floor={}", p.standing == Standing::BelowFloor)?;
+    writeln!(w, "standing={}", p.standing.label())?;
     write_tx_line(w, "declare_tx", o.declare.as_ref())?;
     write_tx_line(w, "unbond_tx", o.unbond.as_ref())?;
     writeln!(w, "submitted={submitted} dry_run={dry_run}")

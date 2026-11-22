@@ -87,8 +87,9 @@ pub async fn run(args: &cli::BondArgs, global_config: Option<&Path>) -> anyhow::
 ///
 /// Reads [`Outcome`] as [`chain_ctx::send`] populates it: `Some` means "may have
 /// taken effect" — confirmed success OR broadcast-with-an-unreadable-receipt —
-/// and `None` means "definitively not applied" (never sent, or a confirmed
-/// revert). That distinction is the whole point (#1355 review): the earlier
+/// and `None` means "not recorded as applied" (never sent, a confirmed revert,
+/// or a send whose broadcast is unknown, which the cause then says). That
+/// distinction is the whole point (#1355 review): the earlier
 /// wording asserted strong negatives ("no TOKEN was transferred", "on-chain
 /// state is unchanged") and told the operator to re-run immediately, which is
 /// unsafe. alloy's nonce filler resolves against the *pending* block, so
@@ -128,12 +129,18 @@ pub(crate) fn resume_hint(outcome: &Outcome) -> String {
             "approve",
             tx,
             "It only grants an allowance — no TOKEN moves until the bond transaction \
-             itself lands, and none is recorded as having done so.",
+             itself lands, and none is recorded as having done so. But if the cause below \
+             says a send's outcome is unknown, a bond may have been broadcast: check this \
+             signer's pending and mined transactions and `activeBond`.",
         ),
         (None, None, None) => "no transaction is recorded as having taken effect: either \
              nothing was broadcast (a pre-flight gas estimate or a pre-flight balance check \
-             rejecting the call), or one was broadcast and confirmed reverted. Check the \
-             cause below for a tx hash, and the pending nonce, before re-running"
+             rejecting the call), or one was broadcast and confirmed reverted. But if the \
+             cause below says a send's outcome is unknown, a bond may have been broadcast: \
+             check this signer's pending and mined transactions and `activeBond` before \
+             re-running, because a re-run then bonds again and doubles the top-up. \
+             Otherwise check the cause below for a tx hash, and the pending nonce, before \
+             re-running"
             .to_string(),
     }
 }

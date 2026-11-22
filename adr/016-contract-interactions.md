@@ -319,7 +319,7 @@ The parameter carries no `[floor, ceiling]` safety rail, because a hash has no m
 
 ### Deployment Order and Initialization Dependencies
 
-Each tier has its own deployment order. Each contract's constructor requires the addresses of contracts deployed before it. `FeeRouter` accepts `address(0)` for `BuybackBurner` at construction; the cross-validation in [§ Tunable Economics](#tunable-economics) requires a non-zero burner whenever `buybackBps` is non-zero.
+Each tier has its own deployment order. Each contract's constructor requires the addresses of contracts deployed before it. The step numbers give the constructor dependency order, not the wall-clock order of the deploy script (`contracts/script/BaseProtocolDeploy.s.sol`). For example, the script deploys the `TimelockController` before TOKEN, because TOKEN deploys with the other targets and USDC is an external input. `FeeRouter` accepts `address(0)` for `BuybackBurner` at construction; the cross-validation in [§ Tunable Economics](#tunable-economics) requires a non-zero burner whenever `buybackBps` is non-zero.
 
 **Governance chain.**
 
@@ -332,6 +332,7 @@ graph TD
     CBOND["5. CapacityBond"]
     BB["6. BuybackBurnerUniswapV3 (optional)"]
     FR["7. FeeRouter"]
+    CSR["7b. CctpSweepReceiver"]
     PR["9. PublisherRegistry"]
     MVP["10. ManualVettingPolicy"]
     OA["11. OriginAssignment"]
@@ -346,9 +347,10 @@ graph TD
     FR --> TL
     FR --> CBOND
     FR -.->|"optional at deploy"| BB
+    CSR --> FR
+    CSR --> USDC
     OA --> CBOND
     OA --> PR
-    OA -.->|"optional at deploy"| CB
     OA --> MVP
     CB --> CBOND
     GOV --> CBOND

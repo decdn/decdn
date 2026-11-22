@@ -481,9 +481,11 @@ pub(crate) fn annotate_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyh
     // that estimate is exactly the quoted per-MB rate. The miss direction is "we
     // stay silent when we could have spoken" — never a fabricated shortfall — so
     // it is phrased as a possibility and as a lower bound.
+    // A zero quoted rate estimates 0, which any headroom covers, so a free
+    // quote is never annotated.
     let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
     let estimate = min_payment(decdn_protocol::client::CHUNK_BYTES, quoted_rate);
-    if quoted_rate == 0 || headroom >= estimate {
+    if headroom >= estimate {
         return err;
     }
     err.context(format!(

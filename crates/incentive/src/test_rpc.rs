@@ -87,8 +87,8 @@ const fn receipt_with_status(to: Address, logs: Vec<Log>, status: bool) -> Trans
 /// [`ScriptedRpc::mine`] with "not mined".
 ///
 /// A clone shares the receipt and the per-send receipt queue, the `eth_call`
-/// queue, the send failures and errors, the recorded nonces and the
-/// `after_calls` hook.
+/// queue, the send failures and errors, the recorded nonces and calldata, and
+/// the `after_calls` hook.
 #[derive(Clone, Debug)]
 pub struct ScriptedRpc {
     send: bool,
@@ -106,6 +106,8 @@ pub struct ScriptedRpc {
     head_timestamp: Option<u64>,
     calls: Arc<Mutex<VecDeque<Bytes>>>,
     sent_nonces: Arc<Mutex<Vec<u64>>>,
+    /// The calldata of each answered send, in order.
+    sent_inputs: Arc<Mutex<Vec<Bytes>>>,
     /// HTTP failures (status, body) the next sends meet, in order.
     send_failures: Arc<Mutex<VecDeque<(u16, String)>>>,
     /// JSON-RPC error answers the next sends meet, in order
@@ -142,6 +144,7 @@ impl ScriptedRpc {
             head_timestamp: None,
             calls: Arc::default(),
             sent_nonces: Arc::default(),
+            sent_inputs: Arc::default(),
             send_failures: Arc::default(),
             send_errors: Arc::default(),
             after_calls: AfterCalls::default(),
@@ -174,6 +177,17 @@ impl ScriptedRpc {
     #[must_use]
     pub fn sent_nonces(&self) -> Vec<u64> {
         self.sent_nonces
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The calldata of each `eth_sendTransaction` this transport answered, in
+    /// order: which calls a caller sent, and in which order. A send that
+    /// carries no calldata is not recorded.
+    #[must_use]
+    pub fn sent_inputs(&self) -> Vec<Bytes> {
+        self.sent_inputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -307,6 +321,24 @@ impl ScriptedRpc {
         }
     }
 
+    /// Record the calldata the `eth_sendTransaction` request `params` carries,
+    /// read from `input` or, failing that, `data`.
+    fn record_input(&self, params: Option<&serde_json::value::RawValue>) {
+        let input = params
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
+            .and_then(|value| {
+                let tx = value.get(0)?;
+                let hex = tx.get("input").or_else(|| tx.get("data"))?.as_str()?;
+                hex.parse::<Bytes>().ok()
+            });
+        if let Some(input) = input {
+            self.sent_inputs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(input);
+        }
+    }
+
     /// The next scripted send failure, if any is left.
     fn next_send_failure(&self) -> Option<(u16, String)> {
         self.send_failures
@@ -399,6 +431,7 @@ impl tower::Service<RequestPacket> for ScriptedRpc {
             }
             ("eth_sendTransaction", ..) if self.send => {
                 self.record_nonce(req.params());
+                self.record_input(req.params());
                 let next = self
                     .receipts
                     .lock()

@@ -11,8 +11,9 @@
 //! - `getRegisteredNodes` returns the `_registeredAddrs` page (every
 //!   registered operator, unfiltered for bond / ejection)
 //!   alongside a parallel `active[]` that the contract computes with
-//!   `isActive(operator)` per entry — the strict "registered AND active
-//!   bond ≥ the operator's floor AND not ejected" predicate. Callers take
+//!   `isActive(operator)` per entry — the strict "registered AND holds a
+//!   tenure (non-zero floor) AND active bond ≥ the operator's floor AND not
+//!   ejected" predicate. Callers take
 //!   the membership set from `active[]` and keep the full page for the
 //!   payout bindings (an operator below its floor is `active == false`
 //!   but still payable), with no per-entry round-trip.
@@ -61,7 +62,8 @@ mod sol_types {
             // View functions (only those consumed by the node runtime)
             // -----------------------------------------------------------------
 
-            /// Full active-bonder predicate: registered AND
+            /// Full active-bonder predicate: registered AND holds a tenure
+            /// (non-zero `bondFloorAtActivation`) AND
             /// `activeBond ≥ bondFloorAtActivation` AND not ejected.
             function isActive(address operator) external view returns (bool);
 
@@ -85,12 +87,15 @@ mod sol_types {
             /// operator has no binding.
             function addressToNodeId(address operator) external view returns (bytes32);
 
-            /// Unix timestamp of the operator's first bond, or `0` if never
-            /// bonded. Write-once — never cleared by `deregisterNode`,
-            /// auto-ejection, or `bindNodeId`. Read by `decdn node rotate-key`
-            /// to report the `age_ramp` anchor an Ethereum-key rotation
-            /// destroys and an iroh-key rotation preserves (ADR 026
-            /// § Governance).
+            /// Unix timestamp of the start of the operator's current tenure,
+            /// or `0` while none runs. An entry stamps it: a `bond` that
+            /// leaves `activeBond ≥ minBond` while no tenure runs, or a
+            /// `registerNode`. A tenured top-up leaves it alone. An `unbond`
+            /// whose remainder falls below `bondFloorAtActivation` clears it.
+            /// `deregisterNode`, ejection and `bindNodeId` keep it. Read by
+            /// `decdn node rotate-key` to report the `age_ramp` anchor an
+            /// Ethereum-key rotation destroys and an iroh-key rotation
+            /// preserves (ADR 026 § Governance).
             function firstBondedAt(address operator) external view returns (uint64);
 
             /// Paginated snapshot of `_registeredAddrs` — every operator
@@ -143,8 +148,11 @@ mod sol_types {
             function minBond() external view returns (uint256);
 
             /// The operator's grandfathered entry floor: the `minBond` in
-            /// force when it last activated, 0 if it never has. `isActive`
-            /// tests `activeBond` against this, not the live `minBond`.
+            /// force at the entry that began its current tenure. It is 0 if
+            /// the operator never entered, and 0 again after an `unbond`
+            /// whose remainder falls below it ends the tenure. A tenured
+            /// top-up keeps it. `isActive` requires it non-zero and tests
+            /// `activeBond` against it, not the live `minBond`.
             function bondFloorAtActivation(address operator) external view returns (uint256);
 
             /// Governable lower bound of the declarable-capacity band (Mbps).

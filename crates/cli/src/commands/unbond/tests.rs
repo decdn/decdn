@@ -1,6 +1,17 @@
 use super::*;
 
 fn plan(declare_to: Option<u64>, below_floor: bool) -> Plan {
+    plan_at(
+        declare_to,
+        if below_floor {
+            Standing::BelowFloor
+        } else {
+            Standing::Covered
+        },
+    )
+}
+
+fn plan_at(declare_to: Option<u64>, standing: Standing) -> Plan {
     Plan {
         capacity_bond: Address::repeat_byte(0x22),
         release: U256::from(40_000u64),
@@ -8,7 +19,7 @@ fn plan(declare_to: Option<u64>, below_floor: bool) -> Plan {
         declare_to,
         prior: U256::from(60_000u64),
         declared_mbps: 100,
-        below_floor,
+        standing,
     }
 }
 
@@ -44,6 +55,100 @@ fn write_plan_reports_a_below_floor_residual() {
     let s = rendered(&plan(None, true), false, &Outcome::default());
     assert!(s.contains("declare_to_mbps=none"), "{s}");
     assert!(s.contains("below_floor=true"), "{s}");
+    assert!(s.contains("standing=below_floor"), "{s}");
+}
+
+/// A registered operator whose tenure already ended is not "below the
+/// floor" of a tenure it does not hold; the receipt says which case it is.
+#[test]
+fn write_plan_reports_a_tenureless_operator() {
+    let s = rendered(
+        &plan_at(None, Standing::NoTenure),
+        false,
+        &Outcome::default(),
+    );
+    assert!(s.contains("below_floor=false"), "{s}");
+    assert!(s.contains("standing=no_tenure"), "{s}");
+    let s = rendered(
+        &plan_at(None, Standing::NoTenure),
+        true,
+        &Outcome::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(
+        v.get("standing").and_then(serde_json::Value::as_str),
+        Some("no_tenure")
+    );
+    assert_eq!(
+        v.get("below_floor").and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
+
+/// The floor fallback. A recorded floor of 0 means no tenure runs. A
+/// registered operator reaches that only through an unbond below its floor,
+/// so it is already inactive whatever this unbond retains. An unregistered
+/// operator is held to the live `minBond`, the floor a registration records.
+#[test]
+fn standing_reads_a_zero_floor_against_registration() {
+    let min_bond = U256::from(50u64);
+    let zero = U256::ZERO;
+    // Registered, no tenure: retained above or below minBond alike.
+    assert_eq!(
+        Standing::of(true, zero, min_bond, U256::from(10u64)),
+        Standing::NoTenure
+    );
+    assert_eq!(
+        Standing::of(true, zero, min_bond, U256::from(100u64)),
+        Standing::NoTenure
+    );
+    // Unregistered, no recorded floor: held to minBond.
+    assert_eq!(
+        Standing::of(false, zero, min_bond, U256::from(49u64)),
+        Standing::BelowFloor
+    );
+    assert_eq!(
+        Standing::of(false, zero, min_bond, U256::from(50u64)),
+        Standing::Covered
+    );
+    // A recorded floor is the grandfathered one, not the live minBond.
+    let floor = U256::from(30u64);
+    for registered in [true, false] {
+        assert_eq!(
+            Standing::of(registered, floor, min_bond, U256::from(40u64)),
+            Standing::Covered
+        );
+        assert_eq!(
+            Standing::of(registered, floor, min_bond, U256::from(29u64)),
+            Standing::BelowFloor
+        );
+    }
+}
+
+fn disclosure(p: &Plan) -> String {
+    let mut buf = Vec::new();
+    write_disclosure(&mut buf, p).unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+/// Each standing gets its own consequence line; only an unbond below the
+/// floor claims to end the tenure.
+#[test]
+fn disclosure_names_the_consequence_of_each_standing() {
+    let below = disclosure(&plan_at(None, Standing::BelowFloor));
+    assert!(below.contains("becomes INACTIVE"), "{below}");
+    assert!(below.contains("clears firstBondedAt"), "{below}");
+    assert!(below.contains("age ramp"), "{below}");
+
+    let covered = disclosure(&plan_at(None, Standing::Covered));
+    assert!(covered.contains("stays active"), "{covered}");
+    assert!(!covered.contains("firstBondedAt"), "{covered}");
+
+    let none = disclosure(&plan_at(None, Standing::NoTenure));
+    assert!(none.contains("already inactive (no tenure)"), "{none}");
+    assert!(none.contains("Re-bond to minBond to re-enter"), "{none}");
+    assert!(!none.contains("becomes INACTIVE"), "{none}");
+    assert!(!none.contains("stays active"), "{none}");
 }
 
 #[test]
@@ -196,6 +301,22 @@ fn resume_hint_with_no_recorded_tx_says_nothing_took_effect() {
     );
     assert!(hint.contains("confirmed reverted"), "{hint}");
     assert!(!hint.contains("on-chain state is unchanged"), "{hint}");
+}
+
+/// A `None` slot also covers a send whose broadcast is unknown, so the hint
+/// with no recorded tx still warns that an unbond may be out, and that a
+/// re-run of `--amount` would release again.
+#[test]
+fn resume_hint_with_no_recorded_tx_covers_an_unknown_broadcast() {
+    let hint = resume_hint(&Outcome::default());
+    assert!(hint.contains("a send's outcome is unknown"), "{hint}");
+    assert!(hint.contains("an unbond may have been broadcast"), "{hint}");
+    assert!(hint.contains("pending and mined transactions"), "{hint}");
+    assert!(hint.contains("`activeBond`"), "{hint}");
+    assert!(
+        hint.contains("a re-run of `--amount` releases that amount again"),
+        "{hint}"
+    );
 }
 
 /// Plan-computation coverage against a mocked provider.

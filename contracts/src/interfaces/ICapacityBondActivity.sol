@@ -8,8 +8,9 @@ pragma solidity 0.8.28;
 ///         focused — mirroring `ICapacityBondEpoch` / `ICapacityBondEjector` —
 ///         so consumers link only the read they need.
 /// @dev    Returns `true` iff `operator` is registered with an active bond
-///         at or above its floor; `false` for unregistered, sub-floor, or
-///         ejected operators. Bond that `unbond` released does not count.
+///         at or above its floor and holds a tenure (non-zero floor); `false`
+///         for unregistered, sub-floor, tenure-less, or ejected operators. Bond
+///         that `unbond` released does not count.
 ///         Operator-level blacklist status (ADR 011) is intentionally NOT
 ///         consulted here — callers needing the combined "authorized origin"
 ///         predicate filter against `ContentBlacklist.isOriginBlacklisted`.

@@ -10,11 +10,12 @@ pragma solidity 0.8.28;
 ///         the system need to know about.
 interface ICapacityBond {
     /// @notice Start of the operator's current tenure: the timestamp of the
-    ///         entry transition (the `bond()` call that lifts `activeBond` to
-    ///         the live `minBond`, or `registerNode`) that began its current run
-    ///         of bonding at or above its floor (`bondFloorAtActivation`).
-    ///         Later bonds keep it. An `unbond()` that leaves the bond below the
-    ///         floor resets it to 0, and the next entry stamps a fresh value.
+    ///         entry (a `bond()` that leaves `activeBond` at or above the live
+    ///         `minBond` while no tenure runs, or `registerNode`) that began its
+    ///         current run of bonding at or above its floor
+    ///         (`bondFloorAtActivation`). Later bonds and re-registrations keep
+    ///         it. An `unbond()` that leaves the bond below the floor resets it
+    ///         to 0, and the next entry stamps a fresh value.
     ///         Source of the `age_ramp` numerator on `DecdnGovernor` per ADR 036
     ///         § Formula. Returns 0 while the operator holds no tenure.
     function firstBondedAt(address operator) external view returns (uint64);
