@@ -11117,7 +11117,7 @@ async fn empty_cache_with_fs_origin(
     Ok((cache, hash, cache_metrics, origin_dir, cache_dir))
 }
 
-/// Spawn a `ClientHandler` server with buffered origin pull-through attached
+/// Spawn a `ClientHandler` server with node-to-node pull-through attached
 /// (`ClientHandlerDeps.pull_through`), returning the dial target and the server's voucher
 /// signer address. Unlike [`spawn_handler_server`], the handler is built inline
 /// so pull-through can be wired before it is spawned.

@@ -38,8 +38,8 @@ pub const DEFAULT_ORIGIN_PROBE_NEGATIVE_TTL_SEC: u64 = 2;
 /// enforces `negative <= fault <= positive` on operator overrides.
 pub const DEFAULT_ORIGIN_PROBE_FAULT_TTL_SEC: u64 = 5;
 
-/// Default per-request ceiling in milliseconds on the live-origin
-/// `{H}.sizeproof` read (#1130 pt3). A slow origin must not stall the
+/// Default ceiling in milliseconds on one live `{H}.sizeproof` walk of the
+/// origin chain (#1130 pt3). A slow origin must not stall the
 /// serve hot path; on overrun the node does not advertise the blob and
 /// memoises the fault.
 pub const DEFAULT_ORIGIN_PROBE_TIMEOUT_MS: u64 = 2000;

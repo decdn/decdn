@@ -303,8 +303,8 @@ pub struct ResolvedCache {
     /// hash that faulted is not re-probed, and is capped by
     /// `origin_probe_ttl_sec` so a recovered origin is noticed soon.
     pub origin_probe_fault_ttl_sec: u64,
-    /// Per-request ceiling in milliseconds on the live `{H}.sizeproof` read
-    /// (#1130 pt3). Default
+    /// Ceiling in milliseconds on one live `{H}.sizeproof` walk of the origin
+    /// chain (#1130 pt3). Default
     /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]. Keeps a slow origin
     /// off the serve hot path.
     pub origin_probe_timeout_ms: u64,

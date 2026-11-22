@@ -1,13 +1,11 @@
 //! Origin retry policy with exponential backoff and jitter (#285).
 //!
-//! `ReadGuard` runs each read of an origin's ranged objects under the
-//! origin's circuit breaker and this retry loop.
-//!
-//! Wraps a single pull-through attempt in a bounded retry loop. The adapter
+//! Wraps a single origin read in a bounded retry loop. The adapter
 //! (or the engine's per-attempt closure) classifies each failure as
 //! [`OriginPullError::Transient`] or [`OriginPullError::Permanent`]; this
 //! module only decides *how many* transient retries to run and *how long*
-//! to sleep between them.
+//! to sleep between them. `ReadGuard` runs each read of an origin's ranged
+//! objects under the origin's circuit breaker, this retry loop and a deadline.
 //!
 //! ## Coalescing interaction and the retry-amplification bound (#1615)
 //!
@@ -135,7 +133,7 @@ where
                         attempts = attempt.saturating_add(1),
                         max_retries = policy.max_retries,
                         error = %format_args!("{e:#}"),
-                        "origin fetch exhausted retry budget; surfacing as permanent",
+                        "origin read exhausted its retry budget",
                     );
                     return (
                         Err(OriginPullError::Permanent(e)),
@@ -199,25 +197,31 @@ impl ReadGuard {
     /// [`OriginPullError::Transient`] at once, with no read and no backoff. A
     /// transient fault is retried with backoff ([`run_with_retry_classified`]).
     /// One that exhausts the budget stays [`OriginPullError::Transient`], so a
-    /// caller that waits out a transient fault (the presence memo, the rescan
-    /// carry-forward) still can, and it counts toward the breaker's trip
-    /// threshold. A permanent fault returns at once and counts as a reachable
-    /// origin.
+    /// caller that tells transient faults apart (the rescan carry-forward)
+    /// still can, and it counts toward the breaker's trip threshold. A
+    /// permanent fault returns at once and counts as a reachable origin.
     ///
-    /// `deadline` covers the read and every retry. A read still running at
-    /// the deadline is cut off and answers [`ReadFailure::Deadline`]. It
-    /// counts toward the trip threshold as an unavailable origin, so an
-    /// origin that stalls trips its breaker as one that errors does.
+    /// `deadline` covers the read and every retry. A deadline already past
+    /// answers [`ReadFailure::Deadline`] at once, with no read. A read still
+    /// running at the deadline is cut off and answers
+    /// [`ReadFailure::Deadline`] with the last error it saw. It counts toward
+    /// the trip threshold as an unavailable origin only when
+    /// [`Deadline::charge`] says so: an origin that stalls through its whole
+    /// budget trips its breaker as one that errors does, but an origin that
+    /// was given only the time an earlier one left is not blamed for it.
     pub(crate) async fn run<T, F, Fut>(
         &self,
         hash: Hash,
-        deadline: Option<tokio::time::Instant>,
-        read: F,
+        deadline: Option<Deadline>,
+        mut read: F,
     ) -> Result<T, ReadFailure>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, OriginPullError>>,
     {
+        if deadline.is_some_and(|d| d.at <= tokio::time::Instant::now()) {
+            return Err(ReadFailure::Deadline { last: None });
+        }
         let guard = match self.breaker.as_deref().map(OriginBreaker::acquire) {
             Some(Admission::ShortCircuit) => {
                 return Err(ReadFailure::Origin(OriginPullError::Transient(
@@ -230,16 +234,40 @@ impl ReadGuard {
             Some(Admission::Proceed(_state, guard)) => Some(guard),
             None => None,
         };
-        let attempts = run_with_retry_classified(self.policy, self.metrics.as_ref(), hash, read);
+        // The last error a cut-off read saw, so a deadline names it.
+        let last: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let noted = || {
+            let attempt = read();
+            let last = &last;
+            async move {
+                let result = attempt.await;
+                if let Err(e) = &result {
+                    *last
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(format!("{e:#}"));
+                }
+                result
+            }
+        };
+        let attempts = run_with_retry_classified(self.policy, self.metrics.as_ref(), hash, noted);
         let finished = match deadline {
-            Some(at) => tokio::time::timeout_at(at, attempts).await.ok(),
+            Some(d) => tokio::time::timeout_at(d.at, attempts).await.ok(),
             None => Some(attempts.await),
         };
         let Some((outcome, terminal)) = finished else {
-            if let Some(guard) = guard {
+            // An uncharged deadline drops the guard unrecorded, which frees a
+            // half-open trial slot as a cancelled read does.
+            if let Some(guard) = guard
+                && deadline.is_some_and(|d| d.charge)
+            {
                 guard.record(OriginOutcome::Unavailable);
             }
-            return Err(ReadFailure::Deadline);
+            let last = last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            return Err(ReadFailure::Deadline { last });
         };
         if let Some(guard) = guard {
             guard.record(match terminal {
@@ -256,6 +284,28 @@ impl ReadGuard {
     }
 }
 
+/// When a [`ReadGuard::run`] read must end, and whether an overrun is the
+/// origin's fault.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline {
+    /// The instant the read and its retries must finish by.
+    pub(crate) at: tokio::time::Instant,
+    /// Whether a read cut off at `at` counts as an unavailable origin. `true`
+    /// when the read had its whole budget; `false` when it got only what an
+    /// earlier read left.
+    pub(crate) charge: bool,
+}
+
+impl Deadline {
+    /// A deadline `budget` from now, charged to the origin on overrun.
+    pub(crate) fn charged_after(budget: std::time::Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + budget,
+            charge: true,
+        }
+    }
+}
+
 /// Why a [`ReadGuard::run`] read failed.
 #[derive(Debug)]
 pub(crate) enum ReadFailure {
@@ -263,7 +313,11 @@ pub(crate) enum ReadFailure {
     Origin(OriginPullError),
     /// The read and its retries ran past the caller's deadline. A
     /// waitable fault: the origin may answer given longer.
-    Deadline,
+    Deadline {
+        /// The last error a retried attempt answered before the cut-off,
+        /// if any.
+        last: Option<String>,
+    },
 }
 
 #[cfg(test)]

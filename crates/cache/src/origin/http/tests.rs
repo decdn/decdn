@@ -573,3 +573,24 @@ async fn chunk_idle_timeout_fires_when_the_origin_stalls_mid_body() -> anyhow::R
     }
     Ok(())
 }
+
+/// A `404` or a `403` on a ranged data read is a missing object: an origin in
+/// front of a bucket without list permission answers 403 for a missing key,
+/// and the presence answer already came from the size proof.
+#[tokio::test]
+async fn fetch_range_data_404_and_403_are_not_found() -> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let origin = HttpOrigin::parse(&server.uri())?;
+    for status in [404u16, 403] {
+        let hash = Hash::new(format!("http-range-{status}").as_bytes());
+        mount_get(&server, hash.to_hex(), ResponseTemplate::new(status)).await;
+        anyhow::ensure!(
+            matches!(
+                origin.fetch_range_data(hash, FIRST_KIB).await?,
+                OriginRangeFetch::NotFound
+            ),
+            "{status} on the data object must be NotFound"
+        );
+    }
+    Ok(())
+}

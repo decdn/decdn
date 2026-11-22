@@ -426,8 +426,10 @@ pub struct CacheConfig {
     /// discovers the blob got evicted anyway.
     pub pinned_hashes: Option<Vec<String>>,
     /// Origin retry policy (#285). Controls exponential backoff for
-    /// transient origin errors on every origin read: the `{H}.sizeproof`,
-    /// `{H}.obao4` and range-window reads, each retried on its own.
+    /// transient origin errors on the node-to-node `pull_through` fetch and
+    /// on each `{H}.obao4` and range-window read, each retried on its own.
+    /// The `{H}.sizeproof` presence read runs once (the presence memo is its
+    /// retry), and a rescan's `enumerate` is not retried.
     /// Absent => defaults from
     /// [`decdn_config_types::RetryPolicy::default`] (3 retries, 100ms
     /// initial backoff doubling to 10s cap, 10% jitter).
@@ -438,8 +440,10 @@ pub struct CacheConfig {
     /// partial sections (e.g. just `max_retries = 5`) get the rest of
     /// the fields filled from defaults.
     pub origin_retry: Option<decdn_config_types::RetryPolicy>,
-    /// Per-origin circuit-breaker policy (#963). Fronts every read of each
-    /// origin: after `failure_threshold` consecutive origin-unavailable
+    /// Per-origin circuit-breaker policy (#963). Fronts each origin's
+    /// `pull_through` fetch and its `{H}.sizeproof`, `{H}.obao4` and
+    /// range-window reads (not `enumerate`): after `failure_threshold`
+    /// consecutive origin-unavailable
     /// failures (transient errors that exhausted the retry budget — NOT
     /// 404s or other permanent per-object errors) the breaker trips OPEN
     /// and fast-fails every read of that origin for `cooldown_ms`
@@ -505,11 +509,13 @@ pub struct CacheConfig {
     /// Rejected unless `origin_probe_negative_ttl_sec <=
     /// origin_probe_fault_ttl_sec <= origin_probe_ttl_sec`.
     pub origin_probe_fault_ttl_sec: Option<u64>,
-    /// Per-request ceiling, in milliseconds, on the live-origin
-    /// `{H}.sizeproof` read (#1130 pt3). Absent =>
-    /// [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`] (2000). A slow origin
-    /// must never stall the serve hot path; on timeout the node does not
-    /// advertise the blob and memoises the fault for one fault TTL.
+    /// Ceiling, in milliseconds, on one live `{H}.sizeproof` walk of the
+    /// origin chain (#1130 pt3): one budget for every origin in turn, not per
+    /// origin. Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_TIMEOUT_MS`]
+    /// (2000). A slow origin must never stall the serve hot path; on overrun
+    /// the node does not advertise the blob and memoises the fault for one
+    /// fault TTL, and the first origin's overrun counts against its circuit
+    /// breaker.
     pub origin_probe_timeout_ms: Option<u64>,
     /// Maximum distinct hashes held in the live-origin probe memo (#1130 pt3).
     /// Absent => [`crate::config::DEFAULT_ORIGIN_PROBE_MEMO_CAPACITY`] (4096).

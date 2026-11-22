@@ -1369,9 +1369,12 @@ pub struct DecdnMetrics {
     pub node_pull_through_timeouts: Counter,
     /// `decdn_node_pull_through_errors_total` (#831): cache-engine errors (not
     /// clean misses) hit while filling a miss on the delivery path — a real
-    /// store/pull fault, surfaced as `NotFound` to the client but logged + bumped
-    /// here so it isn't silent. Covers the node→node pull (#831) and a fault
-    /// of the own-origin `{H}.sizeproof` read.
+    /// store/pull fault, logged and bumped here so it isn't silent. Covers the
+    /// node→node pull (#831), an own-origin presence fault at open, and a
+    /// memoised presence whose size proof cannot be read back. A fault ends
+    /// the open as `InternalError` (wire `Declined`) unless a later tier
+    /// serves the request. A ranged own-origin read that faults after the
+    /// open counts on `decdn_cache_origin_range_faults_total` instead.
     pub node_pull_through_errors: Counter,
     /// `decdn_node_pull_through_window_paused_total` (#856): times the
     /// credit-paced serve loop paused the upstream pull because the pull

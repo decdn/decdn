@@ -214,11 +214,11 @@ async fn read_guard_returns_a_permanent_fault_at_once() {
     );
 }
 
-/// A read that stalls past its deadline answers `Deadline` and counts as an
-/// unavailable origin, so a stalled origin trips its breaker; the next read
-/// short-circuits with no read.
+/// A read that stalls past a charged deadline answers `Deadline` and counts
+/// as an unavailable origin, so a stalled origin trips its breaker; the next
+/// read short-circuits with no read.
 #[tokio::test]
-async fn read_guard_records_a_deadline_as_unavailable() {
+async fn read_guard_records_a_charged_deadline_as_unavailable() {
     let breaker = one_strike_breaker();
     let guard = ReadGuard::new(Some(Arc::clone(&breaker)), instant(3), None);
     let calls = std::sync::atomic::AtomicU32::new(0);
@@ -226,17 +226,85 @@ async fn read_guard_records_a_deadline_as_unavailable() {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::future::pending::<Result<(), OriginPullError>>()
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    let deadline = Deadline::charged_after(Duration::from_millis(20));
     let first = guard.run(Hash::new(b"stall"), Some(deadline), stall).await;
-    assert!(matches!(first, Err(ReadFailure::Deadline)));
+    assert!(matches!(first, Err(ReadFailure::Deadline { last: None })));
     assert_eq!(breaker.state(), crate::circuit_breaker::BreakerState::Open);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(20);
+    let deadline = Deadline::charged_after(Duration::from_millis(20));
     let second = guard.run(Hash::new(b"stall"), Some(deadline), stall).await;
     assert!(matches!(second, Err(ReadFailure::Origin(e)) if e.is_transient()));
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "an open breaker reads nothing"
+    );
+}
+
+/// An uncharged deadline cuts the read off but does not blame the origin:
+/// the breaker stays closed.
+#[tokio::test]
+async fn read_guard_does_not_charge_an_uncharged_deadline() {
+    let breaker = one_strike_breaker();
+    let guard = ReadGuard::new(Some(Arc::clone(&breaker)), instant(3), None);
+    let deadline = Deadline {
+        at: tokio::time::Instant::now() + Duration::from_millis(20),
+        charge: false,
+    };
+    let got = guard
+        .run(Hash::new(b"leftover"), Some(deadline), || {
+            std::future::pending::<Result<(), OriginPullError>>()
+        })
+        .await;
+    assert!(matches!(got, Err(ReadFailure::Deadline { .. })));
+    assert_eq!(
+        breaker.state(),
+        crate::circuit_breaker::BreakerState::Closed
+    );
+}
+
+/// A deadline already past answers at once, with no read and no record.
+#[tokio::test]
+async fn read_guard_reads_nothing_past_its_deadline() {
+    let breaker = one_strike_breaker();
+    let guard = ReadGuard::new(Some(Arc::clone(&breaker)), instant(3), None);
+    let calls = std::sync::atomic::AtomicU32::new(0);
+    let deadline = Deadline {
+        at: tokio::time::Instant::now(),
+        charge: true,
+    };
+    let got = guard
+        .run(Hash::new(b"late"), Some(deadline), || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok::<(), OriginPullError>(()) }
+        })
+        .await;
+    assert!(matches!(got, Err(ReadFailure::Deadline { last: None })));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        breaker.state(),
+        crate::circuit_breaker::BreakerState::Closed
+    );
+}
+
+/// A deadline that cuts off a retry names the last error the read saw.
+#[tokio::test]
+async fn read_guard_deadline_keeps_the_last_error() {
+    let policy = RetryPolicy {
+        max_retries: 10,
+        initial_backoff_ms: 50,
+        max_backoff_ms: 50,
+        jitter_ratio: 0.0,
+    };
+    let guard = ReadGuard::new(None, policy, None);
+    let deadline = Deadline::charged_after(Duration::from_millis(80));
+    let got = guard
+        .run(Hash::new(b"slow-503"), Some(deadline), || async {
+            Err::<(), _>(OriginPullError::Transient(anyhow::anyhow!("503 SlowDown")))
+        })
+        .await;
+    assert!(
+        matches!(&got, Err(ReadFailure::Deadline { last: Some(e) }) if e.contains("503")),
+        "{got:?}"
     );
 }

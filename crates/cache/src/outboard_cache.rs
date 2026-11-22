@@ -6,7 +6,8 @@
 //! entry stays cached.
 //!
 //! The cache holds only outboards that passed the engine's exact-length gate
-//! on the outboard read, each tagged with the origin that served it. A verify fault evicts the copy the failed draw used
+//! on the outboard read, each tagged with the origin that served it. A verify
+//! fault evicts the copy the failed draw used
 //! ([`OutboardCache::evict_if_same`]), so a bad copy is read again, not reused.
 //!
 //! [`OutboardCache`] is a cheap, cloneable handle. Every method takes the lock

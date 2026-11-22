@@ -1963,10 +1963,6 @@ async fn broken_origin_object_faults_before_any_chunk(case: BrokenObject) -> any
         counter_value(&metrics, "serve_stream_rejected_internal_error_total")? == 1,
         "{case:?}: the node refuses the stream with a StreamError before any ChunkData"
     );
-    anyhow::ensure!(
-        counter_value(&metrics, "node_pull_through_errors_total")? == 1,
-        "{case:?}: the fault counts as an own-origin pull-through error"
-    );
 
     // The engine memoised the fault, so the next open refuses at open with no
     // origin read, instead of answering `ok: true` and refusing after the

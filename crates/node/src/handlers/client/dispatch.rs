@@ -646,11 +646,12 @@ impl ClientHandler {
         // to the normal serve path. `Absent` (a genuine 404, or no origin
         // configured at all) is a real foreign-content answer, declined under
         // its own reason so the operator's metrics separate policy declines
-        // from real cache misses. `Fault` (a transport error, a timed-out
-        // read or a proof that does not verify) is NOT an absence, so it
-        // refuses for `InternalError`, matching the store-fault handling on
-        // the `has()` path below. Both
-        // sign `Declined`: this node will not serve the hash during this fetch.
+        // from real cache misses. `Fault` (a transport error, a permanent
+        // fault such as an HTTP 403, an open breaker, a timed-out walk or a
+        // proof that does not verify) is NOT an absence, so it refuses for
+        // `InternalError`, matching the store-fault handling on the `has()`
+        // path below. Both sign `Declined`: this node will not serve the hash
+        // during this fetch.
         if !self.relay_foreign_namespaces {
             match self.cache.origin_presence(hash).await {
                 decdn_cache::OriginPresence::Present(_) => {}

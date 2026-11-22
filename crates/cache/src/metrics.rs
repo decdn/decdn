@@ -38,9 +38,12 @@
 //!   16 KiB chunk-group boundaries. Read the ratio as a trend, not against an
 //!   exact 1.0.
 //! - **Origin retry health** —
-//!   `decdn_cache_origin_retry_exhausted_total / decdn_cache_origin_fetches_total`.
-//!   Sustained nonzero rate = user-visible origin failures the retry
-//!   budget couldn't save (#285).
+//!   `rate(decdn_cache_origin_retry_exhausted_total)`. Sustained nonzero
+//!   rate = user-visible origin failures the retry budget couldn't save
+//!   (#285). It counts every retried origin read (the node-to-node
+//!   `pull_through` fetch, the outboard and each range window), so it is no
+//!   ratio of `decdn_cache_origin_fetches_total`, which counts only the
+//!   `pull_through` calls.
 //! - **GC reclaim ratio** —
 //!   `rate(decdn_cache_gc_bytes_reclaimed_total) /
 //!   rate(decdn_cache_pull_through_bytes_total)` over a recent
@@ -91,9 +94,10 @@ pub struct CacheMetrics {
     /// Operator-actionable: a sustained rate means clients habitually resume
     /// ahead of what payers have cleared.
     pub fill_not_coalesced: Counter,
-    /// Origin fetches that gave up after exhausting `max_retries`
-    /// (#285). Operator-actionable: any nonzero rate = user-visible
-    /// origin failures the retry budget couldn't save.
+    /// Retried origin reads that gave up after exhausting `max_retries`
+    /// (#285): the node-to-node `pull_through` fetch, an outboard read or a
+    /// range-window read. Operator-actionable: any nonzero rate =
+    /// user-visible origin failures the retry budget couldn't save.
     pub origin_retry_exhausted: Counter,
     /// Times `pull_through` advanced from one origin to the next in
     /// the operator-configured fallback chain (#284). One bump per
@@ -189,7 +193,8 @@ pub struct CacheMetrics {
     pub tag_drop_failures: Counter,
 
     /// Origin size probes that faulted during an origin rescan — a transport
-    /// error or a `{H}.sizeproof` that does not verify from one or more
+    /// error, a permanent fault (an HTTP 403, a symlink escape), an open
+    /// breaker or a `{H}.sizeproof` that does not verify from one or more
     /// configured origins with none of them confirming the object, or the
     /// probe walk overrunning its ceiling — rather than answering "held" or
     /// "not held".
@@ -249,8 +254,10 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_circuit_breaker_recoveries_total`.
     pub circuit_breaker_recoveries: Counter,
-    /// Cache misses fast-failed by an OPEN circuit-breaker before the
-    /// retry/backoff loop ran (#963). Each bump is one miss that would
+    /// Origin reads fast-failed by an OPEN circuit-breaker before the
+    /// retry/backoff loop ran (#963): a node-to-node `pull_through` fetch, a
+    /// `{H}.sizeproof` read, an outboard read or a range-window read. Each
+    /// bump is one read that would
     /// otherwise have incurred up to the full
     /// `max_retries`-worth of exponential backoff against a dead origin;
     /// the breaker shed that cost. The whole point of the feature is to
@@ -435,6 +442,20 @@ pub struct CacheMetrics {
     /// Field name omits `_total`: the emitted name is
     /// `decdn_cache_origin_range_timeouts_total`.
     pub origin_range_timeouts: Counter,
+    /// Ranged origin reads (the outboard or a data window) that faulted after
+    /// a `{H}.sizeproof` proved the blob present: a missing or broken `{H}` or
+    /// `{H}.obao4`, an origin that ignores `Range`, a window that fails
+    /// verification, or a read that failed past its retries or budget. Each
+    /// one memoises an origin fault for the hash, so the next open does not
+    /// serve it from the origin until the fault TTL expires.
+    ///
+    /// Operator-actionable: a nonzero rate means a broken origin publish (run
+    /// `decdn origin import` for the object) or an origin that fails ranged
+    /// reads. A store or process fault on the same serve does not count here.
+    ///
+    /// Field name omits `_total`: the emitted name is
+    /// `decdn_cache_origin_range_faults_total`.
+    pub origin_range_faults: Counter,
     /// Own-origin range draws that found the engine-wide pool of
     /// `MAX_CONCURRENT_RANGE_PULLS` permits full and waited for one. Every
     /// draw of every fill shares the pool, and a hung origin holds a permit

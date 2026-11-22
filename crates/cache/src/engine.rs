@@ -42,7 +42,7 @@ use crate::origin_range::{
 };
 use crate::outboard_cache::{OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES, OutboardCache};
 use crate::range_pull::{AlignedRange, align_range_clamped};
-use crate::retry::{ReadFailure, ReadGuard, TerminalFailure, run_with_retry_classified};
+use crate::retry::{Deadline, ReadFailure, ReadGuard, TerminalFailure, run_with_retry_classified};
 use crate::size_proofs::{SIZE_PROOF_ENTRIES, SizeProofMemo};
 use crate::{from_store_hash, to_store_hash};
 
@@ -181,8 +181,9 @@ pub enum OriginPresence {
     /// condition).
     Absent,
     /// The walk could not get an authoritative answer: a transport error, a
-    /// `{H}.sizeproof` that does not verify, or the walk overran
-    /// `cache.origin_probe_timeout_ms`. Distinct from `Absent` on purpose — a
+    /// permanent fault (an HTTP 403, a symlink escape, an object over its
+    /// cap), a `{H}.sizeproof` that does not verify, an open circuit breaker,
+    /// or the walk overran `cache.origin_probe_timeout_ms`. Distinct from `Absent` on purpose — a
     /// caller that would otherwise sign an authoritative `NotFound` must not
     /// do so on a fault.
     Fault,
@@ -2274,9 +2275,10 @@ impl CacheEngine {
     ///
     /// - ANY origin serving an object that verifies is `Present(size)` — the
     ///   first such answer wins, in chain order;
-    /// - failing that, ANY origin answering `Err(_)` (a transport error), or
-    ///   serving an object that does not parse or verify, or the whole walk
-    ///   overrunning `timeout`, is `Fault`;
+    /// - failing that, ANY origin answering `Err(_)` (a transport error, a
+    ///   permanent fault or an open breaker), or serving an object that does
+    ///   not parse or verify, or the whole walk overrunning `timeout`, is
+    ///   `Fault`;
     /// - only when every configured origin answered `Ok(None)` — or no origin
     ///   is configured at all, a node that genuinely holds nothing — is the
     ///   answer `Absent`. This is deliberately the lowest-precedence outcome:
@@ -2285,6 +2287,11 @@ impl CacheEngine {
     ///
     /// One `timeout` covers the whole chain rather than resetting per origin,
     /// so a chain of slow origins cannot add up past the caller's budget.
+    /// Each read runs once under its origin's circuit breaker, with no retry
+    /// ([`Self::presence_guard`]): a fault fails fast and leaves the time to
+    /// the next origin. Only the first origin's overrun counts against its
+    /// breaker; a later origin had only the time the earlier ones left. A walk
+    /// that overruns keeps the cause an earlier origin gave.
     ///
     /// A `Fault` also says whether it is worth waiting out
     /// ([`ChainProbe::transient`]): `true` when at least one origin failed with
@@ -2298,23 +2305,20 @@ impl CacheEngine {
     ///
     /// Reads no data object and no outboard.
     async fn probe_origin_chain(&self, hash: Hash, timeout: Duration) -> ChainProbe {
-        // A ceiling the origin overran says nothing about whether it would
-        // answer given longer, so treat it as the waitable kind.
-        let overran = || ChainProbe {
-            presence: OriginPresence::Fault,
-            transient: true,
-            cause: Some(format!("the origin chain walk overran {timeout:?}")),
-            proof: None,
-        };
-        // One deadline for the whole chain, handed to each origin's guard, so
-        // an origin that stalls counts against its breaker.
-        let deadline = tokio::time::Instant::now() + timeout;
+        // One deadline for the whole chain. The first origin has the whole
+        // budget, so its overrun counts against its breaker. A later origin
+        // gets only what the earlier ones left, so its overrun does not.
+        let at = tokio::time::Instant::now() + timeout;
         let mut cause = None;
         let mut kept_permanent_cause = false;
         let mut any_transient = false;
         for (ix, origin) in self.inner.origins.iter().enumerate() {
+            let deadline = Deadline {
+                at,
+                charge: ix == 0,
+            };
             let read = self
-                .read_guard(ix)
+                .presence_guard(ix)
                 .run(hash, Some(deadline), || origin.fetch_size_proof(hash))
                 .await;
             let (fault, transient) = match read {
@@ -2336,7 +2340,20 @@ impl CacheEngine {
                 },
                 Ok(None) => continue,
                 Err(ReadFailure::Origin(e)) => (format!("{e:#}"), e.is_transient()),
-                Err(ReadFailure::Deadline) => return overran(),
+                // A ceiling the origin overran says nothing about whether it
+                // would answer given longer, so it is the waitable kind. The
+                // walk ends here, and an earlier origin's cause stands.
+                Err(ReadFailure::Deadline { last }) => {
+                    any_transient = true;
+                    if cause.is_none() {
+                        let last = last.map_or_else(String::new, |e| format!(" ({e})"));
+                        cause = Some(format!(
+                            "{:?} origin: the origin chain walk overran {timeout:?}{last}",
+                            origin.kind()
+                        ));
+                    }
+                    break;
+                }
             };
             tracing::debug!(
                 %hash,
@@ -2417,8 +2434,8 @@ impl CacheEngine {
     /// `Fault` ([`Self::origin_range_wire`]), so a broken publish costs one
     /// refused stream per fault TTL, not one per open.
     ///
-    /// Each origin's read runs under its circuit breaker and the retry
-    /// policy, inside the ceiling.
+    /// Each origin's read runs once under its circuit breaker, inside the
+    /// ceiling. Only the first origin's overrun counts against its breaker.
     pub async fn origin_presence(&self, hash: Hash) -> OriginPresence {
         self.origin_presence_with_proof(hash, false).await
     }
@@ -3956,6 +3973,9 @@ impl CacheEngine {
             CacheError::OriginError { .. } | CacheError::VerifyFailed { .. }
         ) {
             return;
+        }
+        if let Some(m) = &self.inner.metrics {
+            m.origin_range_faults.inc();
         }
         let mut memo = self.probe_memo_lock();
         tracing::warn!(
@@ -5599,6 +5619,18 @@ impl CacheEngine {
         ReadGuard::new(
             self.inner.breakers.get(ix).cloned(),
             self.inner.retry_policy,
+            self.inner.metrics.clone(),
+        )
+    }
+
+    /// The guard of the `{H}.sizeproof` read of the origin at `ix`: its
+    /// circuit breaker with no retry. The presence memo is the retry: a fault
+    /// stands for the fault TTL and the next open reads again. A read that
+    /// fails fast also leaves the walk its time for the next origin.
+    fn presence_guard(&self, ix: usize) -> ReadGuard {
+        ReadGuard::new(
+            self.inner.breakers.get(ix).cloned(),
+            RetryPolicy::disabled(),
             self.inner.metrics.clone(),
         )
     }

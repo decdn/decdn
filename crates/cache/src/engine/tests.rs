@@ -2831,6 +2831,11 @@ struct RangeStubOrigin {
     /// The `{H}.sizeproof` object [`Origin::fetch_size_proof`] serves for
     /// `hash`; `None` answers no object.
     size_proof: Option<Bytes>,
+    /// The window starting at this offset fails once with a transport error,
+    /// then serves.
+    fail_once_at: u64,
+    /// Whether the `fail_once_at` window has failed yet.
+    failed_once: std::sync::atomic::AtomicBool,
 }
 
 impl RangeStubOrigin {
@@ -2853,6 +2858,8 @@ impl RangeStubOrigin {
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
             size_proof: None,
+            fail_once_at: u64::MAX,
+            failed_once: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -2876,6 +2883,8 @@ impl RangeStubOrigin {
             gate_outboard: false,
             range_fetches: Arc::new(AtomicUsize::new(0)),
             size_proof: None,
+            fail_once_at: u64::MAX,
+            failed_once: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -2942,6 +2951,13 @@ impl Origin for RangeStubOrigin {
             req.fetch_start < self.panic_from,
             "stub origin panics on request"
         );
+        if req.fetch_start == self.fail_once_at && !self.failed_once.swap(true, Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(crate::OriginPullError::Transient(anyhow::anyhow!(
+                    "stub range transport blip"
+                )))
+            });
+        }
         if req.fetch_start >= self.fail_from {
             return Box::pin(async {
                 Err(crate::OriginPullError::Transient(anyhow::anyhow!(
@@ -3019,16 +3035,61 @@ fn multi_window_stub() -> (Vec<u8>, Hash, RangeStubOrigin, AlignedRange) {
     (data, hash, origin, aligned)
 }
 
+/// A retry policy with the default budget and no backoff, so a test that
+/// waits out transient faults does not sleep.
+const fn instant_retry() -> RetryPolicy {
+    RetryPolicy {
+        max_retries: 3,
+        initial_backoff_ms: 0,
+        max_backoff_ms: 0,
+        jitter_ratio: 0.0,
+    }
+}
+
 async fn stub_engine(
     origins: Vec<RangeStubOrigin>,
+) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
+    guarded_stub_engine(origins, CircuitBreakerPolicy::default(), None).await
+}
+
+/// [`stub_engine`] under `breaker`, metered to `metrics`.
+async fn guarded_stub_engine(
+    origins: Vec<RangeStubOrigin>,
+    breaker: CircuitBreakerPolicy,
+    metrics: Option<Arc<CacheMetrics>>,
 ) -> anyhow::Result<(CacheEngine, tempfile::TempDir)> {
     let tmp = tempfile::tempdir()?;
     let origins = origins
         .into_iter()
         .map(|o| Arc::new(o) as Arc<dyn Origin>)
         .collect();
-    let engine = CacheEngine::open(tmp.path(), origins, 64).await?;
+    let engine = CacheEngine::open_full(
+        tmp.path(),
+        origins,
+        64,
+        crate::PinnedHashes::empty(),
+        instant_retry(),
+        breaker,
+        metrics,
+        Duration::ZERO,
+    )
+    .await?;
     Ok((engine, tmp))
+}
+
+/// A breaker that trips after one unavailable read and stays open.
+const fn one_strike_breaker() -> CircuitBreakerPolicy {
+    CircuitBreakerPolicy {
+        enabled: true,
+        failure_threshold: 1,
+        cooldown_ms: 600_000,
+        half_open_max_calls: 1,
+    }
+}
+
+/// The state of the breaker of the origin at `ix`.
+fn breaker_state(engine: &CacheEngine, ix: usize) -> Option<crate::circuit_breaker::BreakerState> {
+    engine.inner.breakers.get(ix).map(|b| b.state())
 }
 
 /// A first origin that does not honor `Range` does not shadow a second
@@ -3777,6 +3838,75 @@ async fn a_stuck_window_fetch_times_out() -> anyhow::Result<()> {
         matches!(&fault, Some(CacheError::OriginError { source, .. })
             if source.to_string().contains("budget")),
         "a stuck window must end on a timeout OriginError, got {fault:?}"
+    );
+    Ok(())
+}
+
+/// An outboard read that stalls past its budget is an unavailable origin: it
+/// counts as a range timeout and a range fault and trips the origin's
+/// breaker, so the next draw reads no origin at all.
+#[tokio::test]
+async fn a_stuck_outboard_read_trips_the_breaker() -> anyhow::Result<()> {
+    let (_, hash, serving, aligned) = multi_window_stub();
+    let mut stuck = RangeStubOrigin::serving(hash, &[], serving.outboard.unwrap_or_default());
+    stuck.gate_outboard = true;
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = guarded_stub_engine(
+        vec![stuck],
+        one_strike_breaker(),
+        Some(Arc::clone(&metrics)),
+    )
+    .await?;
+    engine.set_origin_read_budget(Duration::from_millis(50), u64::MAX);
+
+    let first = engine.origin_range_wire(hash, &aligned).await;
+    anyhow::ensure!(
+        matches!(&first, Err(CacheError::OriginError { source, .. })
+            if source.to_string().contains("budget")),
+        "{first:?}"
+    );
+    anyhow::ensure!(metrics.origin_range_timeouts.get() == 1);
+    anyhow::ensure!(metrics.origin_range_faults.get() == 1);
+    anyhow::ensure!(
+        breaker_state(&engine, 0) == Some(crate::circuit_breaker::BreakerState::Open),
+        "a stalled read counts against the breaker"
+    );
+
+    let second = engine.origin_range_wire(hash, &aligned).await;
+    anyhow::ensure!(
+        matches!(&second, Err(CacheError::OriginError { source, .. })
+            if source.to_string().contains("circuit breaker")),
+        "an open breaker short-circuits the next draw: {second:?}"
+    );
+    anyhow::ensure!(
+        metrics.origin_range_timeouts.get() == 1,
+        "the short-circuited draw waits on no read"
+    );
+    Ok(())
+}
+
+/// A window read that fails once with a transport error is retried, and the
+/// wire completes: one blip does not end a paid stream.
+#[tokio::test]
+async fn a_window_that_fails_once_is_retried() -> anyhow::Result<()> {
+    let (_, hash, mut origin, aligned) = multi_window_stub();
+    origin.fail_once_at = crate::RANGE_PULL_WINDOW_BYTES;
+    let fetches = Arc::clone(&origin.range_fetches);
+    let metrics = Arc::new(CacheMetrics::default());
+    let (engine, _tmp) = guarded_stub_engine(
+        vec![origin],
+        CircuitBreakerPolicy::default(),
+        Some(Arc::clone(&metrics)),
+    )
+    .await?;
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
+    let (_, fault) = drain_wire(wire).await;
+    anyhow::ensure!(fault.is_none(), "the retried window serves: {fault:?}");
+    anyhow::ensure!(metrics.origin_range_faults.get() == 0);
+    let windows = aligned.blob_size().div_ceil(crate::RANGE_PULL_WINDOW_BYTES);
+    anyhow::ensure!(
+        fetches.load(Ordering::SeqCst) == usize::try_from(windows)? + 1,
+        "one extra read for the retried window"
     );
     Ok(())
 }

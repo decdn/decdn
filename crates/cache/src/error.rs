@@ -169,9 +169,10 @@ pub enum OriginPullError {
     #[error(transparent)]
     Transient(anyhow::Error),
 
-    /// A failure that won't be cured by retrying: HTTP 4xx (other than 404,
-    /// which each read answers as a missing object, and a 403 on the HTTP
-    /// outboard and data reads, read the same way), an object over its cap
+    /// A failure that won't be cured by retrying: an HTTP 4xx (each read
+    /// answers a 404 as a missing object, and the HTTP outboard and data
+    /// reads answer a 403 as one too), an S3 `AccessDenied` or
+    /// `NoSuchBucket`, an object over its cap
     /// or shorter than the requested span, or a symlink escape, a dangling
     /// symlink or a permission denied on the filesystem origin.
     #[error(transparent)]

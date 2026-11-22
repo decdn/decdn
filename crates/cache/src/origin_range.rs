@@ -34,7 +34,7 @@ use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginKind, OriginRangeFetch, OriginRangeRequest};
 use crate::outboard_cache::OutboardCache;
-use crate::retry::{ReadFailure, ReadGuard};
+use crate::retry::{Deadline, ReadFailure, ReadGuard};
 
 /// The time budget for one origin read of the range-pull path — an outboard
 /// fetch or one data window. A read of `len` bytes gets
@@ -107,24 +107,25 @@ where
     Fut: Future<Output = Result<T, OriginPullError>>,
 {
     let limit = budget.map(|b| b.for_len(len));
-    let deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
+    let deadline = limit.map(Deadline::charged_after);
     match guard.run(hash, deadline, read).await {
         Ok(value) => Ok(value),
         Err(ReadFailure::Origin(e)) => Err(CacheError::OriginError {
             hash,
             source: e.into_inner(),
         }),
-        Err(ReadFailure::Deadline) => {
+        Err(ReadFailure::Deadline { last }) => {
             if let Some(m) = metrics {
                 m.origin_range_timeouts.inc();
             }
             let limit = limit.unwrap_or_default();
+            let last = last.map_or_else(String::new, |e| format!("; the last attempt failed: {e}"));
             Err(CacheError::OriginError {
                 hash,
                 source: anyhow::anyhow!(
                     "origin {what} of {len} bytes took longer than its {limit:?} budget \
                      (cache.node_pull_stall_window_sec plus the size at \
-                     cache.node_pull_min_throughput_bps)"
+                     cache.node_pull_min_throughput_bps){last}"
                 ),
             })
         }

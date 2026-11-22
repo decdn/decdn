@@ -739,8 +739,8 @@ node advertises. A candidate whose size proof is missing is not advertised; one
 whose size proof does not verify is a permanent fault. Run `decdn origin
 import` for the object to write its size proof again. A throttle window or
 transport outage during that pass leaves candidates unresolved. Each read runs
-under the origin's circuit breaker and `cache.origin_retry`, so a single blip
-is retried before it counts as a fault.
+once under the origin's circuit breaker; the rescan does not retry it, and the
+next rescan reads it again.
 
 A retry-eligible fault on a candidate an earlier pass indexed keeps that entry,
 on the bet that the origin comes back. The bet has a cost: while it holds, the
