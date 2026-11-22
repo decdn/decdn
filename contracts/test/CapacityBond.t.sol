@@ -116,6 +116,136 @@ contract CapacityBondTest is Test {
         assertEq(bond.firstBondedAt(operator), first);
     }
 
+    // ── Tenure reset on exit ────────────────────────────────────────────────
+    // `firstBondedAt` measures continuous bonding at or above the floor. An
+    // `unbond` below `bondFloorAtActivation` resets it and the floor to 0, and
+    // the next entry stamps both afresh, so an address cannot be pre-aged by
+    // bonding `minBond` and withdrawing it at once.
+
+    /// @notice A full unbond ends the tenure; the next entry stamps a fresh one.
+    function test_firstBondedAt_fullUnbondResetsAndReentryRestamps() public {
+        vm.warp(1_000_000);
+        vm.startPrank(operator);
+        bond.bond(MIN_BOND);
+        assertEq(bond.firstBondedAt(operator), 1_000_000);
+
+        bond.unbond(MIN_BOND);
+        assertEq(bond.firstBondedAt(operator), 0, "a full unbond ends the tenure");
+        assertEq(bond.bondFloorAtActivation(operator), 0, "and clears the floor");
+
+        vm.warp(5_000_000);
+        bond.bond(MIN_BOND);
+        vm.stopPrank();
+        assertEq(bond.firstBondedAt(operator), 5_000_000, "re-entry stamps a fresh tenure");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "re-entry records the live minBond");
+    }
+
+    /// @notice A partial unbond that leaves the bond exactly at the floor keeps
+    ///         the tenure and the floor; one wei more ends both.
+    function test_firstBondedAt_partialUnbondHoldingFloorKeepsTenure() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(2 * MIN_BOND);
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.unbond(MIN_BOND);
+        assertEq(bond.activeBond(operator), MIN_BOND, "the bond sits exactly at the floor");
+        assertEq(bond.firstBondedAt(operator), 1_000_000, "an unbond that holds the floor keeps the tenure");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "and the floor");
+
+        vm.prank(operator);
+        bond.unbond(1);
+        assertEq(bond.firstBondedAt(operator), 0, "one wei below the floor ends the tenure");
+        assertEq(bond.bondFloorAtActivation(operator), 0, "and clears the floor");
+    }
+
+    /// @notice While a tenure runs, no bond moves its stamp: neither a top-up
+    ///         above the floor nor a top-up through a raised `minBond`, which
+    ///         re-grandfathers the floor only.
+    function test_firstBondedAt_reBondDuringTenureNeverMovesIt() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.bond(10e18);
+        assertEq(bond.firstBondedAt(operator), 1_000_000, "a top-up above the floor keeps the stamp");
+
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
+        vm.warp(3_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND); // 50k + 10 + 50k crosses the raised 100k minBond
+        assertEq(bond.firstBondedAt(operator), 1_000_000, "a top-up through a raised minBond keeps the stamp");
+        assertEq(bond.bondFloorAtActivation(operator), 2 * MIN_BOND, "and re-grandfathers the floor");
+    }
+
+    /// @notice An operator that exits fully and re-enters after a `minBond`
+    ///         raise re-grandfathers at the raised value with a fresh tenure.
+    function test_firstBondedAt_reentryAfterMinBondRaiseRegrandfathers() public {
+        vm.warp(1_000_000);
+        vm.startPrank(operator);
+        bond.bond(MIN_BOND);
+        bond.unbond(MIN_BOND);
+        vm.stopPrank();
+
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.bond(2 * MIN_BOND);
+        assertEq(bond.firstBondedAt(operator), 2_000_000, "re-entry stamps the new tenure");
+        assertEq(bond.bondFloorAtActivation(operator), 2 * MIN_BOND, "re-entry grandfathers the raised minBond");
+    }
+
+    /// @notice An operator whose dip ended its tenure but whose balance still
+    ///         clears a since-lowered `minBond` re-enters with its next bond of
+    ///         any size, at the lowered floor.
+    function test_firstBondedAt_reentryAboveLoweredMinBondStampsOnNextBond() public {
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
+        vm.warp(1_000_000);
+        vm.startPrank(operator);
+        bond.bond(2 * MIN_BOND);
+        bond.unbond(MIN_BOND / 2); // 75k < 100k floor
+        vm.stopPrank();
+        assertEq(bond.firstBondedAt(operator), 0, "setup: the dip ends the tenure");
+
+        vm.prank(admin);
+        bond.setMinBond(MIN_BOND); // 75k now clears the live minBond
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.bond(1);
+        assertEq(bond.firstBondedAt(operator), 2_000_000, "the next bond re-enters");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "at the lowered minBond");
+    }
+
+    /// @notice The pre-aging attack: bond `minBond` and withdraw it at once on
+    ///         many addresses in one block. No address keeps a tenure.
+    function test_firstBondedAt_bondUnbondLoopCannotPreAgeAddresses() public {
+        vm.warp(1_000_000);
+        for (uint256 i = 1; i <= 5; i++) {
+            address sybil = address(uint160(0x5B1100 + i));
+            vm.prank(admin);
+            token.transfer(sybil, MIN_BOND);
+            vm.startPrank(sybil);
+            token.approve(address(bond), type(uint256).max);
+            bond.bond(MIN_BOND);
+            bond.unbond(MIN_BOND);
+            vm.stopPrank();
+        }
+        for (uint256 i = 1; i <= 5; i++) {
+            address sybil = address(uint160(0x5B1100 + i));
+            assertEq(bond.firstBondedAt(sybil), 0, "a bond/unbond round trip leaves no tenure");
+            assertEq(bond.bondFloorAtActivation(sybil), 0, "nor a floor");
+            assertEq(token.balanceOf(sybil), MIN_BOND, "the round trip returns the bond");
+        }
+    }
+
     // ── Blacklist-ejection latch (issue #850) ───────────────────────────────
     // Governance blacklisting (ADR 011) sets `ejected` through `ejectNode`, and
     // `blacklistEjected` latches it so `bond()` can't clear it. `unEjectNode`
@@ -1040,7 +1170,7 @@ contract CapacityBondTest is Test {
 
         assertEq(bond.declaredMbps(opAddr), 0, "the tier is the one thing it clears");
         assertEq(bond.activeBond(opAddr), bonded, "the bond stays put");
-        assertEq(bond.firstBondedAt(opAddr), firstBonded, "firstBondedAt is write-once");
+        assertEq(bond.firstBondedAt(opAddr), firstBonded, "deregistering keeps the tenure");
     }
 
     function test_setK_updatesCurveAndEmits() public {
@@ -1421,6 +1551,7 @@ contract CapacityBondTest is Test {
         bond.bond(60_000e18); // 60k < 100k minBond → no up-crossing, floor stays 0
         vm.stopPrank();
         assertEq(bond.bondFloorAtActivation(opAddr), 0, "bond() below minBond captures no floor");
+        assertEq(bond.firstBondedAt(opAddr), 0, "bond() below minBond starts no tenure");
         assertFalse(bond.isActive(opAddr), "not active: unregistered");
 
         // Governance lowers minBond below the operator's existing bond.
@@ -1434,6 +1565,7 @@ contract CapacityBondTest is Test {
         vm.stopPrank();
 
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registerNode captures live minBond as floor");
+        assertEq(bond.firstBondedAt(opAddr), block.timestamp, "registerNode starts the tenure");
         assertTrue(bond.isActive(opAddr), "active after registration");
 
         // A later raise must not de-activate the grandfathered operator.
@@ -1443,9 +1575,9 @@ contract CapacityBondTest is Test {
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "floor unchanged by later raise");
     }
 
-    /// @notice A floor left by an earlier `bond()` crossing above the live
-    ///         `minBond` is replaced at registration, so an operator that clears
-    ///         the live `minBond` is active once registered.
+    /// @notice A floor left by an earlier `bond()` entry above the live
+    ///         `minBond` is replaced at registration, and the running tenure is
+    ///         kept.
     function test_minBond_registerAfterDecrease_replacesStaleHigherFloor() public {
         vm.prank(admin);
         bond.setMinBond(100_000e18);
@@ -1455,22 +1587,59 @@ contract CapacityBondTest is Test {
         bytes32 nodeId = bytes32(uint256(0xF1009A));
         vm.prank(admin);
         token.transfer(opAddr, 100_000e18);
+        vm.warp(1_000_000);
         vm.startPrank(opAddr);
         token.approve(address(bond), type(uint256).max);
         bond.bond(100_000e18); // crosses the 100k minBond → floor 100k
-        bond.unbond(40_000e18); // 60k active
         vm.stopPrank();
         assertEq(bond.bondFloorAtActivation(opAddr), 100_000e18);
 
         vm.prank(admin);
         bond.setMinBond(50_000e18);
 
+        vm.warp(2_000_000);
         vm.startPrank(opAddr);
         bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
         vm.stopPrank();
 
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
+        assertEq(bond.firstBondedAt(opAddr), 1_000_000, "registration keeps the running tenure");
+        assertTrue(bond.isActive(opAddr), "100k clears the 50k entry floor");
+    }
+
+    /// @notice An unbond below the floor ends the tenure before registration.
+    ///         A balance that clears a since-lowered `minBond` then registers
+    ///         without another `bond()`, and registration starts a fresh tenure.
+    function test_minBond_registerAfterFloorDip_startsFreshTenure() public {
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF1009B;
+        address opAddr = vm.addr(opPk);
+        bytes32 nodeId = bytes32(uint256(0xF1009B));
+        vm.prank(admin);
+        token.transfer(opAddr, 100_000e18);
+        vm.warp(1_000_000);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(100_000e18); // floor 100k, tenure from 1_000_000
+        bond.unbond(40_000e18); // 60k < 100k floor
+        vm.stopPrank();
+        assertEq(bond.bondFloorAtActivation(opAddr), 0, "the dip clears the floor");
+        assertEq(bond.firstBondedAt(opAddr), 0, "the dip ends the tenure");
+
+        vm.prank(admin);
+        bond.setMinBond(50_000e18);
+
+        vm.warp(2_000_000);
+        vm.startPrank(opAddr);
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        vm.stopPrank();
+
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
+        assertEq(bond.firstBondedAt(opAddr), 2_000_000, "registration starts a fresh tenure");
         assertTrue(bond.isActive(opAddr), "60k clears the 50k entry floor");
     }
 
@@ -1521,6 +1690,38 @@ contract CapacityBondTest is Test {
         bond.unbond(15_000e18);
         assertEq(bond.activeBond(opAddr), 45_000e18);
         assertFalse(bond.isActive(opAddr)); // 45k < 50k floor: own action de-activates
+        assertEq(bond.firstBondedAt(opAddr), 0); // and ends the tenure
+        assertEq(bond.bondFloorAtActivation(opAddr), 0); // and the grandfathered floor
+    }
+
+    /// @notice A registered operator whose dip ended its tenure forfeits its
+    ///         grandfathered floor: after a `minBond` raise, bonding back to
+    ///         the old floor does not re-activate it, and reaching the raised
+    ///         `minBond` re-enters it with a fresh tenure.
+    function test_minBond_dipForfeitsGrandfatheredFloor() public {
+        vm.warp(1_000_000);
+        address opAddr = _bondAndRegister(0xF10025, MIN_BOND); // floor 50k
+        vm.prank(admin);
+        token.transfer(opAddr, 2 * MIN_BOND);
+
+        vm.prank(opAddr);
+        bond.unbond(10_000e18); // 40k < 50k floor
+        assertFalse(bond.isActive(opAddr), "the dip de-activates");
+
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
+
+        vm.prank(opAddr);
+        bond.bond(10_000e18); // back to the old 50k floor, below the 100k minBond
+        assertFalse(bond.isActive(opAddr), "the old floor no longer applies");
+        assertEq(bond.firstBondedAt(opAddr), 0, "no entry below the live minBond");
+
+        vm.warp(2_000_000);
+        vm.prank(opAddr);
+        bond.bond(MIN_BOND); // 100k reaches the raised minBond
+        assertTrue(bond.isActive(opAddr), "re-entry at the live minBond re-activates");
+        assertEq(bond.firstBondedAt(opAddr), 2_000_000, "with a fresh tenure");
+        assertEq(bond.bondFloorAtActivation(opAddr), 2 * MIN_BOND, "at the raised floor");
     }
 
     function test_updateMultiaddrs_revertsWhenNodeNotActive() public {

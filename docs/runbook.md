@@ -90,9 +90,9 @@ boot chain reads retry. The RPC preflight's own retries show only in its
   event logs. A dead governance-chain endpoint stops every refresh on that
   chain at once: `decdn_blacklist_watcher_last_tick_timestamp_seconds` and
   `decdn_capacity_bond_registry_last_resync_timestamp_seconds` stop advancing,
-  and `decdn_blacklist_ledger_poll_failures_total`,
-  and `decdn_capacity_bond_registry_resync_failures_total` rise together.
-  Several rising together points at the RPC endpoint rather than at any one
+  and `decdn_blacklist_ledger_poll_failures_total` and
+  `decdn_capacity_bond_registry_resync_failures_total` rise together.
+  Both rising together points at the RPC endpoint rather than at any one
   loop. A stale blacklist timestamp matters most: the node may serve a hash
   blacklisted since its last poll; see
   [ContentBlacklist compliance](#contentblacklist-compliance). Each failed

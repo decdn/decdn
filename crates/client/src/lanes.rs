@@ -457,7 +457,7 @@ pub(crate) struct FaceLaneHandle {
     pub(crate) signer: Address,
     pub(crate) prior_amount: U256,
     pub(crate) ledger: Arc<PoolLedger>,
-    /// The lane's buyer context, read to annotate an unbound cache miss.
+    /// The lane's buyer context, read to annotate an underfunded cache miss.
     pub(crate) ctx: Arc<Mutex<PoolContext>>,
 }
 

@@ -9,11 +9,14 @@ pragma solidity 0.8.28;
 ///         declares only the cross-contract read entrypoints other contracts in
 ///         the system need to know about.
 interface ICapacityBond {
-    /// @notice Timestamp at which the operator's `activeBond` first reached
-    ///         `minBond` — set by the first `bond()` call that crosses it.
-    ///         Never overwritten by subsequent re-bonds. Source of the
-    ///         `age_ramp` numerator on `DecdnGovernor` per ADR 036 § Formula.
-    ///         Returns 0 if the operator has never reached `minBond`.
+    /// @notice Start of the operator's current tenure: the timestamp of the
+    ///         entry transition (the `bond()` call that lifts `activeBond` to
+    ///         the live `minBond`, or `registerNode`) that began its current run
+    ///         of bonding at or above its floor (`bondFloorAtActivation`).
+    ///         Later bonds keep it. An `unbond()` that leaves the bond below the
+    ///         floor resets it to 0, and the next entry stamps a fresh value.
+    ///         Source of the `age_ramp` numerator on `DecdnGovernor` per ADR 036
+    ///         § Formula. Returns 0 while the operator holds no tenure.
     function firstBondedAt(address operator) external view returns (uint64);
 
     /// @notice `declaredMbps` in effect at the END of `epoch`

@@ -184,6 +184,10 @@ fn deregister_disclosure_prints_the_tier_to_carry_forward() {
         s.contains("NOT returned"),
         "the bond does not move here: {s}"
     );
+    assert!(
+        s.contains("clears this address's firstBondedAt (1700000000)"),
+        "the tenure loss is disclosed at the first confirmation: {s}"
+    );
 }
 
 /// The node id changing is the surprise of this path, and the workaround is
@@ -214,7 +218,8 @@ fn only_the_costly_phases_prompt() {
 
     assert!(
         !Phase::Unbond {
-            amount: U256::from(1u64)
+            amount: U256::from(1u64),
+            clear_tier: Some(5_000),
         }
         .needs_confirmation()
     );
@@ -235,6 +240,7 @@ fn json_carries_the_phase_and_every_tx_slot() {
     let s = rendered(
         &plan(Phase::Unbond {
             amount: U256::from(50_000u64),
+            clear_tier: None,
         }),
         true,
         &outcome,
@@ -276,6 +282,7 @@ fn dry_run_is_distinguishable_from_a_failed_send() {
     let dry = rendered(
         &plan(Phase::Unbond {
             amount: U256::from(1u64),
+            clear_tier: None,
         }),
         false,
         &Outcome::default(),
@@ -285,10 +292,125 @@ fn dry_run_is_distinguishable_from_a_failed_send() {
     let failed = rendered(
         &plan(Phase::Unbond {
             amount: U256::from(1u64),
+            clear_tier: None,
         }),
         false,
         &Outcome::default(),
         false,
     );
     assert!(failed.contains("submitted=false dry_run=false"), "{failed}");
+}
+
+/// `rotate-key --key eth` with no optional flags, for driving [`select_phase`].
+fn eth_args() -> cli::RotateKeyArgs {
+    cli::RotateKeyArgs {
+        key: cli::RotateKeyTarget::Eth,
+        bind_existing: false,
+        new_keystore: None,
+        mbps: None,
+        region: None,
+        multiaddrs: Vec::new(),
+        accept_terms: false,
+        yes: false,
+        chain: cli::ChainArgs {
+            common: cli::CommonChainArgs {
+                config: None,
+                rpc_url: None,
+                chain_id: None,
+                keystore: None,
+                data_dir: None,
+                keystore_password_file: None,
+                dry_run: false,
+                json: false,
+            },
+            capacity_bond_address: None,
+        },
+    }
+}
+
+/// Run [`select_phase`] against a provider with no queued responses, so any
+/// chain read the selection makes fails the test: the deregister and unbond
+/// phases decide from the registry reads `build_plan` already made.
+async fn phase_for(active: bool, active_bond: u64, declared_mbps: u64) -> Phase {
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+
+    let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+    let bond_contract = CapacityBond::new(Address::repeat_byte(0xCB), provider);
+    select_phase(
+        &bond_contract,
+        PhaseInputs {
+            old_operator: Address::repeat_byte(0x0E),
+            active,
+            active_bond: U256::from(active_bond),
+            declared_mbps,
+            region_hint: "DE".to_string(),
+            packed_multiaddrs: Vec::new(),
+        },
+        &eth_args(),
+    )
+    .await
+    .expect("the phase is decidable from the registry reads alone")
+}
+
+/// An operator out of the active set without `deregisterNode` (ejected, or
+/// displaced by `reclaimNodeId`) still has a declared tier, and `unbond` of
+/// the whole bond reverts `BondBelowCurve` against it. The unbond phase must
+/// clear that tier first, and name it, since nothing can read it back later.
+#[tokio::test]
+async fn an_inactive_operator_with_a_tier_clears_it_before_unbonding() {
+    assert_eq!(
+        phase_for(false, 50_000, 5_000).await,
+        Phase::Unbond {
+            amount: U256::from(50_000u64),
+            clear_tier: Some(5_000),
+        }
+    );
+}
+
+/// The convergence case: a run that landed `declareMbps(0)` and lost the
+/// `unbond` re-reads a zero tier, so the re-run only withdraws. A deregistered
+/// operator reaches the same phase, since `deregisterNode` clears the tier.
+#[tokio::test]
+async fn a_cleared_tier_only_unbonds() {
+    assert_eq!(
+        phase_for(false, 50_000, 0).await,
+        Phase::Unbond {
+            amount: U256::from(50_000u64),
+            clear_tier: None,
+        }
+    );
+}
+
+/// An active operator deregisters, whatever its tier: `declareMbps(0)` is
+/// refused from a registered operator.
+#[tokio::test]
+async fn an_active_operator_deregisters_first() {
+    assert_eq!(
+        phase_for(true, 50_000, 5_000).await,
+        Phase::Deregister {
+            declared_mbps: 5_000
+        }
+    );
+}
+
+/// The cleared tier is the one input the re-onboarding phase cannot read
+/// back, so the unbond receipt carries it in both output shapes.
+#[test]
+fn the_unbond_receipt_names_the_cleared_tier() {
+    let p = plan(Phase::Unbond {
+        amount: U256::from(50_000u64),
+        clear_tier: Some(5_000),
+    });
+    let text = rendered(&p, false, &Outcome::default(), false);
+    assert!(text.contains("clear_tier_mbps=5000"), "{text}");
+    let json = rendered(&p, true, &Outcome::default(), false);
+    let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(
+        v.get("clear_tier_mbps").and_then(serde_json::Value::as_u64),
+        Some(5_000)
+    );
+
+    let none = rendered(&plan(reonboard_phase()), false, &Outcome::default(), false);
+    assert!(none.contains("clear_tier_mbps=none"), "{none}");
 }

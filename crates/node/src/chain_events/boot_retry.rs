@@ -1,9 +1,11 @@
 //! In-process retry for the boot-time chain reads (#2159).
 //!
-//! `build_chain_and_handlers` runs three fail-closed chain bootstraps in
-//! sequence: the `CapacityBond` registry snapshot, the `PaymentPool` `usdc()`
-//! self-check and the `ContentBlacklist`
-//! deny-set enumeration with its enforcement pass. Each one must succeed before
+//! `build_chain_and_handlers` runs four fail-closed chain bootstraps in
+//! sequence (three when no `origin_assignment_address` is set): the
+//! `CapacityBond` registry snapshot, the `OriginAssignment` seat snapshot
+//! (`origin_seat_watcher::bootstrap`), the `PaymentPool` `usdc()` self-check
+//! and the `ContentBlacklist` deny-set enumeration with its enforcement pass.
+//! Each one must succeed before
 //! the node serves, and a boot is only as likely to succeed as the product of
 //! its reads. A single transient provider error therefore must not end the
 //! process: each bootstrap retries its read phase through `BootRetry::run` and

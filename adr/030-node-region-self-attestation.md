@@ -77,7 +77,7 @@ Backstops for the pre-positioned case are deliberately off-protocol: (a) declare
 - No new external trust root and no new external dependency.
 - Reactive blacklist-scope flipping becomes a protocol invariant rather than an unmitigated gap.
 - Operator UX unchanged for honest deployments — VPN, anycast, mobile, and multi-region operators are not penalized by an IP-geolocation gate that would systematically misclassify them.
-- Compatible with the existing on-chain surface: `updateRegion` follows the `updateMultiaddrs` shape ([ADR 019 § NAT and Multiaddr Handling](019-node-onboarding.md#nat-and-multiaddr-handling)), and `regionLastChanged` adopts the timestamp-field shape of `firstBondedAt` ([ADR 019 § Re-Onboarding after Deregistration or Ejection](019-node-onboarding.md#re-onboarding-after-deregistration-or-ejection)) — written at registration like `firstBondedAt`, then restamped on every successful `updateRegion` rather than staying write-once.
+- Compatible with the existing on-chain surface: `updateRegion` follows the `updateMultiaddrs` shape ([ADR 019 § NAT and Multiaddr Handling](019-node-onboarding.md#nat-and-multiaddr-handling)), and `regionLastChanged` adopts the timestamp-field shape of `registeredAt` ([ADR 003 § Data Structure](003-payments.md#data-structure)). `registerNode` writes it like `registeredAt`, and every successful `updateRegion` restamps it.
 
 ### Negative
 

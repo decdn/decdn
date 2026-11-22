@@ -991,12 +991,8 @@ where
 /// the request comes from the lane's signer and reactively pull a cache-missed
 /// blob for it.
 ///
-/// The bind domain's verifying contract is the `CapacityBond`; without one
-/// configured we can't sign, so the request goes out unbound and the node serves
-/// only content it already holds (a cache miss is refused). No warning is
-/// emitted for that — it would fire on every successful cached fetch too,
-/// training users to ignore it; the caller explains the refusal at the point
-/// of failure.
+/// The binding signs under the governance chain's `CapacityBond` EIP-712
+/// domain ([`capacity_bond_domain`]), which every [`GovernanceChain`] names.
 async fn build_pool_ctx<P>(
     deps: &LaneDeps<'_, P>,
     payer: &OwnedPayer,

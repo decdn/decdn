@@ -330,13 +330,13 @@ graph TD
     TL["3. TimelockController"]
     ED["4. Ed25519Verifier"]
     CBOND["5. CapacityBond"]
-    BB["7. BuybackBurner (optional)"]
-    FR["8. FeeRouter"]
-    PR["10. PublisherRegistry"]
-    MVP["11. ManualVettingPolicy"]
-    OA["12. OriginAssignment"]
-    CB["13. ContentBlacklist"]
-    GOV["15. DecdnGovernor"]
+    BB["6. BuybackBurnerUniswapV3 (optional)"]
+    FR["7. FeeRouter"]
+    PR["9. PublisherRegistry"]
+    MVP["10. ManualVettingPolicy"]
+    OA["11. OriginAssignment"]
+    CB["12. ContentBlacklist"]
+    GOV["13. DecdnGovernor"]
 
     CBOND --> TOKEN
     CBOND --> ED

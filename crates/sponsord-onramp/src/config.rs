@@ -39,8 +39,11 @@ pub struct ReleasePin {
 /// without `-o` so that it picks the destination and keeps its overwrite and
 /// hidden-path guards, which an explicit `-o` turns off. v0.3.0 is the oldest
 /// `decdn get` that both picks the destination without `-o` and refuses a
-/// hidden (`.`-prefixed) path on such a pull (GHSA-rff9-95mx-xpw9).
-pub const MIN_DECDN_RELEASE: (u64, u64, u64) = (0, 3, 0);
+/// hidden (`.`-prefixed) path on such a pull (GHSA-rff9-95mx-xpw9). v0.4.0 is
+/// the oldest `decdn get` that verifies node answers under the `CapacityBond`
+/// EIP-712 domain. An older one verifies them under the `SlashJudge` domain and
+/// needs `--slash-judge-address`, which the installers no longer pass.
+pub const MIN_DECDN_RELEASE: (u64, u64, u64) = (0, 4, 0);
 
 impl ReleasePin {
     /// All three values are interpolated into the POSIX and PowerShell

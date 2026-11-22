@@ -456,8 +456,8 @@ pub struct PoolContext {
     /// `ext` so the serving node can recover the signing address, tie the
     /// request to the `(pool, signer, provider)` lane its vouchers pay on
     /// (`pull_authorized`), and reactively populate from its configured origin
-    /// (#1115). `None` ⇒ no binding is sent (an unconfigured
-    /// `capacity_bond` on the client, or an on-chain/registered requester).
+    /// (#1115). `None` ⇒ no binding is sent (an on-chain/registered
+    /// requester).
     pub client_binding: Option<ClientBinding>,
     /// Optional pool owner capability delegating spend to `client_signer`
     /// (ADR 003 §Capability delegation, `buyer_pool::self_owned_lane_ctx` /
@@ -1230,6 +1230,26 @@ impl UpstreamRefused {
             kind: Kind::MidStream {
                 error,
                 at_admission: false,
+            },
+        }
+    }
+
+    /// Build the open-stage refusal a node signs, from a signed `response` with
+    /// `body.ok == false` and the wire `error` its trailing extension carries,
+    /// for a test of code that reads [`Self::evidence`].
+    ///
+    /// Test-only: production builds an open-stage refusal through the
+    /// crate-private `open`, after `verify_response` has checked the signature.
+    /// This constructor checks nothing, so it stays behind `test-util`.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn open_for_test(response: StreamResponse, error: StreamError) -> Self {
+        Self {
+            kind: Kind::Open {
+                error,
+                response: Box::new(response),
+                accepted_pools: None,
             },
         }
     }

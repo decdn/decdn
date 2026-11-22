@@ -15,11 +15,15 @@
 //! clients resolve a serving node to its operator through the binding
 //! (`CapacityBond.nodeIdToAddress`), so a node serving under any other key gets
 //! no routed traffic and no client accepts its signed responses. The node looks
-//! healthy while it earns nothing. No ordering of steps here may produce that
-//! state even transiently, which is
-//! what fixes the sequencing in both submodules — the iroh path commits
-//! `node.secret` only after the bind confirms, and the eth path reads chain
-//! state to pick its phase instead of trusting a flag about what already ran.
+//! healthy while it earns nothing. A key change always passes through that
+//! state between the chain write and the next daemon restart, which is why the
+//! runbook drains and stops the node first. What the order of steps decides is
+//! what a FAILED run leaves behind. Both submodules commit a key only once the
+//! chain confirms it, so a lost or reverted transaction never leaves the daemon
+//! on a key the chain has never seen, and a retry converges: the iroh path
+//! commits `node.secret` only after the `NodeIdBound` receipt, and the eth path
+//! reads chain state to pick its phase instead of trusting a flag about what
+//! already ran.
 //!
 //! Neither path restarts the daemon. The iroh key is not hot-reloadable
 //! (`crates/node/src/runtime/reload.rs` covers `observability.log_level`,

@@ -603,6 +603,11 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
         "every base unit came back to the OLD address"
     );
     assert_eq!(chain.active_bond(old_operator).await?, U256::ZERO);
+    assert_eq!(
+        chain.first_bonded_at(old_operator).await?,
+        0,
+        "a full unbond ends the old address's tenure"
+    );
 
     // ---- 3. Re-onboard on the new address. It needs its own TOKEN — the
     // command checks the balance but never moves funds between the operator's
@@ -665,8 +670,9 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
          why carrying it across needs a `--key iroh` rebind on the old address first"
     );
 
-    // And a reset age-ramp anchor: `firstBondedAt` is per-address and write-once,
-    // so a new address necessarily starts over.
+    // And a reset age-ramp anchor: `firstBondedAt` is per-address, the full
+    // unbond cleared the old address's value, and the new address starts its
+    // own at this bond.
     let first_bonded_after = chain.first_bonded_at(new_operator).await?;
     assert!(
         first_bonded_after > first_bonded_before,

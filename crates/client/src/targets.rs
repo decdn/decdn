@@ -80,8 +80,9 @@ pub(crate) struct Dropouts {
 /// refusals do not end the command that way: any node can send the unsigned
 /// code at will, and a refusing node's own clock may be the wrong one. They
 /// still put the clock hint in the ordinary error's text. When any answer was
-/// unverifiable the cause is almost always local configuration rather than
-/// missing content, so that case gets its own message too. Otherwise the
+/// unverifiable the cause is almost always local configuration or a release
+/// that signs under a different EIP-712 domain, rather than missing content, so
+/// that case gets its own message too. Otherwise the
 /// parenthetical accounts for each of the other counts separately. Reached
 /// only when there is neither a cache holder nor a reachable non-holder to
 /// pull through — a `NotFound` answer is a serve target, not a failure, so it
@@ -110,7 +111,9 @@ pub(crate) fn no_serve_target_error(d: Dropouts) -> anyhow::Error {
              registered under, or their coverage disagreed with the signed answer. That is \
              usually local configuration rather than missing content: check that \
              blockchain.capacity_bond_address and blockchain.chain_id match the deployment \
-             these nodes registered against"
+             these nodes registered against. Version skew is the other cause: the nodes may \
+             run a decdn release that signs under a different EIP-712 domain than this one \
+             verifies, so check that this client and the nodes run compatible releases"
         )));
     }
     // With no unverifiable candidate, every candidate that neither stayed silent

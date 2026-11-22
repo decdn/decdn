@@ -92,7 +92,7 @@ This single transaction atomically:
 
 - Requires `termsHash == currentTermsHash` and verifies the EIP-712 `bindingSignature` over `RegisterNode(nodeId, bindingNonce[ethAddress], termsHash)`, establishing the `nodeId → ethAddress` mapping for response attribution and payment attribution and recording the operator's terms acceptance ([§ Operator Safety Obligations](#operator-safety-obligations)).
 - Verifies the `ed25519Signature` over `keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId]))`, proving the operator controls the iroh private key (prevents NodeId squatting). (`ethAddress` is `msg.sender` and `chainId` is `block.chainid` on-chain; this ADR uses operator-perspective names for consistency with the signing pseudo-code below.)
-- Records `NodeInfo` (including `firstBondedAt` if this is the node's first-ever registration — the immutable anchor of the operator's `age_ramp` governance weight per [ADR 026 § Governance](026-tokenomics.md#governance)).
+- Records `NodeInfo` and the live `minBond` as `bondFloorAtActivation`. `firstBondedAt` anchors the operator's `age_ramp` governance weight ([ADR 026 § Governance](026-tokenomics.md#governance)). The Step 2.2 `bond()` that crossed `minBond` usually set it already. If no tenure runs, `registerNode` stamps it ([ADR 036 § Behaviors that follow from the formula](036-served-bytes-voting-weight.md#behaviors-that-follow-from-the-formula)).
 - Sets `active = true` in the registry.
 - Emits `TermsAccepted(nodeId, termsHash, timestamp)`.
 
@@ -139,16 +139,23 @@ If the read fails, the node retries it as [Boot-time chain reads](#boot-time-cha
 
 #### Boot-time chain reads
 
-Three boot reads must succeed before the node serves: the registry snapshot (Step 3.2), the `PaymentPool.usdc()` self-check, and the blacklist enumeration with its enforcement pass (Step 3.1). The registry and blacklist reads target the governance chain. The `PaymentPool.usdc()` read targets the payment chain.
+Four boot reads must succeed before the node serves. When `blockchain.origin_assignment_address` is not set, there are three. The reads are:
+
+1. The registry snapshot (Step 3.2).
+2. The origin-seat snapshot of `OriginAssignment`, only when `blockchain.origin_assignment_address` is set.
+3. The `PaymentPool.usdc()` self-check.
+4. The blacklist enumeration with its enforcement pass (Step 3.1).
+
+The registry, origin-seat and blacklist reads target the governance chain. The `PaymentPool.usdc()` read targets the payment chain.
 
 - A transient RPC failure does not stop the node. The node retries the read with exponential backoff. The backoff starts at 1 s and doubles on each retry. It does not increase above 60 s.
-- One boot deadline applies to all three reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
+- One boot deadline applies to all of these reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
 - A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429 that has no `Retry-After` header.
 - A retry delays readiness. It does not open the node to connections: Step 3.1 still gates them.
 - The registry and origin-seat snapshots read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
 - The blacklist enumeration reads at the `safe` block ([ADR 011 § Enumerating the deny-set](011-content-takedown.md#enumerating-the-deny-set)).
 
-The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. This limit keeps time for the three reads that come after it. When it fails, the node does not stop. It holds no operator share and makes no upstream purchase until a later read of `operatorBps` succeeds ([ADR 041](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)).
+The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. It runs after the registry and origin-seat snapshots. This limit keeps time for the `usdc()` and blacklist reads that come after it. When it fails, the node does not stop. It holds no operator share and makes no upstream purchase until a later read of `operatorBps` succeeds ([ADR 041](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)).
 
 #### Chain state reads
 
@@ -251,7 +258,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 A node that voluntarily deregistered or was ejected by governance ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) must re-onboard. The flow is identical to initial onboarding with three differences:
 
-1. **`firstBondedAt` is preserved.** The `firstBondedAt` field in `CapacityBond` is immutable once set. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) therefore resumes from the original bonded date, so a re-onboarding operator does not restart the age-ramp clock.
+1. **`firstBondedAt` is preserved while the bond stays.** Deregistration and ejection do not move the bond, so they do not touch `firstBondedAt`. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) therefore resumes from the original bonded date. A full exit is different. An `unbond` that leaves the active bond below `bondFloorAtActivation` clears `firstBondedAt`, and the next `bond()` that crosses `minBond` restarts the age-ramp clock ([ADR 036 § Behaviors that follow from the formula](036-served-bytes-voting-weight.md#behaviors-that-follow-from-the-formula)).
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
 
