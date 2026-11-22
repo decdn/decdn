@@ -246,12 +246,15 @@ pub decdn_protocol::dht::FindValueResponse::hash: decdn_protocol::identity::Cont
 pub decdn_protocol::dht::FindValueResponse::providers: alloc::vec::Vec<decdn_protocol::dht::Provider>
 pub struct decdn_protocol::dht::FindValueResponseExt
 pub struct decdn_protocol::dht::OriginAttestation
-pub decdn_protocol::dht::OriginAttestation::rate_per_mb: u64
-pub decdn_protocol::dht::OriginAttestation::slash_sig: alloc::vec::Vec<u8>
+pub decdn_protocol::dht::OriginAttestation::namespace_id: [u8; 32]
+pub decdn_protocol::dht::OriginAttestation::sig: alloc::vec::Vec<u8>
 pub decdn_protocol::dht::OriginAttestation::timestamp_us: u64
+pub decdn_protocol::dht::OriginAttestation::ttl_sec: u32
 impl decdn_protocol::dht::OriginAttestation
-pub fn decdn_protocol::dht::OriginAttestation::from_response(&decdn_protocol::client::StreamResponse) -> core::option::Option<Self>
-pub const fn decdn_protocol::dht::OriginAttestation::signed_body(&self, [u8; 32]) -> decdn_protocol::client::StreamResponseBody
+pub const fn decdn_protocol::dht::OriginAttestation::expires_at_us(&self) -> u64
+pub const fn decdn_protocol::dht::OriginAttestation::half_life_at_us(&self) -> u64
+pub const fn decdn_protocol::dht::OriginAttestation::is_live_at(&self, u64) -> bool
+pub const fn decdn_protocol::dht::OriginAttestation::ttl_in_bounds(&self) -> bool
 pub struct decdn_protocol::dht::Provider
 pub decdn_protocol::dht::Provider::attestation: decdn_protocol::dht::OriginAttestation
 pub decdn_protocol::dht::Provider::coverage: decdn_protocol::coverage::Coverage
@@ -265,10 +268,14 @@ pub decdn_protocol::dht::StoreRequest::coverage: decdn_protocol::coverage::Cover
 pub decdn_protocol::dht::StoreRequest::hash: decdn_protocol::identity::ContentHash
 pub decdn_protocol::dht::StoreRequest::holder: decdn_protocol::identity::NodeId
 pub struct decdn_protocol::dht::StoreRequestExt
+pub const decdn_protocol::dht::DEFAULT_ATTESTATION_TTL_SEC: u32
+pub const decdn_protocol::dht::MAX_ATTESTATION_FUTURE_SKEW_US: u64
+pub const decdn_protocol::dht::MAX_ATTESTATION_TTL_SEC: u32
 pub const decdn_protocol::dht::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::dht::MAX_CLOSER_NODES: usize
 pub const decdn_protocol::dht::MAX_DHT_FRAME: u32
 pub const decdn_protocol::dht::MAX_PROVIDERS_PER_HASH: usize
+pub const decdn_protocol::dht::MIN_ATTESTATION_TTL_SEC: u32
 pub fn decdn_protocol::dht::encode_find_value_response(&decdn_protocol::dht::FindValueResponse, core::option::Option<&decdn_protocol::dht::FindValueResponseExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::dht::encode_store_request(&decdn_protocol::dht::StoreRequest, core::option::Option<&decdn_protocol::dht::StoreRequestExt>) -> core::result::Result<alloc::vec::Vec<u8>, postcard::error::Error>
 pub fn decdn_protocol::dht::parse_find_value_response_ext(&[u8]) -> core::result::Result<decdn_protocol::dht::FindValueResponseExt, postcard::error::Error>
@@ -598,12 +605,15 @@ pub fn [u8; 32]::from(decdn_protocol::identity::NodeId) -> Self
 impl core::fmt::Display for decdn_protocol::identity::NodeId
 pub fn decdn_protocol::identity::NodeId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_protocol::OriginAttestation
-pub decdn_protocol::OriginAttestation::rate_per_mb: u64
-pub decdn_protocol::OriginAttestation::slash_sig: alloc::vec::Vec<u8>
+pub decdn_protocol::OriginAttestation::namespace_id: [u8; 32]
+pub decdn_protocol::OriginAttestation::sig: alloc::vec::Vec<u8>
 pub decdn_protocol::OriginAttestation::timestamp_us: u64
+pub decdn_protocol::OriginAttestation::ttl_sec: u32
 impl decdn_protocol::dht::OriginAttestation
-pub fn decdn_protocol::dht::OriginAttestation::from_response(&decdn_protocol::client::StreamResponse) -> core::option::Option<Self>
-pub const fn decdn_protocol::dht::OriginAttestation::signed_body(&self, [u8; 32]) -> decdn_protocol::client::StreamResponseBody
+pub const fn decdn_protocol::dht::OriginAttestation::expires_at_us(&self) -> u64
+pub const fn decdn_protocol::dht::OriginAttestation::half_life_at_us(&self) -> u64
+pub const fn decdn_protocol::dht::OriginAttestation::is_live_at(&self, u64) -> bool
+pub const fn decdn_protocol::dht::OriginAttestation::ttl_in_bounds(&self) -> bool
 pub struct decdn_protocol::PoolAccount
 impl decdn_protocol::pool_account::PoolAccount
 pub fn decdn_protocol::pool_account::PoolAccount::address(&self) -> &str
@@ -720,9 +730,12 @@ pub const decdn_protocol::APP_ERR_RATE_LIMITED: u32
 pub const decdn_protocol::APP_ERR_TIMESTAMP_SKEW: u32
 pub const decdn_protocol::BINDING_SIG_LEN: usize
 pub const decdn_protocol::CHUNK_BYTES: u64
+pub const decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC: u32
 pub const decdn_protocol::DISCOVERY_BLOCK_BYTES: u64
 pub const decdn_protocol::EMPTY_ROOT: [u8; 32]
 pub const decdn_protocol::ID_LEN: usize
+pub const decdn_protocol::MAX_ATTESTATION_FUTURE_SKEW_US: u64
+pub const decdn_protocol::MAX_ATTESTATION_TTL_SEC: u32
 pub const decdn_protocol::MAX_BATCH_STORE_HASHES: usize
 pub const decdn_protocol::MAX_CHAIN_ID_LEN: usize
 pub const decdn_protocol::MAX_CHAIN_LENGTH: u8
@@ -737,6 +750,7 @@ pub const decdn_protocol::MAX_RATE_PER_MB: u64
 pub const decdn_protocol::MAX_SIZE_PROOF_BYTES: usize
 pub const decdn_protocol::MAX_STREAM_RESPONSE_FRAME: u32
 pub const decdn_protocol::MB_BYTES: u64
+pub const decdn_protocol::MIN_ATTESTATION_TTL_SEC: u32
 pub const decdn_protocol::SLASH_SIG_LEN: usize
 pub const decdn_protocol::VOUCHER_SIG_LEN: usize
 pub trait decdn_protocol::TopLevelEnum

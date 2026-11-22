@@ -374,6 +374,7 @@ fn insert_record(records: &Mutex<RecordStore>, hash: [u8; 32], holder: [u8; 32])
         Coverage::full(1),
         attested(hash),
         receive_us,
+        |_, _| true,
     );
     assert_matches!(
         outcome,

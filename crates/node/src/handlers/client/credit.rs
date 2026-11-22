@@ -69,6 +69,12 @@ impl ClientHandler {
     ///   mid-stream stops delivery at the next frame (ADR 011 § On Blacklist
     ///   Event). It resets the stream, and a client that resumes gets the signed
     ///   refusal from the open-time gate.
+    /// - The attestation check runs before every frame too. A node serves a
+    ///   hash only while it holds a live origin attestation for it (ADR 005
+    ///   § Serving rule), so a delivery stops at the next frame once the
+    ///   attestation expires with no fresher one kept, or its signer loses its
+    ///   seat or lands on the origin deny-set. It resets the stream the same
+    ///   way.
     /// - The pool re-check and the signer re-check run on a wall-clock cadence,
     ///   not on every frame. The pool view refreshes only as the node folds
     ///   on-chain redemptions, so reading it faster returns the same value. Each
@@ -88,6 +94,10 @@ impl ClientHandler {
         if self.takedown_landed(hash, guards.funder) {
             Self::terminate_for_takedown(send, recv, hash);
             return Ok(Some(ServeStop::Takedown));
+        }
+        if !self.attested_now(hash) {
+            Self::terminate_unattested(send, recv, hash);
+            return Ok(Some(ServeStop::Unattested));
         }
         if guards.last_pool_check.elapsed() < guards.interval {
             return Ok(None);

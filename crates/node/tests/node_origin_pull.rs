@@ -3592,7 +3592,7 @@ fn signed_response(
     let ext = match error {
         None => StreamResponseExt::served(
             support::size_proof_for(req.hash, total_bytes),
-            None,
+            Some(test_support::attest(req.hash)),
             decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes)),
         ),
         Some(error) => StreamResponseExt::refused(error, decdn_protocol::Coverage::empty()),
@@ -15254,6 +15254,7 @@ async fn spawn_dht_record_server(
                 signer: test_support::ORIGIN.address(),
             },
             receive_us,
+            |_, _| true,
         );
     anyhow::ensure!(
         matches!(outcome, InsertOutcome::Inserted),

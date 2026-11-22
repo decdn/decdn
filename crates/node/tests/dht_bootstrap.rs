@@ -426,6 +426,40 @@ async fn client_store_with_an_unverified_attestation_is_refused() -> anyhow::Res
     Ok(())
 }
 
+/// ADR 022 § Origin Attestation: a correctly signed attestation that has
+/// expired is refused at STORE, so a holder cannot advertise content whose
+/// origin stopped attesting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_store_with_an_expired_attestation_is_refused() -> anyhow::Result<()> {
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let server = spin_up_server(HashSet::from([*client_id.as_bytes()])).await?;
+
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
+    let hash = [0x7Au8; 32];
+    // Signed by the seated origin for this hash, a full lifetime ago.
+    let lifetime_us = u64::from(decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC) * 1_000_000;
+    let now_us = decdn_node::handlers::timestamp_skew::now_us();
+    let expired = test_support::attest_at(hash, now_us.saturating_sub(lifetime_us + 1_000_000));
+    let ack = client::store(
+        &dht_conns(&client_ep),
+        target,
+        ContentHash::from_bytes(hash),
+        NodeId::from_bytes(*client_id.as_bytes()),
+        Coverage::full(1),
+        expired,
+    )
+    .await?;
+    assert!(!ack.accepted, "an expired attestation must be refused");
+    assert_eq!(server.records.lock().unwrap().len(), 0);
+
+    client_ep.close().await;
+    server.endpoint.close().await;
+    server.accept_task.abort();
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result<()> {
     // ADR 022 §STORE Flow steps 2-3: a freshly cached blob MUST be
@@ -479,6 +513,9 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
     let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?, 2);
     let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
     cache.admit_bao(hash, ranges, bao).await?;
+    // A node publishes a hash only while it holds a live attestation for it.
+    let attestations = test_support::self_signing();
+    assert!(attestations.keep(*hash.as_bytes(), test_support::attest(*hash.as_bytes())));
     let scheduler = Arc::new(RepublishScheduler::new());
     let (inserts_tx, inserts_rx) = broadcast::channel::<iroh_blobs::Hash>(16);
     let stop = CancellationToken::new();
@@ -491,7 +528,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
         )]))),
         Arc::clone(&scheduler),
         cache,
-        test_support::self_signing(),
+        attestations,
         true,
         Arc::new(decdn_node::metrics::Metrics::new()),
         inserts_rx,
@@ -522,7 +559,7 @@ async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result
             .records
             .lock()
             .unwrap()
-            .providers_at(&ContentHash::from_bytes(*h.as_bytes()), now_us, |_| true)
+            .providers_at(&ContentHash::from_bytes(*h.as_bytes()), now_us, |_, _| true)
             .into_iter()
             .filter(|p| p.node == holder)
             .count()
@@ -903,6 +940,7 @@ struct Publisher {
     ep: Endpoint,
     holder: NodeId,
     cache: decdn_cache::CacheEngine,
+    attestations: Arc<decdn_node::attestations::Attestations>,
     stop: tokio_util::sync::CancellationToken,
     task: tokio::task::JoinHandle<()>,
     _cache_dir: tempfile::TempDir,
@@ -941,6 +979,7 @@ impl Publisher {
         let scheduler = Arc::new(RepublishScheduler::new());
         let inserts = cache.subscribe_inserts();
         seed(&cache, &scheduler);
+        let attestations = test_support::self_signing();
         let stop = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn(run_republish(
             dht_conns(&ep),
@@ -951,7 +990,7 @@ impl Publisher {
             )]))),
             Arc::clone(&scheduler),
             cache.clone(),
-            test_support::self_signing(),
+            Arc::clone(&attestations),
             true,
             Arc::new(Metrics::new()),
             inserts,
@@ -962,10 +1001,19 @@ impl Publisher {
             ep,
             holder,
             cache,
+            attestations,
             stop,
             task,
             _cache_dir: cache_dir,
         })
+    }
+
+    /// Hold a live attestation for `hash`, as a relay does once it pulls it.
+    fn attest(&self, hash: iroh_blobs::Hash) {
+        assert!(
+            self.attestations
+                .keep(*hash.as_bytes(), test_support::attest(*hash.as_bytes()))
+        );
     }
 
     /// This publisher's coverage for `hash` at the server, once a record lands.
@@ -979,7 +1027,11 @@ impl Publisher {
         .unwrap();
         let mut records = self.server.records.lock().unwrap();
         records
-            .providers_at(&ContentHash::from_bytes(*hash.as_bytes()), now_us, |_| true)
+            .providers_at(
+                &ContentHash::from_bytes(*hash.as_bytes()),
+                now_us,
+                |_, _| true,
+            )
             .into_iter()
             .find(|p| p.node == self.holder)
             .map(|p| p.coverage)
@@ -1003,6 +1055,7 @@ impl Publisher {
         let total = 4 * decdn_bao_range::CHUNK_GROUP_BYTES;
         let (root, plaintext, outboard) = synth_blob(usize::try_from(total).unwrap(), 1);
         let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+        self.attest(hash);
         self.cache.admit_bao(hash, ranges, bao).await.unwrap();
         assert!(
             self.await_record(hash).await.is_some(),
@@ -1031,6 +1084,7 @@ async fn run_republish_publishes_a_ranged_partial_once_its_first_block_verifies(
 -> anyhow::Result<()> {
     let p = Publisher::start(|_, _| {}).await?;
     let blob = TwoBlockBlob::new();
+    p.attest(blob.hash());
     let block = decdn_protocol::DISCOVERY_BLOCK_BYTES;
 
     blob.admit(&p.cache, 0, block).await;
@@ -1068,6 +1122,7 @@ async fn run_republish_publishes_a_seeded_partial_when_its_first_block_verifies(
         assert_eq!(scheduler.seed_cold_start([seeded]), 1);
     })
     .await?;
+    p.attest(blob.hash());
     // One group first, so the store holds a partial with no whole block —
     // the shape a restart finds mid-fill.
     blob.admit(&p.cache, 0, group).await;

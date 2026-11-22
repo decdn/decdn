@@ -1542,8 +1542,19 @@ fn write_password_decoy(home: &std::path::Path) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// Put the operator in the on-chain state a launch asks for: fully onboarded, or
-/// bare with gas only.
+/// Seat `operator` as an origin of a fresh namespace owned by a new vetted
+/// publisher. A node serves a hash only while it holds a live origin
+/// attestation for it (ADR 022 § Origin Attestation), so a fixture node needs
+/// a seat to attest the content its own fs backend holds.
+async fn seat_in_fresh_namespace(chain: &ChainFixture, operator: Address) -> anyhow::Result<()> {
+    let publisher = PrivateKeySigner::random();
+    chain.vet_publisher(publisher.address()).await?;
+    let namespace = chain.create_namespace(&publisher).await?;
+    chain.add_origin(&publisher, namespace, operator).await
+}
+
+/// Put the operator in the on-chain state a launch asks for: fully onboarded
+/// and seated as an origin of a fresh namespace, or bare with gas only.
 ///
 /// A free function rather than inline in `launch_configured` so that method
 /// stays inside the workspace's 100-line clippy ceiling.
@@ -1565,7 +1576,10 @@ async fn provision_on_chain(
         chain
             .onboard_operator(operator, node_secret, region, multiaddr)
             .await
-            .context("onboard operator on-chain")
+            .context("onboard operator on-chain")?;
+        seat_in_fresh_namespace(chain, operator.address())
+            .await
+            .context("seat the operator as an origin")
     } else {
         chain
             .fund_eth(operator.address(), 100)

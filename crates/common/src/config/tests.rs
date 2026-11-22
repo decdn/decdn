@@ -1683,6 +1683,34 @@ fn resolve_cache_relay_foreign_namespaces_defaults_false_with_origin() -> anyhow
 }
 
 #[test]
+fn resolve_cache_attestation_ttl_defaults_to_twelve_hours_and_is_bounded() -> anyhow::Result<()> {
+    let cli = empty_cache_args();
+    let resolved = resolve_cache(
+        &cli,
+        Some(&types::CacheConfig::default()),
+        Path::new("/tmp"),
+    )?;
+    anyhow::ensure!(resolved.attestation_ttl_sec == 43_200);
+    for (ttl, ok) in [
+        (3_599, false),
+        (3_600, true),
+        (86_400, true),
+        (86_401, false),
+    ] {
+        let toml = types::CacheConfig {
+            attestation_ttl_sec: Some(ttl),
+            ..Default::default()
+        };
+        let result = resolve_cache(&cli, Some(&toml), Path::new("/tmp"));
+        anyhow::ensure!(result.is_ok() == ok, "attestation_ttl_sec = {ttl}");
+        if let Ok(resolved) = result {
+            anyhow::ensure!(resolved.attestation_ttl_sec == ttl);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn resolve_cache_relay_foreign_namespaces_defaults_true_without_origin() -> anyhow::Result<()> {
     // Role-derived default (#1759): a node with no origin backend is a
     // pure relay edge — its only function is relaying, so absent an

@@ -20,9 +20,10 @@ fn provider(node: NodeId) -> Provider {
 /// the handler is what verifies it.
 fn att() -> OriginAttestation {
     OriginAttestation {
-        rate_per_mb: 1,
+        namespace_id: [1; 32],
         timestamp_us: 1,
-        slash_sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
+        ttl_sec: decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC,
+        sig: vec![0; decdn_protocol::message::SLASH_SIG_LEN],
     }
 }
 
@@ -59,27 +60,117 @@ impl Fixture for RecordStore {
                 signer: SIGNER,
             },
             receive_us,
+            |_, _| true,
         )
     }
 
     fn providers_test(&mut self, hash: &Hash, now_us: u64) -> Vec<Provider> {
-        self.providers_at(hash, now_us, |_| true)
+        self.providers_at(hash, now_us, |_, _| true)
     }
 }
 
 #[test]
-fn providers_leave_out_a_record_whose_signer_lost_its_seat() {
+fn providers_leave_out_a_record_whose_attestation_is_no_longer_valid() {
     let mut s = RecordStore::new(small_cfg());
     s.insert_test(nid(1), h(1), Coverage::full(1), 0);
     assert_eq!(
-        s.providers_at(&h(1), 0, |signer| *signer == SIGNER).len(),
+        s.providers_at(&h(1), 0, |a, signer| *signer == SIGNER && *a == att())
+            .len(),
         1
     );
-    assert!(s.providers_at(&h(1), 0, |_| false).is_empty());
+    assert!(s.providers_at(&h(1), 0, |_, _| false).is_empty());
     assert_eq!(
         s.len(),
         1,
         "an unadmitted record stays stored until it expires"
+    );
+}
+
+/// A re-publish replaces a held attestation that is no longer valid, even
+/// when the held one expires later: its signer lost its seat, so keeping it
+/// would hide the holder from every lookup until it expires.
+#[test]
+fn a_re_publish_replaces_an_attestation_that_is_no_longer_valid() {
+    let mut s = RecordStore::new(small_cfg());
+    let dead = OriginAttestation {
+        timestamp_us: 9,
+        ..att()
+    };
+    let live = att();
+    let dead_signer = Address::repeat_byte(0xDE);
+    let valid = |_: &OriginAttestation, signer: &Address| *signer != dead_signer;
+    s.insert_at(
+        nid(1),
+        h(1),
+        Coverage::full(1),
+        AttestedBy {
+            attestation: dead,
+            signer: dead_signer,
+        },
+        0,
+        valid,
+    );
+    assert_eq!(
+        s.insert_at(
+            nid(1),
+            h(1),
+            Coverage::full(1),
+            AttestedBy {
+                attestation: live.clone(),
+                signer: SIGNER,
+            },
+            1,
+            valid,
+        ),
+        InsertOutcome::Refreshed
+    );
+    assert_eq!(
+        s.providers_at(&h(1), 1, valid)
+            .first()
+            .map(|p| p.attestation.clone()),
+        Some(live)
+    );
+}
+
+#[test]
+fn a_re_publish_keeps_the_attestation_that_expires_last() {
+    let mut s = RecordStore::new(small_cfg());
+    let newer = OriginAttestation {
+        timestamp_us: 5,
+        ..att()
+    };
+    let insert = |s: &mut RecordStore, attestation: OriginAttestation, at: u64| {
+        s.insert_at(
+            nid(1),
+            h(1),
+            Coverage::full(1),
+            AttestedBy {
+                attestation,
+                signer: SIGNER,
+            },
+            at,
+            |_, _| true,
+        )
+    };
+    insert(&mut s, newer.clone(), 0);
+    assert_eq!(insert(&mut s, att(), 1), InsertOutcome::Refreshed);
+    assert_eq!(
+        s.providers_test(&h(1), 1)
+            .first()
+            .map(|p| p.attestation.clone()),
+        Some(newer),
+        "a staler re-publish keeps the fresher attestation"
+    );
+    let newest = OriginAttestation {
+        timestamp_us: 9,
+        ..att()
+    };
+    insert(&mut s, newest.clone(), 2);
+    assert_eq!(
+        s.providers_test(&h(1), 2)
+            .first()
+            .map(|p| p.attestation.clone()),
+        Some(newest)
     );
 }
 

@@ -2963,11 +2963,11 @@ pub struct UpstreamPullHeader {
     /// on an unpaid source, which is the only reason it is carried at all.
     pub interval_bytes: u64,
     /// The origin attestation this upstream offers for the hash (ADR 022
-    /// § Origin Attestation): the one it forwarded in its
-    /// `StreamResponseExt`, else its own signed response, which is an
-    /// attestation when the upstream is itself a seated origin. Unverified
-    /// here; a relay checks it against its seated-origin set before keeping
-    /// it. `None` on an unpaid source.
+    /// § Origin Attestation), from its `StreamResponseExt`. Unverified here;
+    /// a relay checks it against its seated-origin set before keeping it, and
+    /// refuses the upstream when it is missing or invalid and the relay holds
+    /// no live attestation of its own for the hash. `None` on an
+    /// unpaid source.
     pub origin_attestation: Option<decdn_protocol::OriginAttestation>,
 }
 

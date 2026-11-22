@@ -563,6 +563,14 @@ enum ServeRejectReason {
     /// relay the hash during this fetch, and another node may (ADR 002
     /// §Retrieval by namespace).
     ForeignNamespaceDeclined,
+    /// The node holds the blob but no live, valid origin attestation for it,
+    /// and cannot sign its own (ADR 022 § Origin Attestation): its origin
+    /// stopped attesting the hash, lost its seat or came onto the origin
+    /// deny-set, or this node is an unseated origin serving its own backend.
+    /// Ships
+    /// [`StreamError::Declined`] (see [`Self::wire_error`]): this node will not
+    /// serve the hash until it holds a live attestation again.
+    Unattested,
     /// The node has been unable to reach the chain for longer than
     /// `blockchain.chain_staleness_grace_sec` (ADR 011 § Serving while
     /// chain-stale), so its deny-set, pool-solvency, and signer-cap guards are
@@ -623,7 +631,8 @@ impl ServeRejectReason {
             | Self::HashDenied
             | Self::ChainHashDenied
             | Self::OriginDenied
-            | Self::ForeignNamespaceDeclined => StreamError::Declined,
+            | Self::ForeignNamespaceDeclined
+            | Self::Unattested => StreamError::Declined,
         }
     }
 }
@@ -892,9 +901,11 @@ pub struct ClientHandlerDeps {
     /// gate — the same fail-open shape as an unwired [`PoolRoute::pool_view`].
     pub chain_freshness: Option<crate::chain_freshness::ChainFreshness>,
     /// The origin attestations this node holds (ADR 022 § Origin
-    /// Attestation). An `ok: true` response forwards the one held for its hash
-    /// in `StreamResponseExt.origin_attestation`, so a pulling relay can
-    /// advertise what it pulls. `None` (tests without a DHT) forwards none.
+    /// Attestation). The node serves a hash only while it holds a live one,
+    /// and an `ok: true` response forwards it in
+    /// `StreamResponseExt.origin_attestation`, so a pulling relay can serve
+    /// and advertise what it pulls. `None` (tests without a DHT) disables the
+    /// gate and forwards none.
     pub attestations: Option<Arc<crate::attestations::Attestations>>,
     // Optional wiring — `None` unless the deployment enables the feature.
     /// Deadline for the node-to-node cache-miss pull, so a slow upstream
@@ -2222,6 +2233,25 @@ impl ClientHandler {
         tracing::warn!(
             %hash,
             "terminating an in-flight delivery: a takedown landed after the stream opened"
+        );
+        reset_stream(send, recv, APP_ERR_NO_ERROR);
+    }
+
+    /// Cut off an in-flight delivery of a hash the node no longer holds a live
+    /// origin attestation for, by resetting both directions (ADR 005 § Serving
+    /// rule).
+    ///
+    /// The same reset as [`Self::terminate_for_takedown`], for the same
+    /// reasons: no mid-stream `StreamError` fits, and [`APP_ERR_NO_ERROR`]
+    /// keeps the client from scoring the node as faulty for a lapse it did not
+    /// cause. A client that re-requests the hash gets the signed `Declined`
+    /// refusal from the open-time gate. The caller returns
+    /// `Stopped { Unattested }`, which the dispatch sink counts on
+    /// `decdn_serve_stream_terminated_unattested_total`.
+    pub(super) fn terminate_unattested(send: &mut SendStream, recv: &mut RecvStream, hash: Hash) {
+        tracing::info!(
+            %hash,
+            "terminating an in-flight delivery: the node no longer holds a live origin attestation for the hash"
         );
         reset_stream(send, recv, APP_ERR_NO_ERROR);
     }

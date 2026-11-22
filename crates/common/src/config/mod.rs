@@ -1952,6 +1952,22 @@ fn resolve_cache_into(
         // its own namespace; a node with no origin is a pure relay edge and relays.
         // Explicit config overrides either way.
         .unwrap_or(origins.is_empty());
+    let attestation_ttl_sec = file
+        .and_then(|c| c.attestation_ttl_sec)
+        .unwrap_or(decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC);
+    bag.check_with(
+        (decdn_protocol::MIN_ATTESTATION_TTL_SEC..=decdn_protocol::MAX_ATTESTATION_TTL_SEC)
+            .contains(&attestation_ttl_sec),
+        "cache.attestation_ttl_sec",
+        || {
+            format!(
+                "cache.attestation_ttl_sec must lie in [{}, {}] (1 h to 24 h); every node rejects \
+             an origin attestation whose lifetime lies outside it",
+                decdn_protocol::MIN_ATTESTATION_TTL_SEC,
+                decdn_protocol::MAX_ATTESTATION_TTL_SEC
+            )
+        },
+    );
     let node_pull_open_fanout = file
         .and_then(|c| c.node_pull_open_fanout)
         .unwrap_or(DEFAULT_NODE_PULL_OPEN_FANOUT);
@@ -2139,6 +2155,7 @@ fn resolve_cache_into(
         eviction_tick_secs,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
+        attestation_ttl_sec,
         node_pull_open_fanout,
         node_pull_timeout_sec,
         node_pull_stall_window_sec,

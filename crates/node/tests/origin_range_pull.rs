@@ -896,6 +896,8 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
     // client never accepts an `ok: true` the delivery then aborts. Exercised
     // against a cache hit so the request reaches the bounds gate directly.
     let (blob, _outboard, hash) = blob_with_outboard();
+    // The fixture handler attests registered payloads.
+    support::register_payload(&blob);
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
 
@@ -987,6 +989,8 @@ async fn end_past_the_blob_is_served_clamped_not_refused() -> anyhow::Result<()>
     // bounds gate directly (the same gate `offset_past_the_blob_is_rejected_...`
     // exercises for a genuinely out-of-bounds start).
     let (blob, _outboard, hash) = blob_with_outboard();
+    // The fixture handler attests registered payloads.
+    support::register_payload(&blob);
     let blob_size = u64::try_from(blob.len()).unwrap_or(u64::MAX);
     let hex = hash.to_hex();
 

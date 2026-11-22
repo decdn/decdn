@@ -33,8 +33,8 @@ async fn a_reseed_replaces_the_set() {
     let seated = SeatedOriginSet::from_seats([(U256::from(1), Address::repeat_byte(1))]);
     let stub = Arc::new(Stub::new(vec![(U256::from(2), Address::repeat_byte(2))]));
     reseed(&stub, &seated, &Metrics::new()).await;
-    assert!(!seated.is_seated(&Address::repeat_byte(1)));
-    assert!(seated.is_seated(&Address::repeat_byte(2)));
+    assert!(!seated.is_seated_in(U256::from(1), &Address::repeat_byte(1)));
+    assert!(seated.is_seated_in(U256::from(2), &Address::repeat_byte(2)));
 }
 
 /// An attestation naming an operator the set does not hold pulls the next
@@ -53,13 +53,13 @@ async fn an_unknown_origin_pulls_a_rate_limited_reseed() {
     ));
     tokio::task::yield_now().await;
     for _ in 0..10 {
-        assert!(!seated.is_seated(&Address::repeat_byte(4)));
+        assert!(!seated.is_seated_in(U256::from(4), &Address::repeat_byte(4)));
     }
     tokio::time::sleep(UNKNOWN_SEAT_REFRESH_GAP.saturating_sub(Duration::from_secs(1))).await;
     assert_eq!(stub.reads.load(Ordering::SeqCst), 0);
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(stub.reads.load(Ordering::SeqCst), 1);
-    assert!(seated.is_seated(&Address::repeat_byte(4)));
+    assert!(seated.is_seated_in(U256::from(4), &Address::repeat_byte(4)));
     tokio::time::sleep(SEAT_REFRESH_INTERVAL).await;
     assert_eq!(stub.reads.load(Ordering::SeqCst), 2);
     shutdown.cancel();

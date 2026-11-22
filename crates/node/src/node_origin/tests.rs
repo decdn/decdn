@@ -585,6 +585,18 @@ fn a_no_progress_leg_is_not_scored_unreachable() {
     assert_eq!(pull_verdict(&err), PullVerdict::LegNoProgress);
 }
 
+/// A leg refused for carrying no valid origin attestation is a transient
+/// refusal, never `Unreachable`: the peer answered, and the attestation check
+/// reads this node's own seat set.
+#[test]
+fn an_unattested_leg_is_a_transient_refusal_not_unreachable() {
+    let err = anyhow::Error::new(UpstreamUnattested).context("pull leg open");
+    assert_eq!(
+        pull_verdict(&err),
+        PullVerdict::Refused(RefusalVerdict::Transient)
+    );
+}
+
 /// Only a fault in THIS node may stop a failed pull answering `NotFound` (#1560).
 ///
 /// The asymmetry is the whole point, and both halves of it can regress silently. Widen
@@ -1165,6 +1177,7 @@ fn each_open_drop_lands_in_one_trail_count() {
         OpenDrop::NoAddress,
         OpenDrop::Unverifiable,
         OpenDrop::OverCeiling,
+        OpenDrop::Unattested,
     ] {
         tally.record(drop);
     }
@@ -1189,7 +1202,7 @@ fn each_open_drop_lands_in_one_trail_count() {
             opened: 7,
             unreachable: 1,
             absent: 1,
-            dropped: 5,
+            dropped: 6,
             holders: 2,
             spans: true,
             handshakes: 1,

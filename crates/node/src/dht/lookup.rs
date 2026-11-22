@@ -78,6 +78,10 @@ pub struct Lookup {
     /// before it reads a namespace's origin directory (ADR 022 § `FIND_VALUE`
     /// Flow).
     pub origins: Vec<Address>,
+    /// The valid attestation in the answers that expires last. A holder's
+    /// refresh takes it before it asks an origin (ADR 022 § Origin
+    /// Attestation).
+    pub freshest: Option<OriginAttestation>,
 }
 
 /// Default α — parallel in-flight RPCs per round. ADR 022 § Routing Table.
@@ -498,6 +502,7 @@ fn fold_response(
         match state.attesting_origin(verifier, target, &p.attestation) {
             Some(origin) => {
                 state.origins.insert(origin);
+                state.note_attestation(&p.attestation);
                 if openable.contains(&p.node) {
                     state.record_provider(p.node, p.coverage);
                 }
@@ -592,6 +597,8 @@ struct LookupState {
     /// Each distinct attestation's verdict, so one repeated across answers
     /// is recovered once.
     verdicts: HashMap<OriginAttestation, Option<Address>>,
+    /// The valid attestation seen so far that expires last.
+    freshest: Option<OriginAttestation>,
     /// Smallest XOR distance among queried nodes so far. New
     /// candidates only count as "closer" if they beat this.
     best_queried_distance: [u8; NODE_ID_LEN],
@@ -624,6 +631,7 @@ impl LookupState {
             providers: IndexMap::new(),
             origins: IndexSet::new(),
             verdicts: HashMap::new(),
+            freshest: None,
             best_queried_distance: [0xFFu8; NODE_ID_LEN],
             cooling: HashSet::new(),
             cooling_skipped: 0,
@@ -762,6 +770,18 @@ impl LookupState {
         verdict
     }
 
+    /// Keep `attestation`, a valid one, when it expires later than the
+    /// freshest seen so far.
+    fn note_attestation(&mut self, attestation: &OriginAttestation) {
+        if self
+            .freshest
+            .as_ref()
+            .is_none_or(|f| f.expires_at_us() < attestation.expires_at_us())
+        {
+            self.freshest = Some(attestation.clone());
+        }
+    }
+
     fn have_enough_providers(&self) -> bool {
         self.providers.len() >= self.k
     }
@@ -784,6 +804,7 @@ impl LookupState {
         Lookup {
             providers,
             origins: self.origins.into_iter().collect(),
+            freshest: self.freshest,
         }
     }
 }

@@ -126,9 +126,32 @@ pub(crate) fn proven_ext(
 ) -> decdn_protocol::client::StreamResponseExt {
     decdn_protocol::client::StreamResponseExt::served(
         size_proof_for(resp.body.hash, total_bytes),
-        None,
+        Some(decdn_node::dht::attestation::test_support::attest(
+            resp.body.hash,
+        )),
         decdn_protocol::Coverage::full(decdn_protocol::num_blocks(total_bytes)),
     )
+}
+
+/// An attestation store holding a live fixture attestation for every payload
+/// registered so far ([`register_payload`]), whose node signs as the seated
+/// fixture origin, so a fixture handler serves and forwards what it holds and
+/// attests what its own backend holds (ADR 022 § Origin Attestation).
+pub(crate) fn fixture_attestations() -> Arc<decdn_node::attestations::Attestations> {
+    use decdn_node::dht::attestation::test_support;
+    let store = decdn_node::attestations::Attestations::in_memory(
+        test_support::verifier(),
+        Some(decdn_node::attestations::SelfOrigin {
+            signer: Arc::new(test_support::ORIGIN.clone()),
+            ttl_sec: decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC,
+        }),
+    );
+    if let Ok(proofs) = SIZE_PROOFS.lock() {
+        for hash in proofs.keys() {
+            store.keep(*hash, test_support::attest(*hash));
+        }
+    }
+    Arc::new(store)
 }
 
 pub(crate) fn honest_bao_wire_range(
@@ -771,7 +794,7 @@ fn client_handler_deps(
     domains: &HandlerDomains,
     max_concurrent_streams: usize,
 ) -> ClientHandlerDeps {
-    ClientHandlerDeps::new(
+    let mut deps = ClientHandlerDeps::new(
         server_id,
         Arc::clone(metrics),
         limiter,
@@ -797,7 +820,10 @@ fn client_handler_deps(
                 ..Default::default()
             },
         ),
-    )
+    );
+    // Every registered fixture payload is attested, so the handler serves it.
+    deps.attestations = Some(fixture_attestations());
+    deps
 }
 
 /// Like [`build_handler_full`] but hands the assembled [`ClientHandlerDeps`] to

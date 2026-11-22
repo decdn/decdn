@@ -1017,6 +1017,7 @@ impl RuntimeReloadState {
                 eviction_tick_secs: 1,
                 node_to_node_pull_through_enabled: false,
                 relay_foreign_namespaces: decdn_common::config::DEFAULT_RELAY_FOREIGN_NAMESPACES,
+                attestation_ttl_sec: decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC,
                 node_pull_open_fanout: decdn_common::config::DEFAULT_NODE_PULL_OPEN_FANOUT,
                 node_pull_timeout_sec: decdn_common::config::DEFAULT_NODE_PULL_TIMEOUT_SEC,
                 node_pull_stall_window_sec:
@@ -1363,6 +1364,7 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         eviction_tick_secs,
         node_to_node_pull_through_enabled,
         relay_foreign_namespaces,
+        attestation_ttl_sec,
         node_pull_open_fanout,
         node_pull_timeout_sec,
         node_pull_stall_window_sec,
@@ -1401,6 +1403,8 @@ const fn cache_has_restart_required_field(c: &decdn_common::config::types::Cache
         || eviction_tick_secs.is_some()
         || node_to_node_pull_through_enabled.is_some()
         || relay_foreign_namespaces.is_some()
+        // The self-signing origin identity is built once at bring-up.
+        || attestation_ttl_sec.is_some()
         || node_pull_open_fanout.is_some()
         || node_pull_timeout_sec.is_some()
         || node_pull_stall_window_sec.is_some()

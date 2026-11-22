@@ -730,6 +730,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
         "decdn_serve_stream_rejected_chain_hash_denied_total",
         "decdn_serve_stream_rejected_origin_denied_total",
         "decdn_serve_stream_rejected_foreign_declined_total",
+        "decdn_serve_stream_rejected_unattested_total",
         "decdn_serve_stream_rejected_chain_stale_total",
     ];
     let text = metrics.encode().unwrap();
@@ -759,6 +760,7 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
     metrics.serve_stream_rejected_chain_hash_denied();
     metrics.serve_stream_rejected_origin_denied();
     metrics.serve_stream_rejected_foreign_declined();
+    metrics.serve_stream_rejected_unattested();
     metrics.serve_stream_rejected_chain_stale();
 
     let text = metrics.encode().unwrap();
@@ -767,6 +769,31 @@ fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
             has_metric_line(&text, name, 1),
             "reject counter {name} should read exactly 1 after one bump:\n{text}"
         );
+    }
+}
+
+#[test]
+fn attestation_refresh_counters_start_at_zero_and_increment() {
+    let metrics = Metrics::new();
+    let names = [
+        "decdn_attestation_refreshed_dht_total",
+        "decdn_attestation_refreshed_origin_total",
+        "decdn_attestation_refreshed_self_total",
+        "decdn_attestation_refresh_failed_total",
+        "decdn_attestation_expired_total",
+    ];
+    let text = metrics.encode().unwrap();
+    for name in names {
+        assert!(has_metric_line(&text, name, 0), "{name} at zero:\n{text}");
+    }
+    metrics.attestation_refreshed_dht();
+    metrics.attestation_refreshed_origin();
+    metrics.attestation_refreshed_self();
+    metrics.attestation_refresh_failed();
+    metrics.attestation_expired();
+    let text = metrics.encode().unwrap();
+    for name in names {
+        assert!(has_metric_line(&text, name, 1), "{name} at one:\n{text}");
     }
 }
 

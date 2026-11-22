@@ -344,6 +344,11 @@ pub struct ResolvedCache {
     /// is relaying. Explicit config overrides either default. Node-local;
     /// `cache.*` is restart-required.
     pub relay_foreign_namespaces: bool,
+    /// The lifetime, in seconds, of the origin attestations this node signs
+    /// for its own backend's content (ADR 022 § Origin Attestation). In
+    /// `[MIN_ATTESTATION_TTL_SEC, MAX_ATTESTATION_TTL_SEC]`; default
+    /// [`decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC`].
+    pub attestation_ttl_sec: u32,
     /// Providers a node-to-node pull opens a discovery stream on before
     /// ranking (#831). Default
     /// [`crate::config::DEFAULT_NODE_PULL_OPEN_FANOUT`].
