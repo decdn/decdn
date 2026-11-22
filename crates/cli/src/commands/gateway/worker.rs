@@ -4,7 +4,8 @@
 //! a local task on it (a fetch future is not `Send`).
 //!
 //! Pulls run at once, up to a bound. Each one streams into its own pipe, so a
-//! response whose reader stops holds only its own pull. The pulls under one
+//! response whose reader stops holds only its own pull, and only until its
+//! pipe write has waited for the stall limit ([`StallLimit`]). The pulls under one
 //! capability that overlap share one [`Payer`], and with it each lane's voucher
 //! ledger, so they advance the lane's cumulative voucher through one issuer.
 //! The payer drops when its last pull ends; every pull persists its lanes'
@@ -25,7 +26,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use decdn_client::Cumulative;
@@ -35,7 +39,7 @@ use decdn_incentive::Deployment;
 use decdn_incentive::buyer_pool::{BuyerPoolStore, lane_snapshot};
 use decdn_incentive::lane::{LaneKey, PoolId};
 use serde::Serialize;
-use tokio::io::DuplexStream;
+use tokio::io::{AsyncWrite, DuplexStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
@@ -49,7 +53,9 @@ pub(super) struct Job {
     /// The capability that pays for it, with the delegate key it was issued
     /// to.
     pub(super) paying: Credential,
-    /// Where its verified bytes go. The pull closes it before it reports.
+    /// Where its verified bytes go. The pull closes it before it reports. A
+    /// write the response leaves waiting for the worker's stall limit fails,
+    /// and the pull ends with it.
     pub(super) writer: DuplexStream,
     /// The pull's result, sent once `writer` is closed.
     pub(super) done: oneshot::Sender<anyhow::Result<()>>,
@@ -312,12 +318,17 @@ pub(super) struct PullWorker {
 
 impl PullWorker {
     /// Start the worker thread, build `backend`'s host on it, and run up to
-    /// `max_pulls` pulls at once.
+    /// `max_pulls` pulls at once. A pull whose response takes no bytes for
+    /// `stall` ends ([`StallLimit`]).
     ///
     /// # Errors
     ///
     /// The thread or its runtime cannot start, or the host cannot be built.
-    pub(super) async fn start<B: Backend>(backend: B, max_pulls: usize) -> anyhow::Result<Self> {
+    pub(super) async fn start<B: Backend>(
+        backend: B,
+        max_pulls: usize,
+        stall: Duration,
+    ) -> anyhow::Result<Self> {
         let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -337,7 +348,7 @@ impl PullWorker {
                 let local = tokio::task::LocalSet::new();
                 local.block_on(
                     &runtime,
-                    run(backend, max_pulls.max(1), jobs_rx, stop_rx, ready_tx),
+                    run(backend, max_pulls.max(1), stall, jobs_rx, stop_rx, ready_tx),
                 );
             })?;
         ready_rx
@@ -427,6 +438,7 @@ type Payers<P> = Rc<RefCell<HashMap<PayerId, Rc<P>>>>;
 async fn run<B: Backend>(
     backend: B,
     max_pulls: usize,
+    stall: Duration,
     mut jobs: mpsc::UnboundedReceiver<Request>,
     mut stop: oneshot::Receiver<()>,
     ready: oneshot::Sender<anyhow::Result<()>>,
@@ -453,6 +465,7 @@ async fn run<B: Backend>(
                         Rc::clone(&host),
                         Rc::clone(&slots),
                         Rc::clone(&payers),
+                        stall,
                         *job,
                     ));
                 }
@@ -492,12 +505,15 @@ async fn run<B: Backend>(
     }
 }
 
-/// One job, holding a pull slot while it runs.
+/// One job, holding a pull slot while it runs. Its writer fails a write the
+/// response leaves waiting for `stall`, so a response nobody reads frees the
+/// slot.
 async fn pull<B: Backend>(
     backend: Rc<B>,
     host: Rc<B::Host>,
     slots: Rc<Semaphore>,
     payers: Payers<B::Payer>,
+    stall: Duration,
     job: Job,
 ) {
     let Job {
@@ -517,13 +533,94 @@ async fn pull<B: Backend>(
             return;
         }
     };
-    let mut sink = Sink::Writer(Box::new(writer));
+    let mut sink = Sink::Writer(Box::new(StallLimit::new(writer, stall)));
     let result = backend.pull(&host, &payer, &blob, &mut sink).await;
     // The gateway reads the pipe to its end before it waits for the result.
     drop(sink);
     release(&payers, id, &payer);
     drop(payer);
     let _ = done.send(result);
+}
+
+/// A writer that fails a write, flush or shutdown its inner writer leaves
+/// pending for `limit`.
+///
+/// A pull parks while its response does not read: the pipe fills, the
+/// read-ahead fills, and the drive waits for the consumer. That wait holds the
+/// fetch's progress clock, so the no-progress limit never fires and the pull
+/// keeps its slot for as long as the response stays unread. This bound ends
+/// such a pull. It counts only the time a write waits on the response; the
+/// time between writes, while the holders are slow, is the progress clock's
+/// to judge. A response that keeps reading, however slowly, resets it with
+/// each write it lets through.
+struct StallLimit<W> {
+    inner: W,
+    limit: Duration,
+    /// Armed when an operation first returns `Pending`, cleared when one
+    /// completes.
+    stalled: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<W> StallLimit<W> {
+    const fn new(inner: W, limit: Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+
+    /// `poll` as it is, unless it has stayed `Pending` for the limit.
+    fn bound<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        if poll.is_ready() {
+            self.stalled = None;
+            return poll;
+        }
+        let limit = self.limit;
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        if stalled.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        self.stalled = None;
+        tracing::info!(
+            limit_secs = limit.as_secs_f64(),
+            "a gateway response took no bytes; its pull ends"
+        );
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("the response took no bytes for {limit:?}"),
+        )))
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for StallLimit<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.bound(cx, poll)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_flush(cx);
+        this.bound(cx, poll)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.bound(cx, poll)
+    }
 }
 
 /// The payer of the pulls in flight under `id`, or a new one for `paying`.

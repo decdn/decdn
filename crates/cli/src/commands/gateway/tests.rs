@@ -227,7 +227,13 @@ async fn test_gateway_cached(
         common,
         chain,
         delegates: std::sync::Mutex::default(),
-        pulls: PullWorker::start(backend, worker_slots).await.unwrap(),
+        pulls: PullWorker::start(
+            backend,
+            worker_slots,
+            Duration::from_secs(GIVE_UP_AFTER_SECS),
+        )
+        .await
+        .unwrap(),
         cache,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),

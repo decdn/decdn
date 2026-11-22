@@ -377,6 +377,19 @@ Concurrent pulls of one blob fill one cache entry. Each pull fetches the
 chunk groups that are missing when it plans a range. Thus two concurrent
 pulls can pay for the same chunk group once each.
 
+## Pull slots
+
+The gateway runs a fixed number of pulls at once. A request past the bound
+waits for a slot. A pull gives up after `--give-up-after-secs` (120 by
+default) with no verified byte. A pull also gives up when its response takes
+no byte for the same time. The fetch stops its progress clock while the
+consumer does not read, so without this second limit a client that stops
+reading keeps its slot. A client that reads slowly keeps its slot, because
+each byte it takes resets the limit.
+
+The gateway sees its reverse proxy, not the client, so it sets no limit per
+client. A per-client limit on concurrent requests belongs to the proxy.
+
 ## Metrics
 
 Every gateway counts what it serves, the loopback gateway too.

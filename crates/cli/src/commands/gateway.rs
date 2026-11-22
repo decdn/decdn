@@ -238,12 +238,15 @@ const KNOWN_SIGNER_LOOKUPS_PER_MINUTE: u32 = 10;
 const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A gateway pull that makes no verified progress for this long gives up, so
-/// a stuck request does not hold its pull slot.
+/// a stuck request does not hold its pull slot. The default of
+/// `--give-up-after-secs`, which also bounds how long a pull waits on a
+/// response that takes no bytes: a client that stops reading frees its slot.
 const GIVE_UP_AFTER_SECS: u64 = 120;
 
 /// The most pulls that run at once; a request past it waits for a slot. Each
 /// pull stripes across up to `--max-sources` holders, so this also bounds the
-/// streams the gateway opens on one node's connection.
+/// streams the gateway opens on one node's connection. The gateway sees its
+/// reverse proxy, not the client, so a per-client limit is the proxy's.
 const MAX_PULLS: usize = 16;
 
 /// The most parsed manifests the gateway keeps.
@@ -316,6 +319,9 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
     fill_chain_defaults(&mut common, &file)?;
     let chain = resolve_chain(&common, &file)?.config;
     common.give_up_after_secs = common.give_up_after_secs.or(Some(GIVE_UP_AFTER_SECS));
+    let stall = common
+        .give_up_after()
+        .unwrap_or(Duration::from_secs(GIVE_UP_AFTER_SECS));
     let root = common
         .data_dir
         .clone()
@@ -340,6 +346,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
             cache: cache.clone().map(CacheStores::new),
         },
         MAX_PULLS,
+        stall,
     )
     .await
     .context("start the gateway's pull worker")?;
