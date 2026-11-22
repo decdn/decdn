@@ -200,7 +200,7 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
     // EIP-712 RegisterNode signature (Ethereum key). `sign_hash_sync` yields a
     // low-s, 27/28-`v` 65-byte signature accepted by the on-chain OZ
     // `SignatureChecker` (same path as `decdn_incentive::bind_sig`).
-    let domain = bind_sig::bind_node_id_domain(chain_id, cb_addr);
+    let domain = bind_sig::capacity_bond_domain(chain_id, cb_addr);
     let bind_hash =
         bind_sig::register_node_signing_hash(node_id, binding_nonce, terms_hash, &domain);
     let binding_sig = signer.sign_hash_sync(&bind_hash)?.as_bytes().to_vec();

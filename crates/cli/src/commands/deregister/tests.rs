@@ -60,7 +60,7 @@ fn disclosure_says_the_bond_is_not_returned() {
     write_disclosure(&mut buf, &plan(true, false, 1000)).expect("write to a Vec cannot fail");
     let s = String::from_utf8(buf).expect("output is ASCII");
     assert!(s.contains("NOT returned"), "{s}");
-    assert!(s.contains("slashable"), "{s}");
+    assert!(s.contains("stays deposited"), "{s}");
     assert!(s.contains("unbond --all"), "names the next leg: {s}");
     assert!(s.contains("1000 Mbps"), "names the tier being cleared: {s}");
 }

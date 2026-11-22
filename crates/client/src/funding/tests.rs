@@ -103,8 +103,7 @@ async fn an_owned_lane_binds_its_endpoint_with_the_lane_key() -> anyhow::Result<
     let governance = crate::session::GovernanceChain {
         rpc_url: "http://config:8545".to_string(),
         chain_id: deployment.chain_id.wrapping_add(1),
-        slash_judge: Address::repeat_byte(0x44),
-        capacity_bond: Some(capacity_bond),
+        capacity_bond,
     };
     let ctx = attach_client_binding(ctx, &governance, &endpoint)?;
 
@@ -121,14 +120,14 @@ async fn an_owned_lane_binds_its_endpoint_with_the_lane_key() -> anyhow::Result<
         B256::from(*endpoint.id().as_bytes()),
         decdn_incentive::EPHEMERAL_BINDING_NONCE,
         &binding.binding_signature,
-        &bind_node_id_domain(governance.chain_id, capacity_bond),
+        &capacity_bond_domain(governance.chain_id, capacity_bond),
     )?;
     anyhow::ensure!(
         decdn_incentive::verify_binding(
             B256::from(*endpoint.id().as_bytes()),
             decdn_incentive::EPHEMERAL_BINDING_NONCE,
             &binding.binding_signature,
-            &bind_node_id_domain(deployment.chain_id, capacity_bond),
+            &capacity_bond_domain(deployment.chain_id, capacity_bond),
         )
         .ok()
             != Some(lane),

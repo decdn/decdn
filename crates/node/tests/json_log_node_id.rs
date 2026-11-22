@@ -60,7 +60,6 @@ fn run_until_identity(root: &Path) -> anyhow::Result<Vec<serde_json::Value>> {
             .args(["--rpc-url", "http://127.0.0.1:1"])
             .args(["--log-format", "json", "--log-level", "info"])
             .args(["--capacity-bond-address", ADDR])
-            .args(["--slash-judge-address", ADDR])
             .args(["--content-blacklist-address", ADDR])
             .env("HOME", root)
             .env_remove("RUST_LOG")

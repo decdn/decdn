@@ -58,8 +58,8 @@ use decdn_client::{
 };
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
-    bind_node_id_domain, binding_signing_hash, min_payment, signed_to_wire_voucher,
-    slash_judge_domain, stream_sig::StreamSlashData, voucher_domain,
+    binding_signing_hash, capacity_bond_domain, min_payment, signed_to_wire_voucher,
+    stream_sig::StreamSlashData, voucher_domain,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps, ClientProtocol};
@@ -102,7 +102,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 fn slash_domain() -> Eip712Domain {
-    slash_judge_domain(CHAIN_ID, Address::repeat_byte(0x11))
+    capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x11))
 }
 
 fn payment_domain() -> Eip712Domain {
@@ -127,7 +127,7 @@ fn lane_id(signer: Address) -> decdn_node::handlers::client::LaneId {
 }
 
 fn binding_domain() -> Eip712Domain {
-    bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
+    capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
 
 /// The loopback suite's fixed EIP-712 domains.
@@ -8726,8 +8726,8 @@ async fn governance_denied_hash_is_refused_as_hash_blacklisted() -> anyhow::Resu
 ///
 /// The open-time gates cannot cover this: a takedown that lands *after* a stream
 /// opens would otherwise let a multi-GB blob run to completion minutes into a
-/// one-hour removal order, and serving past the compliance window is slashable
-/// (ADR 026 §Slashing and burn).
+/// one-hour removal order, and the compliance window binds traffic already in
+/// flight too.
 ///
 /// The takedown is landed only once a voucher has been accepted, which is what
 /// makes this test exercise the mid-stream path rather than racing the open-time
@@ -9049,7 +9049,7 @@ async fn client_binding_address_mismatch_resets() -> anyhow::Result<()> {
 /// direction — is a client fault. The node resets the stream with
 /// `TIMESTAMP_SKEW` (0x04, ADR 013) and NO signed response (every signed
 /// `StreamResponseBody`, refusals included, echoes the requester's timestamp
-/// into the slash-evidence set, ADR 014 §1). A fresh-stamped request on the
+/// into the EIP-712 signed set, ADR 005 § Signer binding). A fresh-stamped request on the
 /// same handler then draws a signed response, pinning the resets to the
 /// timestamp alone.
 #[tokio::test(flavor = "multi_thread")]

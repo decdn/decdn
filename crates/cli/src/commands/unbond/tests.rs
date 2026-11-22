@@ -1,13 +1,25 @@
 use super::*;
 
-fn plan(action: Action, below_floor: bool) -> Plan {
+fn plan(declare_to: Option<u64>, below_floor: bool) -> Plan {
+    plan_at(
+        declare_to,
+        if below_floor {
+            Standing::BelowFloor
+        } else {
+            Standing::Covered
+        },
+    )
+}
+
+fn plan_at(declare_to: Option<u64>, standing: Standing) -> Plan {
     Plan {
         capacity_bond: Address::repeat_byte(0x22),
-        action,
+        release: U256::from(40_000u64),
+        retained: U256::from(20_000u64),
+        declare_to,
         prior: U256::from(60_000u64),
         declared_mbps: 100,
-        unbonding_period: 14 * 24 * 3600,
-        below_floor,
+        standing,
     }
 }
 
@@ -22,23 +34,16 @@ fn render(p: &Plan, json: bool, o: &Outcome, dry_run: bool) -> String {
 }
 
 #[test]
-fn request_phase_reports_release_retained_and_declare() {
-    let p = plan(
-        Action::Request {
-            release: U256::from(40_000u64),
-            retained: U256::from(20_000u64),
-            declare_to: Some(50),
-        },
-        false,
-    );
+fn plan_reports_release_retained_and_declare() {
+    let p = plan(Some(50), false);
     let s = rendered(&p, false, &Outcome::default());
-    assert!(s.contains("phase=request"), "{s}");
     assert!(s.contains("release_base=40000"), "{s}");
     assert!(s.contains("retained_bond_base=20000"), "{s}");
     assert!(s.contains("declare_to_mbps=50"), "{s}");
-    assert!(s.contains("unbonding_period=14d 0h"), "{s}");
     assert!(s.contains("below_floor=false"), "{s}");
-    assert!(s.contains("submitted=false"), "{s}");
+    assert!(s.contains("declare_tx=skipped"), "{s}");
+    assert!(s.contains("unbond_tx=skipped"), "{s}");
+    assert!(s.contains("submitted=false dry_run=false"), "{s}");
 }
 
 /// Rendering only — the `--all` floor arithmetic itself lives in
@@ -47,73 +52,124 @@ fn request_phase_reports_release_retained_and_declare() {
 fn write_plan_reports_a_below_floor_residual() {
     // The operator has to be able to see, in the receipt, that the node
     // won't come back without re-bonding.
-    let p = plan(
-        Action::Request {
-            release: U256::from(59_000u64),
-            retained: U256::from(1_000u64),
-            declare_to: None,
-        },
-        true,
-    );
-    let s = rendered(&p, false, &Outcome::default());
+    let s = rendered(&plan(None, true), false, &Outcome::default());
     assert!(s.contains("declare_to_mbps=none"), "{s}");
     assert!(s.contains("below_floor=true"), "{s}");
+    assert!(s.contains("standing=below_floor"), "{s}");
+}
+
+/// A registered operator whose tenure already ended is not "below the
+/// floor" of a tenure it does not hold; the receipt says which case it is.
+#[test]
+fn write_plan_reports_a_tenureless_operator() {
+    let s = rendered(
+        &plan_at(None, Standing::NoTenure),
+        false,
+        &Outcome::default(),
+    );
+    assert!(s.contains("below_floor=false"), "{s}");
+    assert!(s.contains("standing=no_tenure"), "{s}");
+    let s = rendered(
+        &plan_at(None, Standing::NoTenure),
+        true,
+        &Outcome::default(),
+    );
+    let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+    assert_eq!(
+        v.get("standing").and_then(serde_json::Value::as_str),
+        Some("no_tenure")
+    );
+    assert_eq!(
+        v.get("below_floor").and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+}
+
+/// The floor fallback. A recorded floor of 0 means no tenure runs. A
+/// registered operator reaches that only through an unbond below its floor,
+/// so it is already inactive whatever this unbond retains. An unregistered
+/// operator is held to the live `minBond`, the floor a registration records.
+#[test]
+fn standing_reads_a_zero_floor_against_registration() {
+    let min_bond = U256::from(50u64);
+    let zero = U256::ZERO;
+    // Registered, no tenure: retained above or below minBond alike.
+    assert_eq!(
+        Standing::of(true, zero, min_bond, U256::from(10u64)),
+        Standing::NoTenure
+    );
+    assert_eq!(
+        Standing::of(true, zero, min_bond, U256::from(100u64)),
+        Standing::NoTenure
+    );
+    // Unregistered, no recorded floor: held to minBond.
+    assert_eq!(
+        Standing::of(false, zero, min_bond, U256::from(49u64)),
+        Standing::BelowFloor
+    );
+    assert_eq!(
+        Standing::of(false, zero, min_bond, U256::from(50u64)),
+        Standing::Covered
+    );
+    // A recorded floor is the grandfathered one, not the live minBond.
+    let floor = U256::from(30u64);
+    for registered in [true, false] {
+        assert_eq!(
+            Standing::of(registered, floor, min_bond, U256::from(40u64)),
+            Standing::Covered
+        );
+        assert_eq!(
+            Standing::of(registered, floor, min_bond, U256::from(29u64)),
+            Standing::BelowFloor
+        );
+    }
+}
+
+fn disclosure(p: &Plan) -> String {
+    let mut buf = Vec::new();
+    write_disclosure(&mut buf, p).unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+/// Each standing gets its own consequence line; only an unbond below the
+/// floor claims to end the tenure.
+#[test]
+fn disclosure_names_the_consequence_of_each_standing() {
+    let below = disclosure(&plan_at(None, Standing::BelowFloor));
+    assert!(below.contains("becomes INACTIVE"), "{below}");
+    assert!(below.contains("clears firstBondedAt"), "{below}");
+    assert!(below.contains("age ramp"), "{below}");
+
+    let covered = disclosure(&plan_at(None, Standing::Covered));
+    assert!(covered.contains("stays active"), "{covered}");
+    assert!(!covered.contains("firstBondedAt"), "{covered}");
+
+    let none = disclosure(&plan_at(None, Standing::NoTenure));
+    assert!(none.contains("already inactive (no tenure)"), "{none}");
+    assert!(none.contains("Re-bond to minBond to re-enter"), "{none}");
+    assert!(!none.contains("becomes INACTIVE"), "{none}");
+    assert!(!none.contains("stays active"), "{none}");
 }
 
 #[test]
-fn waiting_phase_reports_unlock_and_remaining() {
-    let p = plan(
-        Action::Waiting {
-            amount: U256::from(40_000u64),
-            unlock_at: 1_000_000 + 3 * 24 * 3600,
-            now: 1_000_000,
-        },
-        false,
-    );
-    assert_eq!(p.remaining_secs(), 3 * 24 * 3600);
-    let s = rendered(&p, false, &Outcome::default());
-    assert!(s.contains("phase=waiting"), "{s}");
-    assert!(s.contains("pending_base=40000"), "{s}");
-    assert!(s.contains("remaining=3d 0h"), "{s}");
-    // No release keys leak into a phase they don't describe.
-    assert!(!s.contains("release_base"), "{s}");
-}
-
-#[test]
-fn withdraw_phase_reports_the_tx() {
-    let p = plan(
-        Action::Withdraw {
-            amount: U256::from(40_000u64),
-        },
-        false,
-    );
+fn a_landed_unbond_reports_its_tx() {
     let o = Outcome {
-        withdraw: Some(B256::repeat_byte(0xab)),
+        unbond: Some(B256::repeat_byte(0xab)),
         ..Outcome::default()
     };
-    let s = rendered(&p, false, &o);
-    assert!(s.contains("phase=withdraw"), "{s}");
-    assert!(s.contains("withdrawn_base=40000"), "{s}");
+    let s = rendered(&plan(None, false), false, &o);
     assert!(s.contains("declare_tx=skipped"), "{s}");
+    assert!(
+        s.contains(&format!("unbond_tx={:#x}", B256::repeat_byte(0xab))),
+        "{s}"
+    );
     assert!(s.contains("submitted=true"), "{s}");
 }
 
 #[test]
-fn json_carries_only_the_active_phase_keys() {
-    let p = plan(
-        Action::Request {
-            release: U256::from(40_000u64),
-            retained: U256::from(20_000u64),
-            declare_to: Some(50),
-        },
-        false,
-    );
-    let s = rendered(&p, true, &Outcome::default());
+fn json_carries_the_plan_and_both_tx_keys() {
+    let s = rendered(&plan(Some(50), false), true, &Outcome::default());
     let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-    assert_eq!(
-        v.get("phase").and_then(serde_json::Value::as_str),
-        Some("request")
-    );
     assert_eq!(
         v.get("release_base").and_then(serde_json::Value::as_str),
         Some("40000")
@@ -122,25 +178,24 @@ fn json_carries_only_the_active_phase_keys() {
         v.get("declare_to_mbps").and_then(serde_json::Value::as_u64),
         Some(50)
     );
-    assert!(v.get("pending_base").is_none(), "{s}");
     assert!(
-        v.get("withdraw_tx").is_some_and(serde_json::Value::is_null),
+        v.get("unbond_tx").is_some_and(serde_json::Value::is_null),
+        "{s}"
+    );
+    assert!(
+        v.get("declare_tx").is_some_and(serde_json::Value::is_null),
         "{s}"
     );
 }
 
+/// A dry run says so, even though a failed real run also submits nothing.
 #[test]
-fn remaining_secs_is_zero_off_the_waiting_phase() {
-    let p = plan(
-        Action::Withdraw {
-            amount: U256::from(1u64),
-        },
-        false,
-    );
-    assert_eq!(p.remaining_secs(), 0);
+fn dry_run_is_flagged() {
+    let s = render(&plan(None, false), false, &Outcome::default(), true);
+    assert!(s.contains("submitted=false dry_run=true"), "{s}");
 }
 
-/// The convergence case: `execute` sends `declareMbps` and `requestUnbond`
+/// The convergence case: `execute` sends `declareMbps` and `unbond`
 /// as two transactions, so a run that lands the first and loses the second
 /// leaves `declared == target`. Re-running the identical command must pick
 /// up where it left off — skipping the redundant declare and still
@@ -164,76 +219,111 @@ fn tier_step_declares_down_and_rejects_raising() {
     assert!(msg.contains("decdn node bond --mbps"), "{msg}");
 }
 
-/// The gate exists so an operator cannot start a window-long outage by
-/// accident, so the headless-and-unconfirmed case must REFUSE rather than
-/// assume consent — the one wrong answer here is expensive to undo.
+/// The gate exists so an operator cannot leave the active set by accident,
+/// so the headless-and-unconfirmed case must REFUSE rather than assume
+/// consent — the one wrong answer here is expensive to undo.
 #[test]
-fn headless_request_without_yes_refuses() {
-    let request = Action::Request {
-        release: U256::from(1u64),
-        retained: U256::ZERO,
-        declare_to: None,
-    };
-    assert_eq!(
-        decide_confirmation(request, false, false),
-        Confirmation::NeedFlag
-    );
-    assert_eq!(
-        decide_confirmation(request, false, true),
-        Confirmation::Prompt
-    );
-    assert_eq!(
-        decide_confirmation(request, true, false),
-        Confirmation::Bypassed
-    );
+fn headless_unbond_without_yes_refuses() {
+    assert_eq!(decide_confirmation(false, false), Confirmation::NeedFlag);
+    assert_eq!(decide_confirmation(false, true), Confirmation::Prompt);
+    assert_eq!(decide_confirmation(true, false), Confirmation::Bypassed);
+    assert_eq!(decide_confirmation(true, true), Confirmation::Bypassed);
 }
 
-/// A withdrawal only returns TOKEN and the maturing case submits nothing,
-/// so neither may block on a prompt — that would wedge `--json` consumers
-/// and cron-driven withdrawals.
+/// An `unbond` that may have taken effect outranks the `declareMbps` before
+/// it: an operator whose TOKEN may already be released must be told so, and
+/// told that a re-run of `--amount` releases the amount again.
 #[test]
-fn only_a_new_request_is_ever_confirmed() {
-    for action in [
-        Action::Withdraw {
-            amount: U256::from(1u64),
-        },
-        Action::Waiting {
-            amount: U256::from(1u64),
-            unlock_at: 2,
-            now: 1,
-        },
-    ] {
-        for interactive in [true, false] {
-            assert_eq!(
-                decide_confirmation(action, false, interactive),
-                Confirmation::NotNeeded,
-                "{action:?} must not prompt"
-            );
-        }
+fn resume_hint_names_a_possibly_landed_unbond() {
+    let declare = B256::repeat_byte(0xc3);
+    let unbond = B256::repeat_byte(0xd4);
+    for declare_slot in [None, Some(declare)] {
+        let hint = resume_hint(&Outcome {
+            declare: declare_slot,
+            unbond: Some(unbond),
+        });
+        assert!(hint.contains(&format!("unbond tx {unbond:#x}")), "{hint}");
+        assert!(
+            !hint.contains(&format!("{declare:#x}")),
+            "must not name the earlier declare: {hint}"
+        );
+        assert!(hint.contains("may have taken effect"), "{hint}");
+        assert!(hint.contains("activeBond"), "{hint}");
+        assert!(hint.contains("Do NOT re-run until"), "{hint}");
+        assert!(
+            hint.contains("`--amount` releases that amount again"),
+            "{hint}"
+        );
     }
 }
 
+/// A `declareMbps` with no recorded `unbond` leaves the unbond's fate open:
+/// the unbond may never have been sent, may have reverted, or may have been
+/// broadcast with an unknown outcome. The hint must not claim no TOKEN moved.
 #[test]
-fn format_remaining_units() {
-    assert_eq!(format_remaining(0), "now");
-    assert_eq!(format_remaining(45), "45s");
-    assert_eq!(format_remaining(90), "1m");
-    assert_eq!(format_remaining(3600 + 1800), "1h 30m");
-    assert_eq!(format_remaining(14 * 24 * 3600), "14d 0h");
-    assert_eq!(format_remaining(36 * 3600), "1d 12h");
-    // Exact unit boundaries, where an off-by-one `<` would silently reclassify.
-    assert_eq!(format_remaining(60), "1m");
-    assert_eq!(format_remaining(3600), "1h 0m");
-    assert_eq!(format_remaining(86_400), "1d 0h");
+fn resume_hint_after_a_declare_does_not_deny_a_release() {
+    let declare = B256::repeat_byte(0xc3);
+    let hint = resume_hint(&Outcome {
+        declare: Some(declare),
+        unbond: None,
+    });
+    assert!(
+        hint.contains(&format!("declareMbps tx {declare:#x}")),
+        "{hint}"
+    );
+    assert!(hint.contains("may have taken effect"), "{hint}");
+    assert!(
+        hint.contains("an unbond may still have been broadcast"),
+        "{hint}"
+    );
+    assert!(hint.contains("Do NOT re-run until"), "{hint}");
+    for forbidden in [
+        "NO TOKEN was released",
+        "no TOKEN was released",
+        "no transaction landed",
+        "on-chain state is unchanged",
+    ] {
+        assert!(
+            !hint.contains(forbidden),
+            "must not assert `{forbidden}`: {hint}"
+        );
+    }
+}
+
+/// With neither slot recorded, nothing is known to have taken effect, and the
+/// hint still points at the cause rather than calling the chain untouched.
+#[test]
+fn resume_hint_with_no_recorded_tx_says_nothing_took_effect() {
+    let hint = resume_hint(&Outcome::default());
+    assert!(
+        hint.contains("no transaction is recorded as having taken effect"),
+        "{hint}"
+    );
+    assert!(hint.contains("confirmed reverted"), "{hint}");
+    assert!(!hint.contains("on-chain state is unchanged"), "{hint}");
+}
+
+/// A `None` slot also covers a send whose broadcast is unknown, so the hint
+/// with no recorded tx still warns that an unbond may be out, and that a
+/// re-run of `--amount` would release again.
+#[test]
+fn resume_hint_with_no_recorded_tx_covers_an_unknown_broadcast() {
+    let hint = resume_hint(&Outcome::default());
+    assert!(hint.contains("a send's outcome is unknown"), "{hint}");
+    assert!(hint.contains("an unbond may have been broadcast"), "{hint}");
+    assert!(hint.contains("pending and mined transactions"), "{hint}");
+    assert!(hint.contains("`activeBond`"), "{hint}");
+    assert!(
+        hint.contains("a re-run of `--amount` releases that amount again"),
+        "{hint}"
+    );
 }
 
 /// Plan-computation coverage against a mocked provider.
 ///
-/// `resolve_release` decides how much TOKEN moves, and until this module
-/// existed nothing exercised it: the `--all` arm was never executed by any
-/// test (its only e2e use returns from `build_plan`'s pending-request branch
-/// first), and `--to-mbps`'s `max(minBond, ·)` term was inert at the e2e's
-/// chosen tiers — deleting it broke nothing.
+/// `resolve_release` decides how much TOKEN moves. `--to-mbps`'s
+/// `max(minBond, ·)` term is inert at the e2e's chosen tiers, so only these
+/// tests pin it.
 ///
 /// `Asserter` serves `eth_call` responses FIFO, which works here because the
 /// call order is static: `--to-mbps` reads the capacity band only when a
@@ -359,13 +449,13 @@ mod plan_computation {
         assert_eq!(
             declare_to,
             Some(0),
-            "the run must send declareMbps(0) before requestUnbond"
+            "the run must send declareMbps(0) before unbond"
         );
         assert_eq!(retained, U256::ZERO, "bondRequired(0) == 0 — a full exit");
         assert_eq!(
             release,
             token(10_126),
-            "the whole remaining bond, including a slashed-below-floor residual"
+            "the whole remaining bond, including a below-floor residual"
         );
     }
 

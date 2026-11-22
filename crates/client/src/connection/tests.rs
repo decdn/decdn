@@ -332,7 +332,7 @@ async fn a_leg_that_times_out_unpins_its_connection() {
     let connections = super::Connections::new(ep.clone());
     let ctx = crate::source::ctx_with(0xB0, U256::from(1_000_000u64));
     let ledger = std::sync::Arc::new(ctx.new_ledger());
-    let slash = decdn_incentive::slash_judge_domain(1, Address::ZERO);
+    let slash = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
     let source = crate::PeerSource::new(
         &ep,
         peer_addr.clone(),
@@ -583,7 +583,7 @@ async fn a_leg_on_a_pinned_connection_closed_under_the_open_redials_once() {
     let (_peer, peer_addr) = closing_peer(1).await;
     let (ep, _) = loopback_endpoint(Vec::new()).await;
     let connections = super::Connections::new(ep.clone());
-    let slash = decdn_incentive::slash_judge_domain(1, Address::ZERO);
+    let slash = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
     let source = pooled_source(&ep, &peer_addr, &slash, &connections);
 
     let pinned = connections.get(&peer_addr).await.expect("pin a connection");
@@ -615,7 +615,7 @@ async fn a_leg_on_a_fresh_connection_that_fails_is_not_retried() {
     let (_peer, peer_addr) = closing_peer(1).await;
     let (ep, _) = loopback_endpoint(Vec::new()).await;
     let connections = super::Connections::new(ep.clone());
-    let slash = decdn_incentive::slash_judge_domain(1, Address::ZERO);
+    let slash = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
     let source = pooled_source(&ep, &peer_addr, &slash, &connections);
 
     let err = source

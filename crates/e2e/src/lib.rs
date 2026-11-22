@@ -17,7 +17,7 @@
 //!   capability registered to its pending key.
 //! - [`sdk_contract`] — run an SDK's contract suite (a [`sdk_contract::Suite`])
 //!   against a real `decdn gateway`, public or loopback.
-//! - [`time`] — advance anvil time across dispute / timelock / unbond windows.
+//! - [`time`] — advance anvil time across dispute / compliance / timelock windows.
 //! - [`mod@assert`] — on-chain + admin-RPC + delivered-bytes assertion helpers.
 //!
 //! The fixtures shell out to `anvil`/`forge` and spawn the built `decdn-node`

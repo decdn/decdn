@@ -20,10 +20,9 @@ pub struct Profile {
     pub governance_chain_id: u64,
     /// JSON-RPC endpoint `decdn` reads the governance chain through.
     pub governance_rpc_url: String,
-    /// The `CapacityBond` on the governance chain, for node discovery.
+    /// The `CapacityBond` on the governance chain: node discovery, and the
+    /// domain `decdn` checks node signatures under.
     pub capacity_bond: Address,
-    /// The `SlashJudge` on the governance chain, when the onramp names one.
-    pub slash_judge: Option<Address>,
     /// EIP-155 id of the payment chain the pool is on, from the daemon.
     pub pool_chain_id: u64,
     /// JSON-RPC endpoint `decdn` reads the payment chain through.
@@ -48,14 +47,9 @@ impl Installers {
     /// so the scripts hold no assumption about how decdn tags. Every
     /// substituted value was checked at startup to hold nothing a quoted
     /// shell or PowerShell string could misread (`config::script_safe_url`,
-    /// `ReleasePin::new`), or is a number or a hex address. A missing
-    /// `SlashJudge` renders as an empty string.
+    /// `ReleasePin::new`), or is a number or a hex address.
     #[must_use]
     pub fn render(cfg: &OnrampConfig, profile: &Profile) -> Self {
-        let slash_judge = profile
-            .slash_judge
-            .map(|a| a.to_string())
-            .unwrap_or_default();
         let render = |template: &str| {
             template
                 .replace("{{ONRAMP_URL}}", &cfg.public_url)
@@ -69,7 +63,6 @@ impl Installers {
                 )
                 .replace("{{GOVERNANCE_RPC_URL}}", &profile.governance_rpc_url)
                 .replace("{{CAPACITY_BOND}}", &profile.capacity_bond.to_string())
-                .replace("{{SLASH_JUDGE}}", &slash_judge)
                 .replace("{{POOL_CHAIN_ID}}", &profile.pool_chain_id.to_string())
                 .replace("{{POOL_RPC_URL}}", &profile.pool_rpc_url)
                 .replace("{{PAYMENT_POOL}}", &profile.payment_pool.to_string())

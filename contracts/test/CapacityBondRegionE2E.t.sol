@@ -6,11 +6,6 @@ import { Test } from "forge-std/Test.sol";
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { ContentBlacklist } from "../src/ContentBlacklist.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
-import { SlashJudge } from "../src/SlashJudge.sol";
-import { ISlashJudge } from "../src/interfaces/ISlashJudge.sol";
-import { ICapacityBondSlasher } from "../src/interfaces/ICapacityBondSlasher.sol";
-import { IContentBlacklistHashView } from "../src/interfaces/IContentBlacklistHashView.sol";
-import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Token } from "../src/Token.sol";
 
 /// @title CapacityBondRegionE2ETest
@@ -30,31 +25,11 @@ contract CapacityBondRegionE2ETest is Test {
     Token internal token;
     Ed25519Verifier internal verifier;
     CapacityBond internal bond;
-    ContentBlacklist internal deployedBlacklist;
 
     address internal admin = address(0xA11CE);
 
     uint256 internal constant MIN_BOND = 50_000e18;
-    uint256 internal constant UNBONDING = 7 days;
     uint256 internal constant REGION_WINDOW = 7 days;
-
-    // SlashJudge wiring for the cross-contract regional/ripening slash path.
-    uint256 internal constant CHALLENGE_BOND = 100e18;
-    uint256 internal constant MAX_EVIDENCE_AGE_US = 5 days * 1_000_000;
-    address internal challenger = address(0xC4A11E);
-    bytes32 internal constant BLOB = bytes32(uint256(0xB10B));
-    bytes32 internal constant US_EAST = bytes32("us-east");
-    address internal constant MULTISIG = address(0xC0DE);
-
-    /// @dev ADR 011 § Compliance Window — a regional entry is not slashable
-    ///      until `addedAt + complianceWindow` (24h by default). Every slash
-    ///      below must therefore present a response that post-dates it.
-    uint256 internal constant COMPLIANCE_WINDOW = 24 hours;
-
-    // Commit–reveal (#854): mirror of SlashJudge's fixed MIN_REVEAL_DELAY and a
-    // fixed salt for the challenger's blind commitment.
-    uint256 internal constant REVEAL_DELAY = 1 minutes;
-    bytes32 internal constant SALT = bytes32(uint256(0x5A17));
 
     // ===================================================================
     // AUTO-GENERATED — do not edit by hand.
@@ -102,7 +77,6 @@ contract CapacityBondRegionE2ETest is Test {
             ed25519Verifier_: verifier,
             admin: admin,
             minBond_: MIN_BOND,
-            unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
             regionStabilityWindow_: REGION_WINDOW,
@@ -237,13 +211,8 @@ contract CapacityBondRegionE2ETest is Test {
 
     /// @notice The cross-contract eject path: `ContentBlacklist.addOperator`
     ///         (GOVERNANCE_ROLE) calls `CapacityBond.ejectNode` (BLACKLIST_ROLE),
-    ///         deactivating the node and bumping `registrationNonce`.
-    /// @dev    The region-ripening slash-eligibility trigger #689 scope item #3
-    ///         asked for now exists (ADR 030 enforcement) — see the
-    ///         `test_crossContract_regionalSlash_*` tests below, which drive a
-    ///         real `SlashJudge` against this contract's live `regionPrev` /
-    ///         `regionLastChanged`. This test still covers the operator-level
-    ///         blacklist-driven eject path, which is region-independent.
+    ///         deactivating the node and bumping `registrationNonce`. The
+    ///         operator-level blacklist eject path is region-independent.
     function test_crossContractEject_viaContentBlacklist() public {
         _bondAndRegister();
 
@@ -256,7 +225,7 @@ contract CapacityBondRegionE2ETest is Test {
 
         // Both eject side-effect events fire, in order: the blacklist marker
         // then the node auto-eject carrying the remaining bond (MIN_BOND — the
-        // operator bonded the minimum and was never slashed).
+        // operator bonded the minimum).
         vm.expectEmit(true, false, false, false, address(bond));
         emit CapacityBond.EjectedByBlacklist(REG_OPERATOR);
         vm.expectEmit(true, false, false, true, address(bond));
@@ -277,169 +246,8 @@ contract CapacityBondRegionE2ETest is Test {
     }
 
     // ----------------------------------------------------------------------
-    // Cross-contract regional + ripening slash (ADR 030 enforcement, #689 item 3)
-    // ----------------------------------------------------------------------
-
-    /// @notice A hash blacklisted in the node's CURRENT region makes it slashable
-    ///         end-to-end: real `ContentBlacklist` regional entry → real
-    ///         `SlashJudge` reads this contract's live region data → real
-    ///         `CapacityBond.slash`. Proves the production read path, not a mock.
-    function test_crossContract_regionalSlash_currentRegion() public {
-        (, SlashJudge judge) = _deployBlacklistAndJudge();
-        _bondAndRegister(); // node region = "us-east"
-
-        _blacklistRegional(US_EAST, BLOB);
-        // Advance past the compliance window so the served response post-dates
-        // `effectiveAt`, then slash.
-        vm.warp(block.timestamp + COMPLIANCE_WINDOW + 10);
-        _submitBlacklistSlash(judge, uint64(block.timestamp * 1_000_000 - 5_000_000));
-
-        assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 1);
-    }
-
-    /// @notice ADR 030 ripening: after the node flips us-east → eu-west, an entry
-    ///         in its PREVIOUS region (us-east) keeps it slashable for the full
-    ///         stability window — reactive region-flip evasion is foreclosed.
-    function test_crossContract_regionalSlash_prevRegionInWindow() public {
-        (, SlashJudge judge) = _deployBlacklistAndJudge();
-        _bondAndRegister();
-
-        _blacklistRegional(US_EAST, BLOB);
-        // The first update is now gated by the registration-time cooldown stamp,
-        // so warp past REGION_WINDOW before flipping: current becomes eu-west,
-        // regionPrev snapshots us-east, regionLastChanged = now.
-        vm.warp(block.timestamp + REGION_WINDOW + 1);
-        vm.prank(REG_OPERATOR);
-        bond.updateRegion("eu-west");
-
-        // Still inside REGION_WINDOW (7d) but past the 24h compliance window:
-        // the us-east (prev) entry remains in scope and is now enforceable.
-        vm.warp(block.timestamp + COMPLIANCE_WINDOW + 1 hours);
-        _submitBlacklistSlash(judge, uint64(block.timestamp * 1_000_000 - 5_000_000));
-
-        assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 1);
-    }
-
-    /// @notice A serve made AFTER the region change ripens (the served `responseTs`
-    ///         is more than REGION_WINDOW past the flip) is outside the previous
-    ///         region's scope and not slashable for a prev-region entry — the flip
-    ///         has fully taken effect. The slash window is anchored to `responseTs`
-    ///         (ADR 030 item 2, #801), so the serve, not the challenge time, is what
-    ///         must post-date ripening: here the response is taken ~1h before a
-    ///         challenge that lands well past the window.
-    function test_crossContract_regionalSlash_prevRegionAfterWindow() public {
-        (, SlashJudge judge) = _deployBlacklistAndJudge();
-        _bondAndRegister();
-
-        _blacklistRegional(US_EAST, BLOB);
-        // First update is gated by the registration-time cooldown; warp past
-        // REGION_WINDOW before flipping.
-        vm.warp(block.timestamp + REGION_WINDOW + 1);
-        vm.prank(REG_OPERATOR);
-        bond.updateRegion("eu-west");
-
-        // The serve post-dates ripening: `responseTs - effective` (flip) exceeds
-        // REGION_WINDOW, so us-east (prev) is out of scope and eu-west has no entry.
-        // We warp a full window + 1h past the flip, then take responseTs = now - 5s;
-        // the 5s only keeps responseTs validly in the past for liveness/skew — it is
-        // the flip being > a window before responseTs that drops the prev leg.
-        vm.warp(block.timestamp + REGION_WINDOW + 1 hours);
-        uint64 ts = uint64(block.timestamp * 1_000_000 - 5_000_000);
-        SlashJudge.StreamMsg memory s = _stream(ts);
-        bytes memory sig = _signStream(judge, s); // sign before prank (see _submitBlacklistSlash)
-        // Reverts in `_checkBlacklistedBefore`, before the commit–reveal check, so
-        // no commitment is needed; `salt` is still a required argument (#854).
-        vm.prank(challenger);
-        vm.expectRevert(abi.encodeWithSelector(SlashJudge.HashNotBlacklisted.selector, BLOB));
-        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, SALT);
-        assertEq(bond.lifetimeOffenseCount(REG_OPERATOR), 0);
-    }
-
-    // ----------------------------------------------------------------------
     // Helpers
     // ----------------------------------------------------------------------
-
-    /// @dev Deploy a real `ContentBlacklist` + `SlashJudge` wired to `bond`, grant
-    ///      the cross-contract roles, and fund the challenger's bond.
-    function _deployBlacklistAndJudge() internal returns (ContentBlacklist blacklist, SlashJudge judge) {
-        blacklist = new ContentBlacklist(bond, admin);
-        deployedBlacklist = blacklist;
-        judge = new SlashJudge(
-            ICapacityBondSlasher(address(bond)),
-            IERC20(address(token)),
-            IContentBlacklistHashView(address(blacklist)),
-            CHALLENGE_BOND,
-            MAX_EVIDENCE_AGE_US,
-            admin
-        );
-        bytes32 slashRole = bond.SLASH_ROLE();
-        vm.startPrank(admin);
-        bond.grantRole(slashRole, address(judge));
-        // `admin` acts as the US_EAST regional body — the ADR 011 bootstrap
-        // posture, where the DEFAULT_ADMIN_ROLE holder is sole governance. A
-        // bare role grant is no longer enough: a body's write authority is
-        // scoped to the region it is registered for.
-        blacklist.grantRole(blacklist.EMERGENCY_MULTISIG_ROLE(), MULTISIG);
-        blacklist.registerRegionalBody(US_EAST, admin, MULTISIG);
-        token.transfer(challenger, CHALLENGE_BOND * 10);
-        vm.stopPrank();
-        vm.prank(challenger);
-        token.approve(address(judge), type(uint256).max);
-    }
-
-    function _blacklistRegional(bytes32 region, bytes32 hash) internal {
-        vm.prank(admin);
-        deployedBlacklist.addHashRegional(region, hash, "DMCA-TEST");
-    }
-
-    /// @dev Submit a blacklist challenge with a node-signed stream response at
-    ///      `tsUs`; expects a successful slash. Commit–reveal (#854): commit the
-    ///      evidence hash, mature past `MIN_REVEAL_DELAY`, then reveal.
-    function _submitBlacklistSlash(SlashJudge judge, uint64 tsUs) internal {
-        SlashJudge.StreamMsg memory s = _stream(tsUs);
-        // Sign BEFORE pranking: `_signStream` makes an external view call that
-        // would otherwise consume the prank, leaving `msg.sender` as the test.
-        bytes memory sig = _signStream(judge, s);
-
-        bytes32 evidenceHash = keccak256(
-            abi.encode(uint8(ISlashJudge.OffenseType.Blacklist), REG_OPERATOR, _streamStructHash(judge, s))
-        );
-        vm.prank(challenger);
-        judge.commitChallenge(keccak256(abi.encode(evidenceHash, SALT, challenger)));
-        // A 1-minute maturation is negligible against the 5-day evidence window.
-        vm.warp(block.timestamp + REVEAL_DELAY + 1);
-
-        vm.prank(challenger);
-        judge.submitBlacklistChallenge(REG_OPERATOR, REG_NODE_ID, BLOB, abi.encode(s), sig, SALT);
-    }
-
-    function _stream(uint64 tsUs) internal pure returns (SlashJudge.StreamMsg memory) {
-        return SlashJudge.StreamMsg({ hash: BLOB, ok: true, ratePerMb: 10, timestampUs: tsUs });
-    }
-
-    /// @dev The EIP-712 `StreamResponse` struct hash (the blacklist evidence
-    ///      preimage component) over `SlashJudge`'s typehash.
-    function _streamStructHash(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes32) {
-        return keccak256(abi.encode(judge.STREAM_RESPONSE_TYPEHASH(), s.hash, s.ok, s.ratePerMb, s.timestampUs));
-    }
-
-    /// @dev EIP-712 sign a `StreamResponse` with the operator's secp256k1 key over
-    ///      `SlashJudge`'s domain (`"deCDN SlashJudge"` / `"1"`).
-    function _signStream(SlashJudge judge, SlashJudge.StreamMsg memory s) internal view returns (bytes memory) {
-        bytes32 structHash = _streamStructHash(judge, s);
-        bytes32 domainSeparator = keccak256(
-            abi.encode(
-                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256(bytes("deCDN SlashJudge")),
-                keccak256(bytes("1")),
-                block.chainid,
-                address(judge)
-            )
-        );
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
-        (uint8 v, bytes32 r, bytes32 sig) = vm.sign(REG_OP_PK, digest);
-        return abi.encodePacked(r, sig, v);
-    }
 
     /// @dev Bond the minimum and register `REG_NODE_ID` with a fresh EIP-712
     ///      binding signature and the generated ed25519 ownership signature.

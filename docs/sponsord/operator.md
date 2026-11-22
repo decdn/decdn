@@ -55,12 +55,11 @@ on another host needs it.
 | `ONRAMP_POOL_RPC_URL` | required | Public RPC endpoint users' `decdn` pays through, on the payment chain of the daemon's pool. The daemon reports that chain's id |
 | `ONRAMP_TURNSTILE_SECRET` / `_FILE` | required (Turnstile gate) | Cloudflare Turnstile secret |
 | `ONRAMP_TURNSTILE_SITEKEY` | required (Turnstile gate) | Cloudflare Turnstile sitekey |
-| `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install (`v0.3.0` or later; the onramp refuses an older one), and the SHA-256 of its `SHA256SUMS` |
+| `ONRAMP_DECDN_RELEASE`, `ONRAMP_DECDN_SUMS_SHA256` | required | `decdn` release the installers install (`v0.4.0` or later; the onramp refuses an older one), and the SHA-256 of its `SHA256SUMS` |
 | `ONRAMP_BIND` | `127.0.0.1:8080` | Listen address |
 | `ONRAMP_DAEMON_URL` | `http://127.0.0.1:8090` | The daemon |
 | `ONRAMP_SPENDING_CAP_MICRO_USDC` | daemon maximum | Cap requested per capability |
 | `ONRAMP_TTL_SECS` | daemon maximum | TTL requested per capability |
-| `ONRAMP_SLASH_JUDGE_ADDR` | none | `SlashJudge` contract on the governance chain, handed to `decdn` |
 | `ONRAMP_GATE` | `turnstile` | The gate; `custom` only for programs that embed the onramp with their own ([integrator.md](integrator.md)) |
 | `ONRAMP_BRAND_NAME` | `deCDN` | Name on the gate page |
 | `ONRAMP_GATE_TEMPLATE` | built-in | Your own gate page (below) |

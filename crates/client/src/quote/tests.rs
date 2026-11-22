@@ -451,7 +451,6 @@ async fn a_census_opens_each_node_and_cancels_every_stream() -> anyhow::Result<(
         31_337,
         Address::repeat_byte(0x01),
         Address::repeat_byte(0x02),
-        None,
     );
     let blob: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
     let hash = *blake3::hash(&blob).as_bytes();
@@ -460,7 +459,7 @@ async fn a_census_opens_each_node_and_cancels_every_stream() -> anyhow::Result<(
             blob: blob.clone(),
             rate: 9,
         },
-        slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge),
+        capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond),
     )
     .await?;
     let client = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)

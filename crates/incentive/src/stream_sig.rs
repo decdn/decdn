@@ -2,34 +2,34 @@
 //!
 //! Every `StreamResponse` carries a mandatory, non-empty secp256k1 EIP-712
 //! signature (`slash_sig`) over its frozen signed field set. The signature
-//! makes the response cryptographically attributable to a registered node and
-//! is the on-chain evidence for blacklist-violation slashing (ADR 005
-//! §`cdn/client/v1`, ADR 014). A signed refusal (`ok:false`) is inert as
-//! evidence — a blacklist violation requires `ok:true`, so a node may sign
-//! refusals freely.
+//! makes the response attributable to a registered node: the requester checks
+//! that it recovers to the operator bound to the serving `NodeId` (ADR 005
+//! § Signer binding). Pull receipts carry the signed `timestamp_us`: the
+//! requester's timestamp, which the node echoes unchanged once it finds it
+//! within its clock-skew bound.
 //!
-//! The signed payload follows ADR 014 §EIP-712 Type Definitions exactly so an
-//! off-chain Rust signature byte-matches what the on-chain `SlashJudge`
-//! contract recovers signatures against. `hash` is a request-context field
-//! (from the `StreamRequest`); in this implementation's wire shape it is
-//! echoed back in `decdn_protocol::StreamResponseBody.hash` and is part of the
-//! EIP-712 signed set: a verifier reconstructs the typed data from the
-//! response body's own fields.
+//! `hash` is a request-context field (from the `StreamRequest`); in this
+//! implementation's wire shape it is echoed back in
+//! `decdn_protocol::StreamResponseBody.hash` and is part of the EIP-712 signed
+//! set: a verifier reconstructs the typed data from the response body's own
+//! fields.
 //!
 //! # Domain
 //!
 //! ```text
 //! EIP712Domain {
-//!     name: "deCDN SlashJudge",
+//!     name: "CapacityBond",
 //!     version: "1",
-//!     chainId: <L2 chain id>,
-//!     verifyingContract: <SlashJudge deployment address>,
+//!     chainId: <governance chain id>,
+//!     verifyingContract: <CapacityBond deployment address>,
 //! }
 //! ```
 //!
-//! The `SlashJudge` contract uses its own domain separator (distinct from
-//! `CapacityBond` / `PaymentPool`) to prevent cross-contract signature replay
-//! (ADR 014 §EIP-712 Type Definitions). [`slash_judge_domain`] builds it.
+//! The signature shares the `CapacityBond` domain
+//! ([`crate::capacity_bond_domain`]) with the node-binding signatures, which
+//! binds it to one chain and one deployment. The `StreamResponse` type name
+//! differs from every other type signed under that domain, so no other
+//! signature verifies as a stream response.
 //!
 //! # `StreamResponse` type
 //!
@@ -43,41 +43,19 @@
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature};
 use alloy::signers::SignerSync;
-use alloy::sol_types::{SolStruct, eip712_domain};
+use alloy::sol_types::SolStruct;
 
 use decdn_protocol::StreamResponseBody;
 
-/// EIP-712 domain `name` field. Must match the `SlashJudge` contract's domain
-/// exactly — a mismatch produces a different digest and every signature fails
-/// on-chain.
-pub const SLASH_JUDGE_DOMAIN_NAME: &str = "deCDN SlashJudge";
-
-/// EIP-712 domain `version` field.
-pub const SLASH_JUDGE_DOMAIN_VERSION: &str = "1";
-
-/// Construct the EIP-712 domain used to sign stream responses for a given
-/// `SlashJudge` deployment.
-#[must_use]
-pub fn slash_judge_domain(chain_id: u64, verifying_contract: Address) -> Eip712Domain {
-    eip712_domain! {
-        name: SLASH_JUDGE_DOMAIN_NAME,
-        version: SLASH_JUDGE_DOMAIN_VERSION,
-        chain_id: chain_id,
-        verifying_contract: verifying_contract,
-    }
-}
-
-// Solidity struct mirroring ADR 014 §EIP-712 Type Definitions. Field names and
-// order are part of the signed type — both must match the on-chain contract
-// verbatim, hence the camelCase. The `sol!` macro generates a `SolStruct` impl
-// whose `eip712_signing_hash` produces the same 32-byte digest the contract
-// recovers signatures against.
+// Solidity struct mirroring ADR 005 § Signer binding. Field names and order are
+// part of the signed type, hence the camelCase. The `sol!` macro generates a
+// `SolStruct` impl whose `eip712_signing_hash` produces the 32-byte digest a
+// verifier recovers the signer from.
 //
 // Wrapped in a private module because the `sol!` macro uses the Rust struct
-// name as the on-chain Solidity type name in the EIP-712 type-string. The
-// contract's struct is `StreamResponse`, so the Rust struct must be
-// `StreamResponse` too — the wrapping module avoids a name clash with
-// `decdn_protocol::StreamResponse`.
+// name as the Solidity type name in the EIP-712 type-string. The type is
+// `StreamResponse`, so the Rust struct must be `StreamResponse` too — the
+// wrapping module avoids a name clash with `decdn_protocol::StreamResponse`.
 mod sol_types {
     alloy::sol! {
         #[allow(non_snake_case, missing_debug_implementations)]
@@ -93,25 +71,23 @@ mod sol_types {
 use sol_types::StreamResponse as StreamResponseSol;
 
 /// Pinned keccak256 digest of the canonical `StreamResponse` EIP-712 type
-/// string (ADR 014 §EIP-712 Type Definitions):
+/// string (ADR 005 § Signer binding):
 ///
 /// ```text
 /// StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)
 /// ```
 ///
-/// The Solidity suite pins `SlashJudge.STREAM_RESPONSE_TYPEHASH` to the same
-/// digest (`contracts/test/SlashJudge.t.sol`), so a one-sided edit of either
-/// side's type string fails default CI on both sides (#1843).
+/// A test pins the `sol!` type string to this digest, so an edit of the type
+/// string fails CI.
 pub const STREAM_RESPONSE_TYPEHASH: B256 =
     alloy::primitives::b256!("0x8cdc58326f067436e492abcb22129dd2bcee462a10809d3ed3a0377858ebd535");
 
-/// The signed field set of a `StreamResponse` (ADR 014 §1).
+/// The signed field set of a `StreamResponse` (ADR 005 § Signer binding).
 ///
 /// `hash` is a request-context field echoed back in the response body;
 /// `timestamp_us` is the requester-generated timestamp echoed
 /// from the `StreamRequest`. Together with `ok` and `rate_per_mb`, these are
-/// exactly the fields the on-chain `SlashJudge` reconstructs to verify
-/// blacklist-violation evidence.
+/// exactly the fields a verifier reconstructs to recover the signer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSlashData {
     /// BLAKE3 hash of the delivered blob (iroh `Hash` bytes).
@@ -145,20 +121,12 @@ impl StreamSlashData {
         }
     }
 
-    /// EIP-712 signing hash bound to `domain`. This is the 32-byte digest
-    /// passed into `ecrecover` on-chain; it depends only on the data and
+    /// EIP-712 signing hash bound to `domain`. This is the 32-byte digest a
+    /// verifier recovers the signer from; it depends only on the data and
     /// `domain` and is independent of the signing key.
     #[must_use]
     pub fn signing_hash(&self, domain: &Eip712Domain) -> B256 {
         (*self).to_sol().eip712_signing_hash(domain)
-    }
-
-    /// EIP-712 struct hash (`keccak256(abi.encode(STREAM_RESPONSE_TYPEHASH,
-    /// fields...))`), independent of any domain — the per-message hash
-    /// `SlashJudge` folds into its `evidenceHash` commit (#1032, G-NODE-05).
-    #[must_use]
-    pub fn struct_hash(&self) -> B256 {
-        (*self).to_sol().eip712_hash_struct()
     }
 
     /// Sign the stream response with `signer` for the given EIP-712 `domain`,
@@ -189,8 +157,8 @@ impl StreamSlashData {
         signature: &Signature,
         domain: &Eip712Domain,
     ) -> Result<Address, StreamSlashError> {
-        // Reject non-canonical high-`s` so the off-chain accept-set matches the
-        // on-chain `SlashJudge` verifiable-set (#836).
+        // Reject non-canonical high-`s`: each response has exactly one
+        // accepted signature encoding (#836).
         if crate::sig_canon::is_high_s(signature) {
             return Err(StreamSlashError::InvalidSignature);
         }

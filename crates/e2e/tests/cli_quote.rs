@@ -439,8 +439,6 @@ fn run_decdn(
             ),
             "--pool-rpc-url".to_owned(),
             chain.rpc_url(),
-            "--slash-judge-address".to_owned(),
-            format!("{}", chain.addrs().slash_judge),
             "--data-dir".to_owned(),
             data_dir.display().to_string(),
             "--keystore".to_owned(),

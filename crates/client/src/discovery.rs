@@ -158,9 +158,9 @@ pub fn with_dial_addrs(mut target: iroh::EndpointAddr, cand: &NodeCandidate) -> 
 /// not currently active or its `nodeId` is not a valid ed25519 key.
 ///
 /// `is_active` is the on-chain `isActive` predicate that `getRegisteredNodes`
-/// returns per entry (registered AND bond ≥ minBond AND no unbonding AND not
+/// returns per entry (registered AND bond ≥ the operator's floor AND not
 /// ejected) — NOT the raw `NodeInfo.active` registration flag, which stays
-/// `true` for an operator mid-unbonding. Filtering on the strict predicate drops
+/// `true` for an operator whose bond fell below its floor. Filtering on the strict predicate drops
 /// stale-active nodes up front rather than paying a discovery open to a node
 /// that is on its way out. The downstream open-and-rank step is still the final
 /// arbiter of who can actually serve.
@@ -488,7 +488,7 @@ impl Bootstrap {
                 Some(format!(
                     "could not reach the node registry ({registry_error}); using {} \
                      previously known node(s) from the local peer store, identity up to {age} \
-                     old. These nodes may have been deactivated or slashed since.",
+                     old. These nodes may have been deactivated or ejected since.",
                     peers.len()
                 ))
             }

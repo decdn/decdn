@@ -118,7 +118,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     error VettingPolicyNotAContract(address policy);
 
     // -----------------------------------------------------------------
-    // Constructor (ADR 016 § Deployment Order, step 10)
+    // Constructor (ADR 016 § Deployment Order, step 11)
     // -----------------------------------------------------------------
 
     /// @param capacityBond_       Operator activity source.
@@ -222,7 +222,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     }
 
     /// @notice Permissionless: remove an operator that has left the active set
-    ///         (unbonded, deregistered, slash-ejected, or blacklist-ejected —
+    ///         (unbonded, deregistered, or blacklist-ejected —
     ///         every operator blacklisted at the operator level is ejected from
     ///         `CapacityBond`, so this reaches them too) from a namespace's set.
     ///         The contract checks `CapacityBond.isActive` itself, so a caller

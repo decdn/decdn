@@ -91,7 +91,7 @@ pub struct GovernanceChainArgs {
     #[arg(long, value_name = "URL")]
     pub governance_rpc_url: Option<String>,
 
-    /// Governance-chain EIP-155 id, bound into the slash, stream and pointer
+    /// Governance-chain EIP-155 id, bound into the stream, attestation and pointer
     /// signatures. Overrides `blockchain.chain_id`; defaults to
     /// Arbitrum Sepolia.
     #[arg(long, value_name = "ID")]

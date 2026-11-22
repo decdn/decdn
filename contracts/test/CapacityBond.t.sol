@@ -6,7 +6,6 @@ import { Vm } from "forge-std/Vm.sol";
 
 import { CapacityBond } from "../src/CapacityBond.sol";
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
-import { SlashStatus, SlashRecord } from "../src/SlashEscrowLib.sol";
 import { BondMath } from "../src/BondMath.sol";
 import { Token } from "../src/Token.sol";
 
@@ -14,20 +13,14 @@ import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.so
 import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { MockEd25519Verifier } from "./mocks/MockEd25519Verifier.sol";
-import { ISlashJudgeEvidenceView } from "../src/interfaces/ISlashJudgeEvidenceView.sol";
-import { MockSlashJudgeEvidence } from "./mocks/MockSlashJudgeEvidence.sol";
 
-/// @title CapacityBond smoke tests
-/// @notice Minimal coverage of the new ADR 036/028/030/026-v2.2 surface:
-///         `firstBondedAt`, `slashedAtEpoch`, escrow-on-slash (slash escrows
-///         TOKEN; `finalizeUnappealedSlash` / the `SLASH_APPEAL_ROLE` settle
-///         hooks resolve it). NodeId / region-attestation paths require a
-///         signed registration helper and land with the broader integration
-///         suite.
-/// @dev    `admin` is granted `SLASH_APPEAL_ROLE` in `setUp` so escrow-hook
-///         tests can drive `markAppealOpen` / `settleAppealUpheld` /
-///         `settleAppealGranted` directly, standing in for the `SlashAppeal`
-///         contract (whose full flow is covered in `SlashAppeal.t.sol`).
+/// @title CapacityBond unit tests
+/// @notice Coverage of the bond / unbond / capacity-curve surface, the node
+///         registry, the blacklist-ejection latch, and the ADR 036 / 030 reads
+///         (`firstBondedAt`, `declaredMbpsAtEpoch`, `regionScopeData`).
+/// @dev    `admin` is granted `BLACKLIST_ROLE` in `setUp` so ejection tests can
+///         drive `ejectNode` / `unEjectNode` directly, standing in for the
+///         `ContentBlacklist` contract.
 contract CapacityBondTest is Test {
     Token internal token;
     MockEd25519Verifier internal ed25519;
@@ -35,23 +28,14 @@ contract CapacityBondTest is Test {
 
     address internal admin = address(0xA11CE);
     address internal operator = address(0xB0B);
-    address internal challenger = address(0xC4A11);
 
     uint256 internal constant MIN_BOND = 50_000e18;
     // Governance `minBond` ceiling, mirroring `CapacityBond.MIN_BOND_CEILING`
     // (internal), used by the non-retroactive-minBond tests.
     uint256 internal constant MIN_BOND_CEILING_TEST = 1_000_000e18;
-    uint256 internal constant UNBONDING = 7 days;
-    // First-offense slash tier (bps), mirroring `CapacityBond.SLASH_BPS_TIER_1`
-    // (internal), used by the exit slash-safety test.
-    uint256 internal constant SLASH_BPS_TIER_1_TEST = 500;
     // ADR 019 § Terms Acceptance — genesis operator-terms hash the fixture
     // registers against (stand-in for `keccak256(TERMS.md)`).
     bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
-    // 10 days in microseconds — a valid evidence-age ceiling (within [1d,30d])
-    // that is also >= the [7d,60d] unbonding floor, so the mirror check and the
-    // individual bound can be exercised independently.
-    uint256 internal constant MOCK_EVIDENCE_AGE_US = 10 days * 1_000_000;
 
     function setUp() public {
         token = new Token(admin);
@@ -62,7 +46,6 @@ contract CapacityBondTest is Test {
             ed25519Verifier_: ed25519,
             admin: admin,
             minBond_: MIN_BOND,
-            unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
             regionStabilityWindow_: 7 days,
@@ -70,8 +53,6 @@ contract CapacityBondTest is Test {
         });
 
         vm.startPrank(admin);
-        bond.grantRole(bond.SLASH_ROLE(), admin);
-        bond.grantRole(bond.SLASH_APPEAL_ROLE(), admin);
         bond.grantRole(bond.BLACKLIST_ROLE(), admin);
         token.transfer(operator, 200_000e18);
         vm.stopPrank();
@@ -135,152 +116,141 @@ contract CapacityBondTest is Test {
         assertEq(bond.firstBondedAt(operator), first);
     }
 
-    function test_slashedAtEpoch_zeroBeforeSlash() public view {
-        assertEq(bond.slashedAtEpoch(operator), 0);
+    // ── Tenure reset on exit ────────────────────────────────────────────────
+    // `firstBondedAt` measures continuous bonding at or above the floor. An
+    // `unbond` below `bondFloorAtActivation` resets it and the floor to 0, and
+    // the next entry stamps both afresh, so an address cannot be pre-aged by
+    // bonding `minBond` and withdrawing it at once.
+
+    /// @notice A full unbond ends the tenure; the next entry stamps a fresh one.
+    function test_firstBondedAt_fullUnbondResetsAndReentryRestamps() public {
+        vm.warp(1_000_000);
+        vm.startPrank(operator);
+        bond.bond(MIN_BOND);
+        assertEq(bond.firstBondedAt(operator), 1_000_000);
+
+        bond.unbond(MIN_BOND);
+        assertEq(bond.firstBondedAt(operator), 0, "a full unbond ends the tenure");
+        assertEq(bond.bondFloorAtActivation(operator), 0, "and clears the floor");
+
+        vm.warp(5_000_000);
+        bond.bond(MIN_BOND);
+        vm.stopPrank();
+        assertEq(bond.firstBondedAt(operator), 5_000_000, "re-entry stamps a fresh tenure");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "re-entry records the live minBond");
     }
 
-    function test_slash_stampsSlashedAtEpoch() public {
+    /// @notice A partial unbond that leaves the bond exactly at the floor keeps
+    ///         the tenure and the floor; one wei more ends both.
+    function test_firstBondedAt_partialUnbondHoldingFloorKeepsTenure() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(2 * MIN_BOND);
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.unbond(MIN_BOND);
+        assertEq(bond.activeBond(operator), MIN_BOND, "the bond sits exactly at the floor");
+        assertEq(bond.firstBondedAt(operator), 1_000_000, "an unbond that holds the floor keeps the tenure");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "and the floor");
+
+        vm.prank(operator);
+        bond.unbond(1);
+        assertEq(bond.firstBondedAt(operator), 0, "one wei below the floor ends the tenure");
+        assertEq(bond.bondFloorAtActivation(operator), 0, "and clears the floor");
+    }
+
+    /// @notice While a tenure runs, no bond moves its stamp or its floor:
+    ///         neither a top-up above the floor nor a top-up through a raised
+    ///         `minBond`.
+    function test_firstBondedAt_reBondDuringTenureNeverMovesIt() public {
         vm.warp(1_000_000);
         vm.prank(operator);
         bond.bond(MIN_BOND);
 
         vm.warp(2_000_000);
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        // `slashedAtEpoch` stores `actualEpoch + 1` so an epoch-0 slash isn't
-        // confused with the unslashed sentinel; expect the +1-offset stamp.
-        uint64 expected = uint64(uint256(2_000_000) / bond.EPOCH_LENGTH()) + 1;
-        assertEq(bond.slashedAtEpoch(operator), expected);
-    }
-
-    function test_escrowHooks_requireSlashAppealRole() public {
-        _expectMissingRole(operator, bond.SLASH_APPEAL_ROLE());
         vm.prank(operator);
-        bond.markAppealOpen(0);
+        bond.bond(10e18);
+        assertEq(bond.firstBondedAt(operator), 1_000_000, "a top-up above the floor keeps the stamp");
+
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
+        vm.warp(3_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND); // 50k + 10 + 50k tops up through the raised 100k minBond
+        assertEq(bond.firstBondedAt(operator), 1_000_000, "a top-up through a raised minBond keeps the stamp");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "and the grandfathered floor");
     }
 
-    /// A successful appeal (markAppealOpen → settleAppealGranted) clears the
-    /// slash zero-out and refunds the operator's escrowed TOKEN.
-    function test_settleAppealGranted_clearsAndRefunds() public {
+    /// @notice An operator that exits fully and re-enters after a `minBond`
+    ///         raise re-grandfathers at the raised value with a fresh tenure.
+    function test_firstBondedAt_reentryAfterMinBondRaiseRegrandfathers() public {
         vm.warp(1_000_000);
-        vm.prank(operator);
+        vm.startPrank(operator);
         bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
-        assertGt(bond.slashedAtEpoch(operator), 0);
-        assertEq(bond.escrowedTotal(), totalSlash);
-
-        uint256 opBefore = token.balanceOf(operator);
-        vm.startPrank(admin);
-        bond.markAppealOpen(slashId);
-        bond.settleAppealGranted(slashId);
+        bond.unbond(MIN_BOND);
         vm.stopPrank();
 
-        assertEq(bond.slashedAtEpoch(operator), 0);
-        assertEq(token.balanceOf(operator) - opBefore, totalSlash);
-        assertEq(bond.escrowedTotal(), 0);
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
+
+        vm.warp(2_000_000);
+        vm.prank(operator);
+        bond.bond(2 * MIN_BOND);
+        assertEq(bond.firstBondedAt(operator), 2_000_000, "re-entry stamps the new tenure");
+        assertEq(bond.bondFloorAtActivation(operator), 2 * MIN_BOND, "re-entry grandfathers the raised minBond");
     }
 
-    // ── Slashing-lifecycle coverage (issue #703) ────────────────────────────
-
-    /// Slash the same operator 3× and assert the tier ladder escalates
-    /// 5% → 15% → 50% (`SLASH_BPS_TIER_1/2/3`) driven by `lifetimeOffenseCount`.
-    /// The reductions are pure active-bond math. Start at 160k so even after the
-    /// 50% tier the active balance (64.6k) stays above the `minBond/2` (25k)
-    /// auto-eject floor.
-    function test_slash_tierEscalation_15then50pct() public {
+    /// @notice An operator whose dip ended its tenure but whose balance still
+    ///         clears a since-lowered `minBond` re-enters with its next bond of
+    ///         any size, at the lowered floor.
+    function test_firstBondedAt_reentryAboveLoweredMinBondStampsOnNextBond() public {
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
         vm.warp(1_000_000);
+        vm.startPrank(operator);
+        bond.bond(2 * MIN_BOND);
+        bond.unbond(MIN_BOND / 2); // 75k < 100k floor
+        vm.stopPrank();
+        assertEq(bond.firstBondedAt(operator), 0, "setup: the dip ends the tenure");
+
+        vm.prank(admin);
+        bond.setMinBond(MIN_BOND); // 75k now clears the live minBond
+
+        vm.warp(2_000_000);
         vm.prank(operator);
-        bond.bond(160_000e18);
-
-        // Tier 1: 5% of 160k = 8k.
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        assertEq(bond.lifetimeOffenseCount(operator), 1);
-        assertEq(bond.activeBond(operator), 152_000e18);
-
-        // Tier 2: 15% of 152k = 22.8k.
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        assertEq(bond.lifetimeOffenseCount(operator), 2);
-        assertEq(bond.activeBond(operator), 129_200e18);
-
-        // Tier 3 (3rd+ offense): 50% of 129.2k = 64.6k. Under escrow-on-slash
-        // nothing is distributed here — the `Slashed` event reports the
-        // escrowed total only; distribution happens at finality.
-        uint256 challengerBefore = token.balanceOf(challenger);
-        uint256 escrowBefore = bond.escrowedTotal();
-        vm.expectEmit(true, true, false, true);
-        emit CapacityBond.Slashed(operator, challenger, 1, 3, 64_600e18);
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        assertEq(bond.lifetimeOffenseCount(operator), 3);
-        assertEq(bond.activeBond(operator), 64_600e18);
-        // Escrow grew by the slashed total; challenger paid nothing yet.
-        assertEq(bond.escrowedTotal() - escrowBefore, 64_600e18);
-        assertEq(token.balanceOf(challenger), challengerBefore);
+        bond.bond(1);
+        assertEq(bond.firstBondedAt(operator), 2_000_000, "the next bond re-enters");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "at the lowered minBond");
     }
 
-    /// Tier-3 slash against an operator holding BOTH active and unbonding bond
-    /// where `unbonding > active`, so the slash exhausts active first and taps
-    /// unbonding for the remainder (the reachable `else` branch of
-    /// `_reduceBondAtTier`). The literal remainder-clip inside that branch is
-    /// unreachable here (it needs `tierBps > 100%`); see
-    /// `test_reduceBondAtTier_remainderClip` for that path.
-    function test_slash_tier3_mixedBond_exhaustsActiveTapsUnbonding() public {
+    /// @notice The pre-aging attack: bond `minBond` and withdraw it at once on
+    ///         many addresses in one block. No address keeps a tenure.
+    function test_firstBondedAt_bondUnbondLoopCannotPreAgeAddresses() public {
         vm.warp(1_000_000);
-        vm.prank(operator);
-        bond.bond(100_000e18);
-
-        // Bump lifetimeOffenseCount to 2 so the next slash lands at tier 3.
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0)); // 5% → 95k active
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0)); // 15% of 95k → 80.75k active
-        assertEq(bond.activeBond(operator), 80_750e18);
-
-        // Move most bond into unbonding so unbonding (60k) > active (20.75k).
-        vm.prank(operator);
-        bond.requestUnbond(60_000e18);
-        assertEq(bond.activeBond(operator), 20_750e18);
-
-        // Tier 3: totalAtRisk = 80.75k, slashAmount = 40.375k > active 20.75k.
-        // Active is zeroed; remainder (19.625k) comes out of unbonding, leaving
-        // 60k - 19.625k = 40.375k. No underflow, no clip.
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        assertEq(bond.lifetimeOffenseCount(operator), 3);
-        assertEq(bond.activeBond(operator), 0);
-        (uint256 unbondingAmt,) = bond.unbondingOf(operator);
-        assertEq(unbondingAmt, 40_375e18);
-        // Active fell to 0 (< minBond/2 = 25k), so the slash auto-ejected.
-        assertTrue(bond.ejected(operator));
-    }
-
-    /// Directly exercise the defensive remainder-clip in
-    /// `BondMath.reduceAtTier` (the math behind `_reduceBondAtTier`). It is
-    /// unreachable through `slash()` — the clip fires only when
-    /// `slashAmount > totalAtRisk`, i.e. `tierBps > 10_000` (>100%), and the
-    /// immutable ladder maxes at 5_000 (50%). Call the pure library with
-    /// `tierBps = 12_000` to prove it caps `slashAmount` to the at-risk total
-    /// (no over-transfer) and never underflows the unbonding pool.
-    function test_reduceBondAtTier_remainderClip() public pure {
-        // Asymmetric split so `slashAmount` isn't a coincidental round multiple:
-        // totalAtRisk = 110e18; 120% → slashAmount would be 132e18 > totalAtRisk
-        // → clip clamps remainder to unbonding (100e18) and re-derives
-        // slashAmount to active + unbonding = 110e18 (the full at-risk pool).
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(10e18, 100e18, 12_000);
-        assertEq(slashed, 110e18); // capped to at-risk (10 + 100), not 132e18
-        assertEq(newActive, 0);
-        assertEq(newUnbonding, 0);
+        for (uint256 i = 1; i <= 5; i++) {
+            address sybil = address(uint160(0x5B1100 + i));
+            vm.prank(admin);
+            token.transfer(sybil, MIN_BOND);
+            vm.startPrank(sybil);
+            token.approve(address(bond), type(uint256).max);
+            bond.bond(MIN_BOND);
+            bond.unbond(MIN_BOND);
+            vm.stopPrank();
+        }
+        for (uint256 i = 1; i <= 5; i++) {
+            address sybil = address(uint160(0x5B1100 + i));
+            assertEq(bond.firstBondedAt(sybil), 0, "a bond/unbond round trip leaves no tenure");
+            assertEq(bond.bondFloorAtActivation(sybil), 0, "nor a floor");
+            assertEq(token.balanceOf(sybil), MIN_BOND, "the round trip returns the bond");
+        }
     }
 
     // ── Blacklist-ejection latch (issue #850) ───────────────────────────────
-    // `ejected` is set by two mechanisms with different permanence: recoverable
-    // slash auto-ejection (ADR 026) and permanent governance blacklisting
-    // (ADR 011). `blacklistEjected` latches the second so `bond()` can't clear
-    // it. Drop the operator below `minBond/2` (25k) with three escalating slashes
-    // (50k → 47.5k → 40.375k → 20.1875k) where a slash auto-eject is needed.
+    // Governance blacklisting (ADR 011) sets `ejected` through `ejectNode`, and
+    // `blacklistEjected` latches it so `bond()` can't clear it. `unEjectNode`
+    // releases only the latch; the next `bond()` that holds `minBond` then
+    // clears `ejected`.
 
     /// @notice Core bug lock-in: a governance-blacklisted operator cannot
     ///         self-reinstate by re-bonding above `minBond`.
@@ -294,7 +264,7 @@ contract CapacityBondTest is Test {
         assertTrue(bond.blacklistEjected(operator));
         assertFalse(bond.isActive(operator));
 
-        // Re-bond well above `minBond` — the slash-recovery path must NOT fire
+        // Re-bond well above `minBond` — the reinstatement path must NOT fire
         // while the governance latch is set.
         vm.prank(operator);
         bond.bond(MIN_BOND);
@@ -326,6 +296,35 @@ contract CapacityBondTest is Test {
         assertFalse(bond.ejected(operator));
     }
 
+    /// @notice An ejected operator that unbonds below its floor loses its
+    ///         tenure. After `unEjectNode`, the bond that holds `minBond` both
+    ///         reinstates it and starts a fresh tenure.
+    function test_unEjectNode_afterFloorDip_rebondReinstatesWithFreshTenure() public {
+        vm.warp(1_000_000);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.prank(admin);
+        bond.ejectNode(operator);
+
+        vm.prank(operator);
+        bond.unbond(MIN_BOND);
+        assertEq(bond.firstBondedAt(operator), 0, "the dip ends the tenure");
+        assertEq(bond.bondFloorAtActivation(operator), 0, "and clears the floor");
+
+        vm.prank(admin);
+        bond.unEjectNode(operator);
+        assertTrue(bond.ejected(operator), "setup: the latch is cleared, the gate is not");
+
+        vm.warp(2_000_000);
+        vm.expectEmit(true, false, false, false, address(bond));
+        emit CapacityBond.Reinstated(operator);
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        assertFalse(bond.ejected(operator), "the bond that holds minBond reinstates");
+        assertEq(bond.firstBondedAt(operator), 2_000_000, "and stamps a fresh tenure");
+        assertEq(bond.bondFloorAtActivation(operator), MIN_BOND, "at the live minBond");
+    }
+
     function test_unEjectNode_onlyBlacklistRole() public {
         _expectMissingRole(operator, bond.BLACKLIST_ROLE());
         vm.prank(operator);
@@ -341,17 +340,17 @@ contract CapacityBondTest is Test {
         assertFalse(bond.ejected(operator));
     }
 
-    /// @notice The latch is set even when the operator is ALREADY slash-ejected
-    ///         — proves `blacklistEjected` is written outside the
-    ///         `if (!ejected)` one-time-effects guard in `ejectNode`.
-    function test_ejectNode_setsBlacklistLatch_evenWhenAlreadySlashEjected() public {
+    /// @notice The latch is set even when the operator is ALREADY ejected
+    ///         (an earlier blacklist, lifted by `unEjectNode` but not yet
+    ///         reinstated by `bond`) — proves `blacklistEjected` is written
+    ///         outside the `if (!ejected)` one-time-effects guard in `ejectNode`.
+    function test_ejectNode_setsBlacklistLatch_evenWhenAlreadyEjected() public {
         vm.prank(operator);
         bond.bond(MIN_BOND);
 
         vm.startPrank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0)); // 5%  → 47.5k
-        bond.slash(operator, challenger, 1, bytes32(0)); // 15% → 40.375k
-        bond.slash(operator, challenger, 1, bytes32(0)); // 50% → 20.1875k < 25k → auto-eject
+        bond.ejectNode(operator);
+        bond.unEjectNode(operator);
         vm.stopPrank();
         assertTrue(bond.ejected(operator));
         assertFalse(bond.blacklistEjected(operator));
@@ -364,27 +363,6 @@ contract CapacityBondTest is Test {
         vm.prank(operator);
         bond.bond(MIN_BOND);
         assertTrue(bond.ejected(operator));
-    }
-
-    /// @notice Regression: a purely slash-auto-ejected operator (no blacklist)
-    ///         CAN still reinstate by re-bonding (ADR 026 recoverability).
-    function test_slashAutoEjected_canStillReinstateViaBond() public {
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        vm.startPrank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        bond.slash(operator, challenger, 1, bytes32(0));
-        bond.slash(operator, challenger, 1, bytes32(0));
-        vm.stopPrank();
-        assertTrue(bond.ejected(operator));
-        assertFalse(bond.blacklistEjected(operator));
-
-        vm.expectEmit(true, false, false, false, address(bond));
-        emit CapacityBond.Reinstated(operator);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        assertFalse(bond.ejected(operator));
     }
 
     /// @notice End-to-end security property via the REAL gates: a registered,
@@ -453,128 +431,6 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         vm.expectRevert(CapacityBond.ZeroAddress.selector);
         bond.unEjectNode(address(0));
-    }
-
-    /// `BondMath.reduceAtTier` against an operator with NO active bond — the
-    /// whole slash comes out of the unbonding bucket. Reachable in production
-    /// when an operator fully unbonds and is then slashed, so an in-ladder tier
-    /// (50%) is used. Active stays 0; unbonding is halved.
-    function test_reduceBondAtTier_unbondingOnly() public pure {
-        // totalAtRisk = 100e18; 50% = 50e18. active is already 0, so the entire
-        // 50e18 comes from unbonding via the else branch (no clip).
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(0, 100e18, 5000);
-        assertEq(slashed, 50e18);
-        assertEq(newActive, 0);
-        assertEq(newUnbonding, 50e18);
-    }
-
-    /// The common production path: the slash fits entirely within active bond,
-    /// so unbonding is untouched (the `slashAmount <= active` branch).
-    function test_reduceBondAtTier_activeOnly() public pure {
-        // totalAtRisk = 150e18; 50% = 75e18 ≤ active (100e18) → all from active.
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(100e18, 50e18, 5000);
-        assertEq(slashed, 75e18);
-        assertEq(newActive, 25e18);
-        assertEq(newUnbonding, 50e18); // untouched
-    }
-
-    /// Boundary: `slashAmount == active` exactly takes the `<=` branch, zeroing
-    /// active and leaving unbonding whole (guards a future `<=` → `<` slip).
-    function test_reduceBondAtTier_slashEqualsActive() public pure {
-        // totalAtRisk = 200e18; 50% = 100e18 == active → active branch, exact.
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(100e18, 100e18, 5000);
-        assertEq(slashed, 100e18);
-        assertEq(newActive, 0);
-        assertEq(newUnbonding, 100e18); // untouched
-    }
-
-    /// Partial spill: slash exceeds active and takes the remainder from unbonding
-    /// without clipping (the `else` no-clip branch with nonzero residual both).
-    function test_reduceBondAtTier_spillsIntoUnbonding() public pure {
-        // totalAtRisk = 300e18; 50% = 150e18 > active (100e18) → 50e18 spills
-        // into unbonding (200e18), leaving 150e18 unbonding, no clip.
-        (uint256 slashed, uint256 newActive, uint256 newUnbonding) = BondMath.reduceAtTier(100e18, 200e18, 5000);
-        assertEq(slashed, 150e18);
-        assertEq(newActive, 0);
-        assertEq(newUnbonding, 150e18);
-    }
-
-    /// Degenerate inputs: zero balances and a zero tier are well-defined no-ops
-    /// (slashAmount 0, balances unchanged) — pins the contract against a future
-    /// rounding/divide change.
-    function test_reduceBondAtTier_zeroInputs() public pure {
-        (uint256 s0, uint256 a0, uint256 u0) = BondMath.reduceAtTier(0, 0, 5000);
-        assertEq(s0, 0);
-        assertEq(a0, 0);
-        assertEq(u0, 0);
-
-        (uint256 s1, uint256 a1, uint256 u1) = BondMath.reduceAtTier(100e18, 100e18, 0);
-        assertEq(s1, 0);
-        assertEq(a1, 100e18);
-        assertEq(u1, 100e18);
-    }
-
-    /// Two outstanding slashes: granting the NEWER appeal must recompute the
-    /// `slashedAtEpoch` watermark down to the OLDER still-standing slash, and
-    /// only granting the older one too clears it to zero (issue #709).
-    function test_settleAppealGranted_multiSlash_recomputesThenClears() public {
-        vm.warp(1_000_000);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        // Slash #0 (older), then Slash #1 (newer) one epoch later.
-        vm.prank(admin);
-        (uint256 s0,) = bond.slash(operator, challenger, 1, bytes32(0));
-        uint64 stamp0 = bond.slashedAtEpoch(operator);
-        vm.warp(block.timestamp + 8 days);
-        vm.prank(admin);
-        (uint256 s1,) = bond.slash(operator, challenger, 1, bytes32(0));
-        assertTrue(bond.slashedAtEpoch(operator) != stamp0);
-
-        vm.startPrank(admin);
-        // Grant the newer → watermark falls back to the older standing slash.
-        bond.markAppealOpen(s1);
-        bond.settleAppealGranted(s1);
-        assertEq(bond.slashedAtEpoch(operator), stamp0);
-
-        // Grant the older too → no slash stands → watermark clears to zero,
-        // surfaced on-chain as the `SlashedAtEpochStamped(op, 0)` clear sentinel
-        // (the dedicated `SlashedAtEpochCleared` event was removed) — assert the
-        // event shape so off-chain vote-weight indexers stay locked to it.
-        bond.markAppealOpen(s0);
-        vm.expectEmit(true, false, false, true, address(bond));
-        emit CapacityBond.SlashedAtEpochStamped(operator, 0);
-        bond.settleAppealGranted(s0);
-        vm.stopPrank();
-        assertEq(bond.slashedAtEpoch(operator), 0);
-    }
-
-    /// Reversing a MIDDLE slash of three leaves the watermark at the newest
-    /// standing slash: the tail-scan must skip the interior `Reversed` entry and
-    /// keep the max, not fall back (issue #709 multi-slash recompute).
-    function test_settleAppealGranted_reverseMiddleSlash_keepsNewest() public {
-        vm.warp(1_000_000);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        // Three slashes across distinct epochs: #0 (old), #1 (mid), #2 (new).
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        vm.warp(block.timestamp + 8 days);
-        vm.prank(admin);
-        (uint256 sMid,) = bond.slash(operator, challenger, 1, bytes32(0));
-        vm.warp(block.timestamp + 8 days);
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        uint64 stampNewest = bond.slashedAtEpoch(operator);
-
-        // Reverse the MIDDLE slash — the newest still stands, so the watermark
-        // is unchanged (the scan skips the reversed interior entry).
-        vm.startPrank(admin);
-        bond.markAppealOpen(sMid);
-        bond.settleAppealGranted(sMid);
-        vm.stopPrank();
-        assertEq(bond.slashedAtEpoch(operator), stampNewest);
     }
 
     function test_declaredMbps_storesValue() public {
@@ -720,7 +576,7 @@ contract CapacityBondTest is Test {
     // ADR 026 § Capacity-bond curve — on-chain enforcement + governance
     // (issue #770). `bond_required(Mbps) = k × Mbps^α`, default k = 12.6
     // TOKEN, α = 1.2; the coupling `activeBond ≥ bondRequired(declaredMbps)`
-    // is enforced at `declareMbps` / `requestUnbond` / `registerNode`.
+    // is enforced at `declareMbps` / `unbond` / `registerNode`.
     // -----------------------------------------------------------------
 
     function test_bondRequired_matchesAdrWorkedExamples() public view {
@@ -773,7 +629,7 @@ contract CapacityBondTest is Test {
         assertEq(bond.declaredMbps(operator), 1000);
     }
 
-    function test_requestUnbond_revertsWhenItDropsBelowCurve() public {
+    function test_unbond_revertsWhenItDropsBelowCurve() public {
         _bondForMbps(1000);
         vm.prank(operator);
         bond.declareMbps(1000);
@@ -782,45 +638,68 @@ contract CapacityBondTest is Test {
         // Operator bonded exactly `required`; unbonding any amount drops below.
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, required - 1, required));
-        bond.requestUnbond(1);
+        bond.unbond(1);
     }
 
-    function test_requestUnbond_allowedWhenNoCapacityDeclared() public {
+    function test_unbond_allowedWhenNoCapacityDeclared() public {
         // declaredMbps defaults to 0 ⇒ bondRequired(0) == 0, so the curve does
         // not constrain unbonding.
         vm.prank(operator);
         bond.bond(MIN_BOND);
         vm.prank(operator);
-        bond.requestUnbond(MIN_BOND / 2);
+        bond.unbond(MIN_BOND / 2);
         assertEq(bond.activeBond(operator), MIN_BOND / 2);
     }
 
-    function test_requestUnbond_succeedsDownToExactlyCurve() public {
+    function test_unbond_succeedsDownToExactlyCurve() public {
         // Over-bond above the 1 Gbps curve, declare 1000, then unbond the slack
         // down to exactly bondRequired(1000) — the inclusive boundary succeeds.
         uint256 required = bond.bondRequired(1000);
         uint256 slack = 5000e18;
         vm.prank(admin);
         token.transfer(operator, required + slack);
+        uint256 balBefore = token.balanceOf(operator);
         vm.startPrank(operator);
         bond.bond(required + slack);
         bond.declareMbps(1000);
-        bond.requestUnbond(slack);
+        bond.unbond(slack);
         vm.stopPrank();
         assertEq(bond.activeBond(operator), required);
+        assertEq(token.balanceOf(operator), balBefore - required, "the slack is back with the operator");
     }
 
-    function test_slash_doesNotEnforceCurve() public {
-        // A slash may drop active bond below the curve; it must NOT revert
-        // (slash paths are intentionally exempt — ADR 026 § Slashing and burn).
-        _bondForMbps(1000);
+    function test_unbond_revertsOnZeroAmount() public {
         vm.prank(operator);
-        bond.declareMbps(1000);
+        bond.bond(MIN_BOND);
+        vm.prank(operator);
+        vm.expectRevert(CapacityBond.ZeroAmount.selector);
+        bond.unbond(0);
+    }
 
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        // Post-slash active bond is below bondRequired(1000); no revert occurred.
-        assertLt(bond.activeBond(operator), bond.bondRequired(1000));
+    function test_unbond_revertsWhenAmountExceedsActiveBond() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.InsufficientBond.selector, MIN_BOND + 1, MIN_BOND));
+        bond.unbond(MIN_BOND + 1);
+    }
+
+    /// @notice `unbond` pays the TOKEN out in the same call — no window, no
+    ///         second transaction — and logs the amount and the new active bond.
+    function test_unbond_transfersImmediatelyAndEmits() public {
+        vm.prank(operator);
+        bond.bond(MIN_BOND);
+        uint256 opBefore = token.balanceOf(operator);
+        uint256 bondBefore = token.balanceOf(address(bond));
+
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.Unbonded(operator, 20_000e18, MIN_BOND - 20_000e18);
+        vm.prank(operator);
+        bond.unbond(20_000e18);
+
+        assertEq(bond.activeBond(operator), MIN_BOND - 20_000e18);
+        assertEq(token.balanceOf(operator), opBefore + 20_000e18, "the operator holds the TOKEN at once");
+        assertEq(token.balanceOf(address(bond)), bondBefore - 20_000e18, "the contract no longer holds it");
     }
 
     function test_registerNode_revertsWhenBondBelowCurve() public {
@@ -897,20 +776,15 @@ contract CapacityBondTest is Test {
     }
 
     /// @notice A partial unbond that retains the operator's floor keeps it
-    ///         active for the whole unbonding window.
+    ///         active.
     function test_isActive_partialUnbondAboveFloorStaysActive() public {
         vm.warp(1_000_000);
         address b = _registerFreshOperator(0xB2, bytes32(uint256(0xB2)), 2 * MIN_BOND);
 
         vm.prank(b);
-        bond.requestUnbond(MIN_BOND);
+        bond.unbond(MIN_BOND);
         assertEq(bond.activeBond(b), MIN_BOND, "B retains exactly its floor");
         assertTrue(bond.isActive(b), "a partial unbond above the floor keeps B active");
-
-        vm.warp(block.timestamp + bond.unbondingPeriod());
-        vm.prank(b);
-        bond.unbond();
-        assertTrue(bond.isActive(b), "withdrawing the released part keeps B active");
     }
 
     /// @notice `getRegisteredNodes` returns the full registered page and a
@@ -927,7 +801,7 @@ contract CapacityBondTest is Test {
         assertTrue(bond.isActive(b));
 
         vm.prank(b);
-        bond.requestUnbond(1);
+        bond.unbond(1);
         assertLt(bond.activeBond(b), MIN_BOND, "B drops below its floor");
         assertFalse(bond.isActive(b), "a sub-floor bond flips isActive false");
 
@@ -954,14 +828,14 @@ contract CapacityBondTest is Test {
 
     // ADR 003 § Node Registry describes a full exit as deregistration followed
     // by unbonding. That only holds because deregistration also clears the
-    // declared tier: `requestUnbond`'s floor is `bondRequired(declaredMbps)`,
+    // declared tier: `unbond`'s floor is `bondRequired(declaredMbps)`,
     // so an operator that had ever declared would otherwise retain that much
     // bond forever (#1351).
     //
     // `deregisterNode` requires an active node, so the paths that deactivate
     // without it leave the tier standing; those operators exit via
     // `declareMbps(0)` instead (#1361). The four tests below —
-    // `test_ejectedOperator_canReleaseTheTierAndExit`,
+    // `test_belowCurveOperator_canReleaseTheTierAndExit`,
     // `test_neverRegistered_canReleaseTheTierAndExit`,
     // `test_blacklistEjectedOperator_canReleaseTheTierAndExit`, and the negative
     // `test_activeOperator_cannotDeclareZero` — pin that split.
@@ -1043,23 +917,22 @@ contract CapacityBondTest is Test {
         uint256 balanceBefore = token.balanceOf(opAddr);
 
         // While the tier stands, releasing the whole bond is barred by the
-        // curve — this is the state an operator was previously stuck in.
-        // `bondRequired` is read before the prank: an external call inside the
-        // `expectRevert` argument would consume it and send `requestUnbond`
+        // curve. `bondRequired` is read before the prank: an external call
+        // inside the `expectRevert` argument would consume it and send `unbond`
         // from the test contract instead.
         uint256 curveFloor = bond.bondRequired(1000);
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, 0, curveFloor));
-        bond.requestUnbond(bonded);
+        bond.unbond(bonded);
 
         vm.prank(opAddr);
         bond.deregisterNode();
 
-        vm.startPrank(opAddr);
-        bond.requestUnbond(bonded);
-        vm.warp(block.timestamp + UNBONDING);
-        bond.unbond();
-        vm.stopPrank();
+        // One call, same block: no window between deregistration and payout.
+        vm.expectEmit(true, false, false, true, address(bond));
+        emit CapacityBond.Unbonded(opAddr, bonded, 0);
+        vm.prank(opAddr);
+        bond.unbond(bonded);
 
         assertEq(bond.activeBond(opAddr), 0, "the last TOKEN is withdrawable once the tier is cleared");
         assertEq(token.balanceOf(opAddr), balanceBefore + bonded, "the full bond comes back");
@@ -1068,10 +941,10 @@ contract CapacityBondTest is Test {
     // ── Exits are never pausable (issue #2030) ───────────────────────────────
 
     /// @notice A pause must not trap an operator's bond. With the contract
-    ///         paused, an operator can still `requestUnbond` and, after the
-    ///         unbonding period, `unbond` the principal back. Pause halts intake
-    ///         and serving only; a captured PAUSER cannot freeze the exit.
-    function test_exit_notPausable_requestUnbondAndUnbondWhilePaused() public {
+    ///         paused, an operator can still `unbond` the principal back. Pause
+    ///         halts intake and serving only; a captured PAUSER cannot freeze
+    ///         the exit.
+    function test_unbond_worksWhilePaused() public {
         vm.warp(1_000_000);
         vm.prank(operator);
         bond.bond(MIN_BOND);
@@ -1084,55 +957,11 @@ contract CapacityBondTest is Test {
 
         // No capacity is declared, so the curve floor is 0 and the whole bond is
         // releasable — the exit runs entirely while the contract is paused.
-        vm.startPrank(operator);
-        bond.requestUnbond(MIN_BOND);
-        vm.warp(block.timestamp + UNBONDING);
-        bond.unbond();
-        vm.stopPrank();
+        vm.prank(operator);
+        bond.unbond(MIN_BOND);
 
         assertEq(bond.activeBond(operator), 0, "bond fully released despite the pause");
         assertEq(token.balanceOf(operator), balBefore + MIN_BOND, "principal returned while paused");
-    }
-
-    /// @notice Un-gating the exit does not weaken slash safety. An operator with
-    ///         an OPEN slash record cannot recover the at-risk amount by exiting,
-    ///         even while unbonding and even while the contract is paused. The
-    ///         protection is the slash escrow and the unbonding period, never the
-    ///         pause: `slash` reaches bond already sitting in the unbonding queue,
-    ///         and the escrowed portion is not withdrawable by `unbond`.
-    function test_exit_openSlashUnwithdrawable_evenWhileUnbondingAndPaused() public {
-        vm.warp(1_000_000);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        uint256 balBefore = token.balanceOf(operator);
-
-        // Queue the entire bond, THEN slash — proving the slash reaches bond in
-        // the unbonding queue, not only active bond.
-        vm.prank(operator);
-        bond.requestUnbond(MIN_BOND);
-
-        // Tier-1 slash = 5% of the at-risk bond. Active is 0, so it taps the
-        // queue: 50k → 2.5k escrowed, 47.5k left queued.
-        uint256 expectedSlash = (MIN_BOND * SLASH_BPS_TIER_1_TEST) / 10_000;
-        vm.prank(admin);
-        bond.slash(operator, challenger, 1, bytes32(0));
-        assertEq(bond.escrowedTotal(), expectedSlash, "slash escrowed the at-risk portion of the queued bond");
-        assertGt(bond.slashedAtEpoch(operator), 0, "slash record is open");
-
-        // Pause after the slash — the exit must still complete, but only for the
-        // un-slashed remainder.
-        vm.startPrank(admin);
-        bond.grantRole(bond.PAUSER_ROLE(), admin);
-        bond.pause();
-        vm.stopPrank();
-
-        vm.warp(block.timestamp + UNBONDING);
-        vm.prank(operator);
-        bond.unbond();
-
-        uint256 recovered = token.balanceOf(operator) - balBefore;
-        assertEq(recovered, MIN_BOND - expectedSlash, "only the un-slashed remainder is withdrawn");
-        assertEq(bond.escrowedTotal(), expectedSlash, "the slashed amount stays escrowed, unreachable by exit");
     }
 
     /// @notice A re-registration into a new region snapshots the old region in
@@ -1230,53 +1059,37 @@ contract CapacityBondTest is Test {
         assertEq(bond.declaredMbps(opAddr), 1000, "re-declaring needs no further bond");
     }
 
-    /// @notice The #1361 tier-release path, on the state that motivated it: an
-    ///         auto-ejected operator whose slash already took their bond below
-    ///         `bondRequired(tier)`, so `requestUnbond` rejects EVERY non-zero
-    ///         amount while the tier stands.
-    /// @dev    Ejection deliberately does NOT clear the tier — `_ejectNodeEffects`
-    ///         only flips `active` — and `deregisterNode` is unreachable from
-    ///         here.
-    ///
-    ///         Read the "trapped" framing precisely. `declareMbps` enforces no
-    ///         monotonicity, so this operator could always declare DOWN to
-    ///         `minCapacityMbps` and unbond above `bondRequired(10)`; the
-    ///         genuinely stuck residual was that floor-tier cost (199.7 of
-    ///         20,252.7 TOKEN here), not the whole bond. What `declareMbps(0)`
-    ///         adds is a one-step release that strands nothing. The assertion
-    ///         below is `activeBond == 0`, which the tier-down route cannot
-    ///         reach — that is the difference this test exists to pin.
-    function test_ejectedOperator_canReleaseTheTierAndExit() public {
-        address opAddr = _onboardAtTier(0xE7EC7, 1000, bytes32(uint256(0xE7EC7)));
+    /// @notice The #1361 tier-release path on an operator whose bond sits
+    ///         BELOW its standing tier: governance raised `k` after the
+    ///         declaration, so `unbond` rejects EVERY non-zero amount while the
+    ///         tier stands.
+    /// @dev    `declareMbps` enforces no monotonicity, so this operator could
+    ///         also declare DOWN to `minCapacityMbps` and unbond above
+    ///         `bondRequired(10)`, stranding that floor-tier cost. What
+    ///         `declareMbps(0)` adds is a one-step release that strands nothing.
+    ///         The assertion below is `activeBond == 0`, which the tier-down
+    ///         route cannot reach — that is the difference this test pins.
+    function test_belowCurveOperator_canReleaseTheTierAndExit() public {
+        address opAddr = vm.addr(0xE7EC7);
+        uint256 bonded = bond.bondRequired(1000);
+        vm.prank(admin);
+        token.transfer(opAddr, bonded);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(bonded);
+        bond.declareMbps(1000);
+        vm.stopPrank();
 
-        // Repeated offenses until auto-ejection trips (below `minBond / 2`).
-        // Note `isActive` would flip false at `minBond` already — `ejected` is
-        // the flag that means the node was actually removed by the contract.
-        for (uint256 i = 0; i < 20 && !bond.ejected(opAddr); i++) {
-            vm.warp(block.timestamp + 8 days);
-            vm.prank(admin);
-            bond.slash(opAddr, challenger, 1, bytes32(0));
-        }
-        assertTrue(bond.ejected(opAddr), "the fixture must actually reach auto-ejection");
-        assertEq(bond.declaredMbps(opAddr), 1000, "ejection still does not clear the tier");
-
-        uint256 remaining = bond.activeBond(opAddr);
-        assertGt(remaining, 0, "there is bond left to release");
-        assertLt(remaining, bond.bondRequired(1000), "and it sits below the standing curve floor");
-
-        // `deregisterNode` remains unreachable — the release does not restore
-        // it, it routes around it.
-        vm.prank(opAddr);
-        vm.expectRevert(CapacityBond.NodeNotActive.selector);
-        bond.deregisterNode();
-
-        // The "before" half of the proof, restored from the test this replaced:
-        // with the bond already BELOW the floor, every non-zero amount reverts,
-        // not merely amounts that would cross it.
+        vm.prank(admin);
+        bond.setK(20e18);
         uint256 floor = bond.bondRequired(1000);
+        assertLt(bonded, floor, "the fixture must leave the bond below the standing curve floor");
+
+        // With the bond already BELOW the floor, every non-zero amount reverts,
+        // not merely amounts that would cross it.
         vm.prank(opAddr);
-        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, remaining - 1, floor));
-        bond.requestUnbond(1);
+        vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, bonded - 1, floor));
+        bond.unbond(1);
 
         vm.expectEmit(true, false, false, true, address(bond));
         emit CapacityBond.MbpsDeclared(opAddr, 1000, 0);
@@ -1284,17 +1097,13 @@ contract CapacityBondTest is Test {
         bond.declareMbps(0);
         assertEq(bond.declaredMbps(opAddr), 0, "the tier is released");
 
-        // With the floor gone the whole remainder is withdrawable — before
-        // #1361 not one wei was.
+        // With the floor gone the whole bond is withdrawable.
         uint256 balanceBefore = token.balanceOf(opAddr);
-        vm.startPrank(opAddr);
-        bond.requestUnbond(remaining);
-        vm.warp(block.timestamp + UNBONDING);
-        bond.unbond();
-        vm.stopPrank();
+        vm.prank(opAddr);
+        bond.unbond(bonded);
 
-        assertEq(bond.activeBond(opAddr), 0, "the slashed remainder is no longer trapped");
-        assertEq(token.balanceOf(opAddr), balanceBefore + remaining, "and it lands back with the operator");
+        assertEq(bond.activeBond(opAddr), 0, "the bond is no longer trapped");
+        assertEq(token.balanceOf(opAddr), balanceBefore + bonded, "and it lands back with the operator");
     }
 
     /// @notice The second stuck state #1361 closes, and the one directly
@@ -1304,7 +1113,7 @@ contract CapacityBondTest is Test {
     ///         `deregisterNode` available.
     /// @dev    Distinct from the ejected case: here the bond still clears the
     ///         curve, so the operator is pinned at `bondRequired(tier)` rather
-    ///         than at everything. `requestUnbond(bonded)` is the assertion —
+    ///         than at everything. `unbond(bonded)` is the assertion —
     ///         the surplus was always releasable, the floor never was.
     function test_neverRegistered_canReleaseTheTierAndExit() public {
         address opAddr = vm.addr(0x4E4E4);
@@ -1319,7 +1128,7 @@ contract CapacityBondTest is Test {
 
         // Pinned at the curve floor, with no registration to deregister.
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, 0, bonded));
-        bond.requestUnbond(bonded);
+        bond.unbond(bonded);
         vm.stopPrank();
 
         vm.prank(opAddr);
@@ -1328,9 +1137,7 @@ contract CapacityBondTest is Test {
 
         vm.startPrank(opAddr);
         bond.declareMbps(0);
-        bond.requestUnbond(bonded);
-        vm.warp(block.timestamp + UNBONDING);
-        bond.unbond();
+        bond.unbond(bonded);
         vm.stopPrank();
 
         assertEq(bond.activeBond(opAddr), 0, "a never-registered operator can get their bond back");
@@ -1340,8 +1147,7 @@ contract CapacityBondTest is Test {
     ///         governance intervention.
     /// @dev    This is the state with no other escape at all: `registerNode`
     ///         reverts `OperatorEjected` until governance calls `unEjectNode`,
-    ///         so the "re-bond, re-register, deregister" workaround available
-    ///         to a slash-ejected operator does not exist here.
+    ///         so no "re-register, then deregister" route exists here.
     function test_blacklistEjectedOperator_canReleaseTheTierAndExit() public {
         address opAddr = _onboardAtTier(0xB1AC4, 1000, bytes32(uint256(0xB1AC4)));
         uint256 bonded = bond.activeBond(opAddr);
@@ -1352,9 +1158,7 @@ contract CapacityBondTest is Test {
 
         vm.startPrank(opAddr);
         bond.declareMbps(0);
-        bond.requestUnbond(bonded);
-        vm.warp(block.timestamp + UNBONDING);
-        bond.unbond();
+        bond.unbond(bonded);
         vm.stopPrank();
 
         assertEq(bond.activeBond(opAddr), 0, "no unEjectNode needed to recover the bond");
@@ -1379,55 +1183,23 @@ contract CapacityBondTest is Test {
     }
 
     /// @notice `deregisterNode` clears the declared tier and NOTHING else.
-    ///         Three fields must survive it, each for a different reason, and
-    ///         none of them has a test that covers the deregistration path.
     /// @dev    A future "finish the cleanup" refactor is the threat this
-    ///         guards. `unbondingOf`: deleting it would orphan already-escrowed
-    ///         TOKEN with no withdrawal path. `_slashedAtEpoch`: clearing it
-    ///         would let an operator launder a slash out of their ADR 036
-    ///         voting weight with a deregister/re-register cycle.
-    ///         `firstBondedAt`: ADR 003 § Node Registry states it is never
-    ///         cleared by `deregisterNode`, and the age-ramp depends on it.
-    function test_deregisterNode_preservesUnbondingSlashStampAndFirstBonded() public {
+    ///         guards. `activeBond`: deregistration and bond exit are separate
+    ///         operations (ADR 003 § Node Registry). `firstBondedAt`: ADR 003
+    ///         § Node Registry states it is never cleared by `deregisterNode`,
+    ///         and the age-ramp depends on it.
+    function test_deregisterNode_preservesBondAndFirstBonded() public {
         address opAddr = _onboardAtTier(0x9A4D, 1000, bytes32(uint256(0x9A4D)));
-
-        vm.prank(admin);
-        bond.slash(opAddr, challenger, 1, bytes32(0));
-        uint64 stamp = bond.slashedAtEpoch(opAddr);
-        assertGt(stamp, 0, "the fixture must actually record a slash");
+        uint256 bonded = bond.activeBond(opAddr);
         uint64 firstBonded = bond.firstBondedAt(opAddr);
-
-        // The slash took the bond below the curve, so top back up: a request
-        // can only be started for what sits ABOVE `bondRequired(tier)`.
-        uint256 topUp = bond.bondRequired(1000);
-        vm.prank(admin);
-        token.transfer(opAddr, topUp);
-        vm.prank(opAddr);
-        bond.bond(topUp);
-
-        // A request in flight: the remaining bond must still clear the curve,
-        // so release only what sits above it.
-        uint256 releasable = bond.activeBond(opAddr) - bond.bondRequired(1000);
-        assertGt(releasable, 0, "the fixture must leave something releasable");
-        vm.prank(opAddr);
-        bond.requestUnbond(releasable);
-        (uint256 pending, uint256 unlockAt) = bond.unbondingOf(opAddr);
+        assertGt(firstBonded, 0, "the fixture must stamp tenure");
 
         vm.prank(opAddr);
         bond.deregisterNode();
 
         assertEq(bond.declaredMbps(opAddr), 0, "the tier is the one thing it clears");
-        (uint256 pendingAfter, uint256 unlockAfter) = bond.unbondingOf(opAddr);
-        assertEq(pendingAfter, pending, "a pending request survives deregistration");
-        assertEq(unlockAfter, unlockAt, "and its unlock time is not extended");
-        assertEq(bond.slashedAtEpoch(opAddr), stamp, "the slash stamp is not launderable");
-        assertEq(bond.firstBondedAt(opAddr), firstBonded, "firstBondedAt is write-once");
-
-        // And the documented exit is drain-then-release while one is pending,
-        // not a second `requestUnbond`.
-        vm.prank(opAddr);
-        vm.expectRevert(CapacityBond.UnbondingInProgress.selector);
-        bond.requestUnbond(1);
+        assertEq(bond.activeBond(opAddr), bonded, "the bond stays put");
+        assertEq(bond.firstBondedAt(opAddr), firstBonded, "deregistering keeps the tenure");
     }
 
     function test_setK_updatesCurveAndEmits() public {
@@ -1585,271 +1357,6 @@ contract CapacityBondTest is Test {
         assertLt(bond.minCapacityMbps(), bond.maxCapacityMbps());
     }
 
-    function test_slashId_persistsRecord() public {
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
-        assertEq(slashId, 0);
-        (address op, uint64 ts, uint256 amount) = bond.slashRecords(0);
-        assertEq(op, operator);
-        assertGt(ts, 0);
-        assertGt(amount, 0);
-        assertEq(bond.slashCounter(), 1);
-    }
-
-    // ── Per-operator slash enumeration ──────────────────────────────────────
-    //
-    // `operatorSlashCount` + `operatorSlashIdAt` are what let a consumer rebuild
-    // an operator's slash history from chain state instead of re-scanning the
-    // `Slashed` log tail from a block floor on every start.
-
-    /// An operator that was never slashed enumerates as empty rather than
-    /// reverting — the cold-start case a consumer hits on every fresh operator.
-    function test_operatorSlashCount_zeroForUnslashedOperator() public view {
-        assertEq(bond.operatorSlashCount(operator), 0);
-    }
-
-    /// Indexing past the end reverts with the bounds error rather than reading a
-    /// zero `slashId`, which would alias the legitimate `slashId == 0`.
-    function test_operatorSlashIdAt_revertsPastEnd() public {
-        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashIndexOutOfRange.selector, operator, 0, 0));
-        bond.operatorSlashIdAt(operator, 0);
-    }
-
-    /// The list appends in slash order and each entry resolves to that operator's
-    /// own record — the property a consumer walks backwards over.
-    function test_operatorSlashEnumeration_appendsInOrder() public {
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.startPrank(admin);
-        (uint256 first,) = bond.slash(operator, challenger, 1, keccak256("ev-1"));
-        (uint256 second,) = bond.slash(operator, challenger, 2, keccak256("ev-2"));
-        vm.stopPrank();
-
-        assertEq(bond.operatorSlashCount(operator), 2);
-        assertEq(bond.operatorSlashIdAt(operator, 0), first);
-        assertEq(bond.operatorSlashIdAt(operator, 1), second);
-        assertEq(bond.getSlashRecord(first).operator, operator);
-        assertEq(bond.getSlashRecord(second).operator, operator);
-    }
-
-    /// The list is per-operator: slashing one operator must not appear in
-    /// another's enumeration. Guards against a consumer over-reporting slashes
-    /// against a node that was never slashed.
-    function test_operatorSlashEnumeration_isPerOperator() public {
-        address other = address(0xBEEF);
-        vm.prank(admin);
-        token.transfer(other, MIN_BOND);
-        vm.startPrank(other);
-        token.approve(address(bond), MIN_BOND);
-        bond.bond(MIN_BOND);
-        vm.stopPrank();
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1, keccak256("ev"));
-
-        assertEq(bond.operatorSlashCount(operator), 1);
-        assertEq(bond.operatorSlashIdAt(operator, 0), slashId);
-        assertEq(bond.operatorSlashCount(other), 0);
-    }
-
-    /// `offenseType` and `evidenceHash` are persisted on the record. Without them
-    /// the record cannot replace the `Slashed` log: `CapacityBond.Slashed` carries
-    /// the offense but no `slashId`, and `SlashRecorded` carries the `slashId` but
-    /// no offense, so attributing one to the other off-chain otherwise means
-    /// joining two events by transaction ordering. `slash` stores the taxonomy
-    /// byte it is given; a non-zero byte keeps the assertion from passing on
-    /// the zero default.
-    function test_slashRecord_persistsOffenseTypeAndEvidenceHash() public {
-        bytes32 evidence = keccak256("evidence-digest");
-        uint8 offense = 0xA5;
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, offense, evidence);
-
-        SlashRecord memory r = bond.getSlashRecord(slashId);
-        assertEq(r.offenseType, offense);
-        assertEq(r.evidenceHash, evidence);
-    }
-
-    /// The appeal deadline on the record is the authoritative one, so a consumer
-    /// reading it needs no block-timestamp arithmetic of its own.
-    function test_slashRecord_appealWindowCloseIsSlashTimePlusWindow() public {
-        vm.warp(1_000_000);
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
-
-        SlashRecord memory r = bond.getSlashRecord(slashId);
-        assertEq(r.slashedAt, uint64(block.timestamp));
-        // `APPEAL_FILING_WINDOW` is `internal`; the literal matches how the rest
-        // of this suite warps past the window rather than widening visibility.
-        assertEq(r.appealWindowClose, uint64(block.timestamp) + uint64(30 days));
-    }
-
-    // ── Escrow-on-slash lifecycle (ADR 028) ─────────────────────────────────
-
-    /// Slash escrows the TOKEN without distributing it: no challenger transfer,
-    /// no burn, escrow accounting grows, status is `Escrowed`.
-    function test_slash_escrowsWithoutDistribution() public {
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-
-        uint256 supplyBefore = token.totalSupply();
-        uint256 challengerBefore = token.balanceOf(challenger);
-
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
-
-        assertEq(totalSlash, 2500e18); // 5% of 50k
-        assertEq(bond.escrowedTotal(), totalSlash);
-        assertEq(token.balanceOf(challenger), challengerBefore); // nothing paid yet
-        assertEq(token.totalSupply(), supplyBefore); // nothing burned yet
-        SlashRecord memory r = bond.getSlashRecord(slashId);
-        assertEq(uint8(r.status), uint8(SlashStatus.Escrowed));
-        assertEq(r.challenger, challenger);
-    }
-
-    /// Slashing an operator with zero active AND zero unbonding bond mints a
-    /// clean zero-amount escrow record. A fully-zero slash is a reachable
-    /// state, so pin that it stays safe — the offense counter,
-    /// slash-epoch watermark, and auto-eject still fire, escrow stays flat, and
-    /// the unappealed-finalize terminal path no-ops without moving any TOKEN.
-    function test_slash_zeroBondOperator_mintsZeroAmountRecordNoOpsAtFinality() public {
-        // Warp to epoch 2 (14d / 7d EPOCH_LENGTH) so we can assert the *exact*
-        // +1-encoded watermark below. (The +1 encoding means even an epoch-0
-        // slash stamps 1, so `assertGt(.., 0)` would be near-trivially true —
-        // assert the precise value to actually pin the stamp arithmetic.)
-        vm.warp(2 * 7 days);
-
-        address noBond = address(0xDEAD11);
-        assertEq(bond.activeBond(noBond), 0);
-
-        uint256 supplyBefore = token.totalSupply();
-        uint256 escrowBefore = bond.escrowedTotal();
-
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1, bytes32(0));
-
-        // Zero economic value, but the offense / watermark / eject side effects
-        // still fire and the escrow record is well-formed.
-        assertEq(totalSlash, 0);
-        assertEq(bond.escrowedTotal(), escrowBefore);
-        assertEq(bond.lifetimeOffenseCount(noBond), 1);
-        assertEq(bond.slashedAtEpoch(noBond), 3); // epoch 2, +1-encoded
-        assertTrue(bond.ejected(noBond));
-        SlashRecord memory r = bond.getSlashRecord(slashId);
-        assertEq(r.slashAmount, 0);
-        assertEq(uint8(r.status), uint8(SlashStatus.Escrowed));
-
-        // Unappealed finalize after the filing window no-ops: no transfer, no burn.
-        vm.warp(block.timestamp + 30 days + 1);
-        uint256 challengerBefore = token.balanceOf(challenger);
-        bond.finalizeUnappealedSlash(slashId);
-        assertEq(token.balanceOf(challenger), challengerBefore);
-        assertEq(token.totalSupply(), supplyBefore);
-        assertEq(bond.escrowedTotal(), escrowBefore);
-        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Upheld));
-    }
-
-    /// A granted appeal on a zero-amount slash refunds nothing (no `safeTransfer`
-    /// of a zero amount) and still clears the slash-epoch watermark.
-    function test_settleAppealGranted_zeroBondSlash_refundsNothingClearsWatermark() public {
-        vm.warp(2 * 7 days);
-        address noBond = address(0xDEAD12);
-
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(noBond, challenger, 1, bytes32(0));
-        assertEq(totalSlash, 0);
-        assertEq(bond.slashedAtEpoch(noBond), 3); // epoch 2, +1-encoded
-
-        uint256 opBefore = token.balanceOf(noBond);
-        vm.startPrank(admin);
-        bond.markAppealOpen(slashId);
-        // The reversal still emits over the zero-amount record (refund == 0), so
-        // indexers see the state change even though no TOKEN moves.
-        vm.expectEmit(true, true, false, true, address(bond));
-        emit CapacityBond.SlashReversed(slashId, noBond, 0);
-        bond.settleAppealGranted(slashId);
-        vm.stopPrank();
-
-        assertEq(token.balanceOf(noBond), opBefore); // refund == 0, nothing transferred
-        assertEq(bond.escrowedTotal(), 0);
-        assertEq(bond.slashedAtEpoch(noBond), 0); // watermark recomputed to "no standing slash"
-        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Reversed));
-    }
-
-    /// No appeal filed → after the filing window anyone can finalize, paying
-    /// 50% to the challenger and burning 50%.
-    function test_finalizeUnappealedSlash_distributes5050() public {
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
-
-        // Too early: filing window still open.
-        vm.expectRevert(abi.encodeWithSelector(CapacityBond.FilingWindowStillOpen.selector, _windowClose(slashId)));
-        bond.finalizeUnappealedSlash(slashId);
-
-        vm.warp(block.timestamp + 30 days + 1);
-        uint256 supplyBefore = token.totalSupply();
-        uint256 challengerBefore = token.balanceOf(challenger);
-
-        // Permissionless: a random address triggers finality.
-        vm.prank(address(0xDEAD));
-        bond.finalizeUnappealedSlash(slashId);
-
-        assertEq(token.balanceOf(challenger) - challengerBefore, totalSlash / 2);
-        assertEq(supplyBefore - token.totalSupply(), totalSlash - totalSlash / 2);
-        assertEq(bond.escrowedTotal(), 0);
-        assertEq(uint8(bond.getSlashRecord(slashId).status), uint8(SlashStatus.Upheld));
-    }
-
-    /// An opened appeal flips the escrow to `AppealOpen`, so the permissionless
-    /// finalize path can no longer race it.
-    function test_markAppealOpen_blocksFinalize() public {
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId,) = bond.slash(operator, challenger, 1, bytes32(0));
-
-        vm.prank(admin);
-        bond.markAppealOpen(slashId);
-
-        vm.warp(block.timestamp + 30 days + 1);
-        vm.expectRevert(abi.encodeWithSelector(CapacityBond.SlashNotEscrowed.selector, slashId));
-        bond.finalizeUnappealedSlash(slashId);
-    }
-
-    /// Upheld appeal distributes the escrow 50/50 (same as the no-appeal path).
-    function test_settleAppealUpheld_distributes5050() public {
-        vm.prank(operator);
-        bond.bond(MIN_BOND);
-        vm.prank(admin);
-        (uint256 slashId, uint256 totalSlash) = bond.slash(operator, challenger, 1, bytes32(0));
-
-        uint256 supplyBefore = token.totalSupply();
-        uint256 challengerBefore = token.balanceOf(challenger);
-        vm.startPrank(admin);
-        bond.markAppealOpen(slashId);
-        bond.settleAppealUpheld(slashId);
-        vm.stopPrank();
-
-        assertEq(token.balanceOf(challenger) - challengerBefore, totalSlash / 2);
-        assertEq(supplyBefore - token.totalSupply(), totalSlash - totalSlash / 2);
-        assertEq(bond.escrowedTotal(), 0);
-    }
-
-    /// @dev Read the recorded filing-window deadline for revert-arg assertions.
-    function _windowClose(uint256 slashId) internal view returns (uint64) {
-        return bond.getSlashRecord(slashId).appealWindowClose;
-    }
-
     // ----------------------------------------------------------------------
     // ADR 030 — region self-attestation
     //
@@ -1904,12 +1411,6 @@ contract CapacityBondTest is Test {
         _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
         vm.prank(operator);
         bond.setMinBond(MIN_BOND);
-    }
-
-    function test_setUnbondingPeriod_revertsWithoutRole() public {
-        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
-        vm.prank(operator);
-        bond.setUnbondingPeriod(UNBONDING);
     }
 
     function test_setMultiaddrUpdateCooldown_revertsWithoutRole() public {
@@ -2079,6 +1580,7 @@ contract CapacityBondTest is Test {
         bond.bond(60_000e18); // 60k < 100k minBond → no up-crossing, floor stays 0
         vm.stopPrank();
         assertEq(bond.bondFloorAtActivation(opAddr), 0, "bond() below minBond captures no floor");
+        assertEq(bond.firstBondedAt(opAddr), 0, "bond() below minBond starts no tenure");
         assertFalse(bond.isActive(opAddr), "not active: unregistered");
 
         // Governance lowers minBond below the operator's existing bond.
@@ -2092,6 +1594,7 @@ contract CapacityBondTest is Test {
         vm.stopPrank();
 
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registerNode captures live minBond as floor");
+        assertEq(bond.firstBondedAt(opAddr), block.timestamp, "registerNode starts the tenure");
         assertTrue(bond.isActive(opAddr), "active after registration");
 
         // A later raise must not de-activate the grandfathered operator.
@@ -2101,9 +1604,9 @@ contract CapacityBondTest is Test {
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "floor unchanged by later raise");
     }
 
-    /// @notice A floor left by an earlier `bond()` crossing above the live
-    ///         `minBond` is replaced at registration, so an operator that clears
-    ///         the live `minBond` is active once registered.
+    /// @notice A floor left by an earlier `bond()` entry above the live
+    ///         `minBond` is replaced at registration, and the running tenure is
+    ///         kept.
     function test_minBond_registerAfterDecrease_replacesStaleHigherFloor() public {
         vm.prank(admin);
         bond.setMinBond(100_000e18);
@@ -2113,22 +1616,59 @@ contract CapacityBondTest is Test {
         bytes32 nodeId = bytes32(uint256(0xF1009A));
         vm.prank(admin);
         token.transfer(opAddr, 100_000e18);
+        vm.warp(1_000_000);
         vm.startPrank(opAddr);
         token.approve(address(bond), type(uint256).max);
         bond.bond(100_000e18); // crosses the 100k minBond → floor 100k
-        bond.requestUnbond(40_000e18); // 60k active
         vm.stopPrank();
         assertEq(bond.bondFloorAtActivation(opAddr), 100_000e18);
 
         vm.prank(admin);
         bond.setMinBond(50_000e18);
 
+        vm.warp(2_000_000);
         vm.startPrank(opAddr);
         bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
         vm.stopPrank();
 
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
+        assertEq(bond.firstBondedAt(opAddr), 1_000_000, "registration keeps the running tenure");
+        assertTrue(bond.isActive(opAddr), "100k clears the 50k entry floor");
+    }
+
+    /// @notice An unbond below the floor ends the tenure before registration.
+    ///         A balance that clears a since-lowered `minBond` then registers
+    ///         without another `bond()`, and registration starts a fresh tenure.
+    function test_minBond_registerAfterFloorDip_startsFreshTenure() public {
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        uint256 opPk = 0xF1009B;
+        address opAddr = vm.addr(opPk);
+        bytes32 nodeId = bytes32(uint256(0xF1009B));
+        vm.prank(admin);
+        token.transfer(opAddr, 100_000e18);
+        vm.warp(1_000_000);
+        vm.startPrank(opAddr);
+        token.approve(address(bond), type(uint256).max);
+        bond.bond(100_000e18); // floor 100k, tenure from 1_000_000
+        bond.unbond(40_000e18); // 60k < 100k floor
+        vm.stopPrank();
+        assertEq(bond.bondFloorAtActivation(opAddr), 0, "the dip clears the floor");
+        assertEq(bond.firstBondedAt(opAddr), 0, "the dip ends the tenure");
+
+        vm.prank(admin);
+        bond.setMinBond(50_000e18);
+
+        vm.warp(2_000_000);
+        vm.startPrank(opAddr);
+        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        vm.stopPrank();
+
+        assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
+        assertEq(bond.firstBondedAt(opAddr), 2_000_000, "registration starts a fresh tenure");
         assertTrue(bond.isActive(opAddr), "60k clears the 50k entry floor");
     }
 
@@ -2156,26 +1696,14 @@ contract CapacityBondTest is Test {
         bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
     }
 
-    /// @notice A `minBond` raise alone never ejects; only a real slash below the
-    ///         grandfathered `bondFloorAtActivation / 2` does.
-    function test_minBond_raiseNeverEjects_slashStillEjects() public {
+    /// @notice A `minBond` raise alone never ejects or de-activates an
+    ///         operator active under the grandfathered `bondFloorAtActivation`.
+    function test_minBond_raiseNeverEjects() public {
         address opAddr = _bondAndRegister(0xF10023, MIN_BOND); // floor 50k
         vm.prank(admin);
         bond.setMinBond(MIN_BOND_CEILING_TEST); // 1M — a 20× raise
         assertTrue(bond.isActive(opAddr)); // raise alone: still active
         assertFalse(bond.ejected(opAddr)); // raise alone: not ejected
-
-        // Escalating slashes drop active bond below the 25k floor/2 threshold:
-        // 50k → 47.5k (5%) → 40.375k (15%) → 20.1875k (50%) < 25k → eject.
-        vm.startPrank(admin);
-        bond.slash(opAddr, challenger, 1, bytes32(0));
-        assertFalse(bond.ejected(opAddr)); // 47.5k ≥ 25k floor/2
-        bond.slash(opAddr, challenger, 1, bytes32(0));
-        assertFalse(bond.ejected(opAddr)); // 40.375k ≥ 25k floor/2
-        bond.slash(opAddr, challenger, 1, bytes32(0));
-        vm.stopPrank();
-        assertTrue(bond.ejected(opAddr)); // 20.1875k < 25k floor/2 → ejected
-        assertFalse(bond.isActive(opAddr));
     }
 
     /// @notice A grandfathered operator's own partial unbond below its
@@ -2188,14 +1716,103 @@ contract CapacityBondTest is Test {
 
         // Unbond 15k → active 45k, under the 50k grandfathered floor.
         vm.prank(opAddr);
-        bond.requestUnbond(15_000e18);
-        assertEq(bond.activeBond(opAddr), 45_000e18);
-
-        vm.warp(block.timestamp + UNBONDING + 1);
-        vm.prank(opAddr);
-        bond.unbond();
+        bond.unbond(15_000e18);
         assertEq(bond.activeBond(opAddr), 45_000e18);
         assertFalse(bond.isActive(opAddr)); // 45k < 50k floor: own action de-activates
+        assertEq(bond.firstBondedAt(opAddr), 0); // and ends the tenure
+        assertEq(bond.bondFloorAtActivation(opAddr), 0); // and the grandfathered floor
+    }
+
+    /// @notice A tenured operator that tops up through a raised `minBond`
+    ///         records nothing: it keeps its grandfathered floor and its stamp,
+    ///         so a later unbond is judged against the old floor.
+    function test_minBond_tenuredTopUpThroughRaiseKeepsFloor() public {
+        vm.warp(1_000_000);
+        address opAddr = _bondAndRegister(0xF10026, 80_000e18); // floor 50k
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND);
+
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+        vm.prank(admin);
+        token.transfer(opAddr, 40_000e18);
+
+        vm.warp(2_000_000);
+        vm.prank(opAddr);
+        bond.bond(40_000e18); // 80k → 120k, through the raised 100k minBond
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND, "a top-up keeps the grandfathered floor");
+        assertEq(bond.firstBondedAt(opAddr), 1_000_000, "and the stamp");
+
+        vm.prank(opAddr);
+        bond.unbond(60_000e18); // 60k: below the live 100k, above the 50k floor
+        assertEq(bond.firstBondedAt(opAddr), 1_000_000, "an unbond that holds the floor keeps the tenure");
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND, "and the floor");
+        assertTrue(bond.isActive(opAddr), "and the operator stays active");
+    }
+
+    /// @notice The tenure-ending `unbond` compares against the recorded floor,
+    ///         not the live `minBond`: a remainder below a raised `minBond` but
+    ///         above the floor keeps the tenure.
+    function test_minBond_unbondComparesFloorNotRaisedMinBond() public {
+        vm.warp(1_000_000);
+        address opAddr = _bondAndRegister(0xF10027, 80_000e18); // floor 50k
+
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+
+        vm.prank(opAddr);
+        bond.unbond(20_000e18); // 60k < 100k minBond, ≥ 50k floor
+        assertEq(bond.firstBondedAt(opAddr), 1_000_000, "the tenure holds");
+        assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND, "at the 50k floor");
+        assertTrue(bond.isActive(opAddr), "and the operator stays active");
+    }
+
+    /// @notice The tenure-ending `unbond` compares against the recorded floor,
+    ///         not the live `minBond`: a remainder above a lowered `minBond` but
+    ///         below the floor ends the tenure.
+    function test_minBond_unbondComparesFloorNotLoweredMinBond() public {
+        vm.prank(admin);
+        bond.setMinBond(100_000e18);
+        vm.warp(1_000_000);
+        address opAddr = _bondAndRegister(0xF10028, 100_000e18); // floor 100k
+
+        vm.prank(admin);
+        bond.setMinBond(MIN_BOND);
+
+        vm.prank(opAddr);
+        bond.unbond(25_000e18); // 75k ≥ 50k minBond, < 100k floor
+        assertEq(bond.firstBondedAt(opAddr), 0, "the dip below the floor ends the tenure");
+        assertEq(bond.bondFloorAtActivation(opAddr), 0, "and clears the floor");
+        assertFalse(bond.isActive(opAddr), "and de-activates the operator");
+    }
+
+    /// @notice A registered operator whose dip ended its tenure forfeits its
+    ///         grandfathered floor: after a `minBond` raise, bonding back to
+    ///         the old floor does not re-activate it, and reaching the raised
+    ///         `minBond` re-enters it with a fresh tenure.
+    function test_minBond_dipForfeitsGrandfatheredFloor() public {
+        vm.warp(1_000_000);
+        address opAddr = _bondAndRegister(0xF10025, MIN_BOND); // floor 50k
+        vm.prank(admin);
+        token.transfer(opAddr, 2 * MIN_BOND);
+
+        vm.prank(opAddr);
+        bond.unbond(10_000e18); // 40k < 50k floor
+        assertFalse(bond.isActive(opAddr), "the dip de-activates");
+
+        vm.prank(admin);
+        bond.setMinBond(2 * MIN_BOND);
+
+        vm.prank(opAddr);
+        bond.bond(10_000e18); // back to the old 50k floor, below the 100k minBond
+        assertFalse(bond.isActive(opAddr), "the old floor no longer applies");
+        assertEq(bond.firstBondedAt(opAddr), 0, "no entry below the live minBond");
+
+        vm.warp(2_000_000);
+        vm.prank(opAddr);
+        bond.bond(MIN_BOND); // 100k reaches the raised minBond
+        assertTrue(bond.isActive(opAddr), "re-entry at the live minBond re-activates");
+        assertEq(bond.firstBondedAt(opAddr), 2_000_000, "with a fresh tenure");
+        assertEq(bond.bondFloorAtActivation(opAddr), 2 * MIN_BOND, "at the raised floor");
     }
 
     function test_updateMultiaddrs_revertsWhenNodeNotActive() public {
@@ -2291,7 +1908,6 @@ contract CapacityBondTest is Test {
             ed25519Verifier_: ed25519,
             admin: admin,
             minBond_: MIN_BOND,
-            unbondingPeriod_: UNBONDING,
             multiaddrUpdateCooldown_: 0,
             maxMultiaddrSize_: 1024,
             regionStabilityWindow_: 7 days,
@@ -2389,184 +2005,6 @@ contract CapacityBondTest is Test {
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(opPk, digest);
         return abi.encodePacked(r, s, v);
-    }
-
-    // -----------------------------------------------------------------
-    // setSlashJudge (ADR 014 § Interaction with unbonding period)
-    // -----------------------------------------------------------------
-
-    function test_setSlashJudge_revertsWithoutRole() public {
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US);
-        _expectMissingRole(operator, bond.GOVERNANCE_ROLE());
-        vm.prank(operator); // not GOVERNANCE_ROLE
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-    }
-
-    function test_setSlashJudge_revertsOnZeroAddress() public {
-        vm.prank(admin);
-        vm.expectRevert(CapacityBond.ZeroAddress.selector);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(0)));
-    }
-
-    function test_setSlashJudge_setsAndEmits() public {
-        // Judge's maxEvidenceAgeUs (5 days*1e6) is strictly below the bond's
-        // unbondingPeriod*1e6 (7 days*1e6), so the wire-time invariant guard passes.
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
-        vm.prank(admin);
-        vm.expectEmit(true, false, false, false, address(bond));
-        emit CapacityBond.SlashJudgeWired(address(judge));
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        assertEq(address(bond.slashJudge()), address(judge));
-    }
-
-    function test_setSlashJudge_rejectsJudgeViolatingInvariant() public {
-        // bond's unbondingPeriod is 7 days. A judge claiming maxEvidenceAgeUs == 7d*1e6
-        // would violate the strict invariant (7d*1e6 <= 7d*1e6) -> wire must revert.
-        MockSlashJudgeEvidence badJudge = new MockSlashJudgeEvidence(uint256(7 days) * 1_000_000);
-        vm.prank(admin);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CapacityBond.UnbondingBelowEvidenceAge.selector,
-                uint256(7 days) * 1_000_000,
-                uint256(7 days) * 1_000_000
-            )
-        );
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(badJudge)));
-    }
-
-    function test_setSlashJudge_acceptsJudgeSatisfyingInvariant() public {
-        // maxEvidenceAgeUs = 5 days*1e6 < 7 days*1e6 -> satisfies invariant, wire succeeds.
-        MockSlashJudgeEvidence okJudge = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
-        vm.prank(admin);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(okJudge)));
-        assertEq(address(bond.slashJudge()), address(okJudge));
-    }
-
-    function test_setSlashJudge_revertsOnSecondWire() public {
-        // The judge is set once at deploy wiring, then fixed. A second call must
-        // revert, so a captured governance cannot swap in a malicious judge. Both
-        // maxEvidenceAgeUs values (4d, 5d *1e6) are strictly below the bond's
-        // unbondingPeriod*1e6 (7 days*1e6), so the first wire satisfies the invariant.
-        MockSlashJudgeEvidence first = new MockSlashJudgeEvidence(uint256(4 days) * 1_000_000);
-        MockSlashJudgeEvidence second = new MockSlashJudgeEvidence(uint256(5 days) * 1_000_000);
-        vm.startPrank(admin);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(first)));
-        vm.expectRevert(CapacityBond.SlashJudgeAlreadySet.selector);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(second)));
-        vm.stopPrank();
-        // The first judge stays wired.
-        assertEq(address(bond.slashJudge()), address(first));
-    }
-
-    // -----------------------------------------------------------------
-    // setUnbondingPeriod x maxEvidenceAgeUs mirror invariant (ADR 014)
-    // -----------------------------------------------------------------
-
-    function test_setUnbondingPeriod_revertsWhenEqualToEvidenceAge() public {
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US); // 10 days us
-        vm.startPrank(admin);
-        // Raise unbonding to 20 days first so the 10-day judge satisfies the
-        // wire-time invariant (20d*1e6 > 10d*1e6) and can be wired.
-        bond.setUnbondingPeriod(20 days);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // 10 days * 1e6 == MOCK_EVIDENCE_AGE_US -> must revert (strict `<` invariant).
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CapacityBond.UnbondingBelowEvidenceAge.selector, uint256(10 days) * 1_000_000, MOCK_EVIDENCE_AGE_US
-            )
-        );
-        bond.setUnbondingPeriod(10 days);
-        vm.stopPrank();
-    }
-
-    function test_setUnbondingPeriod_revertsWhenBelowEvidenceAge() public {
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US); // 10 days us
-        vm.startPrank(admin);
-        // Raise unbonding to 20 days first so the 10-day judge can be wired.
-        bond.setUnbondingPeriod(20 days);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // 9 days is within [7d,60d] but 9d*1e6 < 10d*1e6 -> mirror check reverts.
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CapacityBond.UnbondingBelowEvidenceAge.selector, uint256(9 days) * 1_000_000, MOCK_EVIDENCE_AGE_US
-            )
-        );
-        bond.setUnbondingPeriod(9 days);
-        vm.stopPrank();
-    }
-
-    function test_setUnbondingPeriod_succeedsAboveEvidenceAge() public {
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US); // 10 days us
-        vm.startPrank(admin);
-        // Raise unbonding to 20 days first so the 10-day judge can be wired.
-        bond.setUnbondingPeriod(20 days);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // 11 days: within [7d,60d] AND 11d*1e6 > 10d*1e6 -> passes both checks.
-        bond.setUnbondingPeriod(11 days);
-        vm.stopPrank();
-        assertEq(bond.unbondingPeriod(), 11 days);
-    }
-
-    function test_setUnbondingPeriod_boundStillEnforcedWithJudge() public {
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(MOCK_EVIDENCE_AGE_US);
-        vm.startPrank(admin);
-        // Raise unbonding to 20 days first so the 10-day judge can be wired.
-        bond.setUnbondingPeriod(20 days);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // 61 days exceeds UNBONDING_PERIOD_CEILING (60 days) -> the bound check reverts FIRST.
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CapacityBond.ParamOutOfBounds.selector, uint256(61 days), uint256(7 days), uint256(60 days)
-            )
-        );
-        bond.setUnbondingPeriod(61 days);
-        vm.stopPrank();
-    }
-
-    function test_setUnbondingPeriod_unwiredAppliesOnlyBound() public {
-        // No setSlashJudge call: slashJudge == address(0).
-        assertEq(address(bond.slashJudge()), address(0));
-        vm.prank(admin);
-        bond.setUnbondingPeriod(8 days); // within [7d,60d], no judge -> succeeds
-        assertEq(bond.unbondingPeriod(), 8 days);
-    }
-
-    function test_setUnbondingPeriod_floorWithLowEvidenceAgeSucceeds() public {
-        // Tightest valid corner: unbonding at the floor (UNBONDING_PERIOD_FLOOR == 7 days)
-        // with a 1-day evidence-age judge. The fixture bond starts at UNBONDING (7 days),
-        // so wiring a 1-day judge passes (7d*1e6 > 1d*1e6); setting to 7 days then passes
-        // both the [7d,60d] bound (7 days is the floor) and the mirror (7d*1e6 > 1d*1e6).
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(1 days) * 1_000_000);
-        vm.startPrank(admin);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        bond.setUnbondingPeriod(7 days); // floor; 7d*1e6 > 1d*1e6 and within [7d,60d]
-        vm.stopPrank();
-        assertEq(bond.unbondingPeriod(), 7 days);
-    }
-
-    // Drives the full regime change in one test: a value accepted while the
-    // judge is unset becomes rejected once a judge is wired, with no other
-    // change. Proves wiring is what tightens the constraint (not the bound).
-    function test_setUnbondingPeriod_sameValueRejectedAfterWiring() public {
-        MockSlashJudgeEvidence judge = new MockSlashJudgeEvidence(uint256(9 days) * 1_000_000);
-        vm.startPrank(admin);
-        // Unwired: 8 days is within [7d,60d] and there is no judge -> accepted.
-        bond.setUnbondingPeriod(8 days);
-        assertEq(bond.unbondingPeriod(), 8 days);
-        // Raise to 20 days so the 9-day judge satisfies the wire-time invariant
-        // (20d*1e6 > 9d*1e6) and can be wired.
-        bond.setUnbondingPeriod(20 days);
-        bond.setSlashJudge(ISlashJudgeEvidenceView(address(judge)));
-        // The same 8-day value is now rejected: 8d*1e6 < 9d*1e6 violates the mirror.
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                CapacityBond.UnbondingBelowEvidenceAge.selector,
-                uint256(8 days) * 1_000_000,
-                uint256(9 days) * 1_000_000
-            )
-        );
-        bond.setUnbondingPeriod(8 days);
-        vm.stopPrank();
     }
 
     function test_declaredMbpsAtEpoch_keepsPerEpochHistory() public {

@@ -32,16 +32,13 @@ pub const MAX_RATE_PER_MB: u64 = 1000;
 
 /// Length in bytes of an EOA secp256k1 EIP-712 signature (`r‖s‖v`, 32+32+1).
 ///
-/// ADR 014 §1 mandates `slash_sig` is **non-empty** and that requesters MUST
-/// reject missing/zero-length signatures — it does not itself fix a byte
-/// length. Off-chain `slash_sig` producers are EOA-only — ADR 024 §Off-Chain
-/// ERC-1271 Verification: "Every signature deCDN produces or verifies
-/// off-chain … is the fixed 65-byte secp256k1 `r‖s‖v` form" — which is always
-/// exactly this length. Variable-length
-/// **ERC-1271** smart-account signatures are verified on-chain by
-/// `SlashJudge` via `SignatureChecker.isValidSignatureNow` (ADR 014
-/// §On-Chain Verification); enforcing exactly this length off-chain is the
-/// correct, intentionally-strict bound for the EOA producer set. When
+/// ADR 005 § Signer binding mandates `slash_sig` is **non-empty** and that
+/// requesters MUST reject missing/zero-length signatures — it does not itself
+/// fix a byte length. Off-chain `slash_sig` producers are EOA-only — ADR 024
+/// §Off-Chain ERC-1271 Verification: "Every signature deCDN produces or
+/// verifies off-chain … is the fixed 65-byte secp256k1 `r‖s‖v` form" — which
+/// is always exactly this length. Enforcing exactly this length off-chain is
+/// the correct, intentionally-strict bound for the EOA producer set. When
 /// off-chain ERC-1271 handling lands this constant becomes a lower bound.
 pub const SLASH_SIG_LEN: usize = 65;
 
@@ -70,14 +67,14 @@ pub enum MessageValidationError {
     /// can still build a response before signing it.
     #[error("rate_per_mb is zero (requesters must reject; #252)")]
     RateIsZero,
-    /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 014 §1
-    /// mandates a non-empty signature on every signed response; the
+    /// `slash_sig` is missing or not [`SLASH_SIG_LEN`] bytes. ADR 005
+    /// § Signer binding mandates a non-empty signature on every signed response; the
     /// EOA-only off-chain signing path (ADR 024 §Off-Chain Signature
     /// Verification — EOA Recovery Only) makes that exactly [`SLASH_SIG_LEN`],
     /// which requesters MUST reject deviations from.
     #[error(
         "slash_sig has invalid length {len} \
-         (ADR 014 §1: mandatory non-empty; EOA form is {expected} bytes)",
+         (ADR 005 § Signer binding: mandatory non-empty; EOA form is {expected} bytes)",
         expected = SLASH_SIG_LEN
     )]
     InvalidSlashSigLen {

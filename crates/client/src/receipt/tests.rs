@@ -5,7 +5,7 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH, preimage_at, root_from_seed};
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{
-    LaneKey, Voucher, signed_to_wire_voucher, slash_judge_domain, voucher_domain,
+    LaneKey, Voucher, capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
 };
 use decdn_protocol::client::{StreamResponse, StreamResponseBody, Voucher as WireVoucher};
 
@@ -19,7 +19,7 @@ const RATE: u64 = 500;
 fn chain() -> ReceiptChain {
     ReceiptChain {
         chain_id: CHAIN_ID,
-        slash_judge: Address::repeat_byte(0x22),
+        capacity_bond: Address::repeat_byte(0x22),
         payment_chain_id: PAYMENT_CHAIN_ID,
         payment_pool: Address::repeat_byte(0x11),
     }
@@ -30,8 +30,7 @@ fn governance() -> crate::session::GovernanceChain {
     crate::session::GovernanceChain {
         rpc_url: "http://127.0.0.1:1".to_owned(),
         chain_id: c.chain_id,
-        slash_judge: c.slash_judge,
-        capacity_bond: None,
+        capacity_bond: c.capacity_bond,
     }
 }
 
@@ -79,7 +78,10 @@ impl Keys {
         };
         let c = chain();
         let sig = StreamSlashData::from_response_body(&body)
-            .sign(&self.node, &slash_judge_domain(c.chain_id, c.slash_judge))
+            .sign(
+                &self.node,
+                &capacity_bond_domain(c.chain_id, c.capacity_bond),
+            )
             .unwrap();
         StreamResponse {
             body,
@@ -1005,7 +1007,7 @@ fn the_json_schema_is_pinned() {
         "format": "decdn-receipt/1",
         "chain": {
             "chain_id": 11_155_111,
-            "slash_judge": a("22"),
+            "capacity_bond": a("22"),
             "payment_chain_id": 421_614,
             "payment_pool": a("11"),
         },

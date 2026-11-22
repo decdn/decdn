@@ -49,12 +49,10 @@
 
     # The chains and contracts a download runs against: the governance chain,
     # where decdn finds nodes and checks their signatures, and the payment
-    # chain of the pool that pays them. $SlashJudge is empty when the onramp
-    # names none.
+    # chain of the pool that pays them.
     $GovernanceChainId = '{{GOVERNANCE_CHAIN_ID}}'
     $GovernanceRpcUrl = '{{GOVERNANCE_RPC_URL}}'
     $CapacityBond = '{{CAPACITY_BOND}}'
-    $SlashJudge = '{{SLASH_JUDGE}}'
     $PoolChainId = '{{POOL_CHAIN_ID}}'
     $PoolRpcUrl = '{{POOL_RPC_URL}}'
     $PaymentPool = '{{PAYMENT_POOL}}'
@@ -355,7 +353,6 @@
       '--pool', "eip155:${PoolChainId}:${PaymentPool}",
       '--pool-rpc-url', $PoolRpcUrl
     )
-    if ($SlashJudge) { $PullArgs += '--slash-judge-address', $SlashJudge }
 
     & $Decdn @PullArgs
     if ($LASTEXITCODE -ne 0) {

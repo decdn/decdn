@@ -25,7 +25,7 @@ pub struct ProbeArgs {
     pub node_id: String,
 
     /// The node operator's Ethereum address (0x-prefixed hex): the answer's
-    /// `slash_sig` must recover to it (ADR 014 §1).
+    /// `slash_sig` must recover to it (ADR 005 § Signer binding).
     #[arg(long, value_name = "0xADDR")]
     pub provider_address: String,
 
@@ -62,13 +62,9 @@ pub struct ProbeArgs {
     #[command(flatten)]
     pub payment: super::common::PoolSelectArgs,
 
-    /// `SlashJudge` contract address (0x hex): the domain the answer's
-    /// signature verifies under. Overrides `blockchain.slash_judge_address`.
-    #[arg(long, value_name = "0xADDR")]
-    pub slash_judge_address: Option<String>,
-
-    /// `CapacityBond` contract address (0x hex): the domain of the open's
-    /// identity binding. Overrides `blockchain.capacity_bond_address`.
+    /// `CapacityBond` contract address (0x hex): the domain the answer's
+    /// signature verifies under, and the domain of the open's identity
+    /// binding. Overrides `blockchain.capacity_bond_address`.
     #[arg(long, value_name = "0xADDR")]
     pub capacity_bond_address: Option<String>,
 

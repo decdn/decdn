@@ -92,11 +92,10 @@ sponsorship daemon and onramp that ship with every release.
   ([ADR 039](adr/039-multi-source-parallel-fetch.md)).
 - **Private origins.** S3, R2, B2, HTTP, and filesystem backends are per-node config. No
   origin URL is ever exposed ([ADR 002](adr/002-content-addressing.md)).
-- **Enforced on-chain.** Every quote and stream response carries a signature that serves
-  as on-chain slash evidence, a slashed operator has 30 days to appeal, and governance
-  blacklists content hashes
-  ([ADR 014](adr/014-on-chain-verification.md), [ADR 028](adr/028-slashing-appeals.md),
-  [ADR 011](adr/011-content-takedown.md)).
+- **Signed and accountable.** Every quote and stream response carries the operator's
+  signature, so a client can attribute it to a bonded operator
+  ([ADR 005](adr/005-protocol.md#signer-binding)). Governance blacklists content hashes,
+  and nodes follow the list ([ADR 011](adr/011-content-takedown.md)).
 - **Governed by service.** No TOKEN balance carries a vote. Vote weight is trailing-window
   served bytes ([ADR 036](adr/036-served-bytes-voting-weight.md)).
 
@@ -372,7 +371,7 @@ daemon and its onramp are two more ([`docs/sponsord/`](docs/sponsord/README.md))
 | `key-gen`, `whoami` | Generate, then inspect, the Ed25519 node key and Ethereum keystore |
 | `config {init,validate}` | Write a config file; check one before the daemon reads it |
 | `setup` | Guided operator onboarding over `key-gen`, `node bond`, and `node register` |
-| `node {…}` | Admin of a running daemon (`health`, `status`, `lanes`, `pools`, `top`, `evict`, `reload`, `drain`, `slashes`); the on-chain lifecycle (`bond`, `unbond`, `register`, `deregister`, `rotate-key`, `update-multiaddrs`, `update-region`); diagnostics (`doctor`, `lookup`) |
+| `node {…}` | Admin of a running daemon (`health`, `status`, `lanes`, `pools`, `top`, `evict`, `reload`, `drain`); the on-chain lifecycle (`bond`, `unbond`, `register`, `deregister`, `rotate-key`, `update-multiaddrs`, `update-region`); diagnostics (`doctor`, `lookup`) |
 | `probe` | Open one unpaid `cdn/client/v1` stream to a node and print its signed answer: the quote, the proven size and the coverage |
 | `get` | Paid pull over `cdn/client/v1` of what a `decdn:` URI names: a blob, a directory bundle, or one file of a bundle ([appendix](adr/appendix-bundles.md)) |
 | `quote` | Price a pull of a `decdn:` URI from the rates the nodes sign in their answers to unpaid stream opens, before any paid byte |
@@ -380,7 +379,6 @@ daemon and its onramp are two more ([`docs/sponsord/`](docs/sponsord/README.md))
 | `pool {…}` | Client payment-pool lifecycle: `list`, `open`, `top-up`, `close`, `reclaim`, `assign` |
 | `publish {…}` | Publisher control plane: `namespace create`; seat and unseat authorized origins with `assign` and `revoke` |
 | `origin {import}` | Write local content into a local filesystem origin store, offline and config-free |
-| `appeal {slash}` | File a slash appeal and post the appeal bond ([ADR 028](adr/028-slashing-appeals.md)) |
 | `self-update` | Replace this binary with the latest release whose `SHA256SUMS.minisig` the embedded key verifies; `--check` only reports |
 
 The global `--config <path>` selects the config file, and every `decdn-node run` flag also
@@ -440,7 +438,7 @@ free of any blob store or AWS SDK. `.github/scripts/check_crate_edges.py` enforc
 boundary in CI.
 
 The contracts cover operator bonding, USDC settlement and the fee split, buyback-and-burn,
-served-bytes governance, slashing and appeals, content takedown, and publisher namespaces.
+served-bytes governance, content takedown, and publisher namespaces.
 [`contracts/README.md`](contracts/README.md) lists each contract, and
 [ADR 016 § Contract Inventory](adr/016-contract-interactions.md#contract-inventory) maps
 how they interact.
@@ -457,8 +455,8 @@ how they interact.
 | Delivery | A large fetch spreads disjoint byte ranges across several holders, at most one per operator, and reassigns ranges as sources finish or stall. Cache admission and eviction are node-local. A node refuses a cache miss whose upstream price leaves no margin after the fee split. | [039](adr/039-multi-source-parallel-fetch.md), [040](adr/040-cache-policy.md), [041](adr/041-refuse-to-serve.md) |
 | Payments | A client funds one shared `PaymentPool` and pays each provider with cumulative off-chain vouchers. Only the provider redeems its own vouchers, so a pool owner's close cannot understate what a node earned. A close starts a grace window in which nodes keep redeeming, and each node's periodic sweep redeems well inside it. | [003](adr/003-payments.md) |
 | Tokenomics | USDC pays for bytes. Operators bond TOKEN on a governance-tunable curve over declared bandwidth (super-linear at the default exponent), with a flat `minBond` floor. Fee-split buckets are governance-tunable. Protocol-owned liquidity is a Uniswap V3 50/50 TOKEN/USDC pool that governance seeds after launch. | [026](adr/026-tokenomics.md), [016](adr/016-contract-interactions.md), [018](adr/018-liquidity-strategy.md) |
-| Enforcement | Every `StreamResponse` carries a secp256k1 EIP-712 `slash_sig`, so serving a blacklisted hash — the one slashable offense — leaves on-chain evidence. There is no rate slash: the client signs the price into each voucher; the Ed25519 NodeId authenticates connections and the registration proof, never slash evidence. A challenge is a commit–reveal that resolves on-chain at reveal time. Slashed TOKEN sits in escrow for a 30-day appeal window. Governance blacklists content hashes. Reputation is a local per-peer EWMA. | [014](adr/014-on-chain-verification.md), [028](adr/028-slashing-appeals.md), [011](adr/011-content-takedown.md), [008](adr/008-reputation.md) |
-| Governance | `DecdnGovernor` with a `TimelockController`. No TOKEN balance carries a vote. Vote weight is trailing-window served bytes, capped per epoch by declared capacity and overall by a per-operator share, ramped by tenure since first bond, and zeroed by a standing slash inside the trailing window. The process moves from admin key to bootstrap multisig to DAO; the contract set stays the same. | [009](adr/009-governance.md), [036](adr/036-served-bytes-voting-weight.md) |
+| Enforcement | Every `StreamResponse` carries a secp256k1 EIP-712 signature by the operator's Ethereum key, which `CapacityBond` binds to its NodeId. The client protects itself: it verifies every byte and signs the price into each voucher. The Ed25519 NodeId authenticates connections and the registration proof. Governance blacklists content hashes, nodes follow the list, and governance can eject an operator that does not. A deregistered operator withdraws its bond in one `unbond` call. Reputation is a local per-peer EWMA. | [005](adr/005-protocol.md#signer-binding), [011](adr/011-content-takedown.md), [026](adr/026-tokenomics.md#capacity-bond-curve), [008](adr/008-reputation.md) |
+| Governance | `DecdnGovernor` with a `TimelockController`. No TOKEN balance carries a vote. Vote weight is trailing-window served bytes, capped per epoch by declared capacity and overall by a per-operator share, and ramped by tenure: the time the operator has held its bond at or above the activation floor. An unbond below that floor ends the tenure. The process moves from admin key to bootstrap multisig to DAO; the contract set stays the same. | [009](adr/009-governance.md), [036](adr/036-served-bytes-voting-weight.md) |
 | Evolution | Varint-length framing, protocol enums, and a three-tier schema-evolution model. Governance runs on Ethereum L1 and payments run on any admitted chain. | [013](adr/013-schema-evolution.md), [chain admission appendix](adr/appendix-l2-deployment.md) |
 
 </details>

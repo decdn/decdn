@@ -2,7 +2,7 @@
 //!
 //! These primitives spin up real in-process iroh endpoints, caches, and
 //! [`ClientHandler`]s on localhost. They are intentionally domain-agnostic: the
-//! EIP-712 domains (slash / voucher / binding) are passed in by the caller so
+//! EIP-712 domains (stream response / voucher / binding) are passed in by the caller so
 //! both the fixed-constant loopback suite (`client_loopback.rs`) and the live
 //! on-chain settlement e2e (`anvil_settlement_e2e.rs`, issue #745, which must
 //! use the deployed contract addresses + anvil chain id) can share them.
@@ -543,7 +543,7 @@ pub(crate) async fn reap<T>(label: &str, task: tokio::task::JoinHandle<T>) -> an
     }
 }
 
-/// EIP-712 domains a [`ClientHandler`] needs: slash-receipt, voucher, and
+/// EIP-712 domains a [`ClientHandler`] needs: stream response, voucher, and
 /// client-binding. Grouped so callers thread one value through the builders.
 #[derive(Clone)]
 pub(crate) struct HandlerDomains {

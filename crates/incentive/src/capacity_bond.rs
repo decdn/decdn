@@ -9,10 +9,11 @@
 //! Two gotchas worth flagging here rather than at the call site:
 //!
 //! - `getRegisteredNodes` returns the `_registeredAddrs` page (every
-//!   registered operator, unfiltered for bond / unbonding / ejection)
+//!   registered operator, unfiltered for bond / ejection)
 //!   alongside a parallel `active[]` that the contract computes with
-//!   `isActive(operator)` per entry — the strict "registered AND active
-//!   bond ≥ the operator's floor AND not ejected" predicate. Callers take
+//!   `isActive(operator)` per entry — the strict "registered AND holds a
+//!   tenure (non-zero floor) AND active bond ≥ the operator's floor AND not
+//!   ejected" predicate. Callers take
 //!   the membership set from `active[]` and keep the full page for the
 //!   payout bindings (an operator below its floor is `active == false`
 //!   but still payable), with no per-entry round-trip.
@@ -61,9 +62,9 @@ mod sol_types {
             // View functions (only those consumed by the node runtime)
             // -----------------------------------------------------------------
 
-            /// Full active-bonder predicate: registered AND
+            /// Full active-bonder predicate: registered AND holds a tenure
+            /// (non-zero `bondFloorAtActivation`) AND
             /// `activeBond ≥ bondFloorAtActivation` AND not ejected.
-            /// Bond queued for unbonding is not `activeBond`.
             function isActive(address operator) external view returns (bool);
 
             /// `nodeId`-keyed convenience over `isActive`.
@@ -80,46 +81,26 @@ mod sol_types {
             /// *different* operator's binding.
             function nodeIdToAddress(bytes32 nodeId) external view returns (address);
 
-            /// Raw `operator → nodeId` binding, the mapping slashability keys
-            /// on: `SlashJudge._checkRegistered` reads it through `nodeIdOf` and
-            /// deliberately ignores `active`, so a bound-but-deregistered
-            /// operator stays slashable (ADR 014). `bindNodeId` swaps it
-            /// atomically, which is why key rotation opens no un-slashable
-            /// window. `bytes32(0)` when the operator has no binding.
+            /// Raw `operator → nodeId` binding. It ignores `active`, so a
+            /// bound-but-deregistered operator still maps to its `nodeId`.
+            /// `bindNodeId` swaps it atomically. `bytes32(0)` when the
+            /// operator has no binding.
             function addressToNodeId(address operator) external view returns (bytes32);
 
-            /// Unix timestamp of the operator's first bond, or `0` if never
-            /// bonded. Write-once — never cleared by `deregisterNode`,
-            /// auto-ejection, or `bindNodeId`. Read by `decdn node rotate-key`
-            /// to report the `age_ramp` anchor an Ethereum-key rotation
-            /// destroys and an iroh-key rotation preserves (ADR 026
-            /// § Governance).
+            /// Unix timestamp of the start of the operator's current tenure,
+            /// or `0` while none runs. An entry stamps it: a `bond` that
+            /// leaves `activeBond ≥ minBond` while no tenure runs, or a
+            /// `registerNode`. A tenured top-up leaves it alone. An `unbond`
+            /// whose remainder falls below `bondFloorAtActivation` clears it.
+            /// `deregisterNode`, ejection and `bindNodeId` keep it. Read by
+            /// `decdn node rotate-key` to report the `age_ramp` anchor an
+            /// Ethereum-key rotation destroys and an iroh-key rotation
+            /// preserves (ADR 026 § Governance).
             function firstBondedAt(address operator) external view returns (uint64);
-
-            /// On-chain escrow record for one slash (ADR 028 escrow-on-slash).
-            /// Field order is ABI-significant — it mirrors `SlashEscrowLib`'s
-            /// struct exactly, and a reordering here silently mis-decodes.
-            struct SlashRecord {
-                address operator;
-                uint64 slashedAt;
-                uint8 status;
-                uint8 offenseType;
-                address challenger;
-                uint64 appealWindowClose;
-                uint256 slashAmount;
-                bytes32 evidenceHash;
-            }
-
-            /// A slash record was minted. Indexed on `operator`, so a node
-            /// filters its own with `topic2` and then point-reads the record —
-            /// the live-tail counterpart to the `operatorSlash*` enumeration.
-            event SlashRecorded(
-                uint256 indexed slashId, address indexed operator, uint64 slashedAt, uint256 slashAmount
-            );
 
             /// Paginated snapshot of `_registeredAddrs` — every operator
             /// with a current registration, **NOT** filtered for bond /
-            /// unbonding / ejection — paired with a parallel `active[]`
+            /// ejection — paired with a parallel `active[]`
             /// where `active[i] == isActive(page[i].ethAddress)`, computed
             /// on-chain. Take membership from `active`; keep `page` for the
             /// payout bindings (an operator below its floor is
@@ -132,42 +113,6 @@ mod sol_types {
             /// Cardinality of `_registeredAddrs`.
             function getRegisteredNodeCount() external view returns (uint256);
 
-            /// How many slashes have ever been minted against `operator`.
-            /// Paired with `operatorSlashIdAt`, this lets a consumer read an
-            /// operator's slashes from chain state: walk backwards from
-            /// `count - 1` and stop at the first record whose
-            /// `appealWindowClose` has already passed.
-            function operatorSlashCount(address operator) external view returns (uint256);
-
-            /// The `slashId` at `index` in `operator`'s append-only slash list.
-            /// Append-only and never reordered, so indices are stable across
-            /// calls and no pinned-block read is required. Reverts
-            /// `SlashIndexOutOfRange` past the end rather than returning a zero
-            /// id, which would alias the legitimate `slashId == 0`.
-            function operatorSlashIdAt(address operator, uint256 index) external view returns (uint256);
-
-            /// Full escrow record for `slashId`.
-            ///
-            /// `appealWindowClose` here is the **base** deadline (`slashedAt +
-            /// appealFilingWindow`), fixed at mint. The deadline the contract
-            /// actually enforces is `appealWindowClose + pausedTotal`
-            /// ([`SlashEscrowLib`] adds the global pause offset at finalize /
-            /// appeal-open time), so a consumer that gates on the deadline MUST
-            /// read [`pausedTotal`](Self::pausedTotal) at the same block and add
-            /// it. `offenseType` and `evidenceHash` are persisted on the record
-            /// precisely so it is self-sufficient — the `CapacityBond.Slashed`
-            /// event carries the offense but no `slashId`, and `SlashRecorded`
-            /// carries the `slashId` but no offense.
-            function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);
-
-            /// Global cumulative appeal-window pause offset, in seconds. Every
-            /// slash's enforced deadline is
-            /// `getSlashRecord(id).appealWindowClose + pausedTotal`; the offset
-            /// only ever grows (`_unpause` credits each ended pause interval), so
-            /// it uniformly extends every open window and preserves base-close
-            /// ordering.
-            function pausedTotal() external view returns (uint64);
-
             /// The operator's raw registration record. `active` here is
             /// `_nodes[operator].active` alone — the flag `deregisterNode`
             /// gates on — NOT the composite `isActive`, which additionally
@@ -178,9 +123,9 @@ mod sol_types {
             function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
 
             /// Whether the operator was removed by the contract rather than by
-            /// choice — auto-ejection on slashing, or a `BLACKLIST_ROLE`
-            /// `ejectNode`. Both inactive states exit the same way
-            /// (`declareMbps(0)` + unbond), but they differ on RE-ENTRY: an
+            /// choice — a `BLACKLIST_ROLE` `ejectNode`. Both inactive states
+            /// exit the same way (`declareMbps(0)` + unbond), but they differ
+            /// on RE-ENTRY: an
             /// ejected operator's `registerNode` reverts `OperatorEjected` until
             /// the latch clears, so the advice has to differ (#1359).
             function ejected(address operator) external view returns (bool);
@@ -203,8 +148,11 @@ mod sol_types {
             function minBond() external view returns (uint256);
 
             /// The operator's grandfathered entry floor: the `minBond` in
-            /// force when it last activated, 0 if it never has. `isActive`
-            /// tests `activeBond` against this, not the live `minBond`.
+            /// force at the entry that began its current tenure. It is 0 if
+            /// the operator never entered, and 0 again after an `unbond`
+            /// whose remainder falls below it ends the tenure. A tenured
+            /// top-up keeps it. `isActive` requires it non-zero and tests
+            /// `activeBond` against it, not the live `minBond`.
             function bondFloorAtActivation(address operator) external view returns (uint256);
 
             /// Governable lower bound of the declarable-capacity band (Mbps).
@@ -233,36 +181,15 @@ mod sol_types {
             /// bondRequired(mbps)` or `mbps` is outside the governable band.
             function declareMbps(uint256 mbps) external;
 
-            /// Start the unbonding window for `amount` base units (ADR 026
-            /// § Capacity-bond curve — lowering a bond is `requestUnbond` +
-            /// `unbond`, there is no atomic refund). Moves `amount` out of
-            /// `activeBond` immediately and locks it for `unbondingPeriod`.
-            /// Reverts if a request is already in flight, or if the remaining
-            /// active bond would fall below `bondRequired(declaredMbps)` — note
-            /// the curve, NOT `minBond`, is the floor here, so the operator can
-            /// legally unbond into an inactive state. `decdn node unbond`
-            /// pre-checks both so neither surfaces as a raw revert.
-            function requestUnbond(uint256 amount) external;
-
-            /// Withdraw a matured unbonding request (`block.timestamp >=
-            /// unlockAt`), transferring the TOKEN back to the operator and
-            /// clearing the request.
-            function unbond() external;
-
-            /// Operator's in-flight unbonding request as `(amount, unlockAt)`;
-            /// `amount == 0` means none. The auto-getter of a
-            /// `UnbondingRequest` mapping, so the static struct flattens to
-            /// this tuple. (Unlike `nodeIdOf` above, which is a hand-written
-            /// multi-return view rather than a struct getter.) A
-            /// non-zero `amount` also makes `isActive` false for the whole
-            /// window, which is why `decdn node unbond` warns before starting
-            /// one.
-            function unbondingOf(address operator) external view returns (uint256 amount, uint256 unlockAt);
-
-            /// Governable unbonding window in seconds (ADR 026 § Capacity-bond
-            /// curve — 14 days by default). Read so the CLI can report the
-            /// unlock time it is about to commit the operator to.
-            function unbondingPeriod() external view returns (uint256);
+            /// Withdraw `amount` base units of active bond to the operator at
+            /// once (ADR 026 § Capacity-bond curve). Reverts `ZeroAmount` on
+            /// zero, `InsufficientBond` above `activeBond`, and
+            /// `BondBelowCurve` if the remaining active bond would fall below
+            /// `bondRequired(declaredMbps)` — note the curve, NOT `minBond`, is
+            /// the floor here, so the operator can legally unbond into an
+            /// inactive state. `decdn node unbond` pre-checks the curve so it
+            /// does not surface as a raw revert.
+            function unbond(uint256 amount) external;
 
             /// Governable ceiling (bytes) on the packed `multiaddrs` field an
             /// operator may publish. `updateMultiaddrs` reverts
@@ -337,7 +264,7 @@ mod sol_types {
             /// Leave the active set: clears `_nodes[msg.sender].active`, bumps
             /// `registrationNonce[nodeId]`, and clears `declaredMbps` —
             /// releasing the `bondRequired(declaredMbps)` floor that
-            /// `requestUnbond` enforces, which is what makes a full bond exit
+            /// `unbond` enforces, which is what makes a full bond exit
             /// reachable (ADR 003 § Node Registry, ADR 026 § Capacity-bond
             /// curve). Does NOT move the bond. Reverts `NodeNotActive` unless
             /// the caller is currently registered.
@@ -350,7 +277,7 @@ mod sol_types {
             ///
             /// Atomically deletes the old `nodeId → address` mapping (bumping
             /// its `registrationNonce`) and writes the new one, so the operator
-            /// is never un-slashable mid-rotation. The bond, `declaredMbps`,
+            /// is never unbound mid-rotation. The bond, `declaredMbps`,
             /// `firstBondedAt`, and every open lane paying this operator
             /// survive untouched — all of them key on the Ethereum address,
             /// which does not change.
@@ -425,8 +352,7 @@ mod sol_types {
             /// the post-increment value.
             event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId, uint64 bindingNonce);
 
-            /// Node deactivated by `slash` or `ejectNode` dropping
-            /// bond below `minBond / 2`. `nodeId`-indexed.
+            /// Node deactivated by `ejectNode`. `nodeId`-indexed.
             event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingBond);
 
             /// Node deactivated by `ContentBlacklist`-role caller.
@@ -438,17 +364,12 @@ mod sol_types {
             /// translate via `nodeIdOf`.
             event Reinstated(address indexed operator);
 
-            /// Operator requested unbonding; flips `isActive` to
-            /// `false` at once when the retained active bond is below
-            /// the operator's floor, while the operator stays in
-            /// `_registeredAddrs`. **Operator-indexed** — translate
-            /// via `nodeIdOf`.
-            event UnbondingRequested(
-                address indexed operator,
-                uint256 amount,
-                uint256 unlockAt,
-                uint256 newActiveBond
-            );
+            /// Operator withdrew `amount` of active bond via `unbond`. Flips
+            /// `isActive` to `false` at once when the retained active bond is
+            /// below the operator's floor, while the operator stays in
+            /// `_registeredAddrs`. **Operator-indexed** — translate via
+            /// `nodeIdOf`.
+            event Unbonded(address indexed operator, uint256 amount, uint256 newActiveBond);
         }
     }
 }

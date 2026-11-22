@@ -39,7 +39,7 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{Deployment, slash_judge_domain};
+use decdn_incentive::{Deployment, capacity_bond_domain};
 use iroh::{Endpoint, RelayUrl};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -1267,7 +1267,7 @@ impl BundlePullerBuilder {
         let discovery = self.nodes.applied_to(self.discovery);
         let governance = &self.chain.governance;
         let ctx = engine::PullCtx {
-            slash_dom: slash_judge_domain(governance.chain_id, governance.slash_judge),
+            slash_dom: capacity_bond_domain(governance.chain_id, governance.capacity_bond),
             pass: engine::PassPool::new(pool, rpc, token, &self.escrows),
             parked: std::collections::HashMap::new(),
             connect: Box::new(connect),

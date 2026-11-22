@@ -9,7 +9,7 @@
 //! when there is none), and fetch it through the acquire loop
 //! ([`decdn_client::acquire`]) across one [`decdn_client::PeerSource`] lane
 //! per holder (signing cumulative vouchers, resuming each lane's persisted
-//! watermark, verifying the `slash_sig` recovers to the provider, ADR 014 §1).
+//! watermark, verifying the `slash_sig` recovers to the provider, ADR 005 § Signer binding).
 //! Every byte is bao-verified; each lane's new watermark is persisted, and the
 //! file is promoted atomically. A holder that faults cools and returns; the
 //! command ends on done, a fault only the user can fix, or the stop policy.
@@ -54,12 +54,11 @@ use decdn_client::session::{
     PoolOpen, ProxyWarmingParams, PullSite,
 };
 use decdn_client::targets::{
-    OpenOpts, OpenRound, OpenSpec, ResolveConfigFault, check_resolvable, holders_or_none,
-    resolve_target_node,
+    OpenOpts, OpenRound, OpenSpec, ResolveConfigFault, holders_or_none, resolve_target_node,
 };
 use decdn_client::{
     Connections, CredentialSlot, DownloadTarget, Downloader, Holder, LaneLedgers,
-    NoAffordableSource, NoCache, NoSourceHasBlob, PeerHealth, PeerStore, PoolContext, PoolReplaced,
+    NoAffordableSource, NoCache, PeerHealth, PeerStore, PoolContext, PoolReplaced,
     ProgressCallback, ProgressClock, PullConfig, PullDeadlines, RecoveryGate, ScratchStores,
     StopPolicy, StreamStores, Streamer, UpstreamRefused, UpstreamVoucherRejected,
 };
@@ -69,7 +68,7 @@ use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::eth_identity::{self, PasswordUse, load_signer};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::rate::min_payment;
-use decdn_incentive::{CapabilityGrant, PoolId, slash_judge_domain};
+use decdn_incentive::{CapabilityGrant, PoolId, capacity_bond_domain};
 use decdn_protocol::client::StreamError;
 use iroh::{Endpoint, PublicKey, RelayUrl};
 
@@ -123,9 +122,8 @@ fn new_progress_bar() -> indicatif::ProgressBar {
 #[derive(Debug)]
 pub(crate) struct ResolvedChain {
     /// The governance chain and the payment pools the command can pay
-    /// through. The governance `capacity_bond` is `None` when neither the flag
-    /// nor `blockchain.capacity_bond_address` is set — only an error on the
-    /// discovery path, never on the explicit-node path.
+    /// through. The governance `capacity_bond` comes from the flag or
+    /// `blockchain.capacity_bond_address`, and resolving fails without it.
     pub(crate) config: ChainConfig,
     /// Where the command keeps its state, and the client's region. The data
     /// dir holds the buyer-pool redb store and (by default) the keystore. It
@@ -248,26 +246,19 @@ pub(crate) fn resolve_chain(
         governance_chain_id,
     )?;
 
-    let sj_raw = args
-        .slash_judge_address
-        .clone()
-        .or_else(|| bc.and_then(|b| b.slash_judge_address.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "slash_judge_address not set (--slash-judge-address or \
-                 blockchain.slash_judge_address)"
-            )
-        })?;
-    let slash_judge = super::chain_ctx::parse_nonzero_address(&sj_raw, "slash_judge_address")?;
-
-    // Optional: only the auto-discovery path reads it, and it errors there if
-    // unset rather than failing every explicit-node fetch.
-    let capacity_bond = args
+    // Required: every answer's signature verifies under the `CapacityBond`
+    // domain, and auto-discovery reads its registry.
+    let cb_raw = args
         .capacity_bond_address
         .clone()
         .or_else(|| bc.and_then(|b| b.capacity_bond_address.clone()))
-        .map(|raw| super::chain_ctx::parse_nonzero_address(&raw, "capacity_bond_address"))
-        .transpose()?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "capacity_bond_address not set (--capacity-bond-address or \
+                 blockchain.capacity_bond_address)"
+            )
+        })?;
+    let capacity_bond = super::chain_ctx::parse_nonzero_address(&cb_raw, "capacity_bond_address")?;
 
     let region = args
         .region
@@ -338,7 +329,6 @@ pub(crate) fn resolve_chain(
             GovernanceChain {
                 rpc_url: governance_rpc_url,
                 chain_id: governance_chain_id,
-                slash_judge,
                 capacity_bond,
             },
             payment_pools,
@@ -463,40 +453,27 @@ fn pinned_node(args: &cli::ClientFetchArgs) -> anyhow::Result<Option<PinnedNode>
     }))
 }
 
-/// Reconnect an opaque `delivery refused: NotFound` to its likely cause(s).
-///
-/// Two causes are checked, and BOTH may be attached: the pool cannot cover what
-/// the node reserves before serving, and/or the request carried no ADR 005
-/// client binding. They are independent — an unbound fetch on a drained pool is
-/// both, and fixing only the one we happened to name first leaves the retry
-/// failing identically. An unbound request (no `blockchain.capacity_bond_address`,
-/// so nothing to sign) cannot authorize the node to reactively pull a
-/// cache-missed blob from its origin, so the node returns a bare `NotFound` —
-/// indistinguishable, without this, from a genuinely absent/blacklisted/wrong
-/// hash. Scoped to `NotFound`, and to [`NoSourceHasBlob`] (every source said
-/// `NotFound`) — a size or blacklist refusal is fixed by neither cause — so
+/// Reconnect an opaque `delivery refused: NotFound` to its likely cause: the
+/// pool cannot cover what the node reserves before serving. The node collapses
+/// that refusal onto a bare `NotFound` — indistinguishable, without this, from
+/// a genuinely absent/blacklisted/wrong hash. Scoped to a signed `NotFound`
+/// refusal — a size or blacklist refusal is not fixed by a larger deposit — so
 /// every other error is returned verbatim.
-pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow::Error {
-    let refused = err
-        .downcast_ref::<UpstreamRefused>()
-        .filter(|refused| matches!(refused.error(), StreamError::NotFound));
-    if refused.is_none() && err.downcast_ref::<NoSourceHasBlob>().is_none() {
-        return err;
-    }
-
-    // Both causes are checked and BOTH may attach. They are independent — an
-    // unbound fetch on a drained pool is both — and naming only the first
-    // leaves the user fixing one and retrying into the other.
-    let mut causes: Vec<String> = Vec::new();
-
-    // Cause (a): our pool cannot cover what the node reserves before serving.
+pub(crate) fn annotate_cache_miss(err: anyhow::Error, ctx: &PoolContext) -> anyhow::Error {
     // The signed refusal carries the node's quoted `rate_per_mb`, and the
     // pool's own deposit and cumulative paid amount on this lane are right
     // here, so the comparison uses only OUR pool and data the node already
     // sent us — it does not weaken the deliberate collapse of seven reject
     // reasons onto `NotFound` (which exists so a prober cannot map other
     // clients' balances).
-    //
+    let Some(quoted_rate) = err
+        .downcast_ref::<UpstreamRefused>()
+        .filter(|refused| matches!(refused.error(), StreamError::NotFound))
+        .and_then(UpstreamRefused::evidence)
+        .map(|resp| resp.body.rate_per_mb)
+    else {
+        return err;
+    };
     // The node's pre-flight reservation is one chunk (the ramp floor); the window
     // only widens as this pool pays, so one chunk is the true lower bound on what
     // it reserves before serving. Estimated with the fixed `CHUNK_BYTES`, since we
@@ -504,50 +481,21 @@ pub(crate) fn annotate_unbound_cache_miss(err: anyhow::Error, ctx: &PoolContext)
     // that estimate is exactly the quoted per-MB rate. The miss direction is "we
     // stay silent when we could have spoken" — never a fabricated shortfall — so
     // it is phrased as a possibility and as a lower bound.
-    if let Some(quoted_rate) = refused
-        .and_then(UpstreamRefused::evidence)
-        .map(|resp| resp.body.rate_per_mb)
-    {
-        let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
-        let estimate = min_payment(decdn_protocol::client::CHUNK_BYTES, quoted_rate);
-        if quoted_rate > 0 && headroom < estimate {
-            causes.push(format!(
-                "this pool's remaining deposit ({headroom}) is below the ~{estimate} the node \
-                 reserves before serving at its quoted rate of {quoted_rate} per MB. The fetch \
-                 path already auto-refills below a low-water mark, so reaching this means the \
-                 configured working deposit is itself too small: raise \
-                 `--working-deposit-micro-usdc` (or `blockchain.buyer_working_deposit_micro_usdc`) \
-                 and retry"
-            ));
-        }
+    // A zero quoted rate estimates 0, which any headroom covers, so a free
+    // quote is never annotated.
+    let headroom = ctx.deposit.saturating_sub(ctx.prior_amount);
+    let estimate = min_payment(decdn_protocol::client::CHUNK_BYTES, quoted_rate);
+    if headroom >= estimate {
+        return err;
     }
-
-    // Cause (b): no binding, so the node would not reactively pull for us.
-    if ctx.client_binding.is_none() {
-        causes.push(
-            "no client identity binding was sent because \
-             blockchain.capacity_bond_address is unset, so the node could not \
-             reactively pull this cache-missed blob from its origin; set \
-             blockchain.capacity_bond_address to enable reactive pull-through"
-                .to_string(),
-        );
-    }
-
-    match causes.len() {
-        0 => err,
-        1 => err.context(causes.concat()),
-        // Numbered rather than joined with "and": each clause is a full sentence
-        // with its own remedy, so a reader needs to see they are separate fixes.
-        n => err.context(format!(
-            "{n} possible causes: {}",
-            causes
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("({}) {c}", i + 1))
-                .collect::<Vec<_>>()
-                .join("; ")
-        )),
-    }
+    err.context(format!(
+        "this pool's remaining deposit ({headroom}) is below the ~{estimate} the node \
+         reserves before serving at its quoted rate of {quoted_rate} per MB. The fetch \
+         path already auto-refills below a low-water mark, so reaching this means the \
+         configured working deposit is itself too small: raise \
+         `--working-deposit-micro-usdc` (or `blockchain.buyer_working_deposit_micro_usdc`) \
+         and retry"
+    ))
 }
 
 /// The largest bundle manifest that the gateway and
@@ -1407,12 +1355,11 @@ pub(crate) async fn fetch_on(
         "a size lookup takes no byte window"
     );
     // The holders to start from: the explicit `--node-id`, or auto-discovery.
-    // A configuration fault ends the fetch here, before the keystore prompts
+    // A malformed `--node-id` ends the fetch here, before the keystore prompts
     // for a password; with no holder yet, the first open discovers them. The
     // round streams: the fetch starts at the first verified holder, and the
     // holders that answer later join it.
     let discovery = discovery_options(common)?;
-    check_resolvable(&discovery, &chain.config)?;
     // The payer's credit window toward each node follows the track record the
     // peer store keeps per operator address; the guard writes it back once this
     // fetch ends, whatever ends it.
@@ -1430,7 +1377,8 @@ pub(crate) async fn fetch_on(
     let config = &chain.config;
     // Every discovery answer and stream response verifies on the governance
     // chain.
-    let slash_dom = slash_judge_domain(config.governance.chain_id, config.governance.slash_judge);
+    let slash_dom =
+        capacity_bond_domain(config.governance.chain_id, config.governance.capacity_bond);
 
     let max_blob_bytes = held_cap(common.max_blob_mb, args.size_cap);
     // The namespace routing hint (ADR 005 § Namespace routing): the URI's
@@ -1808,7 +1756,7 @@ pub(crate) fn print_reclaim_notes(replacements: &[PoolReplaced]) {
 /// because a registered signer's terms are write-once. A terminal `Underpaid`
 /// (the resync budget ran out) gets its own next step. Any other error passes
 /// through verbatim (a stall, a transport fault, a "no node will serve this",
-/// or a `NotFound` already annotated by [`annotate_unbound_cache_miss`]).
+/// or a `NotFound` already annotated by [`annotate_cache_miss`]).
 pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error {
     use decdn_protocol::client::VoucherRejectReason;
 
@@ -1856,8 +1804,8 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     }
 }
 
-/// Reconnect `err` to what the user can do about it: an unbound or
-/// underfunded cache miss ([`annotate_unbound_cache_miss`]), and a pool no
+/// Reconnect `err` to what the user can do about it: an underfunded cache
+/// miss ([`annotate_cache_miss`]), and a pool no
 /// provider's voucher fits — the owner-side remedy on a delegated pool
 /// ([`annotate_delegated_exhaustion`]), else the top-up command.
 pub(crate) fn annotate(err: anyhow::Error, at: &FaultContext) -> anyhow::Error {
@@ -1882,10 +1830,10 @@ pub(crate) fn with_top_up_hint(err: anyhow::Error, pool_id: Option<PoolId>) -> a
     ))
 }
 
-/// [`annotate_unbound_cache_miss`] against the lane context `ctx`.
+/// [`annotate_cache_miss`] against the lane context `ctx`.
 fn annotate_with(err: anyhow::Error, ctx: &Mutex<PoolContext>) -> anyhow::Error {
     match ctx.lock() {
-        Ok(guard) => annotate_unbound_cache_miss(err, &guard),
+        Ok(guard) => annotate_cache_miss(err, &guard),
         Err(_) => err,
     }
 }

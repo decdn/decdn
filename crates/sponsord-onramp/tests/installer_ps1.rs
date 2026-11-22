@@ -97,7 +97,7 @@ fn powershell(command: &str) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-/// Publish `<root>/decdn/releases/download/v0.3.0/` with the stub in a zip
+/// Publish `<root>/decdn/releases/download/v0.4.0/` with the stub in a zip
 /// per Windows target, and return the `SHA256SUMS` digest.
 fn publish(root: &Path) -> String {
     let stage = root.join("stage");
@@ -111,12 +111,12 @@ fn publish(root: &Path) -> String {
         .unwrap();
     assert!(status.success(), "rustc stub");
 
-    let dir = root.join("decdn/releases/download/v0.3.0");
+    let dir = root.join("decdn/releases/download/v0.4.0");
     fs::create_dir_all(&dir).unwrap();
     powershell(&format!(
         "$ErrorActionPreference = 'Stop'; Set-Location -LiteralPath '{dir}'; \
          foreach ($t in 'x86_64', 'aarch64') {{ \
-           Compress-Archive -Force -LiteralPath '{exe}' -DestinationPath \"decdn-0.3.0-$t-pc-windows-msvc.zip\" }}; \
+           Compress-Archive -Force -LiteralPath '{exe}' -DestinationPath \"decdn-0.4.0-$t-pc-windows-msvc.zip\" }}; \
          $lines = Get-ChildItem *.zip | ForEach-Object {{ \
            (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLower() + '  ' + $_.Name }}; \
          [IO.File]::WriteAllText((Join-Path $PWD 'SHA256SUMS'), ($lines -join \"`n\") + \"`n\"); \
@@ -289,7 +289,7 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
     let (ok, stdout, stderr) = fx.get(&args, "3").await;
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(!ok, "a failed decdn fails the run\n{both}");
-    assert!(stdout.contains("Installing decdn v0.3.0"), "{both}");
+    assert!(stdout.contains("Installing decdn v0.4.0"), "{both}");
     assert!(
         stdout.contains("Open this link to start the download:"),
         "{both}"
@@ -303,7 +303,7 @@ async fn get_passes_the_gate_and_resumes_a_failed_download_without_it() {
     let both = format!("stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(ok, "{both}");
     assert!(
-        stdout.contains("decdn v0.3.0 is already installed."),
+        stdout.contains("decdn v0.4.0 is already installed."),
         "{both}"
     );
     assert!(

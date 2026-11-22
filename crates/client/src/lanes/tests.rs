@@ -5,7 +5,7 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_incentive::buyer_pool::{BuyerLaneProgress, BuyerPoolState};
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{Deployment, bind_node_id_domain};
+use decdn_incentive::{Deployment, capacity_bond_domain};
 
 /// One chain at `http://config:8545`, id 1, that no test reaches.
 fn test_chain() -> ChainConfig {
@@ -14,7 +14,6 @@ fn test_chain() -> ChainConfig {
         1,
         Address::repeat_byte(0x33),
         Address::repeat_byte(0x44),
-        None,
     )
 }
 
@@ -31,7 +30,7 @@ fn ctx_with_deposit(
         provider: Address::ZERO,
         deposit,
         client_signer: Arc::new(PrivateKeySigner::random()),
-        voucher_domain: bind_node_id_domain(1, Address::ZERO),
+        voucher_domain: capacity_bond_domain(1, Address::ZERO),
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
         client_binding: binding,
@@ -235,7 +234,7 @@ async fn two_entries_on_one_provider_share_one_connection() -> anyhow::Result<()
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x44));
+    let slash_dom = decdn_incentive::capacity_bond_domain(1, Address::repeat_byte(0x44));
     let connections = Connections::new(ep.clone());
     let writes = OrderedWrites::default();
     let funding = RunFunding::default();
@@ -697,7 +696,7 @@ async fn a_build_queued_on_the_open_lock_ends_with_its_fetch() -> anyhow::Result
         region: None,
         region_allowlist: Vec::new(),
     };
-    let slash_dom = decdn_incentive::slash_judge_domain(1, Address::repeat_byte(0x44));
+    let slash_dom = decdn_incentive::capacity_bond_domain(1, Address::repeat_byte(0x44));
     let connections = Connections::new(ep.clone());
     let writes = OrderedWrites::default();
     let funding = RunFunding::default();

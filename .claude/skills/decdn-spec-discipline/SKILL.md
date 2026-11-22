@@ -142,7 +142,8 @@ mechanism, with the reasoning for why a "no" is fatal.
    choice? If so, the fix is upstream: remove the base and the dependent surface evaporates.
    *(The slash-appeal lien / TWAP / MAX_RESTITUTION apparatus existed only because restitution
    flowed through a USDC insurance pool. Escrow the slashed TOKEN in the bond and refund on
-   successful appeal — the whole dependent surface is gone.)*
+   successful appeal — the whole dependent surface is gone. Later, with no slashable offense
+   left, #2917 removed slashing itself, and the escrow, appeal and unbonding window went with it.)*
 
 8. **Liability.** Is the mechanism's *whole purpose* a legal or security liability? Then the
    move is deletion, not refinement. *(The delegator pool delivered passive yield to lockers —

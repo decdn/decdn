@@ -308,8 +308,6 @@ pub fn node_flags(chain: &ChainFixture, node: &NodeFixture) -> Vec<String> {
         format!("{}", node.operator_addr()),
         "--capacity-bond-address".into(),
         format!("{}", chain.addrs().capacity_bond),
-        "--slash-judge-address".into(),
-        format!("{}", chain.addrs().slash_judge),
     ]
 }
 

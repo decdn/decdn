@@ -27,7 +27,6 @@ Method set (the `AdminRpc` trait in `decdn-common` is the canonical surface):
 | `admin_v1_evict`   | `EvictRequest`          | `EvictResponse`   |
 | `admin_v1_reload`  | none                    | `ReloadResponse`  |
 | `admin_v1_lanes`   | none                    | `LanesResponse`   |
-| `admin_v1_slashes` | none                    | `SlashesResponse` |
 | `admin_v1_pools`   | none                    | `BuyerPoolsResponse` |
 
 Every parameter is required. A caller sends it as a one-element positional array, for example `"params":[{"wait_admin":false}]` for `admin_v1_drain`. A call without it gets `-32602 Invalid params`.

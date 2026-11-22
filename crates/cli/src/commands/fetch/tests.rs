@@ -1,10 +1,10 @@
 use super::*;
 use alloy::primitives::{Address, B256};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_client::NoSourceHasBlob;
 use decdn_client::ProvenSize;
 use decdn_client::bundle::parse_hash;
-use decdn_client::sign_client_binding;
-use decdn_incentive::bind_node_id_domain;
+use decdn_incentive::capacity_bond_domain;
 use std::assert_matches;
 
 fn common() -> cli::ClientFetchArgs {
@@ -16,7 +16,6 @@ fn common() -> cli::ClientFetchArgs {
         provider_address: Some("0x0000000000000000000000000000000000000001".into()),
         governance: cli::GovernanceChainArgs::default(),
         payment: cli::PoolSelectArgs::default(),
-        slash_judge_address: None,
         capacity_bond_address: None,
         region: None,
         proxy_warming: false,
@@ -51,7 +50,7 @@ fn keystore_password_file_flows_through_and_defaults_to_none() {
     let file = config(
         "[blockchain]\nrpc_url = \"http://config:8545\"\n\
          payment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\n\
-         slash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+         capacity_bond_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     assert!(
         resolve_chain(&common(), &file)
@@ -128,23 +127,16 @@ async fn copy_verified_streams_all_bytes_and_reports_final_total() -> anyhow::Re
     Ok(())
 }
 
-fn ctx_with(binding: Option<decdn_protocol::client::ClientBinding>) -> PoolContext {
-    ctx_with_deposit(binding, U256::ZERO)
-}
-
-fn ctx_with_deposit(
-    binding: Option<decdn_protocol::client::ClientBinding>,
-    deposit: U256,
-) -> PoolContext {
+fn ctx() -> PoolContext {
     PoolContext {
         pool_id: B256::ZERO,
         provider: Address::ZERO,
-        deposit,
+        deposit: U256::ZERO,
         client_signer: Arc::new(PrivateKeySigner::random()),
-        voucher_domain: bind_node_id_domain(1, Address::ZERO),
+        voucher_domain: capacity_bond_domain(1, Address::ZERO),
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
-        client_binding: binding,
+        client_binding: None,
         capability: None,
     }
 }
@@ -275,35 +267,14 @@ fn delegated_pool_exhausted_gets_the_owner_remedy_hint() {
     );
 }
 
-/// An unbound (no `capacity_bond_address`) fetch refused with `NotFound` gets
-/// the actionable hint attached, reconnecting the opaque refusal to its cause.
+/// Every source saying `NotFound` ends the fetch as `NoSourceHasBlob`, with no
+/// signed refusal left in the chain to read a quoted rate from, so it passes
+/// through untouched.
 #[test]
-fn unbound_notfound_refusal_gets_actionable_hint() {
-    let annotated = annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(None));
-    assert!(
-        annotated.to_string().contains("capacity_bond_address"),
-        "expected the binding hint, got: {annotated}"
-    );
-}
-
-/// Every source saying `NotFound` ends the fetch as `NoSourceHasBlob`, with
-/// no `UpstreamRefused` left in the chain: an unbound fetch still gets the
-/// binding hint, and a bound one passes through untouched.
-#[test]
-fn unbound_no_source_has_blob_gets_the_binding_hint() {
-    let absent = || anyhow::Error::new(NoSourceHasBlob);
-    let annotated = annotate_unbound_cache_miss(absent(), &ctx_with(None));
-    assert!(
-        annotated.to_string().contains("capacity_bond_address"),
-        "expected the binding hint, got: {annotated}"
-    );
+fn no_source_has_blob_is_untouched() {
+    let annotated = annotate_cache_miss(anyhow::Error::new(NoSourceHasBlob), &ctx());
+    assert_eq!(annotated.to_string(), NoSourceHasBlob.to_string());
     assert!(annotated.downcast_ref::<NoSourceHasBlob>().is_some());
-
-    let signer = PrivateKeySigner::random();
-    let binding = sign_client_binding(&signer, B256::ZERO, &bind_node_id_domain(1, Address::ZERO))
-        .expect("sign binding");
-    let bound = annotate_unbound_cache_miss(absent(), &ctx_with(Some(binding)));
-    assert_eq!(bound.to_string(), NoSourceHasBlob.to_string());
 }
 
 /// A delegated fetch no provider's voucher fits names the owner-side remedy.
@@ -321,41 +292,134 @@ fn delegated_no_affordable_source_gets_the_owner_remedy_hint() {
     );
 }
 
-/// A bound fetch's error is passed through untouched — a `NotFound` there is a
-/// genuine miss, not a missing-binding problem.
+/// A mid-stream `NotFound` carries no signed refusal, so there is no quoted
+/// rate to compare the deposit against: it passes through untouched.
 #[test]
-fn bound_notfound_refusal_is_untouched() {
-    let signer = PrivateKeySigner::random();
-    let binding = sign_client_binding(&signer, B256::ZERO, &bind_node_id_domain(1, Address::ZERO))
-        .expect("sign binding");
-    let annotated =
-        annotate_unbound_cache_miss(refusal(StreamError::NotFound), &ctx_with(Some(binding)));
-    assert!(!annotated.to_string().contains("capacity_bond_address"));
+fn unsigned_notfound_refusal_is_untouched() {
+    let err = refusal(StreamError::NotFound);
+    let want = err.to_string();
+    let annotated = annotate_cache_miss(err, &ctx());
+    assert_eq!(annotated.to_string(), want);
 }
 
-/// A refusal that is NOT `NotFound` gets no binding hint even when unbound: a
-/// client binding authorizes reactive pull-through, so it cannot fix a node
-/// that declines the blob or one the requester cannot fund.
-#[test]
-fn unbound_non_notfound_refusal_is_untouched() {
-    for error in [StreamError::Declined, StreamError::Unfunded] {
-        let annotated = annotate_unbound_cache_miss(refusal(error.clone()), &ctx_with(None));
-        assert!(
-            !annotated.to_string().contains("capacity_bond_address"),
-            "{error:?} must not get the binding hint"
-        );
+/// An open-stage `error` refusal the node signed at `rate_per_mb`, built the
+/// way the fetch path holds one: an `UpstreamRefused` whose `evidence()` is
+/// the signed response.
+fn signed_open(rate_per_mb: u64, error: StreamError) -> anyhow::Error {
+    use decdn_incentive::stream_sig::StreamSlashData;
+    use decdn_protocol::client::{StreamResponse, StreamResponseBody};
+
+    let body = StreamResponseBody {
+        hash: [7; 32],
+        ok: false,
+        rate_per_mb,
+        timestamp_us: 1_700_000_000_000_000,
+    };
+    let operator = PrivateKeySigner::random();
+    let sig = StreamSlashData::from_response_body(&body)
+        .sign(&operator, &capacity_bond_domain(1, Address::ZERO))
+        .unwrap();
+    let response = StreamResponse {
+        body,
+        slash_sig: sig.as_bytes().to_vec(),
+    };
+    anyhow::Error::new(UpstreamRefused::open_for_test(response, error))
+}
+
+/// [`signed_open`] for a `NotFound` refusal.
+fn signed_notfound(rate_per_mb: u64) -> anyhow::Error {
+    signed_open(rate_per_mb, StreamError::NotFound)
+}
+
+/// A pool context with `deposit − prior_amount` of headroom.
+fn ctx_with_headroom(deposit: u64, prior_amount: u64) -> PoolContext {
+    PoolContext {
+        deposit: U256::from(deposit),
+        prior_amount: U256::from(prior_amount),
+        ..ctx()
     }
 }
 
-/// A non-`NotFound` failure (e.g. a transport error) is never mislabeled as a
-/// missing-binding problem, even when unbound.
+/// The branch the annotation exists for: a signed `NotFound` whose quoted
+/// rate prices one chunk above what the pool has left. The node collapses
+/// that refusal onto `NotFound`, so the context is the only place the
+/// operator learns the deposit is the cause.
 #[test]
-fn unbound_non_notfound_error_is_untouched() {
-    let annotated = annotate_unbound_cache_miss(
-        anyhow::anyhow!("connect failed: timed out"),
-        &ctx_with(None),
+fn signed_notfound_above_the_headroom_names_the_deposit() {
+    let rate = 1_000;
+    let estimate = min_payment(decdn_protocol::client::CHUNK_BYTES, rate);
+    let headroom = estimate - U256::from(1u8);
+    let deposit = 10_000u64;
+    let prior = deposit - u64::try_from(headroom).unwrap();
+
+    let err = signed_notfound(rate);
+    let want_root = err.to_string();
+    let annotated = annotate_cache_miss(err, &ctx_with_headroom(deposit, prior));
+    let msg = annotated.to_string();
+    assert!(
+        msg.contains(&format!("remaining deposit ({headroom})")),
+        "names the remaining deposit: {msg}"
     );
-    assert!(!annotated.to_string().contains("capacity_bond_address"));
+    assert!(msg.contains("--working-deposit-micro-usdc"), "{msg}");
+    assert!(
+        annotated.downcast_ref::<UpstreamRefused>().is_some(),
+        "the typed refusal stays in the chain"
+    );
+    assert_eq!(annotated.root_cause().to_string(), want_root);
+}
+
+/// Enough headroom for the node's one-chunk reservation: the deposit is not
+/// the cause, so the refusal passes through untouched.
+#[test]
+fn signed_notfound_within_the_headroom_is_untouched() {
+    let rate = 1_000;
+    let estimate = u64::try_from(min_payment(decdn_protocol::client::CHUNK_BYTES, rate)).unwrap();
+    let err = signed_notfound(rate);
+    let want = err.to_string();
+    let annotated = annotate_cache_miss(err, &ctx_with_headroom(estimate, 0));
+    assert_eq!(annotated.to_string(), want);
+}
+
+/// A zero quoted rate prices one chunk at 0, which even an empty pool covers,
+/// so a free quote is never blamed on the deposit.
+#[test]
+fn signed_notfound_at_rate_zero_is_untouched() {
+    assert_eq!(
+        min_payment(decdn_protocol::client::CHUNK_BYTES, 0),
+        U256::ZERO
+    );
+    let err = signed_notfound(0);
+    let want = err.to_string();
+    let annotated = annotate_cache_miss(err, &ctx_with_headroom(0, 0));
+    assert_eq!(annotated.to_string(), want);
+}
+
+/// A signed open-stage refusal that is NOT `NotFound` is never annotated,
+/// even when its quoted rate prices a chunk above an empty pool: the filter
+/// on the refusal kind, not the headroom, is what passes it through.
+#[test]
+fn signed_non_notfound_refusal_is_untouched() {
+    for error in [StreamError::Declined, StreamError::Unfunded] {
+        let err = signed_open(1_000, error);
+        let want = format!("{err:#}");
+        let annotated = annotate_cache_miss(err, &ctx_with_headroom(0, 0));
+        assert_eq!(format!("{annotated:#}"), want, "no context added");
+    }
+}
+
+/// A refusal that is NOT `NotFound`, or a non-refusal failure, is never
+/// annotated: a larger deposit cannot fix it.
+#[test]
+fn non_notfound_errors_are_untouched() {
+    for err in [
+        refusal(StreamError::Declined),
+        refusal(StreamError::Unfunded),
+        anyhow::anyhow!("connect failed: timed out"),
+    ] {
+        let want = err.to_string();
+        let annotated = annotate_cache_miss(err, &ctx());
+        assert_eq!(annotated.to_string(), want);
+    }
 }
 
 #[test]
@@ -366,9 +430,9 @@ fn flags_override_config() {
     let pp = "0x1111111111111111111111111111111111111111";
     c.payment.pool = Some(format!("eip155:421614:{pp}"));
     c.payment.pool_rpc_url = Some("http://flag:8545".into());
-    c.slash_judge_address = Some("0x2222222222222222222222222222222222222222".into());
+    c.capacity_bond_address = Some("0x2222222222222222222222222222222222222222".into());
     let file = config(
-        "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        "[blockchain]\nrpc_url = \"http://config:8545\"\nchain_id = 1\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\ncapacity_bond_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     let r = resolve_chain(&c, &file).unwrap();
     assert_eq!(
@@ -389,7 +453,7 @@ fn flags_override_config() {
 #[test]
 fn the_governance_rpc_is_required() {
     let file = config(
-        "[blockchain]\npayment_chains = [{ rpc_url = \"http://pay:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n",
+        "[blockchain]\npayment_chains = [{ rpc_url = \"http://pay:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\ncapacity_bond_address = \"0x4444444444444444444444444444444444444444\"\n",
     );
     let err = resolve_chain(&common(), &file).expect_err("no governance rpc");
     assert!(err.to_string().contains("--governance-rpc-url"), "{err}");
@@ -402,13 +466,12 @@ fn the_governance_rpc_is_required() {
 }
 
 /// The governance chain and each payment chain keep their own RPC endpoint
-/// and chain id: registry reads and slash and bind domains use the
+/// and chain id: registry reads and the `CapacityBond` domain use the
 /// governance chain, vouchers each pool's payment chain.
 #[test]
 fn governance_and_payment_chains_stay_apart() {
     let file = config(
         "[blockchain]\nrpc_url = \"http://gov:8545\"\nchain_id = 11155111\n\
-         slash_judge_address = \"0x4444444444444444444444444444444444444444\"\n\
          capacity_bond_address = \"0x5555555555555555555555555555555555555555\"\n\
          [[blockchain.payment_chains]]\nrpc_url = \"http://arb:8545\"\nchain_id = 421614\n\
          payment_pools = [\"0x3333333333333333333333333333333333333333\", \
@@ -444,7 +507,7 @@ fn governance_and_payment_chains_stay_apart() {
 #[test]
 fn config_fills_unset_flags_and_defaults() {
     let file = config(
-        "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_working_deposit_micro_usdc = 5000000\n",
+        "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\ncapacity_bond_address = \"0x4444444444444444444444444444444444444444\"\nbuyer_working_deposit_micro_usdc = 5000000\n",
     );
     let r = resolve_chain(&common(), &file).unwrap();
     assert_eq!(r.config.first_pool().unwrap().rpc_url, "http://config:8545");
@@ -467,7 +530,7 @@ fn config_fills_unset_flags_and_defaults() {
 /// and surface as an opaque `openPool` `ZeroAmount` revert.
 #[test]
 fn resolve_chain_rejects_deposits_the_daemon_resolver_would_reject() {
-    let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\nslash_judge_address = \"0x4444444444444444444444444444444444444444\"\n";
+    let base = "[blockchain]\nrpc_url = \"http://config:8545\"\npayment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\ncapacity_bond_address = \"0x4444444444444444444444444444444444444444\"\n";
 
     // A zero working deposit can never open a pool.
     let err = resolve_chain(
@@ -663,7 +726,7 @@ fn a_delegated_slot_rejects_a_key_the_capability_does_not_name() {
         pool_id: B256::repeat_byte(0x11),
         expiry: u64::MAX,
     }
-    .sign(&delegate, &bind_node_id_domain(1, Address::ZERO))
+    .sign(&delegate, &capacity_bond_domain(1, Address::ZERO))
     .unwrap();
     let grant = CapabilityGrant::from_signed_capability(&capability);
     assert!(delegated_slot(&grant, Arc::new(delegate.clone())).is_ok());

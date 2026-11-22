@@ -1068,12 +1068,7 @@ pub(super) async fn discover_candidates(
     site: &PullSite,
     discovery: &DiscoveryOptions,
 ) -> anyhow::Result<Registry> {
-    let capacity_bond = chain.governance.capacity_bond.ok_or_else(|| {
-        anyhow!(
-            "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
-             blockchain.capacity_bond_address), or pass --node-id to pull from one node"
-        )
-    })?;
+    let capacity_bond = chain.governance.capacity_bond;
     if !discovery.rediscover
         && let Some(cached) = cached_registry(&site.data_dir, now_secs())
     {

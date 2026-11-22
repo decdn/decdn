@@ -894,17 +894,6 @@ pub struct DecdnMetrics {
     /// Each is also a `warn!`. Operator-visible name:
     /// `decdn_settlement_ledger_skipped_rows_total`.
     pub settlement_ledger_skipped_rows: Counter,
-    /// Slashes detected against this node's operator (`CapacityBond` slash
-    /// records), counting each distinct `slashId` once (#1032). A non-zero
-    /// value means the operator was slashed and should consider `decdn appeal
-    /// slash` within the 30-day window. Operator-visible name:
-    /// `decdn_slashes_detected_total`.
-    pub slashes_detected: Counter,
-    /// `decdn_slash_resync_failures_total`: slash re-reads that could not read
-    /// chain state and kept the detected-slash set they already had. Pairs with
-    /// the `warn!` in `slash_watcher`. Field has no `_total` suffix because the
-    /// `OpenMetrics` encoder appends it.
-    pub slash_resync_failures: Counter,
     /// `decdn_capacity_bond_registry_resync_failures_total`: registry re-reads
     /// of `getRegisteredNodes` that could not read chain state and kept the
     /// projections they already had. The staker set gates DHT `Store`
@@ -1844,7 +1833,7 @@ pub struct DecdnMetrics {
     /// stream open. During a takedown, this one is the operator's evidence that
     /// the compliance window held for traffic already in flight — the case that
     /// would otherwise keep a multi-GB blob flowing for minutes after the order
-    /// took effect, which is the slashable one.
+    /// took effect.
     pub serve_stream_terminated_takedown: Counter,
     /// An already-running delivery cut off at a frame boundary because the
     /// node no longer holds a live origin attestation for the hash: it expired
@@ -2007,10 +1996,11 @@ pub struct DecdnMetrics {
     /// time of the blacklist sync's last successful ledger poll, the boot
     /// snapshot included. It is the signal that tells a live blacklist loop from
     /// a dead one — a dead loop keeps serving content blacklisted after the
-    /// failure (slashable via `SlashJudge.submitBlacklistChallenge`).
+    /// failure.
     pub blacklist_watcher_last_tick_timestamp_seconds: Gauge,
     /// `decdn_chain_boot_read_retries_total` (#2159): retries of a boot-time
-    /// chain read (the `PaymentPool` deployment preflight, the registry, slash,
+    /// chain read (the `PaymentPool` deployment preflight, the registry,
+    /// origin-seat snapshot (when `origin_assignment_address` is set),
     /// `usdc()` self-check and blacklist bootstraps, and the best-effort
     /// fee-share reads) after a transient error; one read can retry many
     /// times. The metrics listener serves before these reads, so the value
@@ -2810,13 +2800,6 @@ recorders! {
     /// than paying nothing (`settlement_ledger.rs`). Pairs with a per-site
     /// `warn!`.
     settlement_ledger_skipped_row => settlement_ledger_skipped_rows.inc();
-
-    /// A distinct slash against this node's operator was detected (#1032).
-    /// Counts each `slashId` once.
-    slash_detected => slashes_detected.inc();
-    /// A slash re-read failed and the current detected-slash set was kept.
-    /// Bumps `slash_resync_failures_total`.
-    slash_resync_failure => slash_resync_failures.inc();
 
     /// Publish the current cached active-staker set size (#783). Sampled on
     /// every membership change the watcher applies, so the gauge tracks the

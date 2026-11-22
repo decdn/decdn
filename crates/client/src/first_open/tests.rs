@@ -435,7 +435,7 @@ fn delegate_slot(spending_cap: u64) -> crate::CredentialSlot {
     }
     .sign(
         &signer,
-        &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+        &decdn_incentive::capacity_bond_domain(1, Address::ZERO),
     )
     .unwrap();
     crate::CredentialSlot::new(Arc::new(signer), capability)

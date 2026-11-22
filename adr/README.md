@@ -1,6 +1,6 @@
 # deCDN — Protocol Specification
 
-A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain vouchers backed by a shared payment pool on a payment chain (any chain that meets the [admission rule](appendix-l2-deployment.md#appendix-governance-chain-and-payment-chain-admission)); bonded operators compete on price and latency, with reputation, slashing, and capacity-bonded incentives keeping the mesh honest.
+A decentralized CDN. Nodes cache and serve content-addressed blobs over iroh QUIC; clients pay per-MB via off-chain vouchers backed by a shared payment pool on a payment chain (any chain that meets the [admission rule](appendix-l2-deployment.md#appendix-governance-chain-and-payment-chain-admission)); bonded operators compete on price and latency, with client-side verification, reputation, and capacity-bonded incentives keeping the mesh honest.
 
 This directory is the protocol's canonical specification. Each numbered file is an Architecture Decision Record (ADR) covering one component or invariant of the design. [`architecture.md`](architecture.md) is the living overview — system diagram, ADR-by-ADR summaries, key invariants, trust assumptions, and the canonical reading order.
 
@@ -8,7 +8,7 @@ This directory is the protocol's canonical specification. Each numbered file is 
 
 - **Content-addressed, location-independent.** Every blob is identified by its BLAKE3 hash. Delivery verification is inherent: the receiver hashes received bytes and rejects mismatches. Nodes are interchangeable as long as the hash matches.
 - **Paid byte delivery, end to end.** Every byte transferred — client→node *and* node→node — is paid. There is no free-rider tier and no unpaid relay layer. Off-chain payment-token vouchers, backed by a shared pool on a payment chain, settle on that chain.
-- **Stake to participate, slash on misbehavior.** Nodes must stake TOKEN before joining the mesh. The one slashable misbehavior, serving a blacklisted hash, is detectable on-chain. A client protects itself against every other misbehavior: it verifies the bytes and signs the price into each voucher. Challenge bonds prevent zero-cost griefing.
+- **Stake to participate, verify every byte.** Nodes must stake TOKEN before joining the mesh. A client protects itself against node misbehavior: it verifies the bytes and signs the price into each voucher. Honest nodes follow the on-chain content blacklist, and governance can eject an operator that does not.
 - **Origin storage is opaque.** Origin-backed nodes hold canonical content in S3/R2/B2/NFS/local-disk backends, but no external origin URL is ever exposed. Bypassing the payment layer requires bypassing the network entirely.
 - **Operator return is differentiated by capacity commitment, not raw stake.** The `CapacityBond` lock-to-capacity curve `bond = k × Mbps^α` requires operators to bond TOKEN proportional to declared bandwidth, with super-linear pressure against concentration. No fee discounts, no passive yield to non-operators.
 - **Before mainnet, the protocol has one design.** ADRs read as the canonical specification, not as an iteration log. Rejected alternatives are kept out of the ADR bodies entirely — archived in [`adr/_history/`](_history/alternatives-pre-launch.md), which is part of neither built PDF (see *Decision-record context* below).
@@ -21,7 +21,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 2. **Discovery** — DHT-based content lookup, regional proxy warming, multi-source fetch.
 3. **Payments** — the shared payment pool, vouchers, client architecture, smart-wallet support.
 4. **Tokenomics & incentives** — work-token tokenomics, liquidity strategy, deferred follow-ups.
-5. **Verification & enforcement** — on-chain slashing evidence, reputation, content takedown.
+5. **Verification & enforcement** — reputation, content takedown, region self-attestation.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.
 7. **Operations** — node onboarding.
 8. **Supporting infrastructure** — schema evolution, privacy analysis.

@@ -41,7 +41,7 @@ use decdn_cache::CacheEngine;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    StreamSlashData, bind_node_id_domain, binding_signing_hash, slash_judge_domain, voucher_domain,
+    StreamSlashData, binding_signing_hash, capacity_bond_domain, voucher_domain,
 };
 use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
@@ -94,7 +94,7 @@ const fn slash_verifying() -> Address {
 }
 
 fn slash_domain() -> Eip712Domain {
-    slash_judge_domain(CHAIN_ID, slash_verifying())
+    capacity_bond_domain(CHAIN_ID, slash_verifying())
 }
 
 /// The fixed EIP-712 domains shared by both hops' handlers. The hops are
@@ -103,7 +103,7 @@ fn hop_domains() -> HandlerDomains {
     HandlerDomains {
         slash: slash_domain(),
         voucher: voucher_domain(CHAIN_ID, Address::repeat_byte(0x34)),
-        binding: bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99)),
+        binding: capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x99)),
     }
 }
 

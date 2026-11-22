@@ -3,8 +3,7 @@
 //! When the node is saturated it refuses NEW serves — regardless of blob or
 //! price — so in-flight streams stay fast. A refusal reuses the delivery
 //! path's `NotFound`-shaped reject, so the client re-routes (ADR 037 / #1174)
-//! at only a latency cost; it is not slashable and carries no reputation
-//! penalty. The decision is a pluggable [`LoadShedPolicy`]; the node wiring
+//! at only a latency cost; it carries no reputation penalty. The decision is a pluggable [`LoadShedPolicy`]; the node wiring
 //! layer selects the implementation from config, mirroring the ADR 040
 //! eviction/admission policy split.
 

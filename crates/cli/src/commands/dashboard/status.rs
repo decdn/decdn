@@ -2,8 +2,7 @@
 //! pollers last saw it. The page polls it; nothing here calls a source.
 
 use decdn_common::admin::{
-    BuyerPoolsResponse, EarningsResponse, HealthResponse, LanesResponse, SlashesResponse,
-    StatusResponse,
+    BuyerPoolsResponse, EarningsResponse, HealthResponse, LanesResponse, StatusResponse,
 };
 use serde::Serialize;
 
@@ -98,7 +97,6 @@ pub(super) struct NodeSection {
     pub(super) lanes: Part<LanesResponse>,
     pub(super) earnings: Part<EarningsResponse>,
     pub(super) pools: Part<BuyerPoolsResponse>,
-    pub(super) slashes: Part<SlashesResponse>,
 }
 
 /// Whether a node answers.
@@ -158,8 +156,8 @@ pub(super) enum Read<T> {
     Waiting,
     /// The node answered.
     Ok { value: T },
-    /// The node runs without what this read reports: no slash detection,
-    /// no buyer pool, no settlement ledger, no DHT.
+    /// The node runs without what this read reports: no buyer pool, no
+    /// settlement ledger, no DHT.
     Unconfigured { message: String },
     /// The read failed.
     Error { message: String },

@@ -7,7 +7,7 @@
 
 Existing ADRs specify individual node-lifecycle components in isolation — staking in [ADR 026](026-tokenomics.md#adr-026-tokenomics), on-chain registration in [ADR 001](001-network.md#adr-001-network-topology-and-peer-mesh), NodeId bindings and payment pools in [ADR 003](003-payments.md#adr-003-payment-model), blacklist sync in [ADR 011](011-content-takedown.md#adr-011-content-takedown-and-hash-blacklisting), contract deployment order in [ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model). No single document describes the complete ordered procedure from "operator has a server" to "actively accepting paid delivery requests."
 
-This blocks PoC testnet participation: operators have no canonical reference, and missing or mis-ordered steps produce silent protocol failures (stream and slash timestamps rejected because the clock is unsynchronized; connections refused because the blacklist was not fetched). This ADR defines the authoritative onboarding flow.
+This blocks PoC testnet participation: operators have no canonical reference, and missing or mis-ordered steps produce silent protocol failures (stream timestamps rejected because the clock is unsynchronized; connections refused because the blacklist was not fetched). This ADR defines the authoritative onboarding flow.
 
 ## Decision
 
@@ -29,7 +29,7 @@ Before any on-chain or protocol activity:
 
 1. **Provision server.** Minimum recommended spec: 4 vCPU, 8 GB RAM, 1 TB SSD, 5 TB/month egress. See [ADR 026 § Operator economics](026-tokenomics.md#operator-economics) for operator economics.
 
-2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. A correct clock underpins voucher freshness and the request and slashing timestamp windows: a node refuses a request whose timestamp is more than 30 seconds from its clock, and slash evidence is bounded by a maximum evidence age ([ADR 005](005-protocol.md#adr-005-wire-protocol), [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). A skewed clock produces stale vouchers and out-of-window slash timestamps.
+2. **Synchronize clock.** The node MUST run NTP (or equivalent) and MUST verify the local clock offset is within 10 seconds of UTC before proceeding. A correct clock underpins voucher freshness and the request timestamp window: a node refuses a request whose timestamp is more than 30 seconds from its clock ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). A skewed clock produces stale vouchers and refused requests.
 
 3. **Generate iroh identity.** Run the node binary's `keys generate` (or equivalent) subcommand. This produces an **ed25519 key pair** whose public key is the iroh `NodeId`. The private key MUST be stored securely:
    - **PoC:** encrypted file on disk (passphrase-protected or operator-managed).
@@ -76,9 +76,9 @@ Call `TOKEN.approve(capacityBond, amount)` where `amount ≥ max(minBond, bond_r
 
 #### Step 2.2 — Register at declared capacity
 
-Call `CapacityBond.bond(amount)` to deposit `amount = max(minBond, bond_required(declaredMbps))` TOKEN, then `CapacityBond.declareMbps(declaredMbps)` to self-attest capacity (the band check lives on `declareMbps`). `declaredMbps` must fall within `[MIN_CAPACITY_PER_OPERATOR, MAX_CAPACITY_PER_OPERATOR]` (default `[10 Mbps, 200 Gbps]`); a declaration outside the band reverts. Declared capacity is operator-self-attested at registration; there is no on-chain verification against actual delivery (vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), not from `declaredMbps`, so over-declaration provides no governance upside; the super-linear bond curve is the structural disincentive). Changing tiers is permitted at any time by re-calling `declareMbps(newMbps)` — topping up bond via `bond(...)` or reducing it via `requestUnbond(amount)` + `unbond()` after the unbonding window. There is no atomic `register`-style deposit/refund on the shipped surface; a bond reduction is subject to the 14-day unbonding window.
+Call `CapacityBond.bond(amount)` to deposit `amount = max(minBond, bond_required(declaredMbps))` TOKEN, then `CapacityBond.declareMbps(declaredMbps)` to self-attest capacity (the band check lives on `declareMbps`). `declaredMbps` must fall within `[MIN_CAPACITY_PER_OPERATOR, MAX_CAPACITY_PER_OPERATOR]` (default `[10 Mbps, 200 Gbps]`); a declaration outside the band reverts. Declared capacity is operator-self-attested at registration; there is no on-chain verification against actual delivery (vote weight is sourced from `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight), not from `declaredMbps`, so over-declaration provides no governance upside; the super-linear bond curve is the structural disincentive). Changing tiers is permitted at any time by re-calling `declareMbps(newMbps)` — topping up bond via `bond(...)` or reducing it via `unbond(amount)`. There is no atomic `register`-style deposit/refund on the shipped surface.
 
-The bond locks immediately and is slashable from this point forward, including during the **14-day unbonding window** if the node later unbonds ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)).
+The bond locks immediately. `unbond` returns it in one transaction, down to the floor that the declared tier sets ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)).
 
 **No separate ve-position exists.** The bond is the only TOKEN-side requirement on operators. There is no optional lock for additional yield; non-operator TOKEN holders earn nothing and have no governance weight ([ADR 026 § Governance](026-tokenomics.md#governance)).
 
@@ -90,9 +90,9 @@ Call `CapacityBond.registerNode(nodeId, multiaddrs, regionHint, termsHash, bindi
 
 This single transaction atomically:
 
-- Requires `termsHash == currentTermsHash` and verifies the EIP-712 `bindingSignature` over `RegisterNode(nodeId, bindingNonce[ethAddress], termsHash)`, establishing the `nodeId → ethAddress` mapping for slash evidence and payment attribution and recording the operator's terms acceptance ([§ Operator Safety Obligations](#operator-safety-obligations)).
+- Requires `termsHash == currentTermsHash` and verifies the EIP-712 `bindingSignature` over `RegisterNode(nodeId, bindingNonce[ethAddress], termsHash)`, establishing the `nodeId → ethAddress` mapping for response attribution and payment attribution and recording the operator's terms acceptance ([§ Operator Safety Obligations](#operator-safety-obligations)).
 - Verifies the `ed25519Signature` over `keccak256(abi.encodePacked(nodeId, ethAddress, chainId, registrationNonce[nodeId]))`, proving the operator controls the iroh private key (prevents NodeId squatting). (`ethAddress` is `msg.sender` and `chainId` is `block.chainid` on-chain; this ADR uses operator-perspective names for consistency with the signing pseudo-code below.)
-- Records `NodeInfo` (including `firstBondedAt` if this is the node's first-ever registration — the immutable anchor of the operator's `age_ramp` governance weight per [ADR 026 § Governance](026-tokenomics.md#governance)).
+- Records `NodeInfo` and the live `minBond` as `bondFloorAtActivation`. `firstBondedAt` anchors the operator's `age_ramp` governance weight ([ADR 026 § Governance](026-tokenomics.md#governance)). The Step 2.2 entry `bond()` usually set it already. If no tenure runs, `registerNode` stamps it ([ADR 036 § Behaviors that follow from the formula](036-served-bytes-voting-weight.md#behaviors-that-follow-from-the-formula)).
 - Sets `active = true` in the registry.
 - Emits `TermsAccepted(nodeId, termsHash, timestamp)`.
 
@@ -139,16 +139,23 @@ If the read fails, the node retries it as [Boot-time chain reads](#boot-time-cha
 
 #### Boot-time chain reads
 
-Four boot reads must succeed before the node serves: the registry snapshot (Step 3.2), the slash enumeration, the `PaymentPool.usdc()` self-check, and the blacklist enumeration with its enforcement pass (Step 3.1). The registry, slash, and blacklist reads target the governance chain. The `PaymentPool.usdc()` read targets the payment chain.
+Four boot reads must succeed before the node serves. When `blockchain.origin_assignment_address` is not set, there are three. The reads are:
+
+1. The registry snapshot (Step 3.2).
+2. The origin-seat snapshot of `OriginAssignment`, only when `blockchain.origin_assignment_address` is set.
+3. The `PaymentPool.usdc()` self-check.
+4. The blacklist enumeration with its enforcement pass (Step 3.1).
+
+The registry, origin-seat and blacklist reads target the governance chain. The `PaymentPool.usdc()` read targets the payment chain.
 
 - A transient RPC failure does not stop the node. The node retries the read with exponential backoff. The backoff starts at 1 s and doubles on each retry. It does not increase above 60 s.
-- One boot deadline applies to all four reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
+- One boot deadline applies to all of these reads. The deadline is 10 minutes from the start of the reads. When the next retry cannot start before the deadline, the node exits.
 - A deterministic failure stops the node at once. Examples are no contract at the configured address, an ABI mismatch, a revert, a JSON-RPC invalid request, method or params error, and an HTTP 4xx other than 408 and 429 that has no `Retry-After` header.
 - A retry delays readiness. It does not open the node to connections: Step 3.1 still gates them.
-- The registry, slash, and origin-seat snapshots read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
+- The registry and origin-seat snapshots read at one snapshot block. The snapshot block is 256 blocks below the head that the RPC reports. A load-balanced RPC reports the head of its newest upstream. An upstream that is behind that head cannot serve it, but all upstreams can serve an older block. If the contract has no code at the snapshot block, the contract is newer than the margin, and the node reads at the head.
 - The blacklist enumeration reads at the `safe` block ([ADR 011 § Enumerating the deny-set](011-content-takedown.md#enumerating-the-deny-set)).
 
-The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. This limit keeps time for the four reads that come after it. When it fails, the node does not stop. It holds no operator share and makes no upstream purchase until a later read of `operatorBps` succeeds ([ADR 041](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)).
+The operator-share read (the payment chain pool's immutable `operatorBps`) uses the same retry. It retries for 1 minute at most, inside the same deadline. It runs after the registry and origin-seat snapshots. This limit keeps time for the `usdc()` and blacklist reads that come after it. When it fails, the node does not stop. It holds no operator share and makes no upstream purchase until a later read of `operatorBps` succeeds ([ADR 041](041-refuse-to-serve.md#adr-041-refuse-to-serve-economics)).
 
 #### Chain state reads
 
@@ -158,7 +165,6 @@ The node reads all chain state by `eth_call`. It reads no event log. After boot,
 |-------|----------|------|-------|
 | Registry: active set, `NodeId → operator` bindings, regions, multiaddrs | 5 minutes | `getRegisteredNodes`, paged | Snapshot block |
 | Seated origins | 10 minutes | The full seat set | Snapshot block |
-| This operator's slashes | 15 minutes | `operatorSlashCount(self)` at the head; the slash list, at the snapshot block, only when the count changes | Head, then snapshot block |
 | `ContentBlacklist` deny index | `content_blacklist_poll_interval_sec`, at most 5 minutes | `mutationCount`, then `getMutations` for new records | `safe` |
 | Payment pools with a live lane | 30 seconds | `getPool` and `getAuthorizations` | Head |
 
@@ -207,20 +213,21 @@ Two external mechanisms do the actual work, and both are already in place.
 **No governance weight.** Vote weight comes from `FeeRouter.bytesPerEpoch`,
 capped per epoch by the operator's declared capacity
 ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). An operator that never registered also never called `declareMbps`, so
-the cap is zero and every delivered byte credits zero weight. A slashed operator
-has its weight watermark reset the same way.
+the cap is zero and every delivered byte credits zero weight.
 
-**No counterparty.** A client selects an upstream. It should not select a node
-it cannot slash, because slashability is what backs the delivery promise. A node
-that is absent from the on-chain registry is absent from the set peers route
-through, so the traffic does not arrive.
+**No counterparty.** A client selects an upstream from the on-chain registry.
+It recovers each signed answer to the operator address that the registry binds
+to the node, and drops an answer that does not recover
+([ADR 005 § Signer binding](005-protocol.md#signer-binding)). A node that is
+absent from the on-chain registry is absent from the set peers route through,
+so the traffic does not arrive.
 
 Both constraints sit outside the seller's process. Neither can be removed by
 patching the daemon.
 
 The bring-up binding self-check (§ Operator Safety Obligations) stays advisory
-for the same reason. It tells an operator that their node is unslashable, which
-is information they need. It does not gate anything.
+for the same reason. It tells an operator that peers cannot attribute their
+node's signed answers and so drop them, which is information they need. It does not gate anything.
 
 **Do not add a serve-side registration gate.** It reads as defence in depth and
 is not: it constrains only operators who were never the threat, and it adds a
@@ -247,15 +254,15 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 
 **Multiaddr encoding:** `multiaddrs` is a packed `bytes` field: a sequence of `(uint16 length, bytes data)` entries. Each entry is a QUIC multiaddr string (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1`). A dual-stack node registers one entry per family on the same port (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1` and `/ip6/2001:db8::10/udp/4433/quic-v1`). Maximum total size: 1,024 bytes (governable).
 
-### Re-Onboarding after Deregistration or Auto-Ejection
+### Re-Onboarding after Deregistration or Ejection
 
-A node that voluntarily deregistered or was auto-ejected (bond dropped below 50% of the minimum bond for its declared tier due to slashing — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn)) must re-onboard. The flow is identical to initial onboarding with three differences:
+A node that voluntarily deregistered or was ejected by governance ([ADR 011 § Hash Evasion and Origin Blacklisting](011-content-takedown.md#hash-evasion-and-origin-blacklisting)) must re-onboard. The flow is identical to initial onboarding with three differences:
 
-1. **`firstBondedAt` is preserved.** The `firstBondedAt` field in `CapacityBond` is immutable once set. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) therefore resumes from the original bonded date, so a re-onboarding operator does not restart the age-ramp clock.
+1. **`firstBondedAt` is preserved while the bond stays.** Deregistration and ejection do not move the bond, so they do not touch `firstBondedAt`. The `age_ramp` ([ADR 026 § Governance](026-tokenomics.md#governance)) therefore resumes from the original bonded date. An `unbond` that leaves the active bond below `bondFloorAtActivation` is different: it ends the tenure and clears `firstBondedAt`. The next entry restarts the age-ramp clock. `registerNode` records the live `minBond` as the new `bondFloorAtActivation` in both cases ([ADR 036 § Behaviors that follow from the formula](036-served-bytes-voting-weight.md#behaviors-that-follow-from-the-formula)).
 
 2. **`registrationNonce` is incremented.** On deregistration, `registrationNonce[nodeId]` is incremented. The operator must sign fresh `ed25519Signature` and `bindingSignature` parameters with the new nonce before calling `registerNode` again.
 
-3. **`declaredMbps` is cleared — automatically on the deregistration path only.** `deregisterNode` (`decdn node deregister`) resets the declared capacity tier to 0, releasing the `bond_required(declaredMbps)` floor on the bond ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). The bond itself is untouched, so re-registration after a *voluntary* deregistration needs no new funds — `registerNode` is gated only by `minBond` while the tier is 0 — but Step 2.2's `declareMbps` must be repeated to serve at a tier again. **Auto-ejection does not clear the tier**, so an operator who wants to *rejoin* faces two gates in sequence: `registerNode` reverts `OperatorEjected` while the ejection latch is set, and the latch is cleared only by `bond()` bringing the balance back over `minBond` (a *blacklist* latch is not clearable this way at all — it needs governance's `unEjectNode`). Once past that, `registerNode` re-checks `bond_required(declaredMbps)` against the standing tier, so rejoining at the old tier means re-bonding to its curve cost. An operator who wants to *exit* instead releases the tier with `declareMbps(0)`, which the contract accepts from any inactive operator (`decdn node unbond --all` issues it) — otherwise the floor would keep pinning `bond_required(declaredMbps)` with no `deregisterNode` available to clear it. Note the standing tier is not itself a trap on the bond: `declareMbps` enforces no monotonicity, so declaring *down* to `MIN_CAPACITY_PER_OPERATOR` has always released everything above that tier's curve cost.
+3. **`declaredMbps` is cleared — automatically on the deregistration path only.** `deregisterNode` (`decdn node deregister`) resets the declared capacity tier to 0, releasing the `bond_required(declaredMbps)` floor on the bond ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)). The bond itself is untouched, so re-registration after a *voluntary* deregistration needs no new funds — `registerNode` is gated only by `minBond` while the tier is 0 — but Step 2.2's `declareMbps` must be repeated to serve at a tier again. **Ejection does not clear the tier**, so an operator who wants to *rejoin* faces gates in sequence: `registerNode` reverts `OperatorEjected` while the ejection flag is set. Governance's `unEjectNode` clears the blacklist latch first, and then a `bond()` that leaves the balance at or above `minBond` clears the flag. Once past that, `registerNode` re-checks `bond_required(declaredMbps)` against the standing tier, so rejoining at the old tier means re-bonding to its curve cost. An operator who wants to *exit* instead releases the tier with `declareMbps(0)`, which the contract accepts from any inactive operator (`decdn node unbond --all` issues it) — otherwise the floor would keep pinning `bond_required(declaredMbps)` with no `deregisterNode` available to clear it. Note the standing tier is not itself a trap on the bond: `declareMbps` enforces no monotonicity, so declaring *down* to `MIN_CAPACITY_PER_OPERATOR` has always released everything above that tier's curve cost.
 
 If the node's iroh identity was replaced (key rotation), use `CapacityBond.bindNodeId()` after re-registration to associate the new `nodeId` with the same `ethAddress` — see [ADR 003 § NodeId Binding](003-payments.md#nodeid-to-ethereum-binding). The old `nodeId` mapping is cleared.
 

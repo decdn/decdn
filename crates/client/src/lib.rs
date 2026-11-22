@@ -456,8 +456,8 @@ pub struct PoolContext {
     /// `ext` so the serving node can recover the signing address, tie the
     /// request to the `(pool, signer, provider)` lane its vouchers pay on
     /// (`pull_authorized`), and reactively populate from its configured origin
-    /// (#1115). `None` ⇒ no binding is sent (an unconfigured
-    /// `capacity_bond` on the client, or an on-chain/registered requester).
+    /// (#1115). `None` ⇒ no binding is sent (an on-chain/registered
+    /// requester).
     pub client_binding: Option<ClientBinding>,
     /// Optional pool owner capability delegating spend to `client_signer`
     /// (ADR 003 §Capability delegation, `buyer_pool::self_owned_lane_ctx` /
@@ -572,7 +572,7 @@ impl PoolContext {
     /// Bind `endpoint` to this context's signer, so a node that misses the blob
     /// in its cache may pull it from its origin for this buyer. Without a
     /// binding, such a node refuses the open as `NotFound`. `bind_domain` is
-    /// `decdn_incentive::bind_node_id_domain(chain_id, capacity_bond)`.
+    /// `decdn_incentive::capacity_bond_domain(chain_id, capacity_bond)`.
     ///
     /// # Errors
     ///
@@ -614,7 +614,7 @@ impl PoolContext {
 ///
 /// `own_node_id` MUST be the requester's own endpoint `NodeId` — what the peer
 /// authenticates as `conn.remote_id()` — NOT the target node's. `bind_domain` is
-/// `decdn_incentive::bind_node_id_domain(chain_id, capacity_bond)`.
+/// `decdn_incentive::capacity_bond_domain(chain_id, capacity_bond)`.
 ///
 /// # Errors
 ///
@@ -771,7 +771,7 @@ impl VoucherProgress {
 
 /// The upstream delivered bytes that failed bao verification against the
 /// requested content root — a paid-but-corrupt delivery (the content-addressing
-/// invariant, ADR 014/038). Under ADR 038 the verifier is the per-chunk-group
+/// invariant, ADR 038). Under ADR 038 the verifier is the per-chunk-group
 /// `bao-tree` decoder fed as bytes arrive, not a whole-blob re-hash, so this
 /// fires the moment any group's proof mismatches. Returned (via `anyhow`) by
 /// this crate's decoding consumers — [`ClientRangedStore::ingest_stream`] and the
@@ -1166,16 +1166,12 @@ impl UpstreamRefused {
     ///
     /// Takes the whole `response` rather than just its `error` so the operator's
     /// own signed refusal survives on the value ([`Self::evidence`], #1042) —
-    /// `body` is exactly the field set the `SlashJudge` EIP-712 `StreamResponse`
-    /// typehash covers and `slash_sig` is the operator's secp256k1 signature over
-    /// it.
+    /// `body` is exactly the field set the EIP-712 `StreamResponse` typehash
+    /// covers and `slash_sig` is the operator's secp256k1 signature over it.
     ///
-    /// A refusal (`ok == false`) is **not** on-chain slash evidence: rate
-    /// manipulation requires `ok == true` and blacklist violation requires a
-    /// served claim (ADR 014), so a node may sign refusals freely. The retention
-    /// is kept on its own merits — it is an attributable, non-repudiable record
-    /// of *why* a paid pull was declined, which the caller can log, surface, or
-    /// present in a dispute without re-signing anything.
+    /// The retention is an attributable, non-repudiable record of *why* a paid
+    /// pull was declined, which the caller can log, surface, or present in a
+    /// dispute without re-signing anything.
     fn open(
         response: StreamResponse,
         ext: &StreamResponseExt,
@@ -1238,6 +1234,26 @@ impl UpstreamRefused {
         }
     }
 
+    /// Build the open-stage refusal a node signs, from a signed `response` with
+    /// `body.ok == false` and the wire `error` its trailing extension carries,
+    /// for a test of code that reads [`Self::evidence`].
+    ///
+    /// Test-only: production builds an open-stage refusal through the
+    /// crate-private `open`, after `verify_response` has checked the signature.
+    /// This constructor checks nothing, so it stays behind `test-util`.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn open_for_test(response: StreamResponse, error: StreamError) -> Self {
+        Self {
+            kind: Kind::Open {
+                error,
+                response: Box::new(response),
+                accepted_pools: None,
+            },
+        }
+    }
+
     /// Build the refusal for a [`ClientMessage::StreamError`] frame that a
     /// served stream sent before any delivered byte. A node admits a stream
     /// it can serve at once (a hit, a covering partial, its own origin) only
@@ -1283,13 +1299,11 @@ impl UpstreamRefused {
     /// An attributable record, not loose diagnostics — already verified against
     /// `expected_signer` by `verify_response` before this value is built, so a
     /// present value always recovers to `expected_signer`: the operator address
-    /// the caller bound this pull to, which is what `SlashJudge._checkRegistered`
-    /// resolves `nodeId` against.
+    /// the caller bound this pull to, which the registry binds to `nodeId`.
     ///
-    /// Note it is not by itself *slash* evidence — no offense admits a refusal
-    /// (`ok == false`) as its stream leg (ADR 014). What it gives the caller is a
-    /// non-repudiable statement of why the pull was declined, signed by the
-    /// operator and usable verbatim, with no re-signing.
+    /// What it gives the caller is a non-repudiable statement of why the pull
+    /// was declined, signed by the operator and usable verbatim, with no
+    /// re-signing.
     #[must_use]
     pub fn evidence(&self) -> Option<&StreamResponse> {
         match &self.kind {
@@ -4541,7 +4555,7 @@ fn voucher_rejection(
     }
 }
 
-/// Validate + verify a `StreamResponse` on receive (ADR 005, ADR 014 §1, #252).
+/// Validate + verify a `StreamResponse` on receive (ADR 005, #252).
 /// `hash` and `timestamp_us` are the request's, which the signed body echoes;
 /// `byte_offset` and `byte_len` are its span, which the coverage must agree
 /// with. Returns the proven blob size of a served response, `None` for a

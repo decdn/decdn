@@ -1,21 +1,15 @@
-//! G-NODE-06: `decdn node unbond` — capacity reduction and the unbonding
-//! window, end to end against a real `CapacityBond` (#1033).
+//! G-NODE-06: `decdn node unbond` — capacity reduction and the bond exit, end
+//! to end against a real `CapacityBond` (#1033).
 //!
-//! Drives the production CLI binary through all three phases of the window —
-//! request, maturing, withdraw — and asserts the on-chain consequences the
-//! command promises the operator, in particular that a request whose retained
-//! bond covers minBond keeps the node active for the whole window.
+//! Drives the production CLI binary through every release path — `--to-mbps`,
+//! `--amount`, `--all`, and the full exit after `decdn node deregister` — and
+//! asserts the on-chain consequences the command promises the operator: the
+//! released TOKEN returns in the same run, and a release whose retained bond
+//! covers minBond keeps the node active.
 //!
 //! The CLI wiring mirrors `cli_publish.rs`: a `NodeFixture` supplies the
 //! rendered `node.toml` (`[blockchain]` coordinates + keystore path) and the
 //! isolated `HOME`, so no invocation reaches a developer's real `~/.decdn`.
-//!
-//! **No slash/appeal gate is asserted, deliberately** (#1352). #1033's spec
-//! listed "unbond blocked while a slash/appeal is pending" as a negative case;
-//! that was wrong. ADR 026 § Capacity-bond curve carries the resolution (the
-//! "No slash/appeal-pending gate" bullet) — the unbonding window itself is the
-//! mitigation, and a gate would let a griefing challenger freeze an honest
-//! operator's exit. Do not "fix" the gap by adding an assertion.
 
 #![cfg(feature = "anvil-e2e")]
 #![allow(
@@ -37,7 +31,7 @@ use decdn_e2e::node::{KEYSTORE_PASSWORD, NodeFixture};
 use tokio::process::Command;
 
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule);
-/// the unbonding window is time-warped, so anvil launch + forge deploy dominate.
+/// anvil launch + forge deploy dominate.
 const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Tier the operator bonds up to before reducing. Both tiers must sit on the
@@ -58,7 +52,7 @@ const REDUCED_MBPS: u64 = 2_000;
 const FLOOR_MBPS: u64 = 10;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unbond_reduces_capacity_and_returns_token_after_the_window() -> anyhow::Result<()> {
+async fn unbond_reduces_capacity_and_returns_token_at_once() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
         .context("G-NODE-06 exceeded the overall timeout")??;
@@ -96,9 +90,8 @@ async fn run() -> anyhow::Result<()> {
     assert!(chain.is_active(operator).await?, "bonded + registered");
 
     // ---- 0a. `--dry-run` previews the same reduction without submitting.
-    // The branch sits above both the `Waiting` bail and `confirm_or_bail`, so a
-    // regression that moved it below `execute` would submit a real,
-    // window-long-deactivating transaction on what the operator asked to
+    // The branch sits above `confirm_or_bail`, so a regression that moved it
+    // below `execute` would release real TOKEN on what the operator asked to
     // preview. Note the absent `--yes`: dry-run must not gate on confirmation.
     let preview = run_node_cli(
         &node,
@@ -112,13 +105,12 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
     let receipt = last_json_line(&preview)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
     assert_eq!(json_bool(&receipt, "dry_run"), Some(true));
     assert_eq!(json_bool(&receipt, "submitted"), Some(false));
     assert_eq!(
-        chain.unbonding_of(operator).await?.0,
-        U256::ZERO,
-        "a preview must start no window"
+        chain.active_bond(operator).await?,
+        start_target,
+        "a preview must release nothing"
     );
     assert_eq!(
         chain.declared_mbps(operator).await?,
@@ -134,11 +126,11 @@ async fn run() -> anyhow::Result<()> {
         run_node_cli_raw(&node, &["unbond", "--to-mbps", &REDUCED_MBPS.to_string()]).await?;
     assert!(
         !unconfirmed.status.success(),
-        "an unconfirmed request must exit non-zero, not proceed"
+        "an unconfirmed unbond must exit non-zero, not proceed"
     );
     let stderr = String::from_utf8_lossy(&unconfirmed.stderr);
     assert!(
-        stderr.contains("unbonding window") && stderr.contains("stays active"),
+        stderr.contains("About to release") && stderr.contains("stays active"),
         "the consequence must be disclosed even when refusing: {stderr}"
     );
     assert!(
@@ -146,9 +138,9 @@ async fn run() -> anyhow::Result<()> {
         "stderr must carry the remedy: {stderr}"
     );
     assert_eq!(
-        chain.unbonding_of(operator).await?.0,
-        U256::ZERO,
-        "a refused request must submit nothing"
+        chain.active_bond(operator).await?,
+        start_target,
+        "a refused unbond must submit nothing"
     );
     assert_eq!(
         chain.declared_mbps(operator).await?,
@@ -156,7 +148,15 @@ async fn run() -> anyhow::Result<()> {
         "the refusal must land before the declare leg, not between the two sends"
     );
 
-    // ---- 1. `--to-mbps` declares down, then starts the window.
+    // ---- 0c. No amount flag is a usage error, not a guess.
+    let unspecified = run_node_cli_raw(&node, &["unbond", "--yes"]).await?;
+    assert!(
+        !unspecified.status.success(),
+        "an unbond with no amount flag must exit non-zero"
+    );
+    assert_eq!(chain.active_bond(operator).await?, start_target);
+
+    // ---- 1. `--to-mbps` declares down, then returns the surplus at once.
     let reduced_target = chain
         .min_bond()
         .await?
@@ -168,6 +168,7 @@ async fn run() -> anyhow::Result<()> {
          otherwise this journey asserts nothing"
     );
 
+    let before = chain.token_balance(operator).await?;
     let out = run_node_cli(
         &node,
         &[
@@ -180,90 +181,38 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
     let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
+    assert_eq!(json_bool(&receipt, "submitted"), Some(true));
     assert_eq!(
         json_str(&receipt, "release_base"),
         Some(expected_release.to_string().as_str())
     );
+    assert!(json_str(&receipt, "declare_tx").is_some(), "{receipt}");
+    assert!(json_str(&receipt, "unbond_tx").is_some(), "{receipt}");
 
     assert_eq!(
         chain.declared_mbps(operator).await?,
         REDUCED_MBPS,
-        "declareMbps must land before requestUnbond, or the curve check rejects it"
+        "declareMbps must land before unbond, or the curve check rejects it"
     );
     assert_eq!(chain.active_bond(operator).await?, reduced_target);
-
-    let (pending, unlock_at) = chain.unbonding_of(operator).await?;
-    assert_eq!(pending, expected_release);
-    let period = chain.unbonding_period().await?;
-    let head = chain.head_timestamp().await?;
-    assert!(
-        unlock_at > head && unlock_at <= head + period,
-        "unlock_at ({unlock_at}) must be one unbonding period ({period}s) out from {head}"
+    assert_eq!(
+        chain.token_balance(operator).await? - before,
+        expected_release,
+        "the released amount returns to the operator in the same run"
     );
 
     // The retained bond still covers minBond and the reduced tier, so the node
-    // keeps serving through the window.
+    // keeps serving.
     assert!(
         reduced_target >= chain.min_bond().await?,
         "retained bond still covers minBond"
     );
     assert!(
         chain.is_active(operator).await?,
-        "a request that retains the floor must keep the node active"
+        "an unbond that retains the floor must keep the node active"
     );
 
-    // ---- 2. Re-running while it matures submits nothing and exits non-zero.
-    let waiting = run_node_cli_raw(&node, &["unbond", "--yes", "--json"]).await?;
-    assert!(
-        !waiting.status.success(),
-        "a maturing request must exit non-zero so a retry loop can tell it apart from a withdrawal"
-    );
-    let receipt = last_json_line(&waiting)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("waiting"));
-    assert_eq!(
-        chain.unbonding_of(operator).await?.0,
-        expected_release,
-        "the waiting phase must not touch chain state"
-    );
-
-    // ---- 3. An amount flag while a request is in flight is an error, not a
-    // silent no-op — `requestUnbond` would revert with UnbondingInProgress.
-    let conflict = run_node_cli_raw(&node, &["unbond", "--all", "--yes"]).await?;
-    assert!(!conflict.status.success());
-    assert!(
-        String::from_utf8_lossy(&conflict.stderr).contains("already in flight"),
-        "stderr must name the pending request: {}",
-        String::from_utf8_lossy(&conflict.stderr)
-    );
-
-    // ---- 4. After the window, the same command withdraws.
-    let before = chain.token_balance(operator).await?;
-    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
-    let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("withdraw"));
-    assert_eq!(
-        json_str(&receipt, "withdrawn_base"),
-        Some(expected_release.to_string().as_str())
-    );
-
-    assert_eq!(
-        chain.token_balance(operator).await? - before,
-        expected_release,
-        "the matured request must return exactly the released amount"
-    );
-    assert_eq!(
-        chain.unbonding_of(operator).await?.0,
-        U256::ZERO,
-        "unbond() clears the request"
-    );
-    assert!(
-        chain.is_active(operator).await?,
-        "with the bond above minBond, the node stays active after the withdrawal"
-    );
-
-    // ---- 5. Negative: an --amount below the curve is rejected before any
+    // ---- 2. Negative: an --amount below the curve is rejected before any
     // transaction, with the remediation the operator needs.
     let over = chain.active_bond(operator).await? - chain.bond_required(REDUCED_MBPS).await?
         + U256::from(1u64);
@@ -276,20 +225,21 @@ async fn run() -> anyhow::Result<()> {
         "stderr must name the revert it avoided and how to fix it: {stderr}"
     );
     assert_eq!(
-        chain.unbonding_of(operator).await?.0,
-        U256::ZERO,
+        chain.active_bond(operator).await?,
+        reduced_target,
         "a rejected plan must submit nothing"
     );
 
-    // ---- 6. Convergence: `--to-mbps` sends declareMbps and requestUnbond as
-    // two transactions, so a run that lands the first and loses the second
-    // leaves the tier already reduced while the bond is still high. Re-running
-    // the identical command must resume from there.
+    // ---- 3. Convergence: `--to-mbps` sends declareMbps and unbond as two
+    // transactions, so a run that lands the first and loses the second leaves
+    // the tier already reduced while the bond is still high. Re-running the
+    // identical command must resume from there.
     //
     // That half-done state is reachable with the shipped commands: `node bond`
     // at a tier the operator is already over-bonded for has zero shortfall, so
     // it submits declareMbps and nothing else — byte for byte the state a
-    // partially-failed unbond leaves behind.
+    // partially-failed unbond leaves behind. Leg 1 returned the TOKEN the
+    // re-bond needs.
     run_node_cli(&node, &["bond", "--mbps", &START_MBPS.to_string()]).await?;
     assert_eq!(chain.active_bond(operator).await?, start_target);
     run_node_cli(&node, &["bond", "--mbps", &REDUCED_MBPS.to_string()]).await?;
@@ -304,6 +254,7 @@ async fn run() -> anyhow::Result<()> {
         "… while the bond is still high — the partial-failure state"
     );
 
+    let before = chain.token_balance(operator).await?;
     let out = run_node_cli(
         &node,
         &[
@@ -316,7 +267,6 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
     let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
     // Explicitly present-and-null, not merely absent: `json_str` would also
     // return `None` for a number, so a re-sent declare would slip past it.
     assert!(
@@ -325,23 +275,14 @@ async fn run() -> anyhow::Result<()> {
             .is_some_and(serde_json::Value::is_null),
         "the declare already landed, so the retry must skip it: {receipt}"
     );
+    assert_eq!(chain.active_bond(operator).await?, reduced_target);
     assert_eq!(
-        chain.unbonding_of(operator).await?.0,
+        chain.token_balance(operator).await? - before,
         expected_release,
         "the retry must still release the surplus the first run never got to"
     );
 
-    // ---- 7. Drain step 6's request so the remaining legs start clean. The
-    // phase is asserted rather than assumed: legs 8 and 9 depend on this
-    // withdrawal, and without it a surprise here surfaces as a bare
-    // "exited non-zero" two legs later.
-    let (_, unlock_at) = chain.unbonding_of(operator).await?;
-    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
-    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
-    assert_eq!(chain.active_bond(operator).await?, reduced_target);
-
-    // ---- 8. A below-crossover `--to-mbps`, where `minBond` is the operative
+    // ---- 4. A below-crossover `--to-mbps`, where `minBond` is the operative
     // term. Both journey tiers sit where the curve dominates, so `max(minBond,
     // bondRequired(·))` has never actually selected `minBond` on-chain here.
     let floor_curve = chain.bond_required(FLOOR_MBPS).await?;
@@ -364,7 +305,6 @@ async fn run() -> anyhow::Result<()> {
     )
     .await?;
     let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
     assert_eq!(
         json_str(&receipt, "retained_bond_base"),
         Some(min_bond.to_string().as_str()),
@@ -376,24 +316,17 @@ async fn run() -> anyhow::Result<()> {
         min_bond,
         "the retained bond is minBond exactly, not the curve floor"
     );
-
-    let (_, unlock_at) = chain.unbonding_of(operator).await?;
-    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
-    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
     assert!(
         chain.is_active(operator).await?,
         "`--to-mbps` keeps the operator eligible: minBond is still covered"
     );
 
-    // ---- 9. A real `--all` release. Step 3 only reached `--all`'s
-    // already-in-flight error, so the path that resolves a release has never
-    // run end to end. `--all` goes to the BARE curve floor, not minBond — which
-    // is exactly what takes the node below the active-set threshold.
+    // ---- 5. A real `--all` release. `--all` goes to the BARE curve floor,
+    // not minBond — which is exactly what takes the node below the active-set
+    // threshold.
     let before = chain.token_balance(operator).await?;
     let out = run_node_cli(&node, &["unbond", "--all", "--yes", "--json"]).await?;
     let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
     assert_eq!(
         json_str(&receipt, "retained_bond_base"),
         Some(floor_curve.to_string().as_str()),
@@ -404,19 +337,9 @@ async fn run() -> anyhow::Result<()> {
         receipt
             .get("declare_to_mbps")
             .is_some_and(serde_json::Value::is_null),
-        "`--all` never moves the declared tier: {receipt}"
+        "`--all` never moves a registered operator's declared tier: {receipt}"
     );
     assert_eq!(chain.active_bond(operator).await?, floor_curve);
-    assert!(
-        !chain.is_active(operator).await?,
-        "a request that drops the retained bond below minBond deactivates the node at once"
-    );
-
-    let (pending, unlock_at) = chain.unbonding_of(operator).await?;
-    assert_eq!(pending, min_bond - floor_curve);
-    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
-    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
     assert_eq!(
         chain.token_balance(operator).await? - before,
         min_bond - floor_curve,
@@ -424,17 +347,17 @@ async fn run() -> anyhow::Result<()> {
     );
     assert!(
         !chain.is_active(operator).await?,
-        "with the retained bond below minBond the node stays inactive after withdrawal — \
-         the consequence the command's below-minBond warning discloses"
+        "with the retained bond below minBond the node leaves the active set — the \
+         consequence the command's below-floor warning discloses"
     );
 
-    // ---- 10. The full exit (#1359, #1361). Legs 1–9 all end with the tier
+    // ---- 6. The full exit (#1359, #1361). Legs 1–5 all end with the tier
     // still standing, which is exactly what `bondRequired(declaredMbps)` pins
-    // in place — so no leg above has ever taken the operator's LAST TOKEN out.
+    // in place — so no leg above has taken the operator's LAST TOKEN out.
     // `decdn node deregister` clears the tier; `--all` then releases everything.
     //
     // The operator is still REGISTERED here even though `isActive` is false:
-    // leg 9 took the bond below `minBond`, which is a conjunct of `isActive`
+    // leg 5 took the bond below `minBond`, which is a conjunct of `isActive`
     // but not the flag `deregisterNode` gates on. That divergence is the reason
     // the command reads `getNodeByAddress().active` rather than `isActive`.
     assert!(
@@ -443,7 +366,7 @@ async fn run() -> anyhow::Result<()> {
     );
     assert_eq!(chain.declared_mbps(operator).await?, FLOOR_MBPS);
 
-    // 10a. `--dry-run` previews without leaving the active set.
+    // 6a. `--dry-run` previews without leaving the active set.
     let preview = run_node_cli(&node, &["deregister", "--dry-run", "--json"]).await?;
     let receipt = last_json_line(&preview)?;
     assert_eq!(json_bool(&receipt, "dry_run"), Some(true));
@@ -454,7 +377,7 @@ async fn run() -> anyhow::Result<()> {
         "a preview must not deregister"
     );
 
-    // 10b. Headless without `--yes` refuses, and still discloses the thing an
+    // 6b. Headless without `--yes` refuses, and still discloses the thing an
     // operator is most likely to get wrong: the bond does not come back here.
     let unconfirmed = run_node_cli_raw(&node, &["deregister"]).await?;
     assert!(
@@ -463,7 +386,7 @@ async fn run() -> anyhow::Result<()> {
     );
     let stderr = String::from_utf8_lossy(&unconfirmed.stderr);
     assert!(
-        stderr.contains("NOT returned") && stderr.contains("slashable"),
+        stderr.contains("NOT returned") && stderr.contains("stays deposited"),
         "stderr must disclose that the bond stays put: {stderr}"
     );
     assert!(
@@ -475,7 +398,7 @@ async fn run() -> anyhow::Result<()> {
         "a refused deregistration must submit nothing"
     );
 
-    // 10c. The real deregistration: leaves the set AND clears the tier, which
+    // 6c. The real deregistration: leaves the set AND clears the tier, which
     // is the whole reason it is the first leg of an exit rather than a bare
     // "stop serving".
     let retained_before = chain.active_bond(operator).await?;
@@ -502,7 +425,7 @@ async fn run() -> anyhow::Result<()> {
         "while the bond itself does not move"
     );
 
-    // 10d. A second run is refused with the two routes named, rather than
+    // 6d. A second run is refused with the two routes named, rather than
     // surfacing a bare NodeNotActive revert.
     let again = run_node_cli_raw(&node, &["deregister", "--yes"]).await?;
     assert!(!again.status.success());
@@ -512,12 +435,11 @@ async fn run() -> anyhow::Result<()> {
         "stderr must name re-entry and exit: {stderr}"
     );
 
-    // 10e. `--all` now releases EVERYTHING: with the tier cleared,
+    // 6e. `--all` now releases EVERYTHING: with the tier cleared,
     // `bondRequired(0) == 0`, so the curve floor is gone.
     let before = chain.token_balance(operator).await?;
     let out = run_node_cli(&node, &["unbond", "--all", "--yes", "--json"]).await?;
     let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
     assert_eq!(
         json_str(&receipt, "retained_bond_base"),
         Some("0"),
@@ -527,13 +449,6 @@ async fn run() -> anyhow::Result<()> {
         json_str(&receipt, "release_base"),
         Some(retained_before.to_string().as_str())
     );
-
-    let (pending, unlock_at) = chain.unbonding_of(operator).await?;
-    assert_eq!(pending, retained_before);
-    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
-    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
-
     assert_eq!(
         chain.active_bond(operator).await?,
         U256::ZERO,
@@ -545,15 +460,14 @@ async fn run() -> anyhow::Result<()> {
         "and all of it came back to the operator"
     );
 
-    // ---- 11. `--all` releasing a tier for an INACTIVE operator on-chain
-    // (#1361). Leg 10 cleared the tier with `deregister` *before* `--all` ran,
-    // so `--all`'s own `declareMbps(0)` leg — the whole of #1361's CLI surface —
-    // has still never touched a real chain here; the mocked unit tests are its
-    // only coverage. This reaches the exact stuck state through shipped commands:
-    // `decdn node bond` bonds + declares but never registers (leg 0 relied on
-    // that too), so the operator ends up bonded-and-declared yet OUT of the
-    // registered set — `deregisterNode` reverts for them, and the tier would pin
-    // their bond with no exit but for `declareMbps(0)`.
+    // ---- 7. `--all` releasing a tier for an INACTIVE operator on-chain
+    // (#1361). Leg 6 cleared the tier with `deregister` *before* `--all` ran,
+    // so `--all`'s own `declareMbps(0)` leg has not touched a real chain yet.
+    // This reaches the exact stuck state through shipped commands: `decdn node
+    // bond` bonds + declares but never registers (leg 0 relied on that too), so
+    // the operator ends up bonded-and-declared yet OUT of the registered set —
+    // `deregisterNode` reverts for them, and the tier would pin their bond with
+    // no exit but for `declareMbps(0)`.
     let retier_target = chain
         .min_bond()
         .await?
@@ -578,7 +492,6 @@ async fn run() -> anyhow::Result<()> {
     let before = chain.token_balance(operator).await?;
     let out = run_node_cli(&node, &["unbond", "--all", "--yes", "--json"]).await?;
     let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
     assert_eq!(
         json_str(&receipt, "retained_bond_base"),
         Some("0"),
@@ -591,11 +504,6 @@ async fn run() -> anyhow::Result<()> {
         0,
         "`--all` issued declareMbps(0) for the inactive operator"
     );
-
-    let (_, unlock_at) = chain.unbonding_of(operator).await?;
-    decdn_e2e::time::advance_to(chain.admin(), unlock_at).await?;
-    let out = run_node_cli(&node, &["unbond", "--yes", "--json"]).await?;
-    assert_eq!(json_str(&last_json_line(&out)?, "phase"), Some("withdraw"));
     assert_eq!(
         chain.active_bond(operator).await?,
         U256::ZERO,

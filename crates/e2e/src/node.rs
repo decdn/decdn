@@ -148,7 +148,7 @@ impl NodeFixture {
 
     /// The daemon's bring-up verdict on whether its local key is the one bound
     /// on-chain (#1034) — the signal that distinguishes a rotated node from an
-    /// unslashable one.
+    /// unroutable one.
     pub async fn binding_status(&self) -> anyhow::Result<BindingStatus> {
         Ok(self
             .admin_client()?
@@ -571,7 +571,7 @@ impl NodeFixture {
 
         // The daemon's boot snapshots pin their reads below the head, so mine
         // past that margin: it sees this operator's onboarding and every seat,
-        // registration and slash the journey made before it.
+        // and registration the journey made before it.
         crate::time::mine_past_snapshot_margin(chain.admin()).await?;
         let log = DaemonLog::default();
         let child = spawn_daemon(&config_path, data_dir.path(), &log)?;
@@ -600,9 +600,7 @@ impl NodeFixture {
     /// respawn it against the same config + data dir (no re-onboarding — the
     /// operator is already on-chain), then wait until healthy. Proves persisted
     /// state (e.g. durable blacklist eviction via `evicted.log`) survives a
-    /// restart, and exercises the across-restart slash re-scan (#1032): the new
-    /// process rebuilds its in-memory slash store by re-enumerating on chain and
-    /// seeding the watcher tail. Uses `&self`: the child handle lives behind a
+    /// restart. Uses `&self`: the child handle lives behind a
     /// `Mutex`, so the swap needs no exclusive borrow. A daemon halted by
     /// [`Self::stop`] is respawned.
     pub async fn restart(&self) -> anyhow::Result<()> {
@@ -1052,8 +1050,6 @@ eth_keystore = '{keystore}'
 chain_id = {chain_id}
 payment_chains = [{{ rpc_url = "{rpc_url}", chain_id = {chain_id}, payment_pools = ["{payment_pool}"] }}]
 capacity_bond_address = "{capacity_bond}"
-slash_judge_address = "{slash_judge}"
-slash_appeal_address = "{slash_appeal}"
 content_blacklist_address = "{content_blacklist}"
 # Small so a ledger mutation, or a scope transition with no ledger record
 # (region ripening), is enforced within the test budget.
@@ -1098,8 +1094,6 @@ metrics_bind = "127.0.0.1"
         chain_id = c.chain_id,
         payment_pool = a.payment_pool,
         capacity_bond = a.capacity_bond,
-        slash_judge = a.slash_judge,
-        slash_appeal = a.slash_appeal,
         content_blacklist = a.content_blacklist,
         publisher_registry = a.publisher_registry,
         origin_assignment = a.origin_assignment,

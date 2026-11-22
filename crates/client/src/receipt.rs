@@ -25,7 +25,8 @@ use alloy::sol_types::Eip712Domain;
 use decdn_incentive::chain::CHUNK_BYTES;
 use decdn_incentive::stream_sig::StreamSlashData;
 use decdn_incentive::{
-    Deployment, LaneKey, slash_judge_domain, verify_forward, voucher_domain, wire_voucher_to_signed,
+    Deployment, LaneKey, capacity_bond_domain, verify_forward, voucher_domain,
+    wire_voucher_to_signed,
 };
 use decdn_protocol::client::{StreamResponse, StreamResponseBody, Voucher as WireVoucher};
 use serde::{Deserialize, Serialize};
@@ -171,7 +172,7 @@ impl ReceiptEvidence {
             .unwrap_or_else(PoisonError::into_inner)
             .get_or_insert(ReceiptChain {
                 chain_id: governance.chain_id,
-                slash_judge: governance.slash_judge,
+                capacity_bond: governance.capacity_bond,
                 payment_chain_id: deployment.chain_id,
                 payment_pool: deployment.payment_pool,
             });
@@ -367,8 +368,8 @@ pub struct PullReceipt {
 pub struct ReceiptChain {
     /// The governance chain id, which the stream responses' domain carries.
     pub chain_id: u64,
-    /// The `SlashJudge` contract, the stream responses' `verifyingContract`.
-    pub slash_judge: Address,
+    /// The `CapacityBond` contract, the stream responses' `verifyingContract`.
+    pub capacity_bond: Address,
     /// The payment chain id, which the vouchers' domain carries.
     pub payment_chain_id: u64,
     /// The `PaymentPool` contract, the vouchers' `verifyingContract`.
@@ -519,7 +520,7 @@ impl TryFrom<crate::ledger::Cumulative> for ReceiptAmount {
 }
 
 /// A node's signed answer to one stream request: the [`StreamResponseBody`]
-/// fields and the `SlashJudge`-domain signature over them.
+/// fields and the `CapacityBond`-domain signature over them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiptResponse {
     /// The hash the response answers for.
@@ -878,7 +879,7 @@ impl PullReceipt {
     /// the chain.
     #[must_use]
     pub fn verify(&self) -> Vec<ReceiptFault> {
-        let slash_dom = slash_judge_domain(self.chain.chain_id, self.chain.slash_judge);
+        let slash_dom = capacity_bond_domain(self.chain.chain_id, self.chain.capacity_bond);
         let voucher_dom = voucher_domain(self.chain.payment_chain_id, self.chain.payment_pool);
         let content = &self.content;
         let listed = |hash: &B256| {

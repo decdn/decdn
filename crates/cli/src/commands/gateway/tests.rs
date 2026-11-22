@@ -214,8 +214,7 @@ async fn test_gateway_cached(
         decdn_client::session::GovernanceChain {
             rpc_url: "http://127.0.0.1:1".to_owned(),
             chain_id: 421_614,
-            slash_judge: Address::repeat_byte(2),
-            capacity_bond: None,
+            capacity_bond: Address::repeat_byte(2),
         },
         vec![decdn_client::session::PaymentPoolChain {
             rpc_url: "http://127.0.0.1:1".to_owned(),

@@ -2,15 +2,15 @@
 pragma solidity 0.8.28;
 
 /// @title ICapacityBondRegionView
-/// @notice Aggregate read surface that `SlashJudge` and `ContentBlacklist` call
-///         into to evaluate the ADR 030 § Region-stability window ripening
+/// @notice Aggregate read surface that `ContentBlacklist` calls into to
+///         evaluate the ADR 030 § Region-stability window ripening
 ///         predicate (global ∪ current-region ∪ ripening-prev-region). Bundles
-///         every input the predicate needs into a single view so the consumers
-///         make one cross-contract call instead of five, and so they never have
+///         every input the predicate needs into a single view so the consumer
+///         makes one cross-contract call instead of five, and so it never has
 ///         to ABI-decode the full `NodeInfo` (with its `bytes multiaddrs`) just
 ///         to read `regionHint`.
-/// @dev    Declared as a standalone interface (like `ICapacityBondEjector` /
-///         `ICapacityBondSlasher`) so consumers can type their `capacityBond`
+/// @dev    Declared as a standalone interface (like `ICapacityBondEjector`)
+///         so consumers can type their `capacityBond`
 ///         reference narrowly and slither's `missing-inheritance` detector can
 ///         verify `CapacityBond` provides the surface it implements.
 interface ICapacityBondRegionView {

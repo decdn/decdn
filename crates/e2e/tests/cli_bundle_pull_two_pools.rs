@@ -234,7 +234,6 @@ rpc_url = "{rpc_url}"
 chain_id = {chain_id}
 eth_keystore = '{keystore}'
 capacity_bond_address = "{capacity_bond}"
-slash_judge_address = "{slash_judge}"
 buyer_working_deposit_micro_usdc = {DEPOSIT_MICRO_USDC}
 
 [[blockchain.payment_chains]]
@@ -244,7 +243,6 @@ payment_pools = ["{first}", "{second}"]
 "#,
         keystore = keystore.display(),
         capacity_bond = addrs.capacity_bond,
-        slash_judge = addrs.slash_judge,
         first = pools[0],
         second = pools[1],
     )

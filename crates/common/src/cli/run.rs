@@ -89,7 +89,9 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "PATH", env = "DECDN_KEYSTORE_PASSWORD_FILE")]
     pub keystore_password_file: Option<PathBuf>,
 
-    /// `CapacityBond` contract address (0x-prefixed hex).
+    /// `CapacityBond` contract address (0x-prefixed hex). Also the EIP-712
+    /// `verifyingContract` for the stream response signature `slash_sig`
+    /// (ADR 005 § Signer binding).
     #[arg(long, value_name = "ADDR", env = "DECDN_CAPACITY_BOND_ADDRESS")]
     pub capacity_bond_address: Option<String>,
 
@@ -115,17 +117,12 @@ pub struct BlockchainArgs {
     #[arg(long, value_name = "ADDR", env = "DECDN_PUBLISHER_REGISTRY_ADDRESS")]
     pub publisher_registry_address: Option<String>,
 
-    /// `SlashJudge` contract address (0x-prefixed hex) — EIP-712
-    /// `verifyingContract` for stream `slash_sig` (ADR 014).
-    #[arg(long, value_name = "ADDR", env = "DECDN_SLASH_JUDGE_ADDRESS")]
-    pub slash_judge_address: Option<String>,
-
     /// Required `ContentBlacklist` contract address (0x-prefixed hex). Startup
     /// waits for its initial compliance sync before accepting any ALPN.
     #[arg(long, value_name = "ADDR", env = "DECDN_CONTENT_BLACKLIST_ADDRESS")]
     pub content_blacklist_address: Option<String>,
 
-    /// EIP-712 chain id for the `slash_sig` domain [default: 421614].
+    /// EIP-712 chain id for the `CapacityBond` signing domain [default: 421614].
     #[arg(long, value_name = "ID", env = "DECDN_CHAIN_ID")]
     pub chain_id: Option<u64>,
 }

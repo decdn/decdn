@@ -49,7 +49,7 @@ fn embedded_terms_hash_is_nonzero_and_versioned() {
 #[test]
 fn embedded_terms_hash_matches_committed_terms_md() {
     let expected = alloy::primitives::b256!(
-        "7da33feb48d0b64ca41a4478ea67aeb13832b56b7598cca803bc2b9f5ec37f4b"
+        "9dc5c8d1e93cef8faeacaa129d78437d0d251e86d737c1fa750ff4cfda38a8e8"
     );
     assert_eq!(
         terms_hash(),

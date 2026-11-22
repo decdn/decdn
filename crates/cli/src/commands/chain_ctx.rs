@@ -138,7 +138,6 @@ struct FileBlockchain {
     eth_keystore: Option<PathBuf>,
     publisher_registry_address: Option<String>,
     origin_assignment_address: Option<String>,
-    slash_appeal_address: Option<String>,
     #[serde(default)]
     payment_chains: Vec<FilePaymentChain>,
     cctp_sweep_receiver_address: Option<String>,
@@ -205,7 +204,7 @@ pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileCo
 
 /// Resolve the `rpc_url` / `chain_id` / `data_dir` / `keystore` fields shared by
 /// every on-chain command with the same flag > config > default precedence.
-/// Kept separate so [`resolve`] and [`resolve_appeal`] can't drift on this
+/// Kept separate so [`resolve`] and [`resolve_publish`] can't drift on this
 /// chain. `expand_tilde` is applied to whichever explicit path wins (flag OR
 /// config); the `default_data_dir` fallback is already absolute.
 fn resolve_common(
@@ -266,56 +265,6 @@ pub fn resolve(chain: &cli::ChainArgs, file: &FileConfig) -> anyhow::Result<Reso
         rpc_url,
         chain_id,
         capacity_bond_address,
-        keystore,
-        data_dir,
-    })
-}
-
-/// Coordinates for `decdn appeal slash`, resolved from flags > config >
-/// defaults. Requires `rpc_url` + `slash_appeal_address`; unlike [`Resolved`]
-/// it does *not* require `capacity_bond_address` (the appeal path doesn't touch
-/// `CapacityBond` directly).
-#[derive(Debug)]
-pub struct ResolvedAppeal {
-    /// JSON-RPC endpoint the command talks to.
-    pub rpc_url: String,
-    /// EVM chain id, checked against what the endpoint reports.
-    pub chain_id: u64,
-    /// `SlashAppeal` address the appeal is filed against.
-    pub slash_appeal_address: Address,
-    /// Path to the operator's Ethereum keystore file.
-    pub keystore: PathBuf,
-    /// Node data directory; the keystore and node key default to paths
-    /// under it.
-    pub data_dir: PathBuf,
-}
-
-/// Resolve appeal-command coordinates. Pure so precedence is unit-testable.
-/// `slash_appeal_flag` is the command's `--slash-appeal-address` override.
-pub fn resolve_appeal(
-    chain: &cli::CommonChainArgs,
-    slash_appeal_flag: Option<&str>,
-    file: &FileConfig,
-) -> anyhow::Result<ResolvedAppeal> {
-    let bc = file.blockchain.as_ref();
-    let slash_appeal_raw = slash_appeal_flag
-        .map(str::to_string)
-        .or_else(|| bc.and_then(|b| b.slash_appeal_address.clone()))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "slash_appeal_address not set (pass --slash-appeal-address or set \
-                 blockchain.slash_appeal_address)"
-            )
-        })?;
-    // Reject the zero address via the shared guard (#1153) — see
-    // `parse_nonzero_address`; each of the four addresses resolved here and in
-    // `resolve` / `resolve_publish` gets the same early, labelled rejection.
-    let slash_appeal_address = parse_nonzero_address(&slash_appeal_raw, "slash_appeal_address")?;
-    let (rpc_url, chain_id, data_dir, keystore) = resolve_common(chain, file)?;
-    Ok(ResolvedAppeal {
-        rpc_url,
-        chain_id,
-        slash_appeal_address,
         keystore,
         data_dir,
     })
@@ -430,7 +379,7 @@ pub fn resolve_publish(
     file: &FileConfig,
 ) -> anyhow::Result<ResolvedPublish> {
     let bc = file.blockchain.as_ref();
-    // Shared with `resolve` / `resolve_appeal` so the rpc_url/chain_id/
+    // Shared with `resolve` so the rpc_url/chain_id/
     // data_dir/keystore precedence can't drift between the `node` and
     // `publish` commands. Only the two contract addresses are publish-specific.
     let (rpc_url, chain_id, data_dir, keystore) = resolve_common(&args.common, file)?;

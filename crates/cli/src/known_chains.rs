@@ -1,7 +1,7 @@
 //! Registry of deployment targets `decdn config init --chain <name>` can bake in.
 //!
 //! A deployment target is one **governance chain** (the protocol contracts:
-//! `CapacityBond`, `SlashJudge`, `ContentBlacklist`, `CctpSweepReceiver`, …)
+//! `CapacityBond`, `ContentBlacklist`, `CctpSweepReceiver`, …)
 //! and one or more **payment chains**, each running a `PaymentPool`. Each
 //! [`KnownChain`] pairs a small hand-written descriptor (name, label, chain
 //! ids, public RPC endpoints) with the deployment manifests embedded at compile
@@ -95,16 +95,12 @@ pub fn by_chain_id(chain_id: u64) -> Option<&'static KnownChain> {
 pub struct ChainAddresses {
     /// `blockchain.capacity_bond_address`.
     pub capacity_bond: String,
-    /// `blockchain.slash_judge_address`.
-    pub slash_judge: String,
     /// `blockchain.content_blacklist_address`.
     pub content_blacklist: String,
     /// `blockchain.origin_assignment_address`.
     pub origin_assignment: String,
     /// `blockchain.publisher_registry_address`.
     pub publisher_registry: String,
-    /// `blockchain.slash_appeal_address`.
-    pub slash_appeal: String,
     /// `blockchain.cctp_sweep_receiver_address`.
     pub cctp_sweep_receiver: String,
 }
@@ -175,11 +171,9 @@ pub(crate) fn parse_governance_manifest(
     let manifest = DeploymentManifest::parse(json, chain_id, what)?;
     Ok(ChainAddresses {
         capacity_bond: manifest.contract("CapacityBond", what)?,
-        slash_judge: manifest.contract("SlashJudge", what)?,
         content_blacklist: manifest.contract("ContentBlacklist", what)?,
         origin_assignment: manifest.contract("OriginAssignment", what)?,
         publisher_registry: manifest.contract("PublisherRegistry", what)?,
-        slash_appeal: manifest.contract("SlashAppeal", what)?,
         cctp_sweep_receiver: manifest.contract("CctpSweepReceiver", what)?,
     })
 }

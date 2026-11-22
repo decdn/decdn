@@ -1,8 +1,8 @@
 //! Chain-state reads shared by the node's chain-state snapshots.
 //!
 //! The node reads every piece of chain state it keeps by `eth_call`. It reads
-//! no event log. Each snapshot (the `CapacityBond` registry, this operator's
-//! slashes, the `OriginAssignment` seats, the `ContentBlacklist` deny index and
+//! no event log. Each snapshot (the `CapacityBond` registry, the
+//! `OriginAssignment` seats, the `ContentBlacklist` deny index and
 //! the live payment pools) is re-read by its own `refresh::run_refresh_loop`.
 //! This module holds what those loops share: the per-call timeout (`timed`),
 //! the boot retry ([`boot_retry`]) and the pinned snapshot block
@@ -38,7 +38,7 @@ pub(crate) const DEFAULT_RPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`DEFAULT_RPC_CALL_TIMEOUT`].
 ///
 /// **Every** chain read on a refresh loop's path routes through here: the
-/// snapshot block read, the registry, slash, origin-seat and blacklist
+/// snapshot block read, the registry, origin-seat and blacklist
 /// snapshots, the pool refresh and the redeemer's reads. A *new* read that does
 /// not wrap itself here reintroduces the wedge this exists to prevent: the
 /// alloy HTTP provider has no request timeout, so a provider that holds the

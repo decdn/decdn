@@ -18,10 +18,10 @@ pub static ORIGIN: LazyLock<PrivateKeySigner> = LazyLock::new(|| {
 /// The namespace [`ORIGIN`] holds its seat in.
 pub const NAMESPACE: U256 = U256::from_limbs([1, 0, 0, 0]);
 
-/// The `SlashJudge` domain the fixtures sign under.
+/// The `CapacityBond` domain the fixtures sign under.
 #[must_use]
 pub fn domain() -> Eip712Domain {
-    decdn_incentive::slash_judge_domain(
+    decdn_incentive::capacity_bond_domain(
         421_614,
         address!("0000000000000000000000000000000000001234"),
     )

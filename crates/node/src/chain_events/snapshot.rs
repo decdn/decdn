@@ -3,7 +3,7 @@
 //! An enumeration that pages a swap-and-pop set must read every page and the
 //! count it checks them against at one block, or a removal between two reads
 //! can move an unread element into a read slot. `snapshot_block` picks that
-//! block for the registry, slash and origin-seat snapshots.
+//! block for the registry and origin-seat snapshots.
 
 use alloy::eips::BlockId;
 use alloy::primitives::Address;

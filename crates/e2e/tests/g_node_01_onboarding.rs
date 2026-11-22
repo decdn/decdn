@@ -33,8 +33,8 @@
 //! The real constraints are external and already exist. An unregistered
 //! operator never called `declareMbps`, so `DecdnGovernor._getVotes` caps every
 //! epoch's credited bytes at `declaredMbpsAtEpoch × …` = 0 and it accrues no
-//! vote weight; and a peer choosing an upstream should not pull from a node it
-//! cannot slash. See ADR 019 §Phase 4.
+//! vote weight; and a peer choosing an upstream pulls only from a node in the
+//! active set. See ADR 019 §Phase 4.
 //!
 //! # A correction to the issue text
 //!
@@ -272,7 +272,7 @@ async fn run_journey() -> anyhow::Result<()> {
         "registerNode must have been submitted: {summary}"
     );
     // The registration must bind the key this daemon is ACTUALLY serving under.
-    // A `setup` that registered some other id would leave the node unslashable
+    // A `setup` that registered some other id would leave the node unroutable
     // and — since #1030 — permanently unable to sell, so this is the one field
     // worth cross-checking against the live process rather than against config.
     let live_node_id = node.current_node_id().await?;
@@ -500,9 +500,9 @@ async fn run_under_bonded() -> anyhow::Result<()> {
 /// #1030's second negative: one node id, one owner, forever.
 ///
 /// An impostor that could re-register someone else's `NodeId` under its own
-/// address would redirect that identity's slashability — `SlashJudge` resolves
-/// an accused node through the binding — so the victim's bond would stop
-/// covering their traffic.
+/// address would redirect that identity — peers and clients resolve a serving
+/// node to its operator through the binding — so the victim's signed responses
+/// would be attributed to the impostor.
 ///
 /// The impostor is bonded to `minBond` FIRST, deliberately.
 /// `_checkRegistrationPreconditions` runs before `_checkBindingOneToOne`, so an

@@ -40,11 +40,10 @@ DECDN_SUMS_SHA256="{{DECDN_SUMS_SHA256}}"
 
 # The chains and contracts a download runs against: the governance chain,
 # where decdn finds nodes and checks their signatures, and the payment chain
-# of the pool that pays them. SLASH_JUDGE is empty when the onramp names none.
+# of the pool that pays them.
 GOVERNANCE_CHAIN_ID="{{GOVERNANCE_CHAIN_ID}}"
 GOVERNANCE_RPC_URL="{{GOVERNANCE_RPC_URL}}"
 CAPACITY_BOND="{{CAPACITY_BOND}}"
-SLASH_JUDGE="{{SLASH_JUDGE}}"
 POOL_CHAIN_ID="{{POOL_CHAIN_ID}}"
 POOL_RPC_URL="{{POOL_RPC_URL}}"
 PAYMENT_POOL="{{PAYMENT_POOL}}"
@@ -357,8 +356,7 @@ get() {
     --governance-chain-id "$GOVERNANCE_CHAIN_ID" \
     --capacity-bond-address "$CAPACITY_BOND" \
     --pool "eip155:${POOL_CHAIN_ID}:${PAYMENT_POOL}" \
-    --pool-rpc-url "$POOL_RPC_URL" \
-    ${SLASH_JUDGE:+--slash-judge-address "$SLASH_JUDGE"}
+    --pool-rpc-url "$POOL_RPC_URL"
 
   umask "$user_umask"
   status=0

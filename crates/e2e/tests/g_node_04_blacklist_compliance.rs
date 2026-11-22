@@ -9,9 +9,6 @@
 //!   `was_present` true→false), then refuses paid delivery `Declined` *for the
 //!   blacklist reason* (its `chain_hash_denied` counter), and refuses a
 //!   voucher-less discovery open. Eviction is durable across a daemon restart.
-//!   Finally, a signed post-entry `StreamResponse { ok: true }` for `H` is
-//!   driven through the `SlashJudge` commit-reveal to prove
-//!   serving-after-blacklist is slashable.
 //! - **Regional scope (`regional_blacklist_scope`, ties GOV-05):** a US and a DE
 //!   node both hold `H2`; a US-regional entry is evicted by the US node and
 //!   ignored by the DE node. A global sentinel blob (held only by DE, blacklisted
@@ -28,24 +25,18 @@
 //!   node's governance deny, so the refusal *reason* moves from `chain_hash_denied`
 //!   to the sticky eviction — but the wire code stays `Declined`, the blob stays
 //!   evicted, and a discovery open is still refused. Content un-eviction is not a
-//!   watcher action (eviction is durable and one-way, `evicted.log`); appeal
-//!   restitution is financial, through `SlashAppeal` (ADR 028).
+//!   watcher action (eviction is durable and one-way, `evicted.log`).
 //! - **Open-stream interplay (`takedown_evicts_a_blob_pinned_by_an_open_stream`):**
 //!   a discovery open pins `H` for the life of its stream (the node answers
 //!   `ok`), then governance blacklists `H`; the watcher evicts it anyway. The
 //!   pin is LRU-exemption only — a governance takedown always wins (ADR 040
 //!   §Pinning).
 //!
-//! **Coverage.** The journey exercises all three serving seams end-to-end
+//! **Coverage.** The journey exercises both node-side serving seams end-to-end
 //! against the daemon — delivery refusal (`Declined`, pinned to the governance
-//! deny by the node's per-reason counter), the
-//! discovery open (a signed refusal), and on-chain slashability. DHT
-//! announce-suppression stays delegated to `crates/node/src/dht/publish.rs`
-//! unit tests (its `refuses` gate). `SlashJudge` enforces slashability from
-//! an entry's `effectiveAt` (`addedAt + complianceWindow`, ADR 011 § Compliance
-//! Window, #1169), so the slash drive advances chain time past that window
-//! before stamping evidence — the node's *reaction* budget is now an on-chain
-//! grace, not just a prose target.
+//! deny by the node's per-reason counter) and the discovery open (a signed
+//! refusal). DHT announce-suppression stays delegated to
+//! `crates/node/src/dht/publish.rs` unit tests (its `refuses` gate).
 
 #![cfg(feature = "anvil-e2e")]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace
@@ -60,8 +51,7 @@
 
 use std::time::Duration;
 
-use alloy::primitives::{B256, U256};
-use alloy::signers::local::PrivateKeySigner;
+use alloy::primitives::B256;
 use anyhow::Context;
 use decdn_cache::Hash;
 use decdn_common::admin::{AdminRpcClient, EvictRequest};
@@ -189,10 +179,6 @@ async fn run_global() -> anyhow::Result<()> {
     );
     assert_refused_as_blacklisted(&chain, &node, hash).await?;
 
-    // Full signed-evidence drive: serving H after the entry is on-chain
-    // slashable via SlashJudge.
-    drive_blacklist_slash(&chain, &node, hash).await?;
-
     Ok(())
 }
 
@@ -305,8 +291,7 @@ async fn declined_counters(node: &NodeFixture) -> anyhow::Result<String> {
 /// governance deny but not the eviction: the refusal stays `Declined` but its
 /// reason moves to the sticky eviction, the blob stays evicted, and the
 /// node still refuses a discovery open. Content un-eviction is never a watcher
-/// action — `evicted.log` is durable and one-way, and appeal restitution is
-/// financial (`SlashAppeal`, ADR 028), not a re-serve.
+/// action — `evicted.log` is durable and one-way.
 async fn run_removal_reversal() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -621,35 +606,6 @@ async fn evict_was_present(admin: &HttpClient, hash: Hash) -> anyhow::Result<boo
         .await
         .context("admin evict dry-run")?;
     Ok(resp.was_present)
-}
-
-/// Drive a signed post-entry `StreamResponse { ok: true }` for `hash` through
-/// `SlashJudge.submitBlacklistChallenge` (commit-reveal + challenge bond),
-/// asserting the slash lands. Proves serving a blacklisted hash is slashable.
-///
-/// ADR 011 § Compliance Window: the entry is not slashable until
-/// `effectiveAt = addedAt + complianceWindow`, so the fixture steps chain time
-/// past it before stamping evidence. Without that the challenge reverts with
-/// `BlacklistAfterResponse` — the correct behaviour (#1169), so the drive
-/// respects it rather than routing around it.
-async fn drive_blacklist_slash(
-    chain: &ChainFixture,
-    node: &NodeFixture,
-    hash: Hash,
-) -> anyhow::Result<()> {
-    let challenger = PrivateKeySigner::random();
-    let node_id = B256::from_slice(node.node_id().as_bytes());
-    let slash_id = chain
-        .slash_operator_via_judge(&challenger, node.operator(), node_id, to_b256(hash))
-        .await
-        .context("serving a blacklisted hash must be slashable")?;
-    let (operator, _slashed_at, amount) = chain.slash_record(slash_id).await?;
-    anyhow::ensure!(
-        operator == node.operator_addr(),
-        "the slash record must name the serving operator, got {operator}"
-    );
-    anyhow::ensure!(amount > U256::ZERO, "the slash must take a non-zero amount");
-    Ok(())
 }
 
 fn to_b256(hash: Hash) -> B256 {

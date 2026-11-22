@@ -12,8 +12,8 @@ import { ERC20Permit } from "@openzeppelin/contracts/token/ERC20/extensions/ERC2
 ///         `Ownable` authority, and no upgrade hook.
 /// @dev    Composition per ADR 016 § Contract Inventory:
 ///           - `ERC20` + `ERC20Burnable`: base + `burn` / `burnFrom`,
-///             consumed by the slashing path's 50% burn leg
-///             (ADR 026 § Slashing and burn).
+///             consumed by `BuybackBurner`'s burn of the bought-back TOKEN
+///             (ADR 026 § FeeRouter split).
 ///           - `ERC20Permit`: EIP-2612 gasless approvals
 ///             (ADR 016 § Contract Inventory). Available to holders; no
 ///             protocol contract consumes it today — `CapacityBond.bond`

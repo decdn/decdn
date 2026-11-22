@@ -20,7 +20,7 @@ use decdn_client::endpoint as client_endpoint;
 use decdn_common::admin::{
     AdminRpcClient, BindingStatus, BuyerPoolsResponse, DrainRequest, DrainResponse, EarningsPeriod,
     EarningsRequest, EarningsResponse, EvictRequest, EvictResponse, HealthResponse, LaneSnapshot,
-    LanesResponse, PendingRedeem, ReloadResponse, SlashesResponse, StatusResponse,
+    LanesResponse, PendingRedeem, ReloadResponse, StatusResponse,
 };
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
@@ -72,7 +72,6 @@ pub async fn node_dispatch(
         cli::NodeCommand::ReceiveSweeps(r) => {
             crate::commands::sweep::receive_sweeps(r, global_config).await
         }
-        cli::NodeCommand::Slashes(s) => slashes(s, global_config).await,
         cli::NodeCommand::Pools(p) => pools(p, global_config).await,
         cli::NodeCommand::Evict(e) => evict(e, global_config).await,
         cli::NodeCommand::Reload(r) => reload(r, global_config).await,
@@ -139,7 +138,7 @@ fn write_health(w: &mut impl io::Write, resp: &HealthResponse) -> io::Result<()>
     writeln!(w, "uptime_s={}", resp.uptime_s)?;
     // Always printed, including `unknown`. An absent line would read as "fine"
     // to a script grepping for a problem, and `unknown` means the opposite:
-    // the node's slashability was never verified (#1034).
+    // the node's binding was never verified (#1034).
     writeln!(w, "binding={}", binding_label(resp.binding))?;
     // Only meaningful when there IS a binding; on a mismatch this names the
     // key to restore, which is the whole reason the field is carried.
@@ -149,8 +148,8 @@ fn write_health(w: &mut impl io::Write, resp: &HealthResponse) -> io::Result<()>
     // Always printed (#1030). `false` is the answer to "the node is up and
     // healthy, why is it earning nothing": it is absent from the on-chain
     // registry, so it accrues no governance weight (its declared capacity caps
-    // credited bytes at zero) and peers have no reason to route to a node they
-    // cannot slash. Nothing on the wire says so — the node simply gets no
+    // credited bytes at zero) and peers route only to nodes in the active set.
+    // Nothing on the wire says so — the node simply gets no
     // requests — which is exactly why this line exists.
     writeln!(w, "registry_active={}", resp.registry_active)?;
     Ok(())
@@ -1003,42 +1002,6 @@ pub(crate) fn format_usdc(micro: u64) -> String {
     format!("{whole}.{frac:06}")
 }
 
-/// `decdn node slashes`: call `admin_v1_slashes` on the running node and
-/// print every detected slash against its operator (#1032). Plain text by
-/// default (a summary line + a per-slash table), or pretty JSON with
-/// `--json`.
-pub async fn slashes(args: &cli::SlashesArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
-
-    let parsed: SlashesResponse = client
-        .slashes()
-        .await
-        .map_err(|err| classify_client_error(&url, args.timeout_ms, err))?;
-
-    if args.json {
-        let pretty =
-            serde_json::to_string_pretty(&parsed).context("failed to encode slashes as JSON")?;
-        println!("{pretty}");
-    } else {
-        let mut stdout = io::stdout().lock();
-        write_slashes_table(&mut stdout, &parsed).context("failed to write slashes table")?;
-    }
-
-    Ok(())
-}
-
 /// `decdn node pools`: call `admin_v1_pools` on the running node and print its
 /// buyer-side `PaymentPool` state — the pools it pays upstream providers from.
 ///
@@ -1080,36 +1043,6 @@ pub async fn pools(args: &cli::PoolsArgs, global_config: Option<&Path>) -> anyho
             .context("failed to write pools table")?;
     }
 
-    Ok(())
-}
-
-/// Write the slash table to `w`. Pure function (takes `&mut impl
-/// Write`) so the formatting is unit-testable without an HTTP hop,
-/// mirroring [`write_lanes_table`]. A summary line carries the count as a
-/// stable `key=value` token; the per-slash table follows.
-fn write_slashes_table(w: &mut impl io::Write, resp: &SlashesResponse) -> io::Result<()> {
-    writeln!(w, "slashes={}", resp.slashes.len())?;
-    if resp.slashes.is_empty() {
-        return writeln!(w, "(no slashes detected)");
-    }
-    writeln!(
-        w,
-        "{:<20} {:>6} {:>14} {:>10} APPEAL_CLOSE",
-        "SLASH_ID", "TYPE", "AMOUNT", "EVIDENCE",
-    )?;
-    for s in &resp.slashes {
-        let close = s
-            .appeal_window_close
-            .map_or_else(|| "?".to_string(), |c| c.to_string());
-        writeln!(
-            w,
-            "{:<20} {:>6} {:>14} {:>10} {close}",
-            s.slash_id,
-            s.offense_type,
-            s.amount,
-            short_node_id(&s.evidence_hash),
-        )?;
-    }
     Ok(())
 }
 
@@ -1644,7 +1577,7 @@ fn lookup_sentinel() -> [u8; 32] {
 /// Open each of `candidates` over `cdn/client/v1` for a fixed sentinel hash
 /// and sort ascending by the connection's path RTT ([`rank_by_open`]). The
 /// endpoint is discovery-enabled, as `decdn get`'s is. The answers verify
-/// against `--slash-judge-address`, else `blockchain.slash_judge_address`.
+/// under the resolved `CapacityBond` domain.
 async fn open_and_rank(
     candidates: Vec<NodeCandidate>,
     args: &cli::LookupArgs,
@@ -1654,27 +1587,10 @@ async fn open_and_rank(
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let file = decdn_common::config::load_file_config(config_path)?;
-    let slash_judge_raw = args
-        .slash_judge_address
-        .clone()
-        .or_else(|| {
-            file.blockchain
-                .as_ref()
-                .and_then(|b| b.slash_judge_address.clone())
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "--probe verifies each answer: slash_judge_address not set (pass \
-                 --slash-judge-address or set blockchain.slash_judge_address)"
-            )
-        })?;
-    let slash_judge = chain_ctx::parse_nonzero_address(&slash_judge_raw, "slash_judge_address")?;
     let governance = decdn_client::session::GovernanceChain {
         rpc_url: resolved.rpc_url.clone(),
         chain_id: resolved.chain_id,
-        slash_judge,
-        capacity_bond: Some(resolved.capacity_bond_address),
+        capacity_bond: resolved.capacity_bond_address,
     };
     let relays = client_endpoint::resolve_relays(None, config_path)?;
     let discovery_cfg = client_endpoint::client_discovery(config_path)?;
@@ -1707,8 +1623,8 @@ async fn open_and_rank(
 /// Either answer is signed, so the lookup needs no keystore, no buyer store
 /// and no `PaymentPool`. The key still signs the identity binding under
 /// `governance`'s `CapacityBond`, as every open carries one. Each answer must
-/// verify against the candidate's registry address under `governance`'s
-/// `SlashJudge`. A candidate that cannot be reached
+/// verify against the candidate's registry address under the same
+/// `CapacityBond` domain. A candidate that cannot be reached
 /// (offline, no route, timeout), or whose answer does not verify, is kept at
 /// the end with `rtt_ms: None` and a warning on stderr rather than dropped
 /// or failing the whole lookup — the point of `--probe` is to rank the
@@ -1747,7 +1663,7 @@ async fn rank_by_open(
     )
     .await?;
     let slash_dom =
-        decdn_incentive::slash_judge_domain(governance.chain_id, governance.slash_judge);
+        decdn_incentive::capacity_bond_domain(governance.chain_id, governance.capacity_bond);
     let hash = lookup_sentinel();
     let mut rows = Vec::with_capacity(candidates.len());
     for c in candidates {

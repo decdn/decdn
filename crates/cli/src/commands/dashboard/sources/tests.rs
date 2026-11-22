@@ -205,7 +205,6 @@ fn call<T>(code: i32) -> Result<T, JsonRpcClientError> {
 #[test]
 fn a_missing_feature_is_unconfigured_not_an_error() {
     for code in [
-        SLASH_DETECTION_UNAVAILABLE_CODE,
         BUYER_POOL_UNAVAILABLE_CODE,
         EARNINGS_UNAVAILABLE_CODE,
         DHT_UNAVAILABLE_CODE,

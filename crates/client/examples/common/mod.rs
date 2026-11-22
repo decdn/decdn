@@ -26,9 +26,7 @@ use decdn_client::{
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
 use decdn_incentive::eth_identity::load_signer;
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{
-    BuyerPoolState, BuyerPoolStore, Deployment, LaneKey, bind_node_id_domain, slash_judge_domain,
-};
+use decdn_incentive::{BuyerPoolState, BuyerPoolStore, Deployment, LaneKey, capacity_bond_domain};
 use decdn_protocol::Coverage;
 use iroh::{Endpoint, EndpointAddr};
 
@@ -51,7 +49,6 @@ pub(crate) struct Env {
     rpc_url: String,
     chain_id: u64,
     payment_pool: Address,
-    slash_judge: Address,
     capacity_bond: Address,
     keystore: PathBuf,
     keystore_password: String,
@@ -61,7 +58,7 @@ pub(crate) struct Env {
 
 impl Env {
     /// Read `DECDN_RPC_URL`, `DECDN_CHAIN_ID`, `DECDN_PAYMENT_POOL`,
-    /// `DECDN_SLASH_JUDGE`, `DECDN_CAPACITY_BOND`, `DECDN_KEYSTORE`,
+    /// `DECDN_CAPACITY_BOND`, `DECDN_KEYSTORE`,
     /// `DECDN_KEYSTORE_PASSWORD`, `DECDN_DATA_DIR`, and `DECDN_DEPOSIT` (the pool
     /// deposit in USDC base units, used only when no pool exists yet).
     pub(crate) fn from_env() -> Result<Self> {
@@ -72,7 +69,6 @@ impl Env {
             rpc_url: var("DECDN_RPC_URL")?,
             chain_id: var("DECDN_CHAIN_ID")?.parse()?,
             payment_pool: var("DECDN_PAYMENT_POOL")?.parse()?,
-            slash_judge: var("DECDN_SLASH_JUDGE")?.parse()?,
             capacity_bond: var("DECDN_CAPACITY_BOND")?.parse()?,
             keystore: var("DECDN_KEYSTORE")?.into(),
             keystore_password: var("DECDN_KEYSTORE_PASSWORD")?,
@@ -108,8 +104,10 @@ impl Buyer {
             payment_pool: env.payment_pool,
         };
         let voucher_domain = deployment.voucher_domain();
-        let slash_domain = slash_judge_domain(env.chain_id, env.slash_judge);
-        let bind_domain = bind_node_id_domain(env.chain_id, env.capacity_bond);
+        // Stream responses and the identity binding share the `CapacityBond`
+        // domain.
+        let slash_domain = capacity_bond_domain(env.chain_id, env.capacity_bond);
+        let bind_domain = slash_domain.clone();
 
         // The store is the buyer's only record of its pool and of what each lane
         // has paid. Keep it for the life of the pool.
@@ -165,7 +163,7 @@ impl Buyer {
     /// that names the buyer's pool and asks no pull-through: a holder answers
     /// its signed quote, its proven size and its coverage, and a node that
     /// misses answers `NotFound` at once. Every answer is verified before it
-    /// counts (ADR 014 §1); one that does not verify is dropped. Each stream
+    /// counts (ADR 005 § Signer binding); one that does not verify is dropped. Each stream
     /// is cancelled once it has answered, so nothing is paid here.
     pub(crate) async fn holders(
         &self,
@@ -188,8 +186,7 @@ impl Buyer {
         let governance = GovernanceChain {
             rpc_url: self.env.rpc_url.clone(),
             chain_id: self.env.chain_id,
-            slash_judge: self.env.slash_judge,
-            capacity_bond: Some(self.env.capacity_bond),
+            capacity_bond: self.env.capacity_bond,
         };
         let deployment = Deployment {
             chain_id: self.env.chain_id,

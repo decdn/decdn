@@ -1,5 +1,4 @@
 use super::*;
-use decdn_common::admin::SlashRecordDto;
 
 fn health_response(binding: BindingStatus, bound: Option<&str>) -> HealthResponse {
     health_response_with_registry(binding, bound, true)
@@ -55,7 +54,7 @@ fn health_keeps_node_id_and_uptime_lines() {
     assert!(s.contains("uptime_s=42"), "{s}");
 }
 
-/// A mismatch is the unslashable state, and the bound id is what the
+/// A mismatch is the unroutable state, and the bound id is what the
 /// operator needs to act on it — printing the status without the id would
 /// report a problem and withhold the fix.
 #[test]
@@ -705,57 +704,6 @@ fn short_pool_keeps_the_chain_and_a_short_address() {
         "84532:0xb0b0b0b0b0…"
     );
     assert_eq!(short_pool("garbage"), "garbage");
-}
-
-#[test]
-fn write_slashes_table_empty_emits_sentinel() -> anyhow::Result<()> {
-    let resp = SlashesResponse {
-        slashes: Vec::new(),
-    };
-    let mut buf = Vec::<u8>::new();
-    write_slashes_table(&mut buf, &resp)?;
-    let s = String::from_utf8(buf)?;
-    assert!(s.contains("slashes=0"), "{s}");
-    assert!(s.contains("(no slashes detected)"), "{s}");
-    // No table header when there are no rows.
-    assert!(!s.contains("SLASH_ID"), "header must be omitted: {s}");
-    Ok(())
-}
-
-#[test]
-fn write_slashes_table_renders_header_and_rows() -> anyhow::Result<()> {
-    let resp = SlashesResponse {
-        slashes: vec![
-            SlashRecordDto {
-                slash_id: "42".to_string(),
-                offense_type: 0,
-                amount: "1_000_000".to_string(),
-                evidence_hash: format!("0x{}", "a".repeat(64)),
-                appeal_window_close: Some(1_700_000_000),
-            },
-            SlashRecordDto {
-                slash_id: "43".to_string(),
-                offense_type: 0,
-                amount: "2_500_000".to_string(),
-                evidence_hash: format!("0x{}", "c".repeat(64)),
-                appeal_window_close: None,
-            },
-        ],
-    };
-    let mut buf = Vec::<u8>::new();
-    write_slashes_table(&mut buf, &resp)?;
-    let s = String::from_utf8(buf)?;
-    assert!(s.contains("slashes=2"), "{s}");
-    assert!(s.contains("SLASH_ID"), "header missing: {s}");
-    assert!(s.contains("APPEAL_CLOSE"), "header missing: {s}");
-    // First row: slash id, offense type, amount, evidence preview.
-    assert!(s.contains("42"), "slash id missing: {s}");
-    assert!(s.contains("1_000_000"), "amount missing: {s}");
-    assert!(s.contains("1700000000"), "appeal close missing: {s}");
-    assert!(s.contains("0xaaaaaaaaaa"), "evidence preview missing: {s}");
-    // Second row: a missing appeal close renders as "?".
-    assert!(s.contains('?'), "missing-value sentinel missing: {s}");
-    Ok(())
 }
 
 /// The SIGNER column: a delegated lane renders the delegate, not the
@@ -1589,11 +1537,10 @@ async fn lookup_ranking_needs_no_keystore() {
         // Nothing reads the chain: a dead RPC proves it.
         rpc_url: "http://127.0.0.1:1".to_owned(),
         chain_id: 31_337,
-        slash_judge: Address::repeat_byte(0x02),
-        capacity_bond: Some(Address::repeat_byte(0x03)),
+        capacity_bond: Address::repeat_byte(0x03),
     };
     let operator = alloy::signers::local::PrivateKeySigner::random();
-    let domain = decdn_incentive::slash_judge_domain(chain.chain_id, chain.slash_judge);
+    let domain = decdn_incentive::capacity_bond_domain(chain.chain_id, chain.capacity_bond);
     let (node, opens) = not_found_node(operator.clone(), domain).await;
     let socket = node
         .bound_sockets()

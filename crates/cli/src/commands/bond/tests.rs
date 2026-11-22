@@ -162,6 +162,19 @@ fn resume_hint_names_the_latest_step_that_may_have_taken_effect() {
     );
 }
 
+/// A `None` slot also covers a send whose broadcast is unknown, so the hint
+/// with no recorded tx still warns that a bond may be out, and that a re-run
+/// would double it.
+#[test]
+fn resume_hint_with_no_recorded_tx_covers_an_unknown_broadcast() {
+    let hint = resume_hint(&Outcome::default());
+    assert!(hint.contains("a send's outcome is unknown"), "{hint}");
+    assert!(hint.contains("a bond may have been broadcast"), "{hint}");
+    assert!(hint.contains("pending and mined transactions"), "{hint}");
+    assert!(hint.contains("`activeBond`"), "{hint}");
+    assert!(hint.contains("doubles the top-up"), "{hint}");
+}
+
 /// #1355 review — the property, not a denylist of last release's phrasing.
 ///
 /// `chain_ctx::send` sets its `landed` slot BEFORE awaiting the receipt, so

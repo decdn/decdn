@@ -1,6 +1,6 @@
 # deCDN Contracts
 
-The on-chain surface of deCDN: operator bonding, per-megabyte USDC settlement, served-bytes-weighted governance, and the slashing/appeals machinery. Built with [Foundry](https://book.getfoundry.sh). Dual-currency by design — **USDC** for payments, **TOKEN** for operator bonds. Vote weight comes from served bytes, not from TOKEN balances ([ADR 036](../adr/036-served-bytes-voting-weight.md)).
+The on-chain surface of deCDN: operator bonding, per-megabyte USDC settlement, served-bytes-weighted governance, and the content blacklist. Built with [Foundry](https://book.getfoundry.sh). Dual-currency by design — **USDC** for payments, **TOKEN** for operator bonds. Vote weight comes from served bytes, not from TOKEN balances ([ADR 036](../adr/036-served-bytes-voting-weight.md)).
 
 This is a standalone Foundry project at the repo root, **excluded from the Cargo workspace**. The ADRs in [`../adr/`](../adr/) are the source of truth for every protocol and economic claim; [ADR 016](../adr/016-contract-interactions.md) is the contract-interaction overview and inventory.
 
@@ -11,12 +11,10 @@ Deployable contracts in [`src/`](src/). `PaymentPool` runs on each payment chain
 | Contract | Purpose | ADR |
 |----------|---------|-----|
 | `Token` | Fixed-supply (1B) ERC20 with permit + burn; no mint post-genesis | [026](../adr/026-tokenomics.md) |
-| `CapacityBond` | Operator registry; custodies the TOKEN bond, executes escrow-on-slash, supplies the active flag and declared capacity `FeeRouter` credits against | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
+| `CapacityBond` | Operator registry; custodies the TOKEN bond (released in one `unbond` call), supplies the active flag and declared capacity `FeeRouter` credits against | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
 | `FeeRouter` | Permissionless `deposit` of each sweep: rebate / buyback / treasury split and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
 | `CctpSweepReceiver` | Stateless CCTP V2 bridge adapter: receives a sweep and deposits each operator's share into `FeeRouter` | [016](../adr/016-contract-interactions.md#bridge-adapters) |
 | `PaymentPool` | Payment-chain USDC pool with off-chain vouchers and on-chain redemption; pays `operatorBps` at redemption and sweeps the rest over CCTP, up to 32 operators per transfer. Built on the bridge-neutral `PaymentPoolBase` | [003](../adr/003-payments.md) |
-| `SlashJudge` | On-chain adjudicator for signature-dependent slashable offenses; verifies the EIP-712 slash signature through a commit–reveal challenge | [014](../adr/014-on-chain-verification.md) |
-| `SlashAppeal` | Slash-appeal state machine (open → ratify/reverse) holding a per-appeal TOKEN bond | [028](../adr/028-slashing-appeals.md) |
 | `OriginAssignment` | Namespace origin sets: a vetted publisher seats and unseats bonded operators as origins for its namespaces | [011](../adr/011-content-takedown.md) |
 | `ManualVettingPolicy` | Genesis vetting policy: a `VETTER_ROLE` holder approves which publishers may seat origins | [011](../adr/011-content-takedown.md#vetting-policies) |
 | `OpenVettingPolicy` | Vetting policy that vets every publisher; for local and test deployments only | [011](../adr/011-content-takedown.md#vetting-policies) |
@@ -28,10 +26,9 @@ Deployable contracts in [`src/`](src/). `PaymentPool` runs on each payment chain
 
 Libraries:
 
-- `BondMath` — pure arithmetic for the ADR 026 capacity-bond curve and tier-based slash reduction.
-- `SlashEscrowLib` — shared slash-escrow lifecycle types (status enum + record struct).
+- `BondMath` — pure arithmetic for the ADR 026 capacity-bond curve.
 - `RegionScopeLib` — region string packing and the ADR 030 region-stability scope test,
-  inlined into `SlashJudge` and `ContentBlacklist`.
+  inlined into `ContentBlacklist`.
 - `DeclaredMbpsHistoryLib` — per-operator `declaredMbps` checkpoint history for
   `CapacityBond`, read back per epoch for the ADR 036 vote-weight cap.
 
@@ -39,7 +36,7 @@ Libraries:
 
 ```
 contracts/
-  src/            — contracts (PaymentPoolBase and the buyback bases abstract) + 4 libraries
+  src/            — contracts (PaymentPoolBase and the buyback bases abstract) + 3 libraries
     interfaces/   — frozen external surfaces (I*.sol), including the CCTP V2 calls
   test/           — Foundry suite (*.t.sol + mocks/ + ed25519-vectors/)
   testnet/        — TestnetFaucet and LoopbackCctp (same-chain CCTP for local deploys)

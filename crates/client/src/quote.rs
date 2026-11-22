@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use alloy::primitives::{Address, U256};
+use decdn_incentive::capacity_bond_domain;
 use decdn_incentive::rate::min_payment;
-use decdn_incentive::slash_judge_domain;
 use futures_util::StreamExt as _;
 use iroh::{EndpointAddr, PublicKey, RelayUrl};
 
@@ -259,8 +259,8 @@ pub async fn census_nodes(
 /// node that misses answers a signed `NotFound` at once. The census cancels
 /// every stream once it has answered, so it pays nothing. `namespace_id` is
 /// the routing hint each open carries. Every answer is verified against its
-/// operator's address under `chain`'s `SlashJudge` before it counts (ADR 014
-/// §1), and every verified answer is recorded in `site`'s peer store, so a
+/// operator's address under `chain`'s `CapacityBond` domain before it counts
+/// (ADR 005 § Signer binding), and every verified answer is recorded in `site`'s peer store, so a
 /// pull that follows ranks on fresh RTTs.
 ///
 /// # Errors
@@ -279,7 +279,7 @@ pub async fn census(
         outage_fallback,
     } = nodes;
     let outage_fallback = *outage_fallback;
-    let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
+    let slash_dom = capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
     // The whole blob, with no rate ceiling: the census keeps every answer,
     // and `serve_order` applies the ceiling the pull would.
     let spec = OpenSpec {

@@ -77,7 +77,8 @@ pub struct ClientFetchArgs {
 
     /// The delivering node's Ethereum address (0x-prefixed hex). The caller's
     /// pool lane for this provider is opened/reused against it, and the
-    /// response `slash_sig` must recover to it (ADR 014 §1); a mismatch aborts
+    /// response `slash_sig` must recover to it (ADR 005 § Signer binding); a
+    /// mismatch aborts
     /// the pull. Omit it when auto-discovering (no `--node-id`): it is derived
     /// from the selected node's registry entry.
     ///
@@ -87,7 +88,7 @@ pub struct ClientFetchArgs {
     pub provider_address: Option<String>,
 
     /// The governance chain: its RPC endpoint (registry reads) and chain id
-    /// (the slash and stream signature domains).
+    /// (the stream signature domain).
     #[command(flatten)]
     pub governance: super::common::GovernanceChainArgs,
 
@@ -96,14 +97,10 @@ pub struct ClientFetchArgs {
     #[command(flatten)]
     pub payment: super::common::PoolSelectArgs,
 
-    /// `SlashJudge` contract address (0x hex) — the `slash_sig` EIP-712
-    /// `verifyingContract`. Overrides `blockchain.slash_judge_address`.
-    #[arg(long, value_name = "0xADDR")]
-    pub slash_judge_address: Option<String>,
-
-    /// `CapacityBond` contract address (0x hex) — the active-node registry read
-    /// when auto-discovering (no `--node-id`). Overrides
-    /// `blockchain.capacity_bond_address`. Unused on the explicit-node path.
+    /// `CapacityBond` contract address (0x hex) — the `slash_sig` EIP-712
+    /// `verifyingContract`, and the active-node registry read when
+    /// auto-discovering (no `--node-id`). Overrides
+    /// `blockchain.capacity_bond_address`.
     #[arg(long, value_name = "0xADDR")]
     pub capacity_bond_address: Option<String>,
 

@@ -1,19 +1,17 @@
 //! Bound on the requester-generated `timestamp_us` a handler accepts.
 //!
 //! The signed response body ([`decdn_protocol::client::StreamResponseBody`])
-//! echoes the request's `timestamp_us` into the EIP-712 slash-evidence set
-//! (ADR 014 §1), and `SlashJudge` reads that field as the serve time: it
-//! pairs evidence inside a window keyed on it, applies blacklist
-//! effective-time comparisons to it, and rejects evidence stamped more than 60 seconds ahead of block time. A node
-//! that signs whatever timestamp a requester chose therefore attests to a
-//! serve time of the requester's choosing. The client handler refuses a skewed
-//! request before anything is signed, so every `slash_sig` this node emits
-//! carries a timestamp consistent with its clock at admission. A long serve
-//! only ages the admitted timestamp: the window tiers and the closing response
-//! sign it later, and signing never checks the bound again. ADR 005's RTT
-//! computation (`receive_time - timestamp_us`) makes `timestamp_us` a fresh
-//! wall-clock read on the requester, so an honest requester only trips the
-//! bound with a misconfigured clock. The refusal carries
+//! echoes the request's `timestamp_us` into the EIP-712 signed set (ADR 005
+//! § Signer binding). Other parties read that signed timestamp, and a pull
+//! receipt carries it as the approximate time of each serve. A node that signs
+//! whatever timestamp a requester chose therefore attests to a serve time of
+//! the requester's choosing. The client handler refuses a skewed request
+//! before anything is signed, so every `slash_sig` this node emits carries a
+//! timestamp consistent with its clock at admission. A long serve only ages
+//! the admitted timestamp: the window tiers and the closing response sign it
+//! later, and signing never checks the bound again. An honest requester stamps
+//! the request from its own wall clock, so it only trips the bound with a
+//! misconfigured clock. The refusal carries
 //! [`decdn_protocol::APP_ERR_TIMESTAMP_SKEW`] so the requester's own tooling
 //! names the clock, and the throttled `warn!` at each refusal site tells this
 //! node's operator. That includes the case where this node's clock is the
@@ -24,24 +22,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::warn_throttle::WarnThrottle;
 
 /// Largest accepted difference, in microseconds, between a request's
-/// `timestamp_us` and this node's clock: 30 seconds either way.
-///
-/// Half of `SlashJudge`'s 60-second future-timestamp bound
-/// (`MAX_FUTURE_SKEW_US` in `contracts/src/SlashJudge.sol`). While this node's
-/// clock runs less than 30 seconds ahead of chain time, every timestamp it
-/// admits stays inside that bound, so its signed evidence never reverts
-/// `EvidenceInFuture`. Wide enough that NTP-disciplined clocks never come
-/// close.
+/// `timestamp_us` and this node's clock: 30 seconds either way. Wide enough
+/// that NTP-disciplined clocks never come close.
 pub const MAX_REQUEST_TIMESTAMP_SKEW_US: u64 = 30_000_000;
-
-/// `SlashJudge`'s `MAX_FUTURE_SKEW_US`: the furthest ahead of block time a
-/// signed evidence timestamp may sit.
-const SLASH_JUDGE_MAX_FUTURE_SKEW_US: u64 = 60_000_000;
-
-// An admitted timestamp sits at most the bound ahead of this node's clock.
-// Twice the bound leaves the other half of the judge's allowance for this
-// node's clock to run ahead of chain time.
-const _: () = assert!(2 * MAX_REQUEST_TIMESTAMP_SKEW_US <= SLASH_JUDGE_MAX_FUTURE_SKEW_US);
 
 /// Throttle for the pre-epoch clock `warn!`. [`now_us`] runs once per inbound
 /// request, so an unthrottled line would repeat for every request.
@@ -75,9 +58,8 @@ pub fn now_us() -> u64 {
 
 /// The distance between a request's `timestamp_us` and `now_us` when it
 /// exceeds [`MAX_REQUEST_TIMESTAMP_SKEW_US`]; `None` for an acceptable
-/// timestamp. Symmetric: a stale and a future timestamp are refused alike,
-/// since `SlashJudge` reads signed timestamps on both sides of its pairing
-/// window.
+/// timestamp. Symmetric: a stale and a future timestamp misstate the serve
+/// time alike.
 pub fn excessive_skew_us(timestamp_us: u64, now_us: u64) -> Option<u64> {
     let skew = now_us.abs_diff(timestamp_us);
     (skew > MAX_REQUEST_TIMESTAMP_SKEW_US).then_some(skew)

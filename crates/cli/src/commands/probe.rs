@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use decdn_client::OpenedStream;
 use decdn_common::cli;
-use decdn_incentive::slash_judge_domain;
+use decdn_incentive::capacity_bond_domain;
 use iroh::EndpointAddr;
 
 use super::fetch::{self, FetchHost, Payer};
@@ -67,7 +67,7 @@ impl ProbeAnswer {
 /// whole blob, and asks no pull-through. The keystore unlocks and the pool is
 /// named as for `decdn get` (`Payer::discovery_ctx`); no voucher is sent and
 /// no transaction. The answer is verified before it prints: its `slash_sig`
-/// must recover to `--provider-address` (ADR 014 §1), its echoed hash and
+/// must recover to `--provider-address` (ADR 005 § Signer binding), its echoed hash and
 /// timestamp must match the request, a size it states must carry its proof,
 /// and its coverage must agree with its signed `ok`.
 ///
@@ -99,7 +99,8 @@ pub async fn probe(
             target = target.with_relay_url(url.clone());
         }
         let chain = &host.chain().config;
-        let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
+        let slash_dom =
+            capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
         let opened = decdn_client::discovery_open(
             host.connections(),
             &target,
@@ -142,9 +143,6 @@ pub(crate) fn fetch_args(args: &cli::ProbeArgs) -> anyhow::Result<cli::ClientFet
     common.relay_url.clone_from(&args.relay_url);
     common.governance.clone_from(&args.governance);
     common.payment.clone_from(&args.payment);
-    common
-        .slash_judge_address
-        .clone_from(&args.slash_judge_address);
     common
         .capacity_bond_address
         .clone_from(&args.capacity_bond_address);

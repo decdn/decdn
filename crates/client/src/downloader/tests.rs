@@ -20,7 +20,7 @@ fn ctx_for(provider: u8) -> PoolContext {
         provider: Address::repeat_byte(provider),
         deposit: U256::from(u128::MAX),
         client_signer: Arc::new(PrivateKeySigner::random()),
-        voucher_domain: decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+        voucher_domain: decdn_incentive::capacity_bond_domain(1, Address::ZERO),
         prior_bytes_delivered: U256::ZERO,
         prior_amount: U256::ZERO,
         client_binding: None,

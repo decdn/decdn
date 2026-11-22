@@ -6,7 +6,7 @@
 //! answer ([`crate::discovery_open`]): it carries the node's quote, its proven
 //! size of the blob, and its coverage, and costs the node nothing before the
 //! first voucher. Every answer is verified before it can influence the order
-//! (ADR 014 §1). A streamed round returns at the first verified holder and
+//! (ADR 005 § Signer binding). A streamed round returns at the first verified holder and
 //! keeps its pending opens as a tail, so a holder that answers later joins the
 //! running fetch (`LateOpens`). The holders' streams stay open in
 //! [`ResolvedTargets`], so the fetch adopts the winner's stream with no second
@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, Bytes};
-use decdn_incentive::slash_judge_domain;
+use decdn_incentive::capacity_bond_domain;
 use iroh::{EndpointAddr, PublicKey, RelayUrl};
 use tokio_util::task::AbortOnDropHandle;
 
@@ -80,8 +80,9 @@ pub(crate) struct Dropouts {
 /// refusals do not end the command that way: any node can send the unsigned
 /// code at will, and a refusing node's own clock may be the wrong one. They
 /// still put the clock hint in the ordinary error's text. When any answer was
-/// unverifiable the cause is almost always local configuration rather than
-/// missing content, so that case gets its own message too. Otherwise the
+/// unverifiable the cause is almost always local configuration or a release
+/// that signs under a different EIP-712 domain, rather than missing content, so
+/// that case gets its own message too. Otherwise the
 /// parenthetical accounts for each of the other counts separately. Reached
 /// only when there is neither a cache holder nor a reachable non-holder to
 /// pull through — a `NotFound` answer is a serve target, not a failure, so it
@@ -109,8 +110,10 @@ pub(crate) fn no_serve_target_error(d: Dropouts) -> anyhow::Error {
              verify: their signatures did not recover to the operator address each is \
              registered under, or their coverage disagreed with the signed answer. That is \
              usually local configuration rather than missing content: check that \
-             blockchain.slash_judge_address and blockchain.chain_id match the deployment \
-             these nodes registered against"
+             blockchain.capacity_bond_address and blockchain.chain_id match the deployment \
+             these nodes registered against. Version skew is the other cause: the nodes may \
+             run a decdn release that signs under a different EIP-712 domain than this one \
+             verifies, so check that this client and the nodes run compatible releases"
         )));
     }
     // With no unverifiable candidate, every candidate that neither stayed silent
@@ -532,7 +535,7 @@ struct OpenTally {
     samples: Vec<Sample>,
     /// The ways a candidate drops out, counted separately: the terminal error
     /// has to name the one that actually happened. A wrong
-    /// `slash_judge_address` or `chain_id` makes EVERY honest node fail
+    /// `capacity_bond_address` or `chain_id` makes EVERY honest node fail
     /// verification, and reporting that as "nobody holds the blob" sends the
     /// operator hunting for missing content instead of a local
     /// misconfiguration; a node shedding this client's request rate is
@@ -654,7 +657,7 @@ pub(crate) async fn open_at(
 }
 
 /// Classify `cand`'s discovery open result `res`. The answer was verified
-/// before `res` holds it (ADR 014 §1); a verification fault is
+/// before `res` holds it (ADR 005 § Signer binding); a verification fault is
 /// [`OpenOutcome::Unverifiable`], requester-local policy with no reputation
 /// effect, because an answer that does not verify attributes nothing to
 /// anyone. A signed `NotFound` with a non-empty coverage is a partial holder
@@ -778,7 +781,7 @@ pub(crate) fn classify_open(
 /// node that misses answers a signed `NotFound` at once. Every answer is
 /// verified before it can influence the order: value invariants, echoed-field
 /// correlation, `slash_sig` recovery to the candidate's on-chain operator
-/// address (ADR 014 §1), and the coverage against the signed `ok`. A
+/// address (ADR 005 § Signer binding), and the coverage against the signed `ok`. A
 /// candidate whose answer fails is dropped, exactly as for a timeout; it is
 /// requester-local policy and never scored against the peer. A holder that
 /// quotes above `spec.max_rate_per_mb` is dropped too.
@@ -1155,9 +1158,6 @@ pub(crate) fn failover_order(
 /// active set from `CapacityBond`, take a random, region-first sample of
 /// [`discovery::SELECT_K`] candidates, and [`open_and_order`] them. Returns the
 /// ordered candidate list `fetch` tries in turn (#1174).
-/// Callers must have already unwrapped `chain.governance.capacity_bond` into the
-/// "auto-discovery needs `capacity_bond_address`" error, which is why the
-/// address is a separate parameter rather than read back off `chain`.
 async fn discover_provider(
     (chain, site): (&ChainConfig, &PullSite),
     capacity_bond: Address,
@@ -1203,7 +1203,7 @@ async fn discover_provider(
         );
         if selected.len() >= store_cfg.min_fresh_candidates {
             let slash_dom =
-                slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
+                capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
             mark_round_start();
             let targets = open_and_order(
                 &selected,
@@ -1258,7 +1258,7 @@ async fn discover_provider(
         &[]
     };
     let selected = select_with_widening(all, site.region.as_deref(), allow, &store_cfg);
-    let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
+    let slash_dom = capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
     mark_round_start();
     let targets = open_and_order(
         &selected,
@@ -1664,25 +1664,6 @@ pub(crate) fn pinned_targets(node_id: PublicKey, provider: Address) -> ResolvedT
     }
 }
 
-/// Whether `opts` can resolve holders on `chain` at all: a pinned node, or a
-/// `CapacityBond` to discover them from. A fetch checks this before it
-/// unlocks its keys, so a configuration fault never prompts for a password.
-///
-/// # Errors
-///
-/// A [`ResolveConfigFault`] when discovery needs a `CapacityBond` the chain
-/// does not name.
-pub fn check_resolvable(opts: &DiscoveryOptions, chain: &ChainConfig) -> anyhow::Result<()> {
-    if opts.pinned.is_some() || chain.governance.capacity_bond.is_some() {
-        return Ok(());
-    }
-    Err(anyhow::Error::new(ResolveConfigFault(
-        "auto-discovery needs capacity_bond_address (--capacity-bond-address or \
-         blockchain.capacity_bond_address), or pass --node-id to dial directly"
-            .to_string(),
-    )))
-}
-
 /// Resolve the holders to fetch from (#1174): the pinned node as the one
 /// holder, with the size its open proves as the fetch's size, or
 /// auto-discovery (#936) when nothing is pinned (deriving each provider from
@@ -1694,9 +1675,8 @@ pub fn check_resolvable(opts: &DiscoveryOptions, chain: &ChainConfig) -> anyhow:
 ///
 /// # Errors
 ///
-/// A [`ResolveConfigFault`] when discovery needs a `CapacityBond` the chain
-/// does not name, or when every answer fails its verification; any other
-/// error when no asked node can serve the blob.
+/// A [`ResolveConfigFault`] when every answer fails its verification; any
+/// other error when no asked node can serve the blob.
 pub async fn resolve_target_node(
     opts: &DiscoveryOptions,
     (chain, site): (&ChainConfig, &PullSite),
@@ -1719,12 +1699,7 @@ pub async fn resolve_target_node(
         return Ok(open_pinned(chain, relays.first().cloned(), pinned, hash, open).await);
     }
 
-    check_resolvable(opts, chain)?;
-    let capacity_bond = chain.governance.capacity_bond.ok_or_else(|| {
-        anyhow::Error::new(ResolveConfigFault(
-            "auto-discovery needs capacity_bond_address".to_string(),
-        ))
-    })?;
+    let capacity_bond = chain.governance.capacity_bond;
     // `--timeout-ms` bounds the registry read (#1349). Nothing did before: its
     // retry schedule alone can burn 36 s, so `decdn get --timeout-ms 5000`
     // could sit far longer than 5 s before the transfer it caps had started.
@@ -1822,7 +1797,7 @@ pub(crate) async fn open_pinned(
         marks.discovery_started();
     }
     let started = std::time::Instant::now();
-    let slash_dom = slash_judge_domain(chain.governance.chain_id, chain.governance.slash_judge);
+    let slash_dom = capacity_bond_domain(chain.governance.chain_id, chain.governance.capacity_bond);
     let res = crate::discovery_open(
         open.spec.conns,
         &target,
@@ -1839,20 +1814,11 @@ pub(crate) async fn open_pinned(
     log_open_result(&cand, &res, started);
     let (outcome, opened) = classify_open(&cand, res, open.spec.max_rate_per_mb);
     if matches!(outcome, OpenOutcome::NonHolder(..)) {
-        if chain.governance.capacity_bond.is_none() {
-            tracing::warn!(
-                node = %pinned.node_id,
-                "the pinned node does not hold this blob, and with no CapacityBond \
-                 configured this client sends no identity binding, so the node \
-                 refuses to fill the miss"
-            );
-        } else {
-            tracing::info!(
-                node = %pinned.node_id,
-                "the pinned node did not serve this blob at its open; the lane asks it \
-                 again once it pays from its pool"
-            );
-        }
+        tracing::info!(
+            node = %pinned.node_id,
+            "the pinned node did not serve this blob at its open; the lane asks it \
+             again once it pays from its pool"
+        );
     }
     let mut targets = pinned_targets(pinned.node_id, pinned.provider);
     targets.size_hint = answered_size_hint(&outcome);

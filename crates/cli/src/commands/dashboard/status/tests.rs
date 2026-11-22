@@ -209,7 +209,6 @@ fn node_waiting(state: NodeState) -> NodeSection {
         lanes: Part::waiting(),
         earnings: Part::waiting(),
         pools: Part::waiting(),
-        slashes: Part::waiting(),
     }
 }
 
@@ -333,12 +332,6 @@ fn node_up() -> NodeSection {
             }],
             skipped: Vec::new(),
         }),
-        slashes: Part {
-            updated_unix_ms: Some(NOW_MS),
-            read: Read::Unconfigured {
-                message: "slash detection is not configured".to_owned(),
-            },
-        },
         ..node_waiting(NodeState::Up)
     }
 }
@@ -368,7 +361,7 @@ fn skip_only(started: u64) -> PullView {
 /// A host running everything: two live pulls (one whose heartbeat stopped,
 /// one that resumed), four that ended (a skip-only bundle, a resumed blob),
 /// a file that did not read as a record, a loopback gateway, and a node with
-/// every read but slashes.
+/// every read.
 #[test]
 fn a_full_status_keeps_its_shape() {
     // The gateway's body is its own contract, pinned by the gateway's

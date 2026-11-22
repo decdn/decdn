@@ -62,7 +62,7 @@
 //! no way to break the `CapacityBond` registry read in isolation:
 //! `--capacity-bond-address` is also the ADR 005 client-binding EIP-712
 //! domain's `verifyingContract` (`crates/cli/src/commands/fetch.rs`'s
-//! `attach_client_binding`: `bind_node_id_domain(chain.chain_id,
+//! `attach_client_binding`: `capacity_bond_domain(chain.chain_id,
 //! capacity_bond)`), computed identically on the node side from ITS OWN
 //! (unchanged, correct) config — so pointing the flag anywhere else makes
 //! every subsequent delivery request's binding fail `verify_binding` and the
@@ -533,8 +533,6 @@ fn fetch_argv(
         ),
         "--pool-rpc-url".into(),
         chain.rpc_url(),
-        "--slash-judge-address".into(),
-        format!("{}", chain.addrs().slash_judge),
         "--data-dir".into(),
         data_dir.display().to_string(),
         "--keystore".into(),

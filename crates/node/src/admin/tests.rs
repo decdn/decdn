@@ -50,48 +50,6 @@ async fn state_with() -> (AdminState, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn slashes_unavailable_without_handle() {
-    let (state, _tmp) = state_with().await;
-    let rpc = AdminRpcImpl::new(state);
-    let err = rpc.slashes().await.expect_err("no slash handle wired");
-    assert_eq!(err.code(), SLASH_DETECTION_UNAVAILABLE_CODE);
-}
-
-#[tokio::test]
-async fn slashes_reports_detected_records_newest_first() {
-    use alloy::primitives::{B256, U256};
-    let store: crate::slash_watcher::SlashStore = Arc::new(std::sync::RwLock::new(vec![
-        crate::slash_watcher::DetectedSlash {
-            slash_id: U256::from(1u64),
-            offense_type: 0,
-            amount: U256::from(100u64),
-            evidence_hash: B256::repeat_byte(0x11),
-            appeal_window_close: Some(999),
-        },
-        crate::slash_watcher::DetectedSlash {
-            slash_id: U256::from(2u64),
-            offense_type: 0,
-            amount: U256::from(200u64),
-            evidence_hash: B256::repeat_byte(0x22),
-            appeal_window_close: None,
-        },
-    ]));
-    let (state, _tmp) = state_with().await;
-    let rpc = AdminRpcImpl::new(state.with_slash_detection(SlashStatusHandles { store }));
-    let resp = rpc.slashes().await.expect("slashes ok");
-    assert_eq!(resp.slashes.len(), 2);
-    // Newest-first: the watcher appends in detection order, the method reverses.
-    let first = resp.slashes.first().expect("first slash");
-    assert_eq!(first.slash_id, "2");
-    assert_eq!(first.offense_type, 0);
-    assert_eq!(first.amount, "200");
-    assert_eq!(first.appeal_window_close, None);
-    let second = resp.slashes.get(1).expect("second slash");
-    assert_eq!(second.slash_id, "1");
-    assert_eq!(second.appeal_window_close, Some(999));
-}
-
-#[tokio::test]
 async fn health_returns_hex_node_id_and_nondecreasing_uptime() {
     let id = [0xCDu8; 32];
     let started = Instant::now();

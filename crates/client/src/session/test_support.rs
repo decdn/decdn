@@ -21,14 +21,12 @@ pub(crate) fn one_chain(
     rpc_url: String,
     chain_id: u64,
     payment_pool: Address,
-    slash_judge: Address,
-    capacity_bond: Option<Address>,
+    capacity_bond: Address,
 ) -> ChainConfig {
     ChainConfig {
         governance: GovernanceChain {
             rpc_url: rpc_url.clone(),
             chain_id,
-            slash_judge,
             capacity_bond,
         },
         payment_pools: vec![PaymentPoolChain {

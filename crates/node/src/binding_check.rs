@@ -1,13 +1,12 @@
 //! Startup self-check: is the local iroh key the one bound on-chain? (#1034)
 //!
-//! `SlashJudge._checkRegistered` resolves an accused node through
-//! `CapacityBond.nodeIdOf`, so slashability follows the *binding*, not the key
-//! the daemon happens to serve under. A node whose `node.secret` was replaced
-//! without a matching `bindNodeId` therefore keeps serving and keeps getting
-//! paid while its bond is unreachable — it is unslashable. Nothing else in the
-//! runtime notices: the node is healthy, its lanes settle, and its peers
-//! simply stop routing to an id no longer in the staker set, which reads like
-//! ordinary churn.
+//! Peers and clients resolve a serving node to its operator through the
+//! on-chain *binding* (`CapacityBond.nodeIdToAddress`), not the key the daemon
+//! happens to serve under. A node whose `node.secret` was replaced without a
+//! matching `bindNodeId` therefore serves under an id no client can tie to an
+//! operator. Nothing else in the runtime notices: the node is healthy, its
+//! existing lanes settle, and its peers simply stop routing to an id no longer
+//! in the staker set, which reads like ordinary churn.
 //!
 //! That is the gap this check closes, and the reason it exists on the daemon at
 //! all rather than only in `decdn node rotate-key`. The command is written so
@@ -87,7 +86,7 @@ pub fn classify(bound: B256, local: B256) -> BindingReport {
 ///
 /// Never fails: a read error is [`BindingStatus::Unknown`], which is reported
 /// as its own state rather than folded into "fine" — an operator debugging an
-/// unslashable node has to be able to tell "we checked and it is bound" from
+/// unroutable node has to be able to tell "we checked and it is bound" from
 /// "we could not check".
 pub async fn check<P: Provider>(
     provider: P,
@@ -107,7 +106,7 @@ pub async fn check<P: Provider>(
                 error = %sanitize_error_sources(&err),
                 %operator,
                 %capacity_bond,
-                "could not read the on-chain node-id binding at startup; slashability of this \
+                "could not read the on-chain node-id binding at startup; the binding of this \
                  node's key is UNVERIFIED. Check it with `decdn node health`."
             );
             return BindingReport::unknown();
@@ -130,22 +129,22 @@ fn log(status: BindingStatus, local: B256, bound: B256, operator: Address) {
             %operator,
             "local node key matches the on-chain binding"
         ),
-        // Both remaining arms are the unslashable state, and both name the fix.
+        // Both remaining arms are the unroutable state, and both name the fix.
         // They are split because the repairs differ: a mismatch has a key to
         // choose between, an unbound operator has no registration at all.
         BindingStatus::Mismatch => tracing::warn!(
             local_node_id = %local,
             bound_node_id = %bound,
             %operator,
-            "this node is serving under a key that is NOT the one bound on-chain, so it cannot be \
-             slashed and peers will not route to it. Either bind the local key with `decdn node \
+            "this node is serving under a key that is NOT the one bound on-chain, so peers will \
+             not route to it and clients will not accept its responses. Either bind the local key with `decdn node \
              rotate-key --key iroh --bind-existing`, or restore the key the binding names."
         ),
         BindingStatus::Unbound => tracing::warn!(
             local_node_id = %local,
             %operator,
-            "this operator address has no on-chain node-id binding, so this node cannot be \
-             slashed and peers will not route to it. Register it with `decdn node register` \
+            "this operator address has no on-chain node-id binding, so peers will not route to \
+             this node and clients will not accept its responses. Register it with `decdn node register` \
              (after `decdn node bond`)."
         ),
         // `check` never produces `Unknown` past its early return.

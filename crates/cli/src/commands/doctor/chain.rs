@@ -2,7 +2,7 @@
 //! checks on the governance chain and on each payment chain. No signer, no
 //! state change.
 //!
-//! The governance chain holds `CapacityBond`, `SlashJudge` and the other
+//! The governance chain holds `CapacityBond`, `ContentBlacklist` and the other
 //! protocol contracts: each configured address must carry code. Each
 //! `[[blockchain.payment_chains]]` entry has its own RPC, which must serve the
 //! entry's chain id; each pool on it must answer `operatorBps()` and
@@ -180,13 +180,10 @@ async fn check_governance(report: &mut Report, cfg: &ResolvedConfig, timeout_ms:
     report.push(classify_chain_id(cfg.blockchain.chain_id, onchain));
 
     // (name, address) pairs: required first, then optional configured ones.
-    let mut targets: Vec<(&str, &str)> = vec![
-        (
-            "capacity_bond",
-            cfg.blockchain.capacity_bond_address.as_str(),
-        ),
-        ("slash_judge", cfg.blockchain.slash_judge_address.as_str()),
-    ];
+    let mut targets: Vec<(&str, &str)> = vec![(
+        "capacity_bond",
+        cfg.blockchain.capacity_bond_address.as_str(),
+    )];
     if let Some(addr) = cfg.blockchain.content_blacklist_address.as_deref() {
         targets.push(("content_blacklist", addr));
     }

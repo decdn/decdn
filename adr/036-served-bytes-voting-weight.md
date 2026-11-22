@@ -5,12 +5,11 @@
 
 ## Vote window
 
-The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter` only ever increments the epoch of the sweep's arrival block, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violates the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could sweep bytes mid-vote and raise its own already-counted weight, and two voters casting at different times would see different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — keeps voting deterministic with no change to `FeeRouter`.
+The vote window ends at the **last fully-elapsed epoch** as of the proposal-snapshot timepoint — `endEpoch(t) = epoch(t) == 0 ? ∅ : epoch(t) - 1` (the `∅` epoch-0 case ⇒ empty window ⇒ weight 0; see § Formula) — rather than at `epoch(t)`, the in-progress epoch. `FeeRouter` only ever increments the epoch of the sweep's arrival block, so an in-progress epoch's tally keeps changing after a proposal snapshot. Reading it in `_getVotes`/`quorum`/`proposalThreshold` violates the OpenZeppelin `Governor` snapshot invariant (weight must be immutable after the snapshot): an operator could sweep bytes mid-vote and raise its own already-counted weight, and two voters casting at different times would see different totals/quorum. Counting only elapsed epochs — whose buckets are immutable forever — keeps voting deterministic with no change to `FeeRouter`. The served-bytes term and the quorum denominator are immutable after the snapshot. The `age_ramp` factor has one exception: it can only fall, and only through the operator's own `unbond` below its floor ([§ Behaviors that follow from the formula](#behaviors-that-follow-from-the-formula)). No action raises a counted weight after the snapshot.
 
-Two effects follow, both bounded by one epoch (≤ 1 week):
+One effect follows, bounded by one epoch (≤ 1 week):
 
 - **Served-byte / quorum lag.** The current in-progress epoch's bytes are excluded from vote weight and from the quorum denominator until that epoch elapses.
-- **Slash-immediacy lag for same-epoch slashes.** A slash stamped in the in-progress epoch does not zero a proposal snapshotted earlier in that same epoch; it takes effect once the epoch elapses (the slash window tracks the byte window — both end at `endEpoch(t)`). Slashes from prior epochs zero immediately.
 
 ## Context
 
@@ -18,7 +17,7 @@ Declared capacity (`CapacityBond.declaredMbps`) is operator-asserted at registra
 
 Served bytes arrive at the governance-chain `FeeRouter` as the bytes feed in the hook data of each sweep ([ADR 016 § Contract: FeeRouter](016-contract-interactions.md#contract-feerouter)). The router writes `bytesPerEpoch[operator][epoch]` from it. This counter is the canonical voting-weight source.
 
-The weight rules touch only governance: they leave payment-pool mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), the fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), `CapacityBond`'s registration / slashing semantics, and `SlashAppeal` / `BuybackBurner` unchanged. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp.
+The weight rules touch only governance: they leave payment-pool mechanics ([ADR 003](003-payments.md#adr-003-payment-model)), the fee split ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)), the capacity-bond curve ([ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), and `BuybackBurner` unchanged. `CapacityBond` remains the registration gate and the source of `firstBondedAt` for the age-ramp. The tenure rules, including the reset of `firstBondedAt`, live in `CapacityBond` ([§ Behaviors that follow from the formula](#behaviors-that-follow-from-the-formula)).
 
 ## Decision
 
@@ -66,19 +65,16 @@ Each epoch's counted bytes are capped at what the tier the operator declared at 
   - *Capacity clamp.* The credit for an operator in one epoch cannot exceed `CapacityBond.declaredMbps(operator) × EPOCH_LENGTH × 125_000` minus what `bytesPerEpoch[operator][epoch]` already holds. The clamp binds the operator's counter and the network total alike, so a byte that no declared capacity could carry enters neither. The total sets quorum, proposal threshold and every operator's share cap, so pumping it needs declared capacity, which needs bond. At 1 Gbps an operator credits at most about 75 TB per epoch. The Governor's per-epoch minimum stays. It reads the tier declared at the epoch's close.
   - *Arrival-epoch stamping.* The credit goes to the epoch of the arrival block (`block.timestamp / EPOCH_LENGTH`). A late sweep never changes a closed epoch, so proposal snapshots stay immutable.
 - **A direct deposit restores weight after an empty window.** If no sweep arrives for `windowEpochs` epochs, every operator's weight decays to 0. Quorum and proposal threshold reach 0, but a proposal still needs more for-votes than against-votes. `FeeRouter.deposit` is permissionless on the governance chain. An active operator restores its weight with a direct USDC deposit there, with no bridge and no traffic. The checks above bound the credit: it is at most `net × 1 MiB / deliveryFloor`, and the capacity clamp applies. The cost is `net`, the non-rebated part of the deposit. The rebate returns to the operator in the same transaction. The share cap sizes each operator's weight from the other operators' bytes, so at least two active operators must deposit. The credit counts after its arrival epoch fully elapses. The rebate ceiling of 9900 keeps `net` above zero, so this path is always open.
-- **Tenure starts at the first `minBond` crossing.** `firstBondedAt` records the first time the operator's active bond reached `minBond`. A dust bond below `minBond` does not start the ramp, so an operator cannot pre-age an address for the cost of one base unit.
+- **Tenure starts at an entry and ends when an `unbond` drops below the floor.** This bullet is the one definition of tenure. Other ADRs link here.
+  - *Entry.* An entry is a `bond()` that leaves `activeBond` at or above `minBond` while no tenure runs, or a `registerNode`. An entry records the live `minBond` as `bondFloorAtActivation`. It stamps `firstBondedAt` when no tenure runs. A dust bond below `minBond` records nothing, so it does not start the ramp.
+  - *Tenured top-up.* A `bond()` from an operator whose tenure runs records nothing. The operator keeps its grandfathered floor, also through a raised `minBond`.
+  - *Re-entry.* `registerNode` is an explicit re-entry, for example after deregistration. It records the live `minBond` as the floor. It keeps a running `firstBondedAt`.
+  - *End of tenure.* An `unbond` that leaves `activeBond` below `bondFloorAtActivation` ends the tenure. It clears `firstBondedAt` and `bondFloorAtActivation` to 0. `isActive` needs a non-zero floor, so the operator leaves the active set. The next entry stamps a fresh `firstBondedAt`. Tenure therefore measures continuous bonding at or above the activation floor.
+  - *Deregistration and ejection.* They do not touch the bond, so they keep tenure.
+  - *Effect on past snapshots.* While `firstBondedAt` is 0, `age_ramp` is 0. The Governor reads the live stamp, not a checkpoint. When a tenure ends, the operator's `age_ramp` is 0 at every earlier snapshot. A later stamp gives `age_ramp` 0 for every timepoint before it. The served-bytes term stays immutable after the snapshot. The `age_ramp` factor can only fall, and only through the operator's own `unbond`.
+  - *Why an unbond below the floor ends the tenure.* `unbond` returns the TOKEN at once. A write-once stamp would let one actor pre-age many addresses with the same TOKEN: bond `minBond`, unbond it at once, and move it to the next address. A batch of such calls fits in one transaction. Each address would then hold a tenure that cost no locked capital, and the `age_ramp` tenure-buy-in defense would fail. The reset closes this path. To age an address, the operator must keep `minBond` locked for the whole ramp.
 - **Per-operator cap is computed against the bytes-weighted total at the same timepoint**, not against any historical or capacity-derived total. The cap clamp applies pre-multiplication by `age_ramp`.
 - **`quorum(t)` and `proposalThreshold(t)` use `FeeRouter.totalBytesInWindow(endEpoch(t), N)` as the denominator — an *upper-bound proxy* for `Σ_op vote_weight(op, t)`, not the exact sum.** The exact sum applies the per-operator cap and the `age_ramp` multiplier (both `≤ 1`), so `Σ_op vote_weight ≤ totalBytesInWindow` always. Calibrating quorum against the proxy is intentionally conservative — it makes quorum strictly harder to reach than against the true Σ — and avoids the gas of summing per-operator capped contributions on every `castVote`. The proxy is exact when no operator is above the cap and all operators are past `age_ramp_months` of tenure (the steady state).
-
-### Slashing zero-out
-
-Every `CapacityBond.slash` appends a `SlashRecord` (with its `slashedAt` timestamp and escrow `status`) to the operator's slash list. The Governor's `_getVotes(op, t)` returns zero whenever the operator has a **standing** slash — one NOT in the `Reversed` state (`Escrowed` / `AppealOpen` / `Upheld` all still stand) — with `slashedAt` in `[(endEpoch(t) - N + 1) × epochLength, t]`. The lower edge is the start of the trailing byte window. The upper edge is the timepoint itself, so a slash in the in-progress epoch zeroes every snapshot taken after it, and a slash after `t` never zeroes that snapshot. Once the window slides past the slash, the operator's vote weight recovers based on their forward served-bytes accrual.
-
-The Governor walks the operator's slash list newest first through `operatorSlashCount`, `operatorSlashIdAt` and `getSlashRecord`, and stops at the first slash before the window. Every record counts, so a later slash cannot hide an earlier in-window one. On a **granted** slash appeal via [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)'s `grantAppeal` path, `CapacityBond.settleAppealGranted` marks that record `Reversed`, so it no longer zeroes the vote while any other standing slash still does. An **upheld** appeal (`upholdAppeal` / `rejectAppeal`) leaves the record standing. The walk is bounded in practice because a slashed operator auto-ejects below `minBond / 2`.
-
-`CapacityBond` also keeps `slashedAtEpoch[op]`, the max epoch among the operator's standing slashes plus one (0 for "unslashed"), as an indexer read. The Governor does not read it.
-
-This restores the immediate-vote-removal-on-slash signal that the bytes window alone cannot deliver (an active operator who is slashed today would otherwise continue voting with their accumulated window bytes for up to N weeks).
 
 ### Contracts and surface
 
@@ -93,12 +89,6 @@ The full Solidity surface is documented in [ADR 016 § Contract: FeeRouter](016-
 - `uint64 public windowEpochs;` — storage; constructor takes `windowEpochsDefault`.
 - `function setWindowEpochs(uint64 n) external;` — `GOVERNANCE_ROLE`, bounded `[4, 26]` (see [§ Governable parameters](#governable-parameters-with-safety-bounds)).
 
-**`CapacityBond` additions:**
-
-- `mapping(address => uint256[]) _operatorSlashIds;` — per-operator slash index, read through `operatorSlashCount(op)` / `operatorSlashIdAt(op, i)`.
-- `function getSlashRecord(uint256 slashId) external view returns (SlashRecord memory);` — the record with its `slashedAt` and `status`, read by the Governor's slash walk.
-- `mapping(address => uint64) slashedAtEpoch;` and its getter — the max epoch among the operator's standing slashes plus one, recomputed by the `grantAppeal` flow (`settleAppealGranted` → `_recomputeSlashedAtEpoch`) per [ADR 028](028-slashing-appeals.md#contract-surface). An indexer read; the Governor does not use it.
-
 **`DecdnGovernor._getVotes`** (pseudocode):
 
 ```solidity
@@ -107,15 +97,6 @@ function _getVotes(address op, uint256 timepoint, bytes memory) override returns
     uint64 cur = uint64(timepoint / EPOCH_LENGTH);
     if (cur == 0) return 0;
     uint64 endEpoch = cur - 1;
-    uint64 windowStart = endEpoch + 1 > windowEpochs ? endEpoch + 1 - windowEpochs : 0;
-    // Any standing slash in [window start, timepoint] zeroes the vote. Walk
-    // newest first; stop at the first slash before the window.
-    uint256 windowStartTime = windowStart * EPOCH_LENGTH;
-    for (uint256 i = capacityBond.operatorSlashCount(op); i > 0; i--) {
-        SlashRecord memory r = capacityBond.getSlashRecord(capacityBond.operatorSlashIdAt(op, i - 1));
-        if (r.slashedAt < windowStartTime) break;
-        if (r.slashedAt <= timepoint && r.status != SlashStatus.Reversed) return 0;
-    }
     uint256 served = feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
     uint256 total  = feeRouter.totalBytesInWindow(endEpoch, windowEpochs);
     uint256 others = total - feeRouter.bytesInWindow(op, endEpoch, windowEpochs);
@@ -167,11 +148,7 @@ The attack is bounded but not eliminated. Future tightening options (deferred to
 
 ### Instant-governance via bond-then-serve-burst
 
-Defended by `age_ramp`. A fresh operator who bonds at `t=0` and serves the entire network's traffic at `t=0+ε` votes at `(t / age_ramp_months × seconds_per_month)` of full weight for the first `age_ramp_months` months. With default `age_ramp_months = 6`, day-1 vote weight is ≈ 0.5% of full weight; week-1 is ≈ 3%. This forces sustained activity across both the bytes axis (rolling window) and the time axis (ramp).
-
-### Slashed-but-still-voting
-
-Defended by the slashing zero-out. Without zero-out, a slashed operator continues voting with their accumulated window bytes for up to N weeks. With zero-out, slashing immediately revokes vote weight for the remainder of the window. This is a tighter response than relying on the declared-capacity cap alone, which would only reduce vote weight by the bond-reduction ratio.
+Defended by `age_ramp`. A fresh operator who bonds at `t=0` and serves the entire network's traffic at `t=0+ε` votes at `(t / age_ramp_months × seconds_per_month)` of full weight for the first `age_ramp_months` months. With default `age_ramp_months = 6`, day-1 vote weight is ≈ 0.5% of full weight; week-1 is ≈ 3%. This forces sustained activity across both the bytes axis (rolling window) and the time axis (ramp). The ramp counts only continuous bonding at or above the activation floor, so an attacker cannot age addresses in advance with a bond it withdraws at once.
 
 ### Concentration
 
@@ -184,7 +161,6 @@ The per-operator cap (`voteCapBps`, launch 10%) is the primary concentration def
 - **Voting weight tracks demonstrated network contribution.** An operator who isn't serving has no vote; an operator who is serving heavily has weight proportional to that service (up to the cap).
 - **Reuses the sweep data flow.** The bytes feed already rides each sweep. Marginal contract surface is two integer mappings, one trailing-sum helper, one tenure-ramp lookup.
 - **Strengthens skin-in-the-game story.** Combined with [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)'s per-byte operator payment, governance influence and economic upside both scale with actual delivery.
-- **Slashing-zero-out tightens response time.** Slash → immediate vote zero, recovers naturally over `windowEpochs`. Cleaner than a declared-capacity-proportional reduction.
 
 ### Negative
 
@@ -203,9 +179,8 @@ The per-operator cap (`voteCapBps`, launch 10%) is the primary concentration def
 ## Cross-ADR Impact
 
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** §Production: Operator-Weighted DAO Governance sources voting weight from this ADR's formula, with its clock anchored to governance-chain `FeeRouter` epoch accounting and its quorum calibration reading `FeeRouter.totalBytesInWindow`. Its Governable Parameters table carries `windowEpochs`, and its Consequences > Negative notes wash-trading-as-vote-buying.
-- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** Contract Inventory `DecdnGovernor` row reads `FeeRouter` for vote weight. `classDiagram` `FeeRouter` exposes `totalBytesPerEpoch`, `bytesInWindow`, `totalBytesInWindow`; the `Governor` vote-weight edges target `FeeRouter`. `Contract: FeeRouter` section carries the sweep receiver, the `bytesPerEpoch` / `totalBytesPerEpoch` mappings, getters, `deliveryFloor` and `setWindowEpochs`. `Contract: CapacityBond` section carries `slashedAtEpoch`. Cross-Contract Call Graph + Complete Call Table list `Governor → FeeRouter: bytesInWindow / totalBytesInWindow`. Deployment Order step 14 (`DecdnGovernor`) lists `FeeRouter` as a non-zero constructor input.
+- **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** Contract Inventory `DecdnGovernor` row reads `FeeRouter` for vote weight. `classDiagram` `FeeRouter` exposes `totalBytesPerEpoch`, `bytesInWindow`, `totalBytesInWindow`; the `Governor` vote-weight edges target `FeeRouter`. `Contract: FeeRouter` section carries the sweep receiver, the `bytesPerEpoch` / `totalBytesPerEpoch` mappings, getters, `deliveryFloor` and `setWindowEpochs`. Cross-Contract Call Graph + Complete Call Table list `Governor → FeeRouter: bytesInWindow / totalBytesInWindow`. Deployment Order step 13 (`DecdnGovernor`) lists `FeeRouter` as a non-zero constructor input.
 - **[ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics):** §Governance states the served-bytes `vote_weight` formula and points its `Voting source` row at `FeeRouter` + this ADR. §Governable parameters with safety bounds carries `windowEpochs`.
-- **[ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation):** the `grantAppeal` path (`settleAppealGranted`) clears `CapacityBond.slashedAtEpoch[op]` alongside refunding the operator's escrowed TOKEN (see [ADR 028 § Contract surface](028-slashing-appeals.md#contract-surface)); no other appeal-flow change.
 
 ## References
 
@@ -213,4 +188,3 @@ The per-operator cap (`voteCapBps`, launch 10%) is the primary concentration def
 - [ADR 009 — Governance Model](009-governance.md#adr-009-governance-model)
 - [ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model)
 - [ADR 026 — Tokenomics](026-tokenomics.md#adr-026-tokenomics)
-- [ADR 028 — Slashing Appeals](028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation)

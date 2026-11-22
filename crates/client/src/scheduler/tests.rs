@@ -7440,7 +7440,7 @@ fn delegate(spending_cap: u64) -> crate::Credential {
     }
     .sign(
         &signer,
-        &decdn_incentive::bind_node_id_domain(1, Address::ZERO),
+        &decdn_incentive::capacity_bond_domain(1, Address::ZERO),
     )
     .unwrap();
     crate::Credential {

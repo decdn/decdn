@@ -116,9 +116,6 @@ pub struct ResolvedBlockchain {
     /// `PublisherRegistry` contract address. Independent of the origin directory
     /// (the publish CLI's `namespace create` target); not consumed by the node.
     pub publisher_registry_address: Option<String>,
-    /// `SlashJudge` contract address — the EIP-712 `verifyingContract` for
-    /// `slash_sig` signatures (ADR 014). Required (no default).
-    pub slash_judge_address: String,
     /// Required `ContentBlacklist` contract address (ADR 011/019/031). Successful
     /// node config resolution always produces `Some`; the runtime rejects `None`.
     pub content_blacklist_address: Option<String>,
@@ -131,8 +128,8 @@ pub struct ResolvedBlockchain {
     /// [`super::DEFAULT_CHAIN_STALENESS_GRACE_SEC`]. Always evaluated; a large
     /// value opts out. Only used when `content_blacklist_address` is set.
     pub chain_staleness_grace_sec: u64,
-    /// Governance-chain EIP-712 `chainId` for the `slash_sig`, attestation,
-    /// bind-node and pointer domain separators. Defaults to
+    /// Governance-chain EIP-712 `chainId` for the stream response,
+    /// attestation, bind-node and pointer domain separators. Defaults to
     /// [`super::DEFAULT_CHAIN_ID`] (Arbitrum Sepolia) when unset.
     pub chain_id: u64,
     /// Seconds between RPC connectivity watchdog probes. `0` disables the

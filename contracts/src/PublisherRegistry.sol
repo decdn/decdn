@@ -99,7 +99,7 @@ contract PublisherRegistry is AccessControl {
     /// @param admin Initial `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder
     ///              (Timelock at mainnet per ADR 016 § Deployment Order).
     ///              The two governable parameters start at their ADR 002
-    ///              defaults; no economic constructor args (ADR 016 step 11).
+    ///              defaults; no economic constructor args (ADR 016 step 9).
     constructor(address admin) {
         if (admin == address(0)) revert ZeroAddress();
         maxNamespacesPerPublisher = DEFAULT_MAX_NAMESPACES;

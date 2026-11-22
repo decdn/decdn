@@ -10,7 +10,7 @@ pool's `operatorBps` split. The operator nets the operator share of each sale an
 the full upstream price. A single serve therefore clears only when the upstream
 price is far enough below the sell price to cover the skim.
 
-The protocol does not require a node to serve. Refusing is not slashable. A
+The protocol does not require a node to serve. Refusing is not an offense. A
 refused client re-routes to another provider and pays only a latency cost. A
 node that serves below margin loses money for no protocol reason. "Serve when it
 pays, decline when it does not" is the correct behavior for a trustless market.
@@ -155,7 +155,7 @@ effective ceiling at the point it commits the buy, not only at ranking. A
 candidate that quotes a low rate on its discovery open and then returns a
 higher rate on a later stream exceeds the ceiling, and the node aborts that leg.
 The node also signs its price into each voucher, so a node that asks more than
-its quote is refused and paid nothing more. There is no rate slash.
+its quote is refused and paid nothing more.
 
 ### No route is a valid outcome
 

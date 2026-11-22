@@ -30,7 +30,7 @@ A requester pays on the stream that its discovery open opened, and the node pins
 3. **Shut down** with `decdn node drain --wait`, which polls `admin_v1_health` for `in_flight_streams == 0` rather than returning the moment the trigger fires.
 4. **Upgrade and restart.** Confirm with `decdn node health`, then re-enable inbound at the load balancer.
 
-Stopping without step 1 is not itself slashable — an unanswered connection is not evidence — but it leaves the window above open for every stream that a peer opens before the stop.
+Stopping without step 1 is not a fault — an unanswered connection signs nothing — but it leaves the window above open for every stream that a peer opens before the stop.
 
 ## Tier 1 and Tier 2 operator checklists
 
@@ -40,7 +40,7 @@ A Tier 1 release adds optional fields to existing structs. By construction:
 
 - Wire format stays compatible (postcard two-phase deserialization handles missing trailing extensions).
 - ALPN string unchanged.
-- Signed field set unchanged ([ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing)) — slash evidence stays verifiable across versions.
+- Signed field set unchanged ([ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing)) — signed responses stay verifiable across versions.
 - Payment pools and on-chain bindings unaffected.
 
 **Operator action:** Pull and restart at your normal cadence, following [§ Restarting a node safely](#restarting-a-node-safely). No flag day, no client coordination, and no upgrade-specific drain beyond the standing restart procedure. Skipping a Tier 1 release entirely keeps you interoperable indefinitely — peers on the new version just won't see the optional fields you don't emit.

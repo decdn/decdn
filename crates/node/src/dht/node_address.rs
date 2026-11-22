@@ -16,7 +16,7 @@
 //! `ChainNodeAddressDirectory::from_parts` (#1110).
 //!
 //! The binding is set at `registerNode` and cleared at `deregisterNode`; it is
-//! unaffected by bond / unbonding / ejection transitions (those flip
+//! unaffected by bond / unbond / ejection transitions (those flip
 //! `isActive`, which the *staker set* tracks separately). The snapshot applies
 //! no `isActive` filter: an operator below its bond floor is inactive but still
 //! payable.

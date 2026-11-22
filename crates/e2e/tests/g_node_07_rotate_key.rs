@@ -5,13 +5,12 @@
 //! rotation only, and asserts the three properties that make rotation safe to
 //! perform on a node that is earning:
 //!
-//! 1. **Slashability moves atomically.** `bindNodeId` deletes the old
+//! 1. **The binding moves atomically.** `bindNodeId` deletes the old
 //!    `nodeId → address` mapping and writes the new one in one transaction, so
-//!    the new id is slashable the instant the old one stops being. Both
-//!    directions are asserted on `addressToNodeId` / `nodeIdToAddress` — the
-//!    raw mappings `SlashJudge._checkRegistered` resolves through — rather than
-//!    on `isActiveNode`, which folds in a liveness flag the slashing path
-//!    deliberately ignores.
+//!    the new id is bound the instant the old one stops being. Both directions
+//!    are asserted on the raw `addressToNodeId` / `nodeIdToAddress` mappings
+//!    rather than on `isActiveNode`, which folds in a liveness flag that has
+//!    nothing to do with the binding.
 //! 2. **The retired key stops serving and the new one starts.** iroh
 //!    authenticates the peer key in the QUIC handshake, so this is checked by
 //!    dialing both ids at the same socket.
@@ -32,11 +31,11 @@
 //!
 //! Two more tests sit on the same fixtures. The second covers the negative the
 //! issue names: a key swapped without a matching `bindNodeId` leaves the node
-//! **unslashable**, which must be flagged rather than silently tolerated, and
+//! **unroutable**, which must be flagged rather than silently tolerated, and
 //! must be repairable. The third walks `--key eth`, the other half of the
 //! runbook — the Ethereum-address migration, which has no rebinding API and so
-//! spends the whole unbonding window moving the identity, resetting
-//! `firstBondedAt` and the node id on the way.
+//! moves the whole identity, resetting `firstBondedAt` and the node id on the
+//! way.
 
 #![cfg(feature = "anvil-e2e")]
 // Test scaffolding legitimately uses unwrap/expect/panic; the workspace
@@ -80,8 +79,8 @@ const STOP_BUDGET: Duration = Duration::from_secs(60);
 /// the same sizing `smoke.rs` relies on.
 const PAYLOAD_LEN: usize = 2 * MIB;
 
-/// The Ethereum leg walks the full unbonding window (five sequential CLI
-/// invocations plus the chain-clock advance), so it takes the heavy journey tier
+/// The Ethereum leg runs four sequential CLI invocations, the last of which
+/// bonds and registers a new address, so it takes the heavy journey tier
 /// rather than the standard one (see [`decdn_e2e::timeout`] for the tier rule).
 const ETH_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 
@@ -92,7 +91,7 @@ const ETH_TIMEOUT: Duration = decdn_e2e::timeout::HEAVY;
 const REONBOARD_MBPS: u64 = 10;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rotate_key_rebinds_slashability_and_preserves_in_flight_vouchers() -> anyhow::Result<()> {
+async fn rotate_key_rebinds_the_node_id_and_preserves_in_flight_vouchers() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_rotation()))
         .await
         .context("G-NODE-07 rotation leg exceeded the overall timeout")??;
@@ -213,14 +212,12 @@ async fn run_rotation() -> anyhow::Result<()> {
         "the replaced key must be archived, not destroyed: {receipt}"
     );
 
-    // ---- 3. Slashability moved, and moved completely. These are the two raw
-    // mappings `SlashJudge` resolves through: the new id now has an operator to
-    // charge, and the old id has none, so a challenge citing it reverts
-    // `NodeNotRegistered`.
+    // ---- 3. The binding moved, and moved completely: the new id now resolves
+    // to the operator, and the old id to nobody.
     assert_eq!(
         chain.node_id_of(operator).await?,
         new_id_b256,
-        "the operator must now be bound to the new id — this is what makes it slashable"
+        "the operator must now be bound to the new id — this is what makes it routable"
     );
     assert_eq!(
         chain.operator_of_node_id(new_id_b256).await?,
@@ -230,8 +227,8 @@ async fn run_rotation() -> anyhow::Result<()> {
     assert_eq!(
         chain.operator_of_node_id(old_id_b256).await?,
         Address::ZERO,
-        "the retired id must resolve to nobody — otherwise it stays slashable and the operator \
-         is exposed under a key they no longer control"
+        "the retired id must resolve to nobody — otherwise responses signed under a key the \
+         operator no longer controls still read as theirs"
     );
 
     // ---- 4. Nothing economic moved. This is the runbook's carry-over table,
@@ -352,9 +349,9 @@ async fn unbound_local_key_is_flagged_and_repairable() -> anyhow::Result<()> {
 
 /// The negative case: a node key replaced WITHOUT the matching `bindNodeId`.
 ///
-/// This is not merely an outage. `SlashJudge._checkRegistered` resolves an
-/// accused node through the binding, so a node serving under an unbound key
-/// cannot be slashed at all — it keeps earning while its bond is unreachable.
+/// Peers and clients resolve a serving node to its operator through the
+/// binding, so a node serving under an unbound key gets no routed traffic and
+/// no client accepts its responses — while it looks healthy.
 /// The state is unreachable *through* `decdn node rotate-key` (the key file is
 /// committed only after the bind confirms), but reachable *around* it, by an
 /// operator copying a key file or restoring the wrong backup. So the daemon has
@@ -388,7 +385,7 @@ async fn run_unbound() -> anyhow::Result<()> {
 
     // ---- 2. Restart, and the daemon must call it out. The chain has not moved:
     // the operator is still bound to the old id, so the key now being served is
-    // bound to nobody and cannot be slashed.
+    // bound to nobody.
     node.restart().await?;
     assert_eq!(
         B256::from_slice(node.current_node_id().await?.as_bytes()),
@@ -398,12 +395,12 @@ async fn run_unbound() -> anyhow::Result<()> {
     assert_eq!(
         node.binding_status().await?,
         BindingStatus::Mismatch,
-        "a node serving an unbound key is UNSLASHABLE and must be flagged, not tolerated"
+        "a node serving an unbound key is UNROUTABLE and must be flagged, not tolerated"
     );
     assert_eq!(
         chain.operator_of_node_id(orphan_id).await?,
         Address::ZERO,
-        "the key being served resolves to no operator — nothing to slash"
+        "the key being served resolves to no operator"
     );
     assert_eq!(
         chain.node_id_of(operator).await?,
@@ -486,7 +483,7 @@ async fn run_unbound() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn eth_rotation_walks_the_unbonding_window() -> anyhow::Result<()> {
+async fn eth_rotation_moves_the_whole_identity() -> anyhow::Result<()> {
     tokio::time::timeout(ETH_TIMEOUT, Box::pin(run_eth_rotation()))
         .await
         .context("G-NODE-07 eth leg exceeded the overall timeout")??;
@@ -494,11 +491,11 @@ async fn eth_rotation_walks_the_unbonding_window() -> anyhow::Result<()> {
 }
 
 /// The Ethereum-key path: no rebinding API exists for the on-chain address, so
-/// the migration moves the whole identity across the unbonding window.
+/// the migration moves the whole identity.
 ///
 /// Each invocation reads chain state and performs the next step, so the journey
-/// is written the way an operator actually runs it — the same command, four
-/// times, with the chain clock advanced in between. What is asserted at each
+/// is written the way an operator actually runs it — the same command, three
+/// times, then once more with the new keystore. What is asserted at each
 /// step is the state transition the operator is paying for, plus the two costs
 /// the runbook names and this path cannot avoid: `firstBondedAt` resets, and the
 /// node id changes.
@@ -550,8 +547,8 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
     // This is the whole point of validating the flag ahead of the phase
     // branches: with the guard past the early returns, passing the
     // node's own keystore is accepted silently here and only refused at the
-    // re-onboarding call — two weeks, a 14-day window and four transactions
-    // later, with the tier already cleared and nothing gained. Asserting the
+    // re-onboarding call — two transactions later, with the tier already
+    // cleared, the bond withdrawn, and nothing gained. Asserting the
     // operator is still registered afterwards is what pins "refused *before*
     // `deregisterNode`" rather than merely "refused".
     let own_keystore = decdn_incentive::eth_identity::keystore_path(node.data_dir());
@@ -592,52 +589,27 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
         "deregistration must not move the bond — that is a separate operation"
     );
 
-    // ---- 2. Start the window. The same command, no new flags: the phase came
-    // from the chain, not from the operator remembering where they were.
-    let out = run_eth_cli(&node, &[]).await?;
-    let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("request"));
-    assert!(json_str(&receipt, "request_tx").is_some(), "{receipt}");
-    let (pending, _unlock) = chain.unbonding_of(old_operator).await?;
-    assert_eq!(pending, bond_amount, "the whole bond is now unbonding");
-
-    // ---- 3. Maturing: nothing to submit, and the command must say so with a
-    // NON-ZERO exit. A wrapper looping `until decdn node rotate-key; do sleep;
-    // done` depends on that: a zero exit here would read as "migration done".
-    let waiting = run_eth_cli_raw(&node, &[]).await?;
-    assert!(
-        !waiting.status.success(),
-        "a maturing window must not report success"
-    );
-    let receipt = last_json_line(&waiting)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("waiting"));
-    assert_eq!(json_bool(&receipt, "submitted"), Some(false));
-    assert!(
-        receipt
-            .get("remaining_secs")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|s| s > 0),
-        "the operator needs to know how long is left: {receipt}"
-    );
-
-    // ---- 4. Advance past the window and withdraw. `+2` rather than `+1`
-    // because the comparison runs against the head block's timestamp, which the
-    // withdrawing transaction advances again.
-    let window = chain.unbonding_period().await?;
-    chain.advance_time(window + 2).await?;
+    // ---- 2. Unbond. The same command, no new flags: the phase came from the
+    // chain, not from the operator remembering where they were. The whole bond
+    // returns to the OLD address in this one transaction.
     let before = chain.token_balance(old_operator).await?;
     let out = run_eth_cli(&node, &[]).await?;
     let receipt = last_json_line(&out)?;
-    assert_eq!(json_str(&receipt, "phase"), Some("withdraw"));
-    assert!(json_str(&receipt, "withdraw_tx").is_some(), "{receipt}");
+    assert_eq!(json_str(&receipt, "phase"), Some("unbond"));
+    assert!(json_str(&receipt, "unbond_tx").is_some(), "{receipt}");
     assert_eq!(
         chain.token_balance(old_operator).await? - before,
         bond_amount,
         "every base unit came back to the OLD address"
     );
     assert_eq!(chain.active_bond(old_operator).await?, U256::ZERO);
+    assert_eq!(
+        chain.first_bonded_at(old_operator).await?,
+        0,
+        "a full unbond ends the old address's tenure"
+    );
 
-    // ---- 5. Re-onboard on the new address. It needs its own TOKEN — the
+    // ---- 3. Re-onboard on the new address. It needs its own TOKEN — the
     // command checks the balance but never moves funds between the operator's
     // addresses, which is the operator's decision to make.
     let target = chain
@@ -645,6 +617,10 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
         .await?
         .max(chain.bond_required(REONBOARD_MBPS).await?);
     chain.transfer_token(new_operator, target).await?;
+    // `firstBondedAt` is a block timestamp, and anvil can mine the old bond and
+    // the new one inside the same second. Step past it so the reset below is
+    // observable as a strictly later anchor.
+    chain.advance_time(1).await?;
 
     let out = run_eth_cli(
         &node,
@@ -671,7 +647,7 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
     );
     assert_eq!(chain.declared_mbps(new_operator).await?, REONBOARD_MBPS);
 
-    // ---- 6. The two costs this path cannot avoid, asserted rather than
+    // ---- 4. The two costs this path cannot avoid, asserted rather than
     // assumed.
     //
     // A fresh node id, because `deregisterNode` leaves `nodeIdToAddress`
@@ -694,8 +670,9 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
          why carrying it across needs a `--key iroh` rebind on the old address first"
     );
 
-    // And a reset age-ramp anchor: `firstBondedAt` is per-address and write-once,
-    // so a new address necessarily starts over.
+    // And a reset age-ramp anchor: `firstBondedAt` is per-address, the full
+    // unbond cleared the old address's value, and the new address starts its
+    // own at this bond.
     let first_bonded_after = chain.first_bonded_at(new_operator).await?;
     assert!(
         first_bonded_after > first_bonded_before,
@@ -703,7 +680,7 @@ async fn run_eth_rotation() -> anyhow::Result<()> {
          {first_bonded_before}) — this is the governance age-ramp cost the runbook names"
     );
 
-    // ---- 7. Re-running is a no-op rather than a second migration.
+    // ---- 5. Re-running is a no-op rather than a second migration.
     let out = run_eth_cli(
         &node,
         &["--new-keystore", &new_keystore.display().to_string()],
@@ -730,7 +707,7 @@ async fn run_eth_cli(node: &NodeFixture, extra: &[&str]) -> anyhow::Result<Outpu
     Ok(out)
 }
 
-/// [`run_eth_cli`] without the success assertion — the maturing phase exits
+/// [`run_eth_cli`] without the success assertion, for the refusals that exit
 /// non-zero by design.
 async fn run_eth_cli_raw(node: &NodeFixture, extra: &[&str]) -> anyhow::Result<Output> {
     let mut args = vec!["rotate-key", "--key", "eth", "--yes", "--json"];

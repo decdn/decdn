@@ -856,7 +856,7 @@ pub struct ClientHandlerDeps {
     /// `StreamResponse`; every other use reads it only for its address.
     /// Client bindings are verified here, never signed.
     pub eth_signer: Arc<PrivateKeySigner>,
-    /// EIP-712 domain for slash attestations.
+    /// `CapacityBond` EIP-712 domain for the `StreamResponse` `slash_sig`.
     pub slash_domain: Eip712Domain,
     /// EIP-712 domain for lane bindings.
     pub bind_domain: Eip712Domain,
@@ -1152,7 +1152,7 @@ pub struct ClientHandler {
     shed: Arc<crate::load_shed::LoadShedController>,
     cache: CacheEngine,
     eth_signer: Arc<PrivateKeySigner>,
-    /// `SlashJudge` EIP-712 domain for `StreamResponse.slash_sig`.
+    /// `CapacityBond` EIP-712 domain for `StreamResponse.slash_sig`.
     slash_domain: Eip712Domain,
     /// Held origin attestations, forwarded on `ok: true` responses.
     attestations: Option<Arc<crate::attestations::Attestations>>,
@@ -2201,8 +2201,8 @@ impl ClientHandler {
     ///
     /// The open-time and admission gates are not enough on their own: a
     /// multi-GB blob can still be streaming minutes after a one-hour removal
-    /// order took effect, and serving past the compliance window is slashable
-    /// (ADR 026 §Slashing and burn). Both halves are re-checked because both can
+    /// order took effect, and the compliance window binds traffic already in
+    /// flight too. Both halves are re-checked because both can
     /// land mid-stream — a hash via the local denylist reload, the governance
     /// blacklist, or an eviction; a funder via either origin list.
     ///

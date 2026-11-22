@@ -9,7 +9,7 @@ fn matching_binding_is_bound_and_echoes_the_id() {
     assert_eq!(r.bound_node_id, Some(LOCAL.into()));
 }
 
-/// The whole point of the check: a different bound id is the unslashable
+/// The whole point of the check: a different bound id is the unroutable
 /// state, and the report has to carry the id to restore.
 #[test]
 fn different_binding_is_a_mismatch_that_names_the_bound_id() {

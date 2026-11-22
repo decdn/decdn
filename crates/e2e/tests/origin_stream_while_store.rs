@@ -17,9 +17,8 @@
 //! 3. **Corrupt-safe.** A tampered `{H}.obao4` (a flipped byte in the middle,
 //!    so the outboard's length is unchanged and the tamper is only caught by
 //!    bao verification, not a length pre-check) must fail the client's fetch
-//!    without panicking the daemon or leaving it unhealthy — this
-//!    path carries no slash consequence, only a client-side rejection and node
-//!    liveness matter.
+//!    without panicking the daemon or leaving it unhealthy — only a
+//!    client-side rejection and node liveness matter.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a prior build of the `decdn-node` binary:
@@ -206,9 +205,8 @@ async fn run_missing_outboard_fault() -> anyhow::Result<()> {
 /// Test C — the published outboard is corrupt (a single byte flipped in the
 /// middle, so its length is unchanged and the tamper is caught by bao
 /// verification rather than a cheap length check). The client's fetch must
-/// fail; the daemon must neither panic nor become unhealthy afterward. No
-/// slash surface is touched — this is a pure client-side rejection
-/// plus a node-liveness assertion.
+/// fail; the daemon must neither panic nor become unhealthy afterward. This
+/// is a pure client-side rejection plus a node-liveness assertion.
 async fn run_corrupt_outboard() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

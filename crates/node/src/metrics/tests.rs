@@ -1101,7 +1101,6 @@ fn chain_refresh_metrics_start_at_zero_and_move() {
     for name in [
         "decdn_staker_set_active_count",
         "decdn_capacity_bond_registry_resync_failures_total",
-        "decdn_slash_resync_failures_total",
         "decdn_blacklist_ledger_poll_failures_total",
         "decdn_blacklist_enforcement_failures_total",
     ] {
@@ -1112,14 +1111,12 @@ fn chain_refresh_metrics_start_at_zero_and_move() {
     }
     metrics.staker_set_active_count(7);
     metrics.capacity_bond_registry_resync_failure();
-    metrics.slash_resync_failure();
     metrics.blacklist_ledger_poll_failure();
     metrics.blacklist_enforcement_failure(2);
     let text = metrics.encode().unwrap();
     for (name, value) in [
         ("decdn_staker_set_active_count", 7),
         ("decdn_capacity_bond_registry_resync_failures_total", 1),
-        ("decdn_slash_resync_failures_total", 1),
         ("decdn_blacklist_ledger_poll_failures_total", 1),
         ("decdn_blacklist_enforcement_failures_total", 2),
     ] {

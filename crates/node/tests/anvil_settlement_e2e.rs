@@ -83,8 +83,8 @@ use decdn_client::sign_client_binding;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolStore, MemoryBuyerPoolStore, PoolStateStore, bind_node_id_domain,
-    register_node_signing_hash, slash_judge_domain, voucher_domain,
+    BuyerPoolStore, MemoryBuyerPoolStore, PoolStateStore, capacity_bond_domain,
+    register_node_signing_hash, voucher_domain,
 };
 use decdn_node::buyer_pool::BuyerPoolService;
 use decdn_node::chain_events::boot_retry::BootRetry;
@@ -598,7 +598,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let usdc_addr = deploy_mock_usdc(&admin, &contracts).await?;
     let cctp = anvil_deploy::deploy_loopback_cctp(&admin, &contracts).await?;
     run_deploy_script(&contracts, &rpc_url, (usdc_addr, cctp), node_addr).await?;
-    let (capacity_bond, token, slash_judge) = read_manifest(&manifest)?;
+    let (capacity_bond, token) = read_manifest(&manifest)?;
     let receiver = anvil_deploy::manifest_contract(&manifest, "CctpSweepReceiver")?;
     let payment_pool = anvil_deploy::deploy_payment_pool(
         &contracts,
@@ -643,7 +643,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     // `termsHash` is read from the deployed contract so the signature matches
     // whatever genesis terms the deploy script committed.
     let terms_hash = bond.currentTermsHash().call().await?;
-    let bind_domain = bind_node_id_domain(CHAIN_ID, capacity_bond);
+    let bind_domain = capacity_bond_domain(CHAIN_ID, capacity_bond);
     let binding_sig = node_signer
         .sign_hash_sync(&register_node_signing_hash(
             node_id,
@@ -712,7 +712,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let metrics = Arc::new(Metrics::new());
     let voucher_dom = voucher_domain(CHAIN_ID, payment_pool);
     let domains = HandlerDomains {
-        slash: slash_judge_domain(CHAIN_ID, slash_judge),
+        slash: capacity_bond_domain(CHAIN_ID, capacity_bond),
         voucher: voucher_dom.clone(),
         binding: bind_domain.clone(),
     };
@@ -1664,9 +1664,8 @@ async fn run_deploy_script(
     anyhow::bail!("DEPLOY_ATTEMPTS must be >= 1 (was {DEPLOY_ATTEMPTS})")
 }
 
-/// Read `(CapacityBond, Token, SlashJudge)` from the governance deploy
-/// manifest.
-fn read_manifest(path: &Path) -> anyhow::Result<(Address, Address, Address)> {
+/// Read `(CapacityBond, Token)` from the governance deploy manifest.
+fn read_manifest(path: &Path) -> anyhow::Result<(Address, Address)> {
     let get = |k: &str| anvil_deploy::manifest_contract(path, k);
-    Ok((get("CapacityBond")?, get("Token")?, get("SlashJudge")?))
+    Ok((get("CapacityBond")?, get("Token")?))
 }

@@ -5,11 +5,8 @@
 //!
 //! Each full CUJ journey is its own sibling file on top of these fixtures:
 //! `g_node_04_blacklist_compliance.rs` and `origin_blacklist_compliance.rs`
-//! (hash and operator deny-sets), `slash_appeal.rs` (G-NODE-05 detection +
-//! appeal), `g_node_06_unbond.rs` (capacity reduction and the unbonding
-//! window), `g_gov_03_real_evidence.rs` (daemon signatures as on-chain
-//! evidence),
-//! `g_origin_01_publish.rs` (namespace lifecycle), the `cli_*` files (publish,
+//! (hash and operator deny-sets), `g_node_06_unbond.rs` (capacity reduction
+//! and the bond exit), `g_origin_01_publish.rs` (namespace lifecycle), the `cli_*` files (publish,
 //! setup, fetch resume / top-up, bundle pull), and `anvil_pool_redeem.rs` (the
 //! capability-registration + voucher redemption path). Feature-scoped journeys
 //! sit beside them on the same fixtures — e.g. `origin_stream_while_store.rs` —

@@ -33,7 +33,6 @@ region = "us"
 rpc_url = "https://sepolia-rollup.arbitrum.io/rpc"
 payment_chains = [{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
-slash_judge_address = "0x0000000000000000000000000000000000000003"
 content_blacklist_address = "0x0000000000000000000000000000000000000004"
 "#;
 
@@ -231,7 +230,6 @@ const MULTI_ERROR: &str = r#"
 [blockchain]
 payment_chains = [{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
-slash_judge_address = "0x0000000000000000000000000000000000000003"
 
 [cache]
 cache_size_mb = 100
@@ -353,7 +351,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
             buyer_working_deposit_micro_usdc: 10_000_000,
             buyer_max_approve: true,
             pool_min_remaining_deposit_micro_usdc: 100_000,
-            slash_judge_address: "0x0000000000000000000000000000000000000003".to_string(),
             content_blacklist_address: None,
             content_blacklist_poll_interval_sec: 600,
             chain_staleness_grace_sec: 1800,
@@ -842,7 +839,6 @@ const MINIMAL_VALID_CONFIG: &str = r#"
 rpc_url = "http://127.0.0.1:8545"
 payment_chains = [{ rpc_url = "http://127.0.0.1:8546", chain_id = 84532, payment_pools = ["0x0000000000000000000000000000000000000001"] }]
 capacity_bond_address = "0x0000000000000000000000000000000000000002"
-slash_judge_address = "0x0000000000000000000000000000000000000003"
 content_blacklist_address = "0x0000000000000000000000000000000000000004"
 
 [cache]

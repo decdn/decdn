@@ -36,8 +36,8 @@ use decdn_client::LocalPullFault;
 use decdn_client::{PoolContext, Recovery};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    StreamSlashData, Voucher, bind_node_id_domain, binding_signing_hash, min_payment,
-    signed_to_wire_voucher, slash_judge_domain, voucher_domain,
+    StreamSlashData, Voucher, binding_signing_hash, capacity_bond_domain, min_payment,
+    signed_to_wire_voucher, voucher_domain,
 };
 use decdn_node::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use decdn_node::dht::attestation::test_support;
@@ -99,7 +99,7 @@ const fn slash_verifying() -> Address {
     Address::repeat_byte(0x11)
 }
 fn slash_domain() -> Eip712Domain {
-    slash_judge_domain(CHAIN_ID, slash_verifying())
+    capacity_bond_domain(CHAIN_ID, slash_verifying())
 }
 fn voucher_dom() -> Eip712Domain {
     voucher_domain(CHAIN_ID, Address::repeat_byte(0x34))
@@ -115,7 +115,7 @@ fn buyer_pool() -> decdn_node::node_origin::BuyerPool {
         .unwrap_or_else(|| unreachable!("one accepted pool"))
 }
 fn binding_dom() -> Eip712Domain {
-    bind_node_id_domain(CHAIN_ID, Address::repeat_byte(0x99))
+    capacity_bond_domain(CHAIN_ID, Address::repeat_byte(0x99))
 }
 
 /// A recorded `record_progress` call: `(provider, bytes_delivered, amount)`.
@@ -12250,7 +12250,7 @@ impl OriginDirectory for MutableOriginDirectory {
 }
 
 /// A cached entry can be disowned INSIDE its own 15s: a node ejected from the active
-/// set (chain ejection / unbonding) while its candidate-cache entry is still live. The
+/// set (chain ejection / an unbond below the floor) while its candidate-cache entry is still live. The
 /// cold path denies it via `filter_active_stakers`; the hit path bypasses
 /// `find_providers`, so it must re-apply `staker_set.is_active` itself (#1223). This
 /// proves that re-check FIRES — the ejected provider is skipped on the hit and NOT

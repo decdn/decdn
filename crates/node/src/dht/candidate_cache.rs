@@ -23,16 +23,15 @@
 //! suppression's, and not something tighter.
 //!
 //! The cache stores no signature. A `StreamResponse` carries `slash_sig`: a
-//! peer's signed statement about the blob, which can corroborate a blacklist
-//! violation for `MAX_EVIDENCE_AGE_US` (5 days, ADR 014 §Evidence staleness).
-//! A structure that survives one request to speed up the next has no business
-//! holding another node's slashable statements: retaining them turns an
-//! availability cache into an evidence locker.
+//! peer's signed statement about one answer at one time. The next pull opens
+//! the candidate again and verifies a fresh signed answer before it pays, so a
+//! retained signature is never read. A structure that survives one request to
+//! speed up the next has no business holding another node's signed
+//! statements.
 //!
 //! `Coverage` and the proven size are exempt from that concern, not an
 //! exception to it: both ride the unsigned `StreamResponseExt`, outside the
-//! `slash_sig` set, so they carry no author to slash and are not evidence of
-//! anything. They ride the entry so a cache-hit candidate can still be
+//! `slash_sig` set, so they carry no author. They ride the entry so a cache-hit candidate can still be
 //! range-planned (`plan_covered_runs`) against its coverage; without it a real
 //! partial holder would read as covering nothing on the hit path and be
 //! excluded from range assignment.
@@ -95,17 +94,17 @@ pub struct CachedCandidate {
     pub rtt_ms: u32,
     /// The discovery blocks the provider reported holding on that answer
     /// (`StreamResponseExt.coverage`). UNSIGNED, outside the `slash_sig` set,
-    /// so retaining it is not the evidence retention the module doc forbids;
-    /// it carries no slashable author. A cache-hit candidate is range-planned
+    /// so retaining it is not the signature retention the module doc forbids;
+    /// it carries no author. A cache-hit candidate is range-planned
     /// against this value rather than reading as covering nothing.
     pub coverage: Coverage,
     /// The blob size the answer proved, when it carried a size proof. Outside
-    /// `slash_sig`, like `coverage`, so it carries no slashable author either.
+    /// `slash_sig`, like `coverage`, so it carries no author either.
     /// The pull leg cuts its first upstream open from it.
     pub total_bytes_hint: Option<u64>,
 }
 
-// The guard against retaining slashable evidence is the exhaustive struct
+// The guard against retaining signed statements is the exhaustive struct
 // literal at the single write site (no `..`, so any new field must be populated
 // there — sending the author back to the module doc). `CachedCandidate` does not
 // derive `Copy`: `Coverage` wraps a `Vec<u8>`, which cannot be `Copy`. A

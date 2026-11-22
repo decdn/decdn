@@ -13,8 +13,9 @@
 //! The two signed artifacts on this protocol are produced/verified by
 //! `decdn_incentive`:
 //!   - `StreamResponse.slash_sig` — an EIP-712 secp256k1 signature over the
-//!     signed body fields `{hash, ok, rate_per_mb, timestamp_us}` (ADR 014
-//!     §1), produced by the stream-response slash signer in `decdn_incentive`.
+//!     signed body fields `{hash, ok, rate_per_mb, timestamp_us}` (ADR 005
+//!     § Signer binding), produced by the stream-response signer in
+//!     `decdn_incentive`.
 //!     The outcome (the size proof or the refusal class) is unsigned.
 //!   - `Voucher.signature` — an EIP-712 secp256k1 voucher signature; the wire
 //!     carries `{signature, amount}` and the receiver reconstructs the full typed
@@ -219,8 +220,8 @@ impl ClientMessage {
 ///
 /// `timestamp_us` is a requester-generated microsecond timestamp echoed back in
 /// [`StreamResponseBody::timestamp_us`]; it both correlates the response and
-/// dates the signed evidence of blacklist-violation slashing (ADR 005,
-/// ADR 014). `byte_offset` supports seek/resume on failover — the requester
+/// dates the signed answer, which a pull receipt carries as the approximate
+/// serve time (ADR 005 § Signer binding). `byte_offset` supports seek/resume on failover — the requester
 /// reconnects to another node and resumes from the last BLAKE3-verified byte.
 ///
 /// This struct holds **only the frozen base fields** (ADR 013 §Tier 1). The
@@ -478,8 +479,8 @@ pub fn parse_stream_request_ext(remainder: &[u8]) -> Result<StreamRequestExt, po
 pub struct StreamResponse {
     /// Signed body. Its wire layout is frozen per ADR 013.
     pub body: StreamResponseBody,
-    /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 014 §1;
-    /// produced by the `decdn_incentive` stream slash signer). Always exactly
+    /// EIP-712 secp256k1 signature over `body`'s signed fields (ADR 005
+    /// § Signer binding; produced by the `decdn_incentive` stream signer). Always exactly
     /// [`SLASH_SIG_LEN`] bytes — *not* a signature over postcard bytes.
     pub slash_sig: Vec<u8>,
 }
@@ -507,7 +508,7 @@ pub struct StreamResponseExt {
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
     /// Which 64 MiB discovery blocks ([`crate::coverage`]) the node holds or
     /// can serve. Unsigned: a hint, never a commitment, and nothing may let it
-    /// decide a payment or a slash. A receiver checks it against the signed
+    /// decide a payment. A receiver checks it against the signed
     /// body and the requested span with [`StreamResponseExt::consistent_with`]
     /// and drops a response where they disagree.
     pub coverage: crate::Coverage,
@@ -754,7 +755,7 @@ pub fn parse_stream_response_ext(remainder: &[u8]) -> Result<StreamResponseExt, 
     }
 }
 
-/// Signed fields of a [`StreamResponse`] (ADR 014 §1). Layout is frozen per
+/// Signed fields of a [`StreamResponse`] (ADR 005 § Signer binding). Layout is frozen per
 /// ADR 013 — future additions go on [`StreamResponse`] as optional unsigned
 /// fields, not here.
 ///
@@ -766,7 +767,7 @@ pub struct StreamResponseBody {
     /// BLAKE3 hash this response answers for, echoed from the request.
     pub hash: [u8; 32],
     /// Whether the node will serve the blob. A signed `true` commits the node to
-    /// deliver; for a blacklisted hash it is slash evidence (ADR 014).
+    /// deliver.
     pub ok: bool,
     /// Quoted rate in token base units per MB. Bounded by [`MAX_RATE_PER_MB`].
     #[serde(deserialize_with = "crate::message::deserialize_rate_per_mb")]
@@ -777,7 +778,7 @@ pub struct StreamResponseBody {
 }
 
 impl StreamResponse {
-    /// Validate requester-side invariants (ADR 005, ADR 014 §1, #252):
+    /// Validate requester-side invariants (ADR 005, #252):
     ///
     /// - `rate_per_mb` within `(0, MAX_RATE_PER_MB]` (the decode path already
     ///   enforces the upper bound via `deserialize_rate_per_mb`; this adds the

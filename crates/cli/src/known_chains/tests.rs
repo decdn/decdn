@@ -12,8 +12,6 @@ const GOVERNANCE_MANIFEST: &str = r#"{
     "FeeRouter": "0x0000000000000000000000000000000000000004",
     "OriginAssignment": "0x0000000000000000000000000000000000000005",
     "PublisherRegistry": "0x0000000000000000000000000000000000000006",
-    "SlashAppeal": "0x0000000000000000000000000000000000000007",
-    "SlashJudge": "0x0000000000000000000000000000000000000008",
     "Token": "0x0000000000000000000000000000000000000009"
   },
   "deployBlock": 100,
@@ -69,7 +67,6 @@ fn the_governance_manifest_yields_the_governance_set() -> anyhow::Result<()> {
         a.cctp_sweep_receiver,
         "0x0000000000000000000000000000000000000002"
     );
-    assert_eq!(a.slash_judge, "0x0000000000000000000000000000000000000008");
     Ok(())
 }
 
@@ -139,11 +136,9 @@ fn every_known_chain_manifest_parses_and_matches() {
         // caught here at CI, not on an operator's first `config validate`.
         for (field, value) in [
             ("capacity_bond", &addrs.capacity_bond),
-            ("slash_judge", &addrs.slash_judge),
             ("content_blacklist", &addrs.content_blacklist),
             ("origin_assignment", &addrs.origin_assignment),
             ("publisher_registry", &addrs.publisher_registry),
-            ("slash_appeal", &addrs.slash_appeal),
             ("cctp_sweep_receiver", &addrs.cctp_sweep_receiver),
         ] {
             decdn_common::config::parse_contract_address(field, value)

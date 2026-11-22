@@ -35,11 +35,11 @@ use serde::{Deserialize, Serialize};
 /// Whether the node's local iroh key is the one bound to its operator address
 /// on-chain (#1034).
 ///
-/// This is a correctness signal, not a liveness one. `SlashJudge` resolves an
-/// accused node through `CapacityBond.nodeIdOf`, so a node serving under a key
-/// no binding points at is **unslashable**: it earns normally while its bond is
-/// unreachable, which is a protocol fault rather than an outage — and one with
-/// no symptom the operator would otherwise notice. A key rotation that swapped
+/// This is a correctness signal, not a liveness one. Peers and clients resolve
+/// a serving node to its operator through the on-chain binding
+/// (`CapacityBond.nodeIdToAddress`), so a node serving under a key no binding
+/// points at gets no routed traffic and no client accepts its signed
+/// responses — a fault with no error the operator would otherwise see. A key rotation that swapped
 /// `node.secret` without submitting `bindNodeId` lands exactly here, which is
 /// why `decdn node rotate-key` orders its steps to make the state unreachable
 /// and why the daemon reports it when it happens anyway.
@@ -53,7 +53,7 @@ pub enum BindingStatus {
     /// The on-chain binding names this node's key. Nothing to do.
     Bound,
     /// The operator is bound to a DIFFERENT node id than the local key —
-    /// the un-slashable state. Either rotate on-chain to match the local key
+    /// the unroutable state. Either rotate on-chain to match the local key
     /// (`decdn node rotate-key --key iroh --bind-existing`) or restore the
     /// key the binding names. Sampled once at bring-up like every other
     /// variant here, so a live repair does not clear this to `Bound` until
@@ -107,8 +107,8 @@ pub struct HealthResponse {
     /// the threat (see ADR 019 §How criterion 1 is enforced). What `false`
     /// means is that the two EXTERNAL constraints are in force: the operator
     /// accrues no governance weight, because its declared capacity caps
-    /// credited bytes at zero, and peers have no reason to route to a node they
-    /// cannot slash.
+    /// credited bytes at zero, and peers route only to nodes in the active
+    /// set.
     ///
     /// Unlike [`Self::binding`], this is read LIVE on every poll — it is a
     /// lookup in the registry projection the daemon already keeps current off
@@ -120,7 +120,7 @@ pub struct HealthResponse {
     /// nothing". Nothing on the wire says so; the traffic simply does not
     /// arrive. The cause is one of never registered, registered under a key
     /// this process no longer holds (see [`Self::binding`]), deregistered,
-    /// ejected, bond below `minBond`, or an unbonding request in flight.
+    /// ejected, or active bond below the operator's floor.
     pub registry_active: bool,
 }
 
@@ -740,38 +740,6 @@ pub struct BuyerPoolsResponse {
     pub skipped: Vec<String>,
 }
 
-/// One slash detected against this node's operator (`SlashJudge.Slashed`,
-/// #1032, G-NODE-05). Surfaced so an operator (or a keeper script) can notice a
-/// slash and file `decdn appeal slash` within the 30-day window without watching
-/// the chain directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlashRecordDto {
-    /// The globally-monotonic on-chain `slashId` (`CapacityBond.slash`),
-    /// rendered as a decimal string — it is a `uint256` and can exceed `u64`.
-    /// This is the value passed to `decdn appeal slash <SLASH_ID>`.
-    pub slash_id: String,
-    /// Offense taxonomy index (ADR 014): `0` = Blacklist. Kept numeric to
-    /// avoid drift if the enum grows.
-    pub offense_type: u8,
-    /// Bond amount slashed, in TOKEN base units, as a decimal string (`uint256`).
-    pub amount: String,
-    /// `keccak256` evidence digest from the `CapacityBond` slash record (ADR
-    /// 014), `0x`-prefixed 32-byte hex.
-    pub evidence_hash: String,
-    /// Appeal-window close (Unix seconds) the contract enforces: the slash
-    /// record's base `appealWindowClose` plus the global `pausedTotal` at the
-    /// last read. A later protocol pause only moves it later.
-    pub appeal_window_close: Option<u64>,
-}
-
-/// Snapshot of every slash the watcher has detected against this node's
-/// operator (#1032). Empty list when none — a clean operator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SlashesResponse {
-    /// One entry per distinct detected `slashId`, most-recent first.
-    pub slashes: Vec<SlashRecordDto>,
-}
-
 /// JSON-RPC error code: the request shape was wrong (bad hex, etc.).
 /// Matches the standard JSON-RPC 2.0 `Invalid params` code.
 pub const INVALID_PARAMS_CODE: i32 = -32_602;
@@ -821,11 +789,7 @@ pub const DHT_POISONED_CODE: i32 = -32_006;
 /// underlying store error.
 pub const POOL_STORE_ERROR_CODE: i32 = -32_007;
 
-/// JSON-RPC error code: `admin_v1_slashes` was called on a node whose slash
-/// watcher is not wired (e.g. no `slash_judge_address`, or a test/CLI-only
-/// invocation). Benign config state, distinct from a generic failure so an
-/// operator gets "no slash detection on this node" rather than an opaque error.
-pub const SLASH_DETECTION_UNAVAILABLE_CODE: i32 = -32_009;
+// -32_009 is retired: do not assign it to a new error code.
 
 /// JSON-RPC error code: `admin_v1_pools` could not read the buyer pool store.
 /// Distinct from [`POOL_STORE_ERROR_CODE`], which covers the seller-side lane
@@ -948,16 +912,6 @@ pub trait AdminRpc {
     /// be read.
     #[method(name = "lanes")]
     async fn lanes(&self) -> RpcResult<LanesResponse>;
-
-    /// Return every slash the node's watcher has detected against its own
-    /// operator (#1032, G-NODE-05): per slash the `slashId`, offense type,
-    /// amount, evidence digest, block, and the 30-day appeal-window close time.
-    /// Consumed directly by operators/keepers (no CLI subcommand wraps it) so
-    /// they notice a slash and file `decdn appeal slash` in time. Returns
-    /// [`SLASH_DETECTION_UNAVAILABLE_CODE`]
-    /// when the slash watcher is not wired on this node.
-    #[method(name = "slashes")]
-    async fn slashes(&self) -> RpcResult<SlashesResponse>;
 
     /// Return the node's buyer-side `PaymentPool` state: every pool its buyer
     /// leg tracks, the deposit it believes each holds, and the per-lane spend

@@ -15,7 +15,7 @@ use crate::{Connections, PoolContext, PullDeadlines, RateAboveCeiling, UpstreamR
 const OPEN: Duration = Duration::from_secs(5);
 
 fn domain() -> Eip712Domain {
-    decdn_incentive::slash_judge_domain(31_337, Address::repeat_byte(0x11))
+    decdn_incentive::capacity_bond_domain(31_337, Address::repeat_byte(0x11))
 }
 
 fn blob() -> Vec<u8> {

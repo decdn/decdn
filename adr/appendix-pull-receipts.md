@@ -19,7 +19,7 @@ node gave.
 
 Signed messages already answer these questions. Each node signs
 a `StreamResponse` for each stream
-([ADR 014](014-on-chain-verification.md#eip-712-type-definitions)). The payer
+([ADR 005 § Signer binding](005-protocol.md#signer-binding)). The payer
 signs each cumulative voucher
 ([ADR 003](003-payments.md#eip-712-voucher-signature)). A pull receipt keeps
 these messages instead of dropping them.
@@ -31,10 +31,10 @@ rejects any other format when it parses the document. It has these parts:
 
 | Part | Content | Signed by |
 |------|---------|-----------|
-| `chain` | The payment chain id and the `PaymentPool` address, and the governance chain id and the `SlashJudge` address. | Nobody. The EIP-712 domain of each signature below binds it to these values. |
+| `chain` | The payment chain id and the `PaymentPool` address, and the governance chain id and the `CapacityBond` address. | Nobody. The EIP-712 domain of each signature below binds it to these values. |
 | `content` | The requested hash, `blob` or `bundle`, the namespace, the whole blobs that landed with their sizes, the hashes that a node accepted but that did not land (`unlanded`), and whether the pull completed. | Nobody. The client states it. |
 | `window` | The start time and the end time of the pull. | Nobody. The client states it. |
-| `lanes[].responses` | For each hash a node served on the lane, the first accepting `StreamResponse` body and its `slash_sig`. | The node's operator key, under the `SlashJudge` domain. |
+| `lanes[].responses` | For each hash a node served on the lane, the first accepting `StreamResponse` body and its `slash_sig`. | The node's operator key, under the `CapacityBond` domain. |
 | `lanes[].proof.voucher` | The voucher that signs the lane's anchor at the end of the pull. | The lane signer, under the `PaymentPool` domain. |
 | `lanes[].proof.reveal` | The deepest preimage released under that voucher's chain. | Nobody. The preimage proves itself against the voucher's `chain_root` ([ADR 003](003-payments.md#hash-chain-metering-payword)). |
 | `lanes[].proof.claim` | `amount + index × chunk_price` over `bytes_delivered + index × CHUNK_BYTES`. | Nobody. A reader computes it again from the voucher and the reveal. |
@@ -70,7 +70,7 @@ node's and the payer's, and the receipt already holds them.
 7. Each claim is equal to the claim that its voucher and reveal prove, and is
    not below the prior watermark on either axis.
 8. On a chain that the build knows, the receipt's `PaymentPool` and
-   `SlashJudge` addresses are equal to the build's addresses. On a chain that
+   `CapacityBond` addresses are equal to the build's addresses. On a chain that
    the build does not know, `verify` says that it did not check them.
 
 `verify` does not check the settlement. A reader checks it against the chain.
@@ -81,7 +81,9 @@ it reads, so a settlement that the chain does not show stays out.
 ## What a Receipt Proves
 
 - The node with operator address X quotes rate R and size S for hash H on
-  pool P. The client chooses the timestamp, and the node signs it.
+  pool P. The client chooses the timestamp, and the node signs it only
+  within 30 seconds of its own clock
+  ([ADR 005 § Signer binding](005-protocol.md#signer-binding)).
 - The payer signs a cumulative claim C to provider X on pool P. A node that
   holds that voucher and that preimage can redeem up to C. Redemption pays
   only what the pool balance and the signer's capability allow
@@ -98,19 +100,12 @@ it reads, so a settlement that the chain does not show stays out.
 - **That the downloads are distinct people, or that the payer is not the
   publisher.** A publisher can pay its own nodes from its own pool and get a
   valid receipt. A count of receipts is a count of paid pulls.
-- **The namespace or the wall-clock time.** No node signs either value.
+- **The namespace or the exact wall-clock time.** No node signs the
+  namespace. The signed timestamp is the client's, and it is exact only to
+  within 30 seconds of the node's clock.
 - **Settlement before `settle` runs.** A node redeems in its own sweep
   ([ADR 003](003-payments.md#redemption-and-close)), so the claim is not
   settled when the pull ends.
-
-## Slashing
-
-A receipt adds no offense and no evidence path. The one on-chain offense
-stays the same: blacklist violation
-([ADR 014](014-on-chain-verification.md#evidence-verification-per-offense-type)).
-A blacklist challenge accepts one `StreamResponse`, within the evidence age.
-A person who holds a receipt has no power that the holder of the response did
-not already have. Vouchers are not slashing evidence.
 
 ## Privacy
 

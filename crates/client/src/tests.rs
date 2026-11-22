@@ -240,7 +240,7 @@ fn request_ext_reflects_the_context() -> anyhow::Result<()> {
     use super::{PoolContext, request_ext, sign_client_binding};
 
     let signer = PrivateKeySigner::random();
-    let domain = decdn_incentive::bind_node_id_domain(1, Address::ZERO);
+    let domain = decdn_incentive::capacity_bond_domain(1, Address::ZERO);
     let ctx = PoolContext {
         pool_id: B256::ZERO,
         provider: Address::ZERO,
@@ -1191,15 +1191,12 @@ async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
 /// An open-stage refusal must carry the upstream's **signed** `StreamResponse`
 /// out with it, not just the wire code (#1042).
 ///
-/// This is the seam that makes real daemon output admissible on-chain. The
+/// This is the seam that keeps real daemon output attributable. The
 /// `slash_sig` here is produced by the same `StreamSlashData` signer the node
-/// uses and covers the same EIP-712 digest `SlashJudge.submitBlacklistChallenge`
-/// checks, so what the assertion actually proves is that the operator's
-/// self-incriminating attestation survives the client's error path intact —
-/// byte-for-byte, still recovering to the signer. A `refusal()` that kept only
-/// `response.error` would drop the body and signature on the floor, leaving
-/// `SlashJudge` reachable only from a test that holds the operator's key and
-/// synthesises its own evidence.
+/// uses, so what the assertion actually proves is that the operator's signed
+/// statement survives the client's error path intact — byte-for-byte, still
+/// recovering to the signer. A `refusal()` that kept only `response.error`
+/// would drop the body and signature on the floor.
 ///
 /// Deliberately routed through the private [`UpstreamRefused::open`] — the one
 /// constructor the open stage uses — rather
@@ -1223,7 +1220,7 @@ fn the_wire_bounds_a_size_proof_at_the_codecs_longest() {
 #[test]
 fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::slash_judge_domain;
+    use decdn_incentive::capacity_bond_domain;
     use decdn_incentive::stream_sig::StreamSlashData;
     use decdn_protocol::client::{
         StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
@@ -1237,7 +1234,7 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
         .size_proof
         .to_vec();
     let operator = PrivateKeySigner::random();
-    let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+    let domain = capacity_bond_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
     let ts = 1_700_000_000_000_000;
     let verify = |ext: StreamResponseExt| -> anyhow::Result<Option<super::ProvenSize>> {
         let body = StreamResponseBody {
@@ -1304,7 +1301,7 @@ fn an_open_without_a_size_proof_is_a_source_fault() -> anyhow::Result<()> {
 #[test]
 fn an_open_whose_coverage_disagrees_is_a_source_fault() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::slash_judge_domain;
+    use decdn_incentive::capacity_bond_domain;
     use decdn_incentive::stream_sig::StreamSlashData;
     use decdn_protocol::client::{
         StreamError, StreamResponse, StreamResponseBody, StreamResponseExt,
@@ -1318,7 +1315,7 @@ fn an_open_whose_coverage_disagrees_is_a_source_fault() -> anyhow::Result<()> {
         .size_proof
         .to_vec();
     let operator = PrivateKeySigner::random();
-    let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+    let domain = capacity_bond_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
     let ts = 1_700_000_000_000_000;
     let verify = |ext: StreamResponseExt| -> anyhow::Result<Option<super::ProvenSize>> {
         let body = StreamResponseBody {
@@ -1431,16 +1428,16 @@ fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
 #[test]
 fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
-    use decdn_incentive::slash_judge_domain;
+    use decdn_incentive::capacity_bond_domain;
     use decdn_incentive::stream_sig::StreamSlashData;
     use decdn_protocol::client::{StreamError, StreamResponse, StreamResponseBody};
 
     use super::UpstreamRefused;
 
     let operator = PrivateKeySigner::random();
-    let domain = slash_judge_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
+    let domain = capacity_bond_domain(31_337, alloy::primitives::Address::repeat_byte(0x11));
     // The wire shape of a signed refusal: the node signed `ok = false` for a
-    // hash it had just announced (now inert as slash evidence).
+    // hash it had just announced.
     let body = StreamResponseBody {
         hash: [0x5Au8; 32],
         ok: false,
@@ -1489,7 +1486,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
         response_ext.error(),
     );
     // The whole point: the surviving signature still recovers to the operator,
-    // so it can be replayed to `SlashJudge` with no re-signing by the observer.
+    // so a third party can check it with no re-signing by the observer.
     let recovered = alloy::primitives::Signature::try_from(preserved.slash_sig.as_slice())?;
     StreamSlashData::from_response_body(&preserved.body).verify_signer(
         &recovered,
@@ -1501,7 +1498,7 @@ fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Resul
 
 /// #1377: `open()` on a `body.ok == false` response that carries no error code
 /// is a protocol violation (the `validate` invariant was bypassed), so it does
-/// NOT produce a typed `UpstreamRefused` that a challenger could act on — it
+/// NOT produce a typed `UpstreamRefused` that a caller could act on — it
 /// surfaces as a plain error instead of laundering a malformed refusal.
 #[test]
 fn open_on_a_response_without_an_error_code_is_not_a_typed_refusal() {

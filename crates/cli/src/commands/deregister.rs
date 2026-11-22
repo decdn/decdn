@@ -2,20 +2,19 @@
 //!
 //! The reverse of `decdn node register`, and the first leg of a full bond exit.
 //! `deregisterNode()` clears `declaredMbps`, which is what releases the
-//! `bondRequired(declaredMbps)` floor `requestUnbond` enforces (#1351); the
+//! `bondRequired(declaredMbps)` floor `unbond` enforces (#1351); the
 //! complete sequence is
 //!
 //! ```text
-//! decdn node deregister  ->  decdn node unbond --all  ->  [window]  ->  decdn node unbond
+//! decdn node deregister  ->  decdn node unbond --all
 //! ```
 //!
 //! Two things about that sequence drive this command's shape, and both are
 //! disclosed rather than left to be discovered:
 //!
 //! - **The bond does not move here.** `deregisterNode` touches the registration
-//!   and the tier, nothing else: the deposit stays put and stays fully
-//!   slashable. An operator who reads "deregister" as "exit and refund" has
-//!   done only the first of three steps. This is the likeliest misconception,
+//!   and the tier, nothing else: the deposit stays put. An operator who reads
+//!   "deregister" as "exit and refund" has done only the first of two steps. This is the likeliest misconception,
 //!   so the summary says so on every run.
 //! - **Re-entry is not free.** The call bumps `registrationNonce[nodeId]`,
 //!   which invalidates any registration signature already signed against the
@@ -23,8 +22,8 @@
 //!   `declareMbps` + `registerNode` (the bond itself is retained, so no new
 //!   funds are needed; ADR 003 § Node Registry).
 //!
-//! Unlike `unbond` there is no phase to select from chain state — this is one
-//! transaction that either applies or reverts. There is still a pre-flight
+//! There is no phase to select from chain state — this is one transaction
+//! that either applies or reverts. There is still a pre-flight
 //! read, of registry state (`getNodeByAddress` + `ejected`, NOT the composite
 //! `isActive` — see `build_plan`), so the two states the operator can be in
 //! are named up front instead of surfacing as a bare `NodeNotActive` revert:
@@ -107,7 +106,7 @@ pub(crate) struct Plan {
     /// The tier this call will clear, and therefore the `bondRequired` floor it
     /// releases. `0` when none was ever declared.
     pub(crate) declared_mbps: u64,
-    /// Bond that stays deposited and slashable afterwards, in base units.
+    /// Bond that stays deposited afterwards, in base units.
     pub(crate) retained_bond: alloy::primitives::U256,
 }
 
@@ -171,7 +170,7 @@ fn ensure_active(plan: &Plan) -> anyhow::Result<()> {
         "this operator was ejected by the contract, so there is no registration to \
          deregister — `deregisterNode` would revert NodeNotActive. Exit directly with \
          `decdn node unbond --all`, which releases the declared tier for an inactive \
-         operator and starts the unbonding window."
+         operator and returns the bond."
     );
     anyhow::bail!(
         "this operator is not in the active node set — either it never registered, or it \
@@ -193,10 +192,8 @@ pub(crate) enum Confirmation {
     NeedFlag,
 }
 
-/// Decide whether to prompt. Unlike `unbond` there is no `NotNeeded` arm —
-/// every run of this command that reaches the gate is submitting the
-/// deregistration, and there is no phase (`unbond`'s withdraw) that merely
-/// returns TOKEN.
+/// Decide whether to prompt. Every run of this command that reaches the gate
+/// is submitting the deregistration.
 pub(crate) const fn decide_confirmation(yes: bool, interactive: bool) -> Confirmation {
     if yes {
         Confirmation::Bypassed
@@ -256,9 +253,8 @@ pub(crate) fn write_disclosure(w: &mut impl io::Write, plan: &Plan) -> io::Resul
     // The bond first, because "deregister" reads as "exit and refund".
     writeln!(
         w,
-        "Your bond of {} base units is NOT returned by this call. It stays deposited and \
-         fully slashable. To withdraw it, follow with `decdn node unbond --all`, wait out \
-         the unbonding window, then re-run `decdn node unbond`.",
+        "Your bond of {} base units is NOT returned by this call. It stays deposited. To \
+         withdraw it, follow with `decdn node unbond --all`.",
         plan.retained_bond,
     )?;
     if plan.declared_mbps != 0 {

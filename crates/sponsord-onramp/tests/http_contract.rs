@@ -279,14 +279,14 @@ async fn installer(path: &str, config: sponsord_onramp::config::OnrampConfig) ->
 
 /// The values each installer carries (`test_config` and `test_info`): this
 /// onramp, the pinned decdn release, and the download profile.
-fn expected(slash_judge: &str) -> [(&'static str, String); 12] {
+fn expected() -> [(&'static str, String); 11] {
     let pool = Address::repeat_byte(0x22).to_string();
     let bond = Address::repeat_byte(0x33).to_string();
     [
         ("ONRAMP_URL", "https://up.example.org".into()),
         ("RELEASES", "https://github.com/decdn".into()),
-        ("DECDN_RELEASE", "v0.3.0".into()),
-        ("DECDN_VERSION", "0.3.0".into()),
+        ("DECDN_RELEASE", "v0.4.0".into()),
+        ("DECDN_VERSION", "0.4.0".into()),
         ("DECDN_SUMS_SHA256", "ab".repeat(32)),
         ("GOVERNANCE_CHAIN_ID", "11155111".into()),
         (
@@ -294,7 +294,6 @@ fn expected(slash_judge: &str) -> [(&'static str, String); 12] {
             "https://governance-rpc.example".into(),
         ),
         ("CAPACITY_BOND", bond),
-        ("SLASH_JUDGE", slash_judge.into()),
         ("POOL_CHAIN_ID", "421614".into()),
         ("POOL_RPC_URL", "https://rpc.example".into()),
         ("PAYMENT_POOL", pool),
@@ -315,7 +314,7 @@ fn ps1_name(sh: &str) -> String {
 async fn decdn_sh_is_rendered() {
     let body = installer("/decdn.sh", test_config()).await;
     assert!(body.starts_with("#!/bin/sh"));
-    for (name, value) in expected("") {
+    for (name, value) in expected() {
         let line = format!("{name}=\"{value}\"");
         assert!(body.lines().any(|l| l == line), "{line}");
     }
@@ -325,27 +324,10 @@ async fn decdn_sh_is_rendered() {
 async fn decdn_ps1_is_rendered() {
     let body = installer("/decdn.ps1", test_config()).await;
     assert!(body.contains("-pc-windows-msvc"));
-    for (name, value) in expected("") {
+    for (name, value) in expected() {
         let line = format!("${} = '{value}'", ps1_name(name));
         assert!(body.lines().any(|l| l.trim() == line), "{line}");
     }
-}
-
-#[tokio::test]
-async fn installers_carry_the_slash_judge_when_set() {
-    let judge = Address::repeat_byte(0x44);
-    let mut config = test_config();
-    config.slash_judge = Some(judge);
-    let sh = installer("/decdn.sh", config).await;
-    assert!(sh.lines().any(|l| l == format!("SLASH_JUDGE=\"{judge}\"")));
-
-    let mut config = test_config();
-    config.slash_judge = Some(judge);
-    let ps1 = installer("/decdn.ps1", config).await;
-    assert!(
-        ps1.lines()
-            .any(|l| l.trim() == format!("$SlashJudge = '{judge}'"))
-    );
 }
 
 fn from_peer(mut req: Request<Body>, ip: &str) -> Request<Body> {

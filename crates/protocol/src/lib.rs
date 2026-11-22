@@ -132,7 +132,7 @@ pub const APP_ERR_RATE_LIMITED: u32 = 0x10;
 /// Request refused because its `timestamp_us` differs from the node's clock
 /// by more than 30 seconds (ADR 013 §Application Error Codes; ADR 005
 /// §`cdn/client/v1`). The signed response body echoes the requester's
-/// timestamp into the slash-evidence set, so a node refuses such a request
+/// timestamp into the EIP-712 signed set, so a node refuses such a request
 /// with no signed response.
 ///
 /// Delivered as a `RESET_STREAM` on `cdn/client/v1`. The usual cause is the

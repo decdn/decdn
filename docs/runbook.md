@@ -58,8 +58,8 @@ new content cannot be admitted.
    [#236](https://github.com/decdn/decdn/issues/236); until then, restart
    is the only path for a `cache_dir` change.
 3. If pruning manually, prefer evicting whole blob files — never truncate.
-   Truncated bytes will fail BLAKE3 verification on read, which is a
-   slashing signal (see [Slashing risk](#slashing-risk)).
+   Truncated bytes fail BLAKE3 verification on read, so the node cannot
+   serve them.
 
 ## RPC unreachable
 
@@ -90,11 +90,11 @@ boot chain reads retry. The RPC preflight's own retries show only in its
   event logs. A dead governance-chain endpoint stops every refresh on that
   chain at once: `decdn_blacklist_watcher_last_tick_timestamp_seconds` and
   `decdn_capacity_bond_registry_last_resync_timestamp_seconds` stop advancing,
-  and `decdn_blacklist_ledger_poll_failures_total`,
-  `decdn_capacity_bond_registry_resync_failures_total` and
-  `decdn_slash_resync_failures_total` rise together. Several rising together
-  points at the RPC endpoint rather than at any one loop. A stale blacklist
-  timestamp is the one carrying slash risk; see
+  and `decdn_blacklist_ledger_poll_failures_total` and
+  `decdn_capacity_bond_registry_resync_failures_total` rise together.
+  Both rising together points at the RPC endpoint rather than at any one
+  loop. A stale blacklist timestamp matters most: the node may serve a hash
+  blacklisted since its last poll; see
   [ContentBlacklist compliance](#contentblacklist-compliance). Each failed
   refresh keeps the projection the node already has and retries on its next
   interval.
@@ -209,83 +209,13 @@ decrypt.
   [the operator key-rotation appendix](../adr/appendix-operator-key-rotation.md)
   instead.
 
-## Slashing risk
-
-**Trigger** — the one offense `SlashJudge` adjudicates, through
-`submitBlacklistChallenge` (per
-[ADR 011](../adr/011-content-takedown.md),
-[ADR 014](../adr/014-on-chain-verification.md)):
-
-- **Blacklist violation** — serving content after the blacklist entry's
-  `effectiveAt` (`addedAt` plus the compliance window), not after `addedAt`
-  — see [ContentBlacklist compliance](#contentblacklist-compliance). The
-  evidence is a signed `StreamResponse` with `ok: true`; the answer to a
-  discovery open is one too.
-
-There is no rate slash: a client sees the signed quote before it pays and
-signs that price into each voucher. A rate change needs no wait.
-
-There is no "missed response" offense: every slash is driven by the
-operator's own signed messages, so a node that stays silent cannot be
-slashed by an external adversary.
-
-**Detect:**
-
-- Alerts in `prometheus-alerts.yml` (verbatim names):
-  - `DecdnBlacklistWatcherStalled` (critical) — the blacklist sync has
-    not completed a ledger poll for several intervals, so the node may be
-    serving content blacklisted since the last successful poll. It fires on
-    the age of `decdn_blacklist_watcher_last_tick_timestamp_seconds`. See
-    [ContentBlacklist compliance](#contentblacklist-compliance).
-  - `DecdnBlacklistEnforcementFailing` (critical) — a re-scope could not
-    re-verify or evict every known deny-set entry, so a blacklisted hash may
-    still be servable.
-- Grafana: the slash-safety row in `grafana-dashboard.json`.
-
-**Remediate:**
-
-1. **Fix the root cause before anything else:** blacklist sync lag or a
-   stale RPC endpoint.
-   A slash you appeal while the underlying problem persists will not stop
-   the next strike.
-2. **There is no counter-evidence window.** If on-chain verification passes,
-   the slash executes synchronously inside the challenger's
-   `submitBlacklistChallenge` reveal — see
-   [ADR 014 § Bond Handling](../adr/014-on-chain-verification.md#bond-handling).
-   Nothing you send afterwards can undo it in-protocol; there is no
-   counter-evidence deadline to race, only the appeal window in step 3.
-3. **The recourse is a slash appeal.** File it with the CLI, which reads the
-   governable bond, sets the TOKEN allowance for you, and surfaces the
-   contract reverts verbatim:
-
-   ```bash
-   # Get the slashId — admin RPC on the loopback admin port (default 9191).
-   curl -sS -H 'content-type: application/json' \
-     -d '{"jsonrpc":"2.0","method":"admin_v1_slashes","params":[],"id":1}' \
-     http://127.0.0.1:9191/
-
-   decdn appeal slash <SLASH_ID> <EVIDENCE_BUNDLE_HASH> --dry-run
-   ```
-
-   Drop `--dry-run` to send. Under the hood this is
-   `SlashAppeal.openSlashAppeal(slashId, evidenceBundleHash)`, callable only
-   by the slashed operator, within `APPEAL_FILING_WINDOW` — **30 days from
-   the slash**, enforced by `CapacityBond.markAppealOpen`, which reverts once
-   it lapses (a protocol pause extends it by the paused duration). It costs
-   `APPEAL_BOND` (1,000 TOKEN by default, governable within `[100, 10,000]`),
-   burned in full if the appeal fails. The evidence bundle is assembled
-   off-chain and committed by hash. You may appeal every slash in a cluster,
-   but only **one appeal per 365 days can be granted**
-   (`APPEAL_FREQUENCY_WINDOW`), so lead with the most clear-cut case. Flow,
-   windows, and what counts as evidence:
-   [ADR 028](../adr/028-slashing-appeals.md#adr-028-slashing-appeals-and-dispute-escalation).
-
 ## ContentBlacklist compliance
 
 **Symptoms:** governance or a regional body has published a blocked BLAKE3
 hash on-chain via `ContentBlacklist`, and this node may still be caching,
-announcing, or serving it. Serving a globally blocked hash is a slashable
-offense (see [Slashing risk](#slashing-risk)). Protocol semantics:
+announcing, or serving it. A node must stop serving a blocked hash by the
+entry's `effectiveAt`, and governance can blacklist and eject an operator that
+does not (`ContentBlacklist.addOperator`, below). Protocol semantics:
 [ADR 011](../adr/011-content-takedown.md).
 
 **How a node learns about a blocked hash.** `crates/node/src/blacklist_watcher.rs`
@@ -355,8 +285,7 @@ action is required.
   entries, `isHashBlacklistedInRegion(hash, region)` for a regional entry. The
   `region` argument is `bytes32`, not a string: global scope is the sentinel
   `bytes32("GLOBAL")` (with `cast`, pass the literal `GLOBAL` right-padded to
-  32 bytes). `getHashEntry(region, hash)` returns the raw `(addedAt, suspended)`
-  that the slashing predicate reads.
+  32 bytes). `getHashEntry(region, hash)` returns the raw entry.
 
 **Remediate:**
 
@@ -378,11 +307,9 @@ action is required.
 2. **You have a grace window, but evict immediately anyway.**
    [ADR 011 § Compliance Window](../adr/011-content-takedown.md#compliance-window)
    gives every entry an `effectiveAt = addedAt + window` — 24 hours for a
-   governance or regional add, 2 hours for an emergency multisig add — and
-   `SlashJudge` anchors slash eligibility to `effectiveAt`, not `addedAt` (see
-   `_checkBlacklistedBefore` in `contracts/src/SlashJudge.sol`). A delivery whose
-   signed response timestamp is at or before `effectiveAt` is not slashable.
-   Practical consequences:
+   governance or regional add, 2 hours for an emergency multisig add. The
+   compliance rule binds from `effectiveAt`, not `addedAt`: a node must stop
+   serving the hash by then. Practical consequences:
    - The window is a safety margin for poll latency and downtime, not a licence.
      Evict on discovery; do not schedule against the deadline.
    - Both windows are governance-tunable within `[1 hour, 7 days]`, so read
@@ -390,11 +317,11 @@ action is required.
      24h/2h. The value is stamped on the entry at add time, so an entry keeps
      the window that was in force when it landed — check the entry's own
      `effectiveAt` via `getHashEntry(region, hash)`.
-   - Slash exposure comes from **global and in-scope regional** entries alike
+   - The rule covers **global and in-scope regional** entries alike
      (ADR 030 scope: global ∪ current region ∪ ripening previous region).
    - An emergency entry (`emergency == true`) auto-expires — 14 days for
      `GENERAL`, 90 for `CSAM`/`TERRORIST` — unless governance ratifies it with
-     `addHashGlobal`. It stops being slashable at that deadline whether or not
+     `addHashGlobal`. It stops binding at that deadline whether or not
      anyone has called `expireEmergencyEntry` to materialize the removal.
 
 3. **If you believe the entry is wrong, escalate it — don't just keep serving.**
@@ -418,22 +345,15 @@ action is required.
    remove them: `_requireActiveBodyFor` gates `addHashRegional` **and**
    `removeHashRegional`, so suspending closes the only route by which that
    body's existing entries could come off. Suspension also retracts nothing —
-   every entry already issued stays live, enforceable and slashable, because
-   `_bodySuspended` is not consulted by `_isLive` or by `SlashJudge`. If a
+   every entry already issued stays live and enforceable, because `_isLive`
+   does not consult `_bodySuspended`. If a
    suspension is already in place and you need an entry removed, governance must
    first `unsuspendRegionalBody` or replace the body outright.
 
    In every case, keep the hash evicted until the removal actually lands: the
-   entry is enforceable, and therefore slashable, right up to that point.
+   entry is enforceable right up to that point.
    Semantics:
    [ADR 011 § Removing a Wrongful Entry](../adr/011-content-takedown.md#removing-a-wrongful-entry).
-
-4. **A slash you already took is a separate matter.** Getting the entry removed
-   (step 3) stops future exposure; it does **not** refund a slash you already
-   incurred for serving the hash. Restitution for the slash itself — e.g. you
-   were offline during the window — is the
-   [ADR 028 SlashAppeal](../adr/028-slashing-appeals.md) path, with its own bond
-   and evidence rules, and it is the only appeal surface the protocol carries.
 
 ## Node-to-node pulls never succeed (buyer wallet or pool)
 

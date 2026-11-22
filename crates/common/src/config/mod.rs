@@ -342,7 +342,8 @@ pub const DEFAULT_SERVE_ECONOMICS_WARMING_BUDGET: u64 = 5_000_000;
 /// ≤ $5/day/source. Base units/sec ≈ `5_000_000 / 86_400`.
 pub const DEFAULT_SERVE_ECONOMICS_WARMING_REFILL: u64 = 58;
 
-/// Default EIP-712 `chainId` for the `slash_sig` domain separator (ADR 014).
+/// Default EIP-712 `chainId` for the `CapacityBond` signing domain (ADR 005
+/// § Signer binding).
 /// Arbitrum Sepolia — the initial network target; matches the chain id bound
 /// on the runtime `PrivateKeySigner` (`decdn_incentive::eth_identity`). To
 /// target a different chain, override via `blockchain.chain_id` (see
@@ -356,8 +357,8 @@ pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 300;
 /// Default seconds the node may go without a successful chain read before the
 /// serve path refuses (ADR 011 § Serving while chain-stale). Thirty
 /// minutes: comfortably inside the one-hour compliance-window floor, so a node
-/// stops serving well before an outage-hidden takedown could cross into
-/// slashable territory, while short RPC blips never take the node dark.
+/// stops serving well before an outage-hidden takedown takes effect, while
+/// short RPC blips never take the node dark.
 pub const DEFAULT_CHAIN_STALENESS_GRACE_SEC: u64 = 1800;
 
 /// Default providers a node-to-node cache-miss pull opens a voucher-less
@@ -1345,8 +1346,9 @@ fn resolve_blockchain_into(
 
     // The all-zero address checksum-validates cleanly but is never a real
     // deployment; staking against a codeless address surfaces only as an
-    // opaque on-chain revert. Reject it here — mirroring `slash_judge_address`
-    // and `content_blacklist_address` below — so `decdn config check` catches it
+    // opaque on-chain revert, and signing stream responses against it
+    // produces `slash_sig`s no verifier accepts (ADR 005 § Signer binding).
+    // Reject it here — mirroring `content_blacklist_address` below — so `decdn config check` catches it
     // and the daemon's runtime guard (#1219) is uniform defense-in-depth rather
     // than the sole check. Skipped when the value is an empty placeholder: the
     // missing/parse problem is already recorded.
@@ -1410,43 +1412,8 @@ fn resolve_blockchain_into(
              set it to the deployed PublisherRegistry contract",
         );
     }
-    // Required like the other contract addresses: a wrong/zero
-    // `verifyingContract` silently produces `slash_sig`s no verifier accepts
-    // (ADR 014 §1).
-    let slash_judge_address = resolve_contract_address(
-        "blockchain.slash_judge_address",
-        "slash_judge_address",
-        "missing required option: --slash-judge-address \
-         (or blockchain.slash_judge_address in config file)",
-        cli.slash_judge_address
-            .clone()
-            .or_else(|| file.and_then(|b| b.slash_judge_address.clone())),
-        bag,
-    );
-    // The all-zero address is syntactically valid but is never a real
-    // `SlashJudge` deployment; signing against it produces `slash_sig`s no
-    // verifier can attribute (ADR 014 §1). Only meaningful once the address
-    // itself parsed — a placeholder empty string here just means the
-    // missing/parse problem is already recorded, so skip the cascade.
-    if !slash_judge_address.is_empty() {
-        bag.check(
-            slash_judge_address
-                .trim_start_matches("0x")
-                .bytes()
-                .any(|b| b != b'0'),
-            "blockchain.slash_judge_address",
-            "blockchain.slash_judge_address must not be the zero address — \
-             set it to the deployed SlashJudge contract (ADR 014 §1)",
-        );
-    }
-
-    // `blockchain.slash_appeal_address` is accepted in the file (see
-    // `BlockchainConfig`) but consumed only by the `decdn appeal slash` CLI
-    // (via `chain_ctx::resolve_appeal`, which validates it) — the daemon does
-    // not resolve or use it, so there is nothing to resolve here.
-
     // Required for every paid-delivery node: without this contract the daemon
-    // has no local protection against serving slashable blacklisted content.
+    // has no local protection against serving blacklisted content.
     let content_blacklist_address = resolve_contract_address(
         "blockchain.content_blacklist_address",
         "content_blacklist_address",
@@ -1461,8 +1428,8 @@ fn resolve_blockchain_into(
     // origin-directory addresses): every `isHashBlacklistedForOperator` call
     // against a codeless address reverts on empty return data, the watcher maps
     // that to "leave the blob in place", and nothing is ever evicted while the
-    // operator believes compliance is active — maximal slash exposure with a
-    // "configured" watcher. Reject it explicitly, mirroring `slash_judge_address`.
+    // operator believes compliance is active. Reject it explicitly, mirroring
+    // `capacity_bond_address`.
     if !content_blacklist_address.is_empty() {
         bag.check(
             content_blacklist_address
@@ -1523,10 +1490,10 @@ fn resolve_blockchain_into(
         .chain_id
         .or_else(|| file.and_then(|b| b.chain_id))
         .unwrap_or(DEFAULT_CHAIN_ID);
-    // `chain_id` is bound into every `slash_sig` EIP-712 domain separator
+    // `chain_id` is bound into every `CapacityBond` EIP-712 domain separator
     // (and the runtime signer). Chain id 0 is not a real network; signing
-    // against it produces `slash_sig`s no `SlashJudge` can verify — the same
-    // silently-broken-but-running failure mode the zero-`slash_judge_address`
+    // against it produces `slash_sig`s no verifier accepts — the same
+    // silently-broken-but-running failure mode the zero-`capacity_bond_address`
     // check above prevents.
     bag.check_with(chain_id != 0, "blockchain.chain_id", || {
         format!(
@@ -1676,7 +1643,6 @@ fn resolve_blockchain_into(
         origin_directory_negative_ttl_sec,
         origin_directory_cache_capacity,
         publisher_registry_address,
-        slash_judge_address,
         content_blacklist_address,
         content_blacklist_poll_interval_sec,
         chain_staleness_grace_sec,
@@ -2753,8 +2719,8 @@ fn resolve_content_into(
 /// Resolve payment fields.
 ///
 /// Rejects `rate_per_mb == 0`: the value participates in the node selection
-/// score (`rate_per_mb × rtt_ms × …`, ADR 001 § Node Selection Algorithm) and
-/// feeds the on-chain rate-mismatch evidence path (ADR 014). A zero rate would
+/// score (`rate_per_mb × rtt_ms × …`, ADR 001 § Node Selection Algorithm). A
+/// zero rate would
 /// make this node trivially win every client selection while earning no
 /// payable revenue — an obvious misconfiguration that should fail startup, not
 /// silently degrade the network.
@@ -3404,11 +3370,6 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
         expand_str(
             &mut b.publisher_registry_address,
             "blockchain.publisher_registry_address",
-        )?;
-        expand_str(&mut b.slash_judge_address, "blockchain.slash_judge_address")?;
-        expand_str(
-            &mut b.slash_appeal_address,
-            "blockchain.slash_appeal_address",
         )?;
         expand_str(
             &mut b.content_blacklist_address,

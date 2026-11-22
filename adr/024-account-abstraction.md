@@ -53,20 +53,12 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 | `registerNode` — `bindingSignature` | `SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)` |
 | `bindNodeId` — `signature` | `SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)` |
 
-**SlashJudge ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)):**
-
-| Function | Verification |
-| --- | --- |
-| `submitBlacklistChallenge` | ECDSA recovery of `digest`, compared against `challengedNode` |
-
-The challenger supplies the `challengedNode` address; the contract recovers the signer of the evidence digest and compares it against that address, then confirms the address is slashable. `SlashJudge` is the one contract that does not use `SignatureChecker`: `slash_sig` is re-verified later as evidence, so its validity must not depend on code at the operator's address. Code an operator attaches to an EOA (an EIP-7702 delegate) is never consulted, and a smart-account operator cannot serve ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)).
-
 #### Gas Impact
 
 | Signer Type | Additional Gas vs `ecrecover` | Acceptable? |
 | --- | --- | --- |
 | EOA | +2,600 (EXTCODESIZE check) | Yes — negligible |
-| Safe (1-of-1) | +~12,000 (external call + `checkSignatures`) | Yes — on-chain verification happens only at redemption, pool close, and slash — not per off-chain voucher |
+| Safe (1-of-1) | +~12,000 (external call + `checkSignatures`) | Yes — on-chain verification happens only at redemption, pool close, and registration — not per off-chain voucher |
 | Safe (2-of-3) | +~15,000 | Yes — same rationale |
 
 ### Wallet Support — EOA Default, Safe Supported
@@ -80,7 +72,7 @@ deCDN recommends none of them. A 1-of-1 Safe carries the same trust posture as t
 **An EOA keystore on the signing host is the default.**
 
 - **Hot signing (`slash_sig`) — the binding constraint.** Nodes sign a `slash_sig` on every `StreamResponse`. A requester verifies the `StreamResponse` signature **off-chain**, recovering the signer and comparing it against the node's registered address, on a discovery open and on a paid stream alike. A Safe owner-key signature recovers to the *owner*, not to the Safe, so a Safe-addressed operator's stream responses are rejected — the node is neither discovered nor paid. Multi-owner thresholds are separately infeasible here: `SignatureChecker` → Safe's `checkSignatures` cannot reach a quorum at wire speed, and pre-approving every digest via `signMessage` is impractical. Closing this gap is [§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving).
-- **Cold paths are wallet-agnostic.** Bond management (`CapacityBond.bond(...)` + `declareMbps(...)`, `registerNode()`, `deregisterNode()`, `requestUnbond(...)`, `unbond()`) and node-to-node pool operations (`openPool()`, `closePool()`, `topUp()`) are all on-chain and infrequent, so `SignatureChecker` accepts an EOA or a Safe of any threshold. But the registered address is also the address a node serves under — `registerNode` binds `msg.sender` — so there is no split where a Safe custodies the bond while an EOA serves. Holding the on-chain identity in a Safe today means holding a **non-serving** identity: the bond and earnings are multisig-protected, and the node cannot complete a paid delivery.
+- **Cold paths are wallet-agnostic.** Bond management (`CapacityBond.bond(...)` + `declareMbps(...)`, `registerNode()`, `deregisterNode()`, `unbond(...)`) and node-to-node pool operations (`openPool()`, `closePool()`, `topUp()`) are all on-chain and infrequent, so `SignatureChecker` accepts an EOA or a Safe of any threshold. But the registered address is also the address a node serves under — `registerNode` binds `msg.sender` — so there is no split where a Safe custodies the bond while an EOA serves. Holding the on-chain identity in a Safe today means holding a **non-serving** identity: the bond and earnings are multisig-protected, and the node cannot complete a paid delivery.
 
 #### Clients
 
@@ -111,23 +103,21 @@ ERC-1271 validity is not a property of a keypair; it is `isValidSignature(digest
 | Class | Signatures | ERC-1271 safe? | Why |
 | --- | --- | --- | --- |
 | **Consumed at call time** | bond, `registerNode` / `bindNodeId`, `redeem` voucher + capability, pool close, buyer capability grant | Yes — this is what `SignatureChecker` already does | The question is "is it valid *now*?", answered and consumed in the same transaction |
-| **Re-verified later as evidence** | `slash_sig` on `StreamResponse`, and anything else `SlashJudge` re-verifies to punish an offense | **No** | The attacker controls validity in the gap between taking payment and the on-chain slash |
+| **Re-verified later as evidence** | `slash_sig` on `StreamResponse` | **No** | The signer controls validity in the gap between taking payment and the later check |
 
-The slashing model ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)) assumes the incriminating signature is the same signature that authorized the paid action and that it stays provably valid until it reaches `SlashJudge`. Smart-account signers break both assumptions. `slash_sig` sits in the second class, so it cannot move to ERC-1271.
+A `StreamResponse` signature is evidence of a serve. The requester checks it before it pays ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). A pull receipt keeps it, so that any party can check it again later, with no network access ([Appendix: Pull Receipts](appendix-pull-receipts.md#verification)). Both checks assume that the signature that authorized the paid action stays provably valid after the payment. Smart-account signers break this assumption. `slash_sig` sits in the second class, so it cannot move to ERC-1271.
 
 #### Hazards a future design must answer
 
-1. **Selective validator.** The operator's `isValidSignature` returns the magic value for serve / voucher digests — so the node is paid and serves — but invalid for the exact blacklist digests `SlashJudge` re-verifies. The function receives only a digest and a signature; the operator does not need caller context, only to mark the evidence digests invalid. The node serves, collects, and is categorically un-slashable.
+1. **Selective validator.** The operator's `isValidSignature` returns the magic value for most serve digests, so the node is paid and serves. It returns invalid for the digests that the operator wants to disown, for example every answer for one hash. The function receives only a digest and a signature. The operator does not need caller context, only to mark those digests invalid. The node serves and collects, and its signed answers for those digests prove nothing.
 
-2. **Post-payment revocation.** Simpler, and needs no per-digest cunning: the client verifies off-chain and pays *now*; the operator flips a storage flag or revokes the signing session *after*, and the later on-chain re-verification returns invalid. First-class, immediate revocation — the very property a session-key module advertises as a feature — is here the attack: it is exactly what defeats "verify now, slash later."
+2. **Post-payment revocation.** Simpler, and needs no per-digest cunning: the client verifies off-chain and pays *now*; the operator flips a storage flag or revokes the signing session *after*, and the later re-verification of a receipt returns invalid. First-class, immediate revocation — the very property a session-key module advertises as a feature — is here the attack: it is exactly what defeats "verify now, check again later."
 
-3. **Gas-bomb on the slash path.** `SlashJudge` → `SignatureChecker` → an external call into the challenged node's contract. A malicious validator burns all forwarded gas or reverts, so the *challenger's* slash transaction fails. `SignatureChecker` puts no gas cap on the ERC-1271 call. Slashing-evasion by denial of service. Any on-chain re-verification of a smart-account signer in a slash path must cap the gas it forwards.
-
-4. **Off-chain ERC-1271 is unsound as evidence.** An off-chain verifier could check the signer for code and, when present, call `isValidSignature` over an RPC round-trip. But that answers "valid as of block N", and validity is mutable after N. Caching *code presence* is safe (it does not change post-deployment); caching *validity* is not. Fail-open accepts forged signatures; fail-closed makes serving depend on RPC liveness. The recovery-only off-chain path pays none of this.
+3. **Off-chain ERC-1271 is unsound as evidence.** An off-chain verifier could check the signer for code and, when present, call `isValidSignature` over an RPC round-trip. But that answers "valid as of block N", and validity is mutable after N. Caching *code presence* is safe (it does not change post-deployment); caching *validity* is not. Fail-open accepts forged signatures; fail-closed makes serving depend on RPC liveness. The recovery-only off-chain path pays none of this.
 
 #### The direction, not the design
 
-Because `slash_sig` cannot be ERC-1271, a viable design keeps it EOA-recovered while letting funds sit in a Safe. The shape that does this is a **native operator-signer delegation** that mirrors the buyer capability of [ADR 003 § PaymentPool](003-payments.md#paymentpool): the Safe custodies the bond and earnings and binds, on-chain, a capped hot EOA to the node identity; that EOA signs `slash_sig`, and requesters verify it by recovery exactly as today. The bound EOA is covered by the same bond and the same slashing, so the penalty still lands on a signature the operator cannot avoid emitting to get paid — the property the second signature class requires. This is lower-altitude than a Safe-7579 adapter plus a session-key module, and it does not import a mutable-validity signer into the slash path. It is a direction for a future ADR written against a live consumer, not a commitment here.
+Because `slash_sig` cannot be ERC-1271, a viable design keeps it EOA-recovered while letting funds sit in a Safe. The shape that does this is a **native operator-signer delegation** that mirrors the buyer capability of [ADR 003 § PaymentPool](003-payments.md#paymentpool): the Safe custodies the bond and earnings and binds, on-chain, a capped hot EOA to the node identity; that EOA signs `slash_sig`, and requesters verify it by recovery exactly as today. The bound EOA signs by recovery, so a signature that the operator emits to get paid stays valid after the payment — the property the second signature class requires. This is lower-altitude than a Safe-7579 adapter plus a session-key module, and it does not import a mutable-validity signer into the evidence path. It is a direction for a future ADR written against a live consumer, not a commitment here.
 
 A 1-of-1 Safe and any EOA are served by the stock `CompatibilityFallbackHandler`. deCDN deploys no Safe infrastructure. It runs no ERC-4337 entry point, paymaster, or bundler: operators and clients submit transactions directly and hold the native gas token of each chain they transact on, the same assumption as [ADR 003](003-payments.md#adr-003-payment-model). A future operator-custody design ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)) would assess its own dependencies against the hazards recorded there.
 
@@ -146,5 +136,5 @@ A 1-of-1 Safe and any EOA are served by the stock `CompatibilityFallbackHandler`
 ### Negative
 
 - Hot-signing parties (nodes, clients) hold a single software-held EOA key. Multisig protection of the high-frequency signing path is not available; a multi-owner Safe is viable only on the infrequent stake / withdraw / pool-open paths, for parties who choose that split themselves.
-- A node whose serving identity is a smart account cannot participate off-chain. The contracts accept it; the node's off-chain verifiers do not, and reject anything but the 65-byte recovery form fail-closed. Closing that gap is unimplemented, and the ERC-1271 route that looks obvious is unsound for slash-critical signing ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)).
-- Gas overhead for smart account signature verification is higher than pure `ecrecover` (+10–15k gas per verification). Applies only to on-chain operations (redemption, pool close, slash submission), not the high-frequency off-chain signing path.
+- A node whose serving identity is a smart account cannot participate off-chain. The contracts accept it; the node's off-chain verifiers do not, and reject anything but the 65-byte recovery form fail-closed. Closing that gap is unimplemented, and the ERC-1271 route that looks obvious is unsound for signatures that serve as evidence ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)).
+- Gas overhead for smart account signature verification is higher than pure `ecrecover` (+10–15k gas per verification). Applies only to on-chain operations (redemption, pool close, registration), not the high-frequency off-chain signing path.

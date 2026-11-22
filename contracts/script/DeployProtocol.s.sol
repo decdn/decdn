@@ -70,7 +70,7 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///         FeeRouter constructor cross-checks), so it is read from there rather
 ///         than a tunable that could only ever be 7 days.
 ///
-///         Optional env vars (defaults from ADR 026 / ADR 028 / ADR 009 / 036):
+///         Optional env vars (defaults from ADR 026 / ADR 009 / 036):
 ///           - `BOOTSTRAP_MULTISIG`         (default unset = DAO governance live at
 ///                                            deploy). Set it to the 5-of-9 bootstrap
 ///                                            multisig to launch into the ADR 009
@@ -85,14 +85,12 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///                                            no threshold automation.
 ///           - `TIMELOCK_DELAY`             (default 48h; floor MIN_TIMELOCK_DELAY)
 ///           - `MIN_BOND`                   (default 50_000e18)
-///           - `UNBONDING_PERIOD`           (default 14 days)
 ///           - `MULTIADDR_UPDATE_COOLDOWN`  (default 0)
 ///           - `MAX_MULTIADDR_SIZE`         (default 1024)
 ///           - `REGION_STABILITY_WINDOW`    (default 7 days)
 ///           - `FEE_ROUTER_WINDOW_EPOCHS`   (default 13; bounded [4, 26] per ADR 036)
-///           - `SLASH_APPEAL_BOND`          (default 1000e18)
 contract DeployProtocol is BaseProtocolDeploy {
-    // Defaults — ADR 026 / 028 / 009 values.
+    // Defaults — ADR 026 / 009 values.
     uint256 internal constant DEFAULT_TIMELOCK_DELAY = 48 hours;
     // Floor below which a Timelock has no meaningful reaction window against a
     // malicious proposal — guards against an accidental `TIMELOCK_DELAY=0` (which
@@ -100,7 +98,6 @@ contract DeployProtocol is BaseProtocolDeploy {
     // default per ADR 009; the floor only blocks footgun values.
     uint256 internal constant MIN_TIMELOCK_DELAY = 1 hours;
     uint256 internal constant DEFAULT_MIN_BOND = 50_000e18;
-    uint256 internal constant DEFAULT_UNBONDING_PERIOD = 14 days;
     uint256 internal constant DEFAULT_MULTIADDR_UPDATE_COOLDOWN = 0;
     uint256 internal constant DEFAULT_MAX_MULTIADDR_SIZE = 1024;
     uint256 internal constant DEFAULT_REGION_STABILITY_WINDOW = 7 days;
@@ -109,7 +106,6 @@ contract DeployProtocol is BaseProtocolDeploy {
     // so this constant + that cross-check is the single enforced source of truth.
     uint64 internal constant FEE_ROUTER_EPOCH_LENGTH = 7 days;
     uint64 internal constant DEFAULT_FEE_ROUTER_WINDOW_EPOCHS = 13;
-    uint256 internal constant DEFAULT_SLASH_APPEAL_BOND = 1000e18;
 
     // Launch FeeRouter split (ADR 016 § Tunable Economics example): with the
     // reference `operatorBps` of 6000 on each payment chain, a 75% rebate and no
@@ -205,7 +201,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         // (see `script/TransitionToGovernor.s.sol`, issue #1175).
         cfg.bootstrapMultisig = vm.envOr("BOOTSTRAP_MULTISIG", address(0));
         cfg.minBond = vm.envOr("MIN_BOND", DEFAULT_MIN_BOND);
-        cfg.unbondingPeriod = vm.envOr("UNBONDING_PERIOD", DEFAULT_UNBONDING_PERIOD);
         cfg.multiaddrUpdateCooldown = vm.envOr("MULTIADDR_UPDATE_COOLDOWN", DEFAULT_MULTIADDR_UPDATE_COOLDOWN);
         cfg.maxMultiaddrSize = vm.envOr("MAX_MULTIADDR_SIZE", DEFAULT_MAX_MULTIADDR_SIZE);
         cfg.regionStabilityWindow = vm.envOr("REGION_STABILITY_WINDOW", DEFAULT_REGION_STABILITY_WINDOW);
@@ -226,8 +221,6 @@ contract DeployProtocol is BaseProtocolDeploy {
         cfg.feeRouterBuybackBps = 0;
         cfg.feeRouterDeliveryFloor = LAUNCH_DELIVERY_FLOOR;
         cfg.buybackBurner = address(0);
-
-        cfg.slashAppealBond = vm.envOr("SLASH_APPEAL_BOND", DEFAULT_SLASH_APPEAL_BOND);
     }
 
     // -----------------------------------------------------------------
@@ -341,10 +334,8 @@ contract DeployProtocol is BaseProtocolDeploy {
         vm.serializeAddress(contracts, "Ed25519Verifier", address(cfg.ed25519Verifier));
         vm.serializeAddress(contracts, "FeeRouter", address(d.router));
         vm.serializeAddress(contracts, "PublisherRegistry", address(d.registry));
-        vm.serializeAddress(contracts, "SlashAppeal", address(d.slashAppeal));
         vm.serializeAddress(contracts, "OriginAssignment", address(d.originAssignment));
         vm.serializeAddress(contracts, "ManualVettingPolicy", address(d.vettingPolicy));
-        vm.serializeAddress(contracts, "SlashJudge", address(d.slashJudge));
         vm.serializeAddress(contracts, "TimelockController", address(d.timelock));
         string memory contractsJson = vm.serializeAddress(contracts, "Token", address(d.token));
 

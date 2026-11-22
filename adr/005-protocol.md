@@ -75,7 +75,7 @@ A client whose persisted peer store holds enough fresh peers does not send disco
 
 #### Coverage consistency
 
-No signature covers `coverage`. It is a hint. It decides no payment and no slash. The requester checks it against the signed body and the requested span (`StreamResponseExt::consistent_with`). It drops an answer where they disagree, as it drops an answer with a bad signature:
+No signature covers `coverage`. It is a hint. It decides no payment. The requester checks it against the signed body and the requested span (`StreamResponseExt::consistent_with`). It drops an answer where they disagree, as it drops an answer with a bad signature:
 
 - An `ok: true` answer covers every block that the span touches below the proven size.
 - An `ok: false` answer has an empty coverage, or a coverage that does not cover the span.
@@ -125,7 +125,7 @@ A node advertises its configured `rate_per_mb` verbatim in every `StreamResponse
 
 #### Rate self-enforcement
 
-The requester protects itself against the price. It needs no slash for this:
+The requester protects itself against the price:
 
 - The quote is in the signed answer, so the requester sees the price before it pays anything.
 - A requester refuses a quote above its own ceiling (`max_rate_per_mb`). A client drops such a node from discovery, and a lane refuses such a stream. This is local policy. No governance ceiling is necessary.
@@ -133,7 +133,7 @@ The requester protects itself against the price. It needs no slash for this:
 - The requester signs the price into each voucher as `chunk_price`. The node refuses a voucher whose `chunk_price` is not its quote (`ChunkPriceMismatch`), and a voucher that pays below its quote for the span that the voucher adds (`Underpaid`). See [`VoucherRejected` semantics](#voucherrejected-semantics).
 - A rebase never moves a lane below the price of the bytes that it verified. Each verified byte has the price of the stream that verified it. A later rate never prices an earlier byte.
 
-So a requester pays only a rate that it saw in a signed answer and accepted. There is no rate slash: the client protects itself by its lane ceiling and by signing the price into each voucher.
+So a requester pays only a rate that it saw in a signed answer and accepted. The client protects itself by its lane ceiling and by signing the price into each voucher.
 
 #### Client identity binding
 
@@ -160,9 +160,36 @@ The client includes `ethereum_address` and `binding_signature` in the first `Str
 
 #### Signer binding
 
-The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher, or it cancels the stream and tries another node. There is no surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged. `slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, timestamp_us}`, signed with the operator's Ethereum key registered in `CapacityBond` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)) and verifiable via `ecrecover` — see [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence). It is mandatory and non-empty on every `StreamResponse`. The signed-field set is the v1 baseline; per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any change to this set is a Tier 3 ALPN bump. Signing the full response prevents a malicious party from altering unsigned fields while reusing a valid signature — `ok` is a message-integrity field that ensures a node cannot silently alter delivery status without accountability. A signed `ok: true` for a blacklisted hash is the evidence of the one slashable offense, a blacklist violation ([ADR 014 § Blacklist violation](014-on-chain-verification.md#blacklist-violation)). The existing `Max evidence age` parameter ([ADR 009](009-governance.md#adr-009-governance-model)) bounds the age of evidence, so honest operators are never exposed to indefinite slash risk from old responses. **Submitting slash evidence requires a 100 TOKEN challenge bond** — see [ADR 026 § Slashing and burn](026-tokenomics.md#slashing-and-burn) — returned if the challenge succeeds, forfeited if it fails, preventing zero-cost griefing via fabricated slash claims. A requester MUST stamp `timestamp_us` from its current wall clock. The node refuses a `StreamRequest` whose `timestamp_us` differs from its own clock by more than 30 seconds. The refusal is a stream reset with the `TIMESTAMP_SKEW` error code ([ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)) and no signed response. So every timestamp the node signs lies within 30 seconds of its clock at admission. The node checks the timestamp once, at admission. Later responses on the stream sign the same timestamp as it ages, so a transfer can run longer than 30 seconds.
+The delivering node advertises its `rate_per_mb` in `StreamResponse`. The payer accepts by sending the first voucher, or it cancels the stream and tries another node. There is no surprise pricing. `timestamp_us` in `StreamResponse` is the requester-generated microsecond timestamp from `StreamRequest`, echoed back unchanged.
 
-Connection-level peer identity is authenticated by the iroh QUIC handshake against the registered NodeId (Ed25519). Message-body attribution and on-chain slash evidence both rely on `slash_sig`: verifiers recover the Ethereum address via `ecrecover` (3,000 gas on-chain) and confirm it maps to the expected NodeId via `CapacityBond.nodeIdOf` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). There is no opt-out. Requesters MUST reject responses with missing or zero-length `slash_sig`, and MUST recover the signature to the peer's registered operator address before acting on the response. A length check alone leaves the quote unattributed: selection reads `ok` and `rate_per_mb` off the response, and neither binds the peer to anything until the signature recovers. A response that fails to verify is dropped as requester-local policy — it MUST NOT be scored against the peer, because a signature that does not recover attributes nothing to anyone. See [ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence) for the EIP-712 type definition and the `SlashJudge` contract interface.
+`slash_sig` is an EIP-712 secp256k1 signature over `{hash, ok, rate_per_mb, timestamp_us}`. The operator signs it with its Ethereum key. `CapacityBond.registerNode` binds that key to the node's NodeId ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). `slash_sig` is mandatory and non-empty on every `StreamResponse`, including the answer to a discovery open. The signature covers the full signed body, so a party cannot alter a signed field and reuse a valid signature. `ok` is a message-integrity field: a node cannot change the delivery status of a signed answer.
+
+```solidity
+bytes32 constant STREAM_RESPONSE_TYPEHASH = keccak256(
+    "StreamResponse(bytes32 hash,bool ok,uint64 ratePerMb,uint64 timestampUs)"
+);
+
+EIP712Domain({
+    name: "CapacityBond",
+    version: "1",
+    chainId: <deployment chain>,
+    verifyingContract: <CapacityBond address>
+})
+```
+
+The signature uses the `CapacityBond` EIP-712 domain. The registration and rebinding signatures use the same domain ([ADR 003 § Binding Message Format](003-payments.md#binding-message-format)). The origin attestation that a DHT record carries uses it too ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). Each message has its own type name, so a signature over one type never verifies as a signature over another type. The domain binds each signature to one chain and one deployment. A verifier identifies the deployment by the `CapacityBond` address. No contract reads a `StreamResponse` signature: it is off-chain evidence.
+
+`hash` echoes the hash of the `StreamRequest`. Implementers include it when they build and verify the typed data. The signed `StreamResponse` names no pool and no payer. It is a statement by the node about its own serve of a hash, so a third party can verify it without the request. A pull receipt carries it as portable evidence ([Appendix: Pull Receipts](appendix-pull-receipts.md#appendix-pull-receipts)). The signed-field set is the v1 baseline. Per [ADR 013 § Signed Field Freezing](013-schema-evolution.md#signed-field-freezing), any change to this set is a Tier 3 ALPN bump. No signed field holds the blob size. A response states the size only in its size proof, which the receiver verifies against `hash` ([§ Bounded byte ranges](#bounded-byte-ranges)).
+
+**The node signs only a timestamp near its own clock.** A requester MUST stamp `timestamp_us` from its current wall clock. The node refuses a `StreamRequest` whose `timestamp_us` differs from its own clock by more than 30 seconds. The refusal is a stream reset with the `TIMESTAMP_SKEW` error code ([ADR 013 § Application Error Codes](013-schema-evolution.md#application-error-codes)) and no signed response. So every timestamp the node signs lies within 30 seconds of its clock at admission. The bound matters because other parties read the signed timestamp: a pull receipt carries it as the approximate time of each serve. Without the bound, a node would sign a serve time that the requester chose. The node checks the timestamp once, at admission. Later responses on the stream sign the same timestamp as it ages, so a transfer can run longer than 30 seconds.
+
+Connection-level peer identity is authenticated by the iroh QUIC handshake against the registered NodeId (Ed25519). Message-body attribution relies on `slash_sig`: a verifier recovers the Ethereum address with `ecrecover` and confirms that it maps to the expected NodeId through `CapacityBond.nodeIdOf` ([ADR 003 § NodeId-to-Ethereum Binding](003-payments.md#nodeid-to-ethereum-binding)). Recovery is by ECDSA only, never ERC-1271 ([ADR 024 § The signature partition](024-account-abstraction.md#the-signature-partition)). There is no opt-out. Requesters MUST reject responses with missing or zero-length `slash_sig`, and MUST recover the signature to the peer's registered operator address before acting on the response. A length check alone leaves the quote unattributed: selection reads `ok` and `rate_per_mb` off the response, and neither binds the peer to anything until the signature recovers. A response that fails to verify is dropped as requester-local policy — it MUST NOT be scored against the peer, because a signature that does not recover attributes nothing to anyone.
+
+The signature has three costs:
+
+- The node computes one secp256k1 EIP-712 signature for each `StreamResponse`, about 1 ms. A discovery round costs this signature on every candidate that answers, not only on the node that the requester pays.
+- `slash_sig` adds about 65 bytes to each `StreamResponse`. For a discovery answer that the requester cancels, this overhead is meaningful. Before a multi-MB delivery, it is negligible.
+- A verifier uses `ecrecover` and a `CapacityBond.nodeIdOf` lookup to attribute a message to a NodeId. It does not verify directly against the iroh key. Clients and requesting nodes already keep the binding cache for voucher attribution, so the extra cost is one map lookup for each verification.
 
 #### Serving rule
 
@@ -215,7 +242,7 @@ A node that pulls a cache miss from an upstream node is a requester too. It pays
 
 `byte_offset` is the start of a request; `byte_len` bounds its **end**. A request expresses the half-open range `[byte_offset, byte_offset + byte_len)`, with `byte_len == 0` meaning "to end-of-blob" (whole-tail behavior, so an absent or zero value is the default). A bounded range lets a node scope a cache-miss **origin** fetch to exactly the requested bytes rather than pulling the whole blob to serve a fraction of it — see [ADR 037 § Origin-tier pull-through](037-regional-proxy-warming.md#origin-tier-pull-through-ranged-fetch--external-outboard). It also scopes payment: `total_bytes`, the size the served response's size proof states, stays the **full blob size** — the buyer derives remaining bytes as `total_bytes - byte_offset`, and the serving node needs the blob size to frame bao verification of the range — while the **delivered, metered** byte count for a bounded request is `min(byte_len, total_bytes - byte_offset)`, or the whole tail (`total_bytes - byte_offset`) when `byte_len == 0`.
 
-`byte_len` is part of the base `StreamRequest` (not an optional extension): it is billing-relevant. A node that ignored it would over-deliver and over-bill with no slash evidence. Every node must understand it. Because `cdn/client/v1` is pre-finalisation (no testnet deployment), this is a **straight in-place addition** to the message, not a Tier-3 evolution: there is no version bump and no compatibility shim ([ADR 013 § Schema evolution](013-schema-evolution.md#adr-013-schema-evolution)). The node MUST reject a `byte_offset` at or past the blob end with a `StreamError`. When a range's end overflows or runs past the blob end, the node serves the range up to the blob end.
+`byte_len` is part of the base `StreamRequest` (not an optional extension): it is billing-relevant. A node that ignored it would over-deliver and over-bill. Every node must understand it. Because `cdn/client/v1` is pre-finalisation (no testnet deployment), this is a **straight in-place addition** to the message, not a Tier-3 evolution: there is no version bump and no compatibility shim ([ADR 013 § Schema evolution](013-schema-evolution.md#adr-013-schema-evolution)). The node MUST reject a `byte_offset` at or past the blob end with a `StreamError`. When a range's end overflows or runs past the blob end, the node serves the range up to the blob end.
 
 **A node proves the blob size.** A **size proof** is the only way a message states a blob size. It holds the size and the bao encoding of the final BLAKE3 chunk of a blob of that size at chunk granularity ([ADR 038](038-bao-verified-range-streaming.md#adr-038-bao-verified-range-streaming-on-cdnclientv1)): the chunk (at most 1 KiB) and one pair of parent hashes (64 bytes) for each level on the path from that chunk to the root. A proof for a blob of 100 GiB is under 3 KiB. BLAKE3 binds the length of the input into the tree, so only the true size verifies a final chunk under the root. A `StreamResponse` with `ok = true` has a served outcome, and that outcome is its size proof: the response has no other size field, so a served response without a proof cannot exist. The receiver MUST verify the proof against the content hash before it uses the size: before it plans or splits ranges, allocates, compares the size with a cap, or pays against it. A receiver that gets a proof that does not verify treats the response as a fault of that node.
 
@@ -416,7 +443,7 @@ Every refusal scopes to the node that sent it, for the current fetch. A requeste
 
 **`Unfunded` is gated on a proven requester.** The node speaks `Unfunded` only to a requester that passed the lane-ownership proof or holds a verified signer binding. Any other requester gets `NotFound` for the same state. So a requester cannot tell "no such content" from "this pool cannot pay", and pool and signer state stay unmappable off the wire ([ADR 003 § Pool solvency](003-payments.md#pool-solvency-and-the-refundable-floor-m)).
 
-**A withdrawn blob is not slash evidence.** The only slashable offense is a blacklist violation ([ADR 014](014-on-chain-verification.md#adr-014-on-chain-verification-for-slashing-evidence)). No offense pairs an `ok: true` answer with a later refusal. A node withdraws a blob by an operator evict or by a quarantine of corrupt bytes, and a request for a withdrawn blob gets `Declined`. Capacity eviction does not withdraw a blob while a stream on it is open ([§ Open-stream pin](#open-stream-pin)). A high rate of these refusals means that the operator evicts often, or that the store finds corrupt bytes.
+**A withdrawn blob gets `Declined`.** A node withdraws a blob by an operator evict or by a quarantine of corrupt bytes. An `ok: true` answer followed by a later refusal is not a fault. Capacity eviction does not withdraw a blob while a stream on it is open ([§ Open-stream pin](#open-stream-pin)). A high rate of these refusals means that the operator evicts often, or that the store finds corrupt bytes.
 
 #### `VoucherRejected` semantics
 
@@ -497,7 +524,7 @@ Before it commits to a stream, the node checks its own store and the proven size
 4. **Time to first byte:** the requester bounds the wait from `StreamRequest` to the first byte with a time budget. On a cache-miss pull the serving node fills from upstream before it emits the first byte, so this latency scales with blob size. The budget is requester-local policy. Its expiry says nothing about the peer and does not affect reputation, the same treatment as an unsigned timeout.
 5. **Steady-state throughput:** the requester counts bytes read off the QUIC stream, partial frames included, so the measure is frame-size-independent. It reconnects to the next candidate with `byte_offset` set to the last BLAKE3-verified byte when the throughput over a trailing window falls below a minimum floor. The window and floor are requester-local configuration; the recommended defaults are a 20-second window and a 4 KiB/s floor. The abort is requester-local policy and does not affect reputation. A self-inflicted pause at the credit-window boundary, while the requester still owes the covering proof, does not count as a sender stall.
 
-The error code is **not** covered by `slash_sig` — it is informational only and not used for slashing evidence.
+The error code is **not** covered by `slash_sig`. It is informational only.
 
 ### Stream Lifecycle State Machine
 

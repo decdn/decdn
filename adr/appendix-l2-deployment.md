@@ -4,14 +4,14 @@
 
 ## Governance chain
 
-Ethereum L1 holds TOKEN, the bond, slashing, governance, the treasury, and the buyback. Payments are chain-neutral, so the trust root does not depend on any one payment chain.
+Ethereum L1 holds TOKEN, the bond, governance, the treasury, and the buyback. Payments are chain-neutral, so the trust root does not depend on any one payment chain.
 
 Uniswap V3 and native private relays are available on L1. The buyback path uses both ([ADR 018 § Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3)).
 
 Operators pay L1 gas for these actions:
 
 - `registerNode` (Ed25519 verification) costs about 1M gas.
-- Bond operations, slash challenges, and votes also run on the governance chain.
+- Bond operations and votes also run on the governance chain.
 
 These are one-time or rare actions. The frequent actions, payment and redemption, run on the payment chains, where gas is cheap. Operators need gas on each payment chain where they redeem and sweep.
 

@@ -505,10 +505,10 @@ impl core::convert::TryFrom<decdn_client::Cumulative> for decdn_client::receipt:
 pub type decdn_client::receipt::ReceiptAmount::Error = ruint::from::FromUintError<u64>
 pub fn decdn_client::receipt::ReceiptAmount::try_from(decdn_client::Cumulative) -> core::result::Result<Self, Self::Error>
 pub struct decdn_client::receipt::ReceiptChain
+pub decdn_client::receipt::ReceiptChain::capacity_bond: alloy_primitives::bits::address::Address
 pub decdn_client::receipt::ReceiptChain::chain_id: u64
 pub decdn_client::receipt::ReceiptChain::payment_chain_id: u64
 pub decdn_client::receipt::ReceiptChain::payment_pool: alloy_primitives::bits::address::Address
-pub decdn_client::receipt::ReceiptChain::slash_judge: alloy_primitives::bits::address::Address
 pub struct decdn_client::receipt::ReceiptContent
 pub decdn_client::receipt::ReceiptContent::complete: bool
 pub decdn_client::receipt::ReceiptContent::entries: alloc::vec::Vec<decdn_client::receipt::ReceiptEntry>
@@ -617,10 +617,9 @@ pub decdn_client::session::DiscoveryOptions::registry_timeout: core::time::Durat
 impl core::default::Default for decdn_client::session::DiscoveryOptions
 pub fn decdn_client::session::DiscoveryOptions::default() -> Self
 pub struct decdn_client::session::GovernanceChain
-pub decdn_client::session::GovernanceChain::capacity_bond: core::option::Option<alloy_primitives::bits::address::Address>
+pub decdn_client::session::GovernanceChain::capacity_bond: alloy_primitives::bits::address::Address
 pub decdn_client::session::GovernanceChain::chain_id: u64
 pub decdn_client::session::GovernanceChain::rpc_url: alloc::string::String
-pub decdn_client::session::GovernanceChain::slash_judge: alloy_primitives::bits::address::Address
 pub struct decdn_client::session::PaymentPoolChain
 pub decdn_client::session::PaymentPoolChain::deployment: decdn_incentive::deployment::Deployment
 pub decdn_client::session::PaymentPoolChain::rpc_url: alloc::string::String

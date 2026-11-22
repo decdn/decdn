@@ -33,7 +33,7 @@ fn sample_manifest_json() -> String {
         r#"{{
               "contracts": {{
                 "CapacityBond": "{}", "FeeRouter": "{}",
-                "Token": "{}", "SlashJudge": "{}", "SlashAppeal": "{}",
+                "Token": "{}",
                 "DecdnGovernor": "{}", "TimelockController": "{}",
                 "PublisherRegistry": "{}", "OriginAssignment": "{}",
                 "ManualVettingPolicy": "{}", "ContentBlacklist": "{}",
@@ -44,8 +44,6 @@ fn sample_manifest_json() -> String {
         addr(1),
         addr(3),
         addr(4),
-        addr(5),
-        addr(6),
         addr(7),
         addr(8),
         addr(9),
@@ -114,7 +112,7 @@ fn read_manifest_parses_contracts_and_usdc() {
     assert_eq!(manifest.usdc, Address::with_last_byte(0xff));
     // Every `contracts` entry of both manifests, name-sorted, including those
     // with no typed field.
-    assert_eq!(manifest.contracts.len(), 13);
+    assert_eq!(manifest.contracts.len(), 11);
     assert!(
         manifest
             .contracts

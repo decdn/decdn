@@ -268,8 +268,7 @@ pub trait Origin: std::fmt::Debug + Send + Sync + 'static {
     /// hash file contents. Callers verify served bytes against the content
     /// address at serve time, and a wrong/corrupt file is the publisher's
     /// error (it only hurts the publisher — an announced-but-unservable hash
-    /// costs bandwidth + local reputation, never a bond slash, provided the
-    /// serve path never signs an `ok:false` refusal).
+    /// costs bandwidth + local reputation, nothing more).
     fn enumerate(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Hash>, OriginPullError>> + Send + '_>> {

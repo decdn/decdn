@@ -44,7 +44,7 @@ impl std::fmt::Debug for AttestationVerifier {
 
 impl AttestationVerifier {
     /// Build a verifier over the seated-origin set, the node's origin
-    /// deny-set and the `SlashJudge` EIP-712 domain the signatures use.
+    /// deny-set and the `CapacityBond` EIP-712 domain the signatures use.
     #[must_use]
     pub fn new(
         seated: Arc<dyn SeatedOrigins>,

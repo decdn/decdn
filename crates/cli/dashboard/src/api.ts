@@ -377,23 +377,6 @@ export interface BuyerPoolsResponse {
   skipped: string[];
 }
 
-export interface SlashRecordDto {
-  /** A `uint256`, in decimal. */
-  slash_id: string;
-  /** `0` blacklist. */
-  offense_type: number;
-  /** TOKEN base units, in decimal. */
-  amount: string;
-  evidence_hash: string;
-  block_number: number | null;
-  /** Nominal: a pause only moves the real deadline later. */
-  appeal_window_close: number | null;
-}
-
-export interface SlashesResponse {
-  slashes: SlashRecordDto[];
-}
-
 /** Per-second rates since the scrape before. */
 export interface NodeRates {
   hits: number;
@@ -452,7 +435,6 @@ export type NodeSection = {
   lanes: Part<LanesResponse>;
   earnings: Part<EarningsResponse>;
   pools: Part<BuyerPoolsResponse>;
-  slashes: Part<SlashesResponse>;
 } & NodeState;
 
 /** The dashboard's `/_status` body. */

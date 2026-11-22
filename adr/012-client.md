@@ -67,7 +67,7 @@ Startup sequence from first launch to ready state:
 4. If the registry read fails (retries exhausted, or a deterministic failure):
      On stored peer identity present: fall back to the peer store, and tell
        the user the identity is cached and how old it is — those nodes may
-       have been deactivated or slashed since it was last seen
+       have been deactivated or ejected since it was last seen
      On no stored identity: exit with error —
        "Cannot reach bootstrap sources. Check network connectivity
         and RPC endpoint configuration."
@@ -153,7 +153,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 - **Content integrity:** BLAKE3 hash verification on every received blob. A malicious node cannot serve corrupted data.
 - **Voucher binding:** EIP-712 signatures on vouchers are produced by a capability-authorized signer key. The owner controls how much it authorizes (the `spending_cap`) and — since it issues the capability — who may sign and until when (`expiry`).
-- **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. The client signs that rate into each voucher as `chunk_price`, and the node refuses a voucher at another price ([ADR 005 § Rate self-enforcement](005-protocol.md#rate-self-enforcement)). There is no rate slash: the client protects itself.
+- **Rate commitment:** `StreamResponse` carries a `slash_sig` (EIP-712 secp256k1) over the response fields, binding the node's registered Ethereum identity to the quoted `rate_per_mb`. The client signs that rate into each voucher as `chunk_price`, and the node refuses a voucher at another price ([ADR 005 § Rate self-enforcement](005-protocol.md#rate-self-enforcement)). The client protects itself.
 - **Node identity:** QUIC handshake authenticates the remote NodeId (Ed25519). The client knows it is communicating with the registered node.
 - **Payment pool state:** On-chain, publicly verifiable. The owner can always close and reclaim; a node can always redeem its lanes.
 
@@ -164,7 +164,7 @@ Client identity bindings are **ephemeral and per-connection**, per [ADR 003 — 
 
 #### Not trusted — the client does not rely on these
 
-- Any individual node's self-reported metadata (region) beyond what is signed and slashable. The region claim only shortlists which registry candidates the client opens; it is never a rank key. The failover order is measured RTT, which a node cannot forge ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)).
+- Any individual node's self-reported metadata (region) beyond what is signed. The region claim only shortlists which registry candidates the client opens; it is never a rank key. The failover order is measured RTT, which a node cannot forge ([ADR 037 § Client selection policy](037-regional-proxy-warming.md#client-selection-policy-latency-driven-proxy-preference)).
 - Reputation reported by other peers. The client ranks nodes solely from its own measured RTT and failure history; it consumes no reputation score, its own or anyone else's.
 - Node availability promises beyond signed stream responses.
 
@@ -228,8 +228,9 @@ in current schema terms:
 - `[identity]` — `data_dir` (holds the buyer payment-pool store and, by default, the ETH
   keystore) and an optional ISO 3166-1 alpha-2 `region`.
 - `[blockchain]` — `eth_keystore`, the governance-chain set, and the payment chains. The
-  governance-chain set is the table's own keys: `rpc_url`, `chain_id`, `capacity_bond_address`,
-  and `slash_judge_address`. Each payment chain is one `[[blockchain.payment_chains]]` entry:
+  governance-chain set is the table's own keys: `rpc_url`, `chain_id` and `capacity_bond_address`.
+  The `CapacityBond` address also names the EIP-712 domain under which a client verifies the
+  `StreamResponse` signature ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). Each payment chain is one `[[blockchain.payment_chains]]` entry:
   `rpc_url`, `chain_id`, and `payment_pools`, a list of one or more `PaymentPool` contract
   addresses. The config names at least one entry, and no pool appears twice. The settlement token
   is the `usdc()` of each pool, so the config does not name it. A client reads the registry from
