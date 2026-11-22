@@ -15317,6 +15317,7 @@ async fn spawn_dht_record_server(
                 signer: test_support::ORIGIN.address(),
             },
             receive_us,
+            |_, _| true,
         );
     anyhow::ensure!(
         matches!(outcome, InsertOutcome::Inserted),

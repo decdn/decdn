@@ -37,8 +37,9 @@ pub fn verifier() -> AttestationVerifier {
     )
 }
 
-/// An attestation store whose node signs as [`ORIGIN`], so it holds a live
-/// attestation for every hash it is asked about.
+/// An attestation store whose node signs as [`ORIGIN`], so it signs its own
+/// attestation for every hash its own backend holds. It holds none for any
+/// other hash until a test keeps one.
 #[must_use]
 pub fn self_signing() -> Arc<crate::attestations::Attestations> {
     Arc::new(crate::attestations::Attestations::in_memory(

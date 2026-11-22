@@ -134,7 +134,7 @@ PoC stores the iroh secret key unencrypted at `~/.decdn/iroh_key` ([ADR 012](012
 | P-21 | Permanent client NodeId | Accept | Serving nodes and T1 observers link sessions by the stable Ethereum address the payment model requires (P-02); the residual benefit against participants that get no request is already leaked through accepted P-08 and P-10 | — |
 | P-22 | Settlement volume leakage | Accept | Inherent to on-chain settlement; settlement amount must be public for dispute resolution | — |
 | P-23 | `slash_sig` content inventory | Accept | Required for on-chain accountability; removing `slash_sig` eliminates slashability | — |
-| P-24 | Origin attestation in DHT records | Accept | Required so that every cached copy traces to a vetted origin. The attestation names no pool, payer or client, and an origin's seats are public already | — |
+| P-24 | Origin attestation in DHT records | Accept | Required so that every cached copy traces to a vetted origin. The attestation names no pool, payer or client, and an origin's seats are public already. The link from a hash to one of its namespaces is new public information. It is accepted: the namespace is the publisher's own, and the publisher chooses to publish the hash through it | — |
 
 ### Candidate Mitigations
 

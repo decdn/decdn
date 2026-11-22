@@ -79,6 +79,7 @@ async fn a_seated_origin_re_signs_its_own_content() {
     let hash = [5; 32];
     let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(hash)));
     let (r, _dir) = refresher(Some(seated()), vec![backend]).await;
+    r.cache.rescan_origins().await;
     let aged = attest_at(hash, now_us() - AGED_US);
     assert!(r.attestations.keep(hash, aged.clone()));
     r.refresh_due().await;
@@ -92,16 +93,19 @@ async fn a_seated_origin_does_not_attest_what_its_backend_lacks() {
     let hash = [5; 32];
     let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes([6; 32])));
     let (r, _dir) = refresher(Some(seated()), vec![backend]).await;
+    r.cache.rescan_origins().await;
     let aged = attest_at(hash, now_us() - AGED_US);
     assert!(r.attestations.keep(hash, aged.clone()));
     r.refresh_due().await;
-    assert_eq!(r.attestations.held(&hash), Some(aged), "not re-signed");
+    assert_eq!(r.attestations.held(&hash), None, "dropped, never re-signed");
 }
 
 #[tokio::test]
 async fn a_refresh_with_no_source_retries_later() {
     let hash = [5; 32];
-    let (r, _dir) = refresher(None, Vec::new()).await;
+    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(hash)));
+    let (r, _dir) = refresher(None, vec![backend]).await;
+    r.cache.rescan_origins().await;
     let aged = attest_at(hash, now_us() - AGED_US);
     assert!(r.attestations.keep(hash, aged.clone()));
     r.refresh_due().await;
@@ -139,17 +143,39 @@ fn expiring_soon(hash: [u8; 32]) -> decdn_protocol::OriginAttestation {
     .unwrap()
 }
 
+/// An attestation for a blob the node does not hold is dropped when its
+/// refresh comes due, live or expired, rather than refreshed: a pull that
+/// kept it never landed, or the blob was evicted.
 #[tokio::test]
-async fn an_expired_attestation_of_a_blob_the_node_lacks_is_dropped() {
-    let hash = [5; 32];
+async fn an_attestation_of_a_blob_the_node_lacks_is_dropped_not_refreshed() {
     let (r, _dir) = refresher(Some(seated()), Vec::new()).await;
-    // Kept while live, then left to expire.
-    assert!(r.attestations.keep(hash, expiring_soon(hash)));
+    let live = [5; 32];
+    let expired = [6; 32];
+    assert!(
+        r.attestations
+            .keep(live, attest_at(live, now_us() - AGED_US))
+    );
+    assert!(r.attestations.keep(expired, expiring_soon(expired)));
     tokio::time::sleep(Duration::from_secs(3)).await;
     r.refresh_due().await;
-    assert_eq!(r.attestations.held(&hash), None);
-    assert_eq!(r.attestations.live(&hash), None);
-    assert_eq!(expired_count(&r.metrics), 1);
+    assert_eq!(r.attestations.held(&live), None);
+    assert_eq!(r.attestations.held(&expired), None);
+    assert_eq!(expired_count(&r.metrics), 0, "no refresh ran");
+}
+
+/// A wanted hash the node no longer holds stops being wanted. One it holds
+/// stays wanted while no DHT is wired to look it up.
+#[tokio::test]
+async fn a_wanted_hash_is_dropped_once_the_blob_is_gone() {
+    let held = [5; 32];
+    let backend: Arc<dyn Origin> = Arc::new(Holds(Hash::from_bytes(held)));
+    let (r, _dir) = refresher(None, vec![backend]).await;
+    r.cache.rescan_origins().await;
+    r.attestations.want(held);
+    r.attestations.want([6; 32]);
+    r.refresh_due().await;
+    let retry = now_us() + REFRESH_RETRY_US;
+    assert_eq!(r.attestations.wanted_due(retry, 8), vec![held]);
 }
 
 /// The node keeps the expired attestation of a blob it still holds, serves
@@ -186,6 +212,7 @@ async fn an_unseated_node_never_self_signs_on_refresh() {
         ttl_sec: MIN_ATTESTATION_TTL_SEC,
     };
     let (r, _dir) = refresher(Some(stranger), vec![backend]).await;
+    r.cache.rescan_origins().await;
     let aged = attest_at(hash, now_us() - AGED_US);
     assert!(r.attestations.keep(hash, aged.clone()));
     r.refresh_due().await;

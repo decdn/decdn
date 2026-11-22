@@ -196,19 +196,98 @@ fn a_lapsed_attestation_stays_held_and_reports_its_lapse_once() {
     assert_eq!(store.refresh_failed([5; 32], retry), RefreshFailed::Gone);
 }
 
-/// `forget_lapsed` removes only an expired entry, so a fresh attestation kept
-/// while a refresh ran survives that refresh's failure.
+/// `forget_if_held` removes only the attestation the caller read, so a
+/// different one kept while a refresh ran survives that refresh's drop.
 #[test]
-fn forget_lapsed_keeps_a_live_entry() {
+fn forget_if_held_keeps_a_replaced_entry() {
     let store = Attestations::in_memory(verifier(), None);
     let now = now_us();
-    let att = attest_at([4; 32], now);
-    assert!(store.keep([4; 32], att.clone()));
-    assert!(!store.forget_lapsed(&[4; 32], now));
-    assert_eq!(store.held(&[4; 32]), Some(att.clone()));
-    assert!(store.forget_lapsed(&[4; 32], att.expires_at_us() + 1));
+    let old = attest_at([4; 32], now - HOUR_US);
+    let fresh = attest_at([4; 32], now);
+    assert!(store.keep([4; 32], old.clone()));
+    assert!(store.keep([4; 32], fresh.clone()));
+    assert!(!store.forget_if_held(&[4; 32], &old));
+    assert_eq!(store.held(&[4; 32]), Some(fresh.clone()));
+    assert!(store.forget_if_held(&[4; 32], &fresh));
     assert_eq!(store.held(&[4; 32]), None);
-    assert!(!store.forget_lapsed(&[4; 32], att.expires_at_us() + 1));
+}
+
+/// A held attestation that is no longer valid is replaced by a valid one,
+/// even when the held one expires later: its signer lost its seat.
+#[test]
+fn keep_replaces_a_later_expiring_attestation_whose_signer_lost_its_seat() {
+    let other = PrivateKeySigner::random();
+    let seats = Arc::new(SeatedOriginSet::from_seats([
+        (NAMESPACE, ORIGIN.address()),
+        (NAMESPACE, other.address()),
+    ]));
+    let v = AttestationVerifier::new(
+        Arc::clone(&seats) as Arc<dyn crate::dht::seated_origins::SeatedOrigins>,
+        Arc::new(ContentDenylist::empty()),
+        domain(),
+    );
+    let store = Attestations::in_memory(v, None);
+    let now = now_us();
+    let later = attest_at([4; 32], now);
+    let earlier = sign_attestation(
+        &other,
+        &domain(),
+        [4; 32],
+        NAMESPACE,
+        now - HOUR_US,
+        DEFAULT_ATTESTATION_TTL_SEC,
+    )
+    .unwrap();
+    assert!(store.keep([4; 32], later));
+    seats.unseat(NAMESPACE, ORIGIN.address());
+    assert_eq!(store.live(&[4; 32]), None);
+    assert!(store.keep([4; 32], earlier.clone()));
+    assert_eq!(store.live(&[4; 32]), Some(earlier));
+}
+
+/// A wanted hash comes due once, then waits for its retry. Keeping an
+/// attestation for it, or forgetting it, ends the want. A hash with any held
+/// attestation is never wanted: its own refresh covers it.
+#[test]
+fn a_wanted_hash_is_looked_up_until_an_attestation_is_kept() {
+    let store = Attestations::in_memory(verifier(), None);
+    let now = now_us();
+    store.want([7; 32]);
+    assert_eq!(store.wanted_due(now, 8), vec![[7; 32]]);
+    assert!(store.wanted_due(now, 8).is_empty(), "waits for its retry");
+    assert_eq!(store.wanted_due(now + REFRESH_RETRY_US, 8), vec![[7; 32]]);
+    assert!(store.keep([7; 32], attest([7; 32])));
+    assert!(store.wanted_due(now + 2 * REFRESH_RETRY_US, 8).is_empty());
+
+    store.want([7; 32]);
+    assert!(
+        store.wanted_due(now + 3 * REFRESH_RETRY_US, 8).is_empty(),
+        "held"
+    );
+
+    store.want([8; 32]);
+    store.forget(&[8; 32]);
+    assert!(store.wanted_due(now, 8).is_empty());
+}
+
+/// A `.tmp` file a crash left between write and rename does not load, and
+/// the load removes it, so a forgotten attestation cannot come back from it.
+#[test]
+fn a_leftover_temporary_file_is_removed_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let att = attest([3; 32]);
+    {
+        let store = Attestations::open(verifier(), dir.path(), None);
+        assert!(store.keep([3; 32], att.clone()));
+    }
+    let files = dir.path().join(ATTESTATIONS_DIR);
+    let real = files.join(file_name(&[3; 32]));
+    let tmp = real.with_extension("tmp");
+    std::fs::copy(&real, &tmp).unwrap();
+    std::fs::remove_file(&real).unwrap();
+    let store = Attestations::open(verifier(), dir.path(), None);
+    assert_eq!(store.held(&[3; 32]), None);
+    assert!(!tmp.exists());
 }
 
 /// Due refreshes list the live attestations first, the soonest to expire

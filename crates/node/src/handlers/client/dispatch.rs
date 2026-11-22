@@ -739,9 +739,9 @@ impl ClientHandler {
         let request_class;
         let admitted_at = std::time::Instant::now();
         // A node serves a hash only while it holds a live origin attestation
-        // for it (ADR 022 § Origin Attestation). A hit checks here; a miss gets
-        // its attestation from the fill that lands the blob: the own-origin
-        // leg signs one, and the pull leg refuses an upstream that offers none.
+        // for it (ADR 022 § Origin Attestation). A hit checks here. A miss is
+        // checked once its fill lands (below) or by the own-origin arm, and
+        // every served answer is checked again when it is signed.
         let partial_size = if audit.is_serveable() {
             None
         } else {

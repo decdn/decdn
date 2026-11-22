@@ -594,7 +594,10 @@ impl DhtHandler {
         {
             let accepted = match (store_guard.as_mut(), attested) {
                 (Some(store), Some(attested)) => {
-                    let outcome = store.insert_at(req.holder, hash, coverage, attested, now_us);
+                    let outcome =
+                        store.insert_at(req.holder, hash, coverage, attested, now_us, |a, s| {
+                            self.verifier.still_valid(a, s, now_us)
+                        });
                     if outcome.accepted() {
                         self.metrics.dht_store_accepted();
                         true
@@ -741,7 +744,14 @@ impl DhtHandler {
         // Step 4: receiver-anchored insert with all the cap rules.
         let now_us = now_us();
         let outcome = if let Ok(mut store) = self.records.lock() {
-            Some(store.insert_at(req.holder, req.hash, req.coverage, attested, now_us))
+            Some(store.insert_at(
+                req.holder,
+                req.hash,
+                req.coverage,
+                attested,
+                now_us,
+                |a, s| self.verifier.still_valid(a, s, now_us),
+            ))
         } else {
             // Poisoned record-store mutex: respond `accepted: false`
             // so the publisher backs off rather than retrying into a

@@ -169,12 +169,13 @@ Connection-level peer identity is authenticated by the iroh QUIC handshake again
 A node serves a hash only while it holds a live, valid origin attestation for it ([ADR 022 § Origin Attestation](022-content-discovery.md#origin-attestation)). The attestation is a seated origin's signed, expiring statement that it serves the hash in a namespace. Its EIP-712 type is separate from `StreamResponse`. Any namespace satisfies the rule. The request's `namespace_id` stays a routing hint ([§ Namespace routing](#namespace-routing)).
 
 - **Cache hit.** A cache hit, whole or a covering partial, with no live attestation gets `Declined`.
-- **Own backend.** A seated origin whose own backend holds the hash signs its own attestation on demand, in the lowest namespace that it is seated in. An origin node that holds no seat refuses its own backend content with `Declined`.
+- **Own backend.** A seated origin whose own backend holds the hash signs its own attestation on demand, in the lowest namespace that it is seated in. An origin node that holds no seat refuses its own backend content with `Declined`, unless it holds a live attestation for the hash from another origin.
+- **Empty blob.** The empty blob has no content to attest or take down. A node serves it with no attestation.
 - **Pinned hash.** A pinned hash follows the same rule ([ADR 040](040-cache-policy.md#pinning-durable-operator-evict-and-the-open-stream-pin-stay-engine-enforced)).
 - **Signed answer.** The node reads its attestation again when it signs an `ok: true` answer. The open-time check can go stale while the node waits on funding and fill work, and a miss that joins a fill in progress does no handshake of its own. With no live attestation at that point, the node answers `Declined`.
 - **In flight.** The node checks the rule again before each frame of a delivery. The attestation can expire with no fresher one found, or its signer can lose its seat or come onto the origin deny-set. The node then stops the delivery with a stream reset and the QUIC code `NO_ERROR`, as for a takedown ([ADR 011 § On Blacklist Event](011-content-takedown.md#on-blacklist-event)). A client that asks again gets `Declined`.
 
-**Origin attestation field.** Every `StreamResponse` with `ok: true` carries the node's live attestation for the hash in the unsigned extension field `origin_attestation`. A seated origin's own attestation rides there too. A relay verifies the attestation from its pull leg, stores it and publishes its DHT records with it. The pull path refuses an upstream whose served answer carries no valid attestation: the requester drops that upstream at discovery, before it ranks or pays it. A client ignores the field.
+**Origin attestation field.** Every `StreamResponse` with `ok: true` for a non-empty blob carries the node's live attestation for the hash in the unsigned extension field `origin_attestation`. A seated origin's own attestation rides there too. A relay verifies the attestation from its pull leg, stores it and publishes its DHT records with it. The pull path refuses an upstream whose served answer carries no valid attestation when it holds no live attestation of its own for the hash: the requester drops that upstream at discovery, before it ranks or pays it. A client ignores the field.
 
 #### Namespace routing
 
@@ -545,7 +546,7 @@ All protocol messages use [postcard](https://docs.rs/postcard) — compact, no-s
 - Discovery opens run in parallel before the requester commits, so it pays no slow or unresponsive node
 - Discovery and delivery share one stream and one connection. The discovery stream of the winner is its first paid leg, so a fetch does not pay the round trip of a second open
 - `cdn/client/v1` carries all discovery and all paid delivery — no separate protocol is needed for discovery or for node→node pulls
-- `StreamResponse` carries no route hint of any kind, so the backend topology of origin-backed nodes is fully hidden from the network. The origin attestation names the seated origin operator that attests a hash and its namespace, both public on-chain, and nothing about its backend
+- `StreamResponse` carries no route hint of any kind, so the backend topology of origin-backed nodes is fully hidden from the network. The origin attestation names the seated origin operator that attests a hash and one namespace of the hash, and nothing about its backend. The operator and its seats are public on-chain. The link from the hash to the namespace is new public information ([ADR 017 § P-24](017-privacy.md#disposition-summary))
 - The delivery protocol is self-enforcing — payment and data flow are coupled by design
 - `byte_offset` in `StreamRequest` makes failover transparent; the requester resumes without restarting the stream
 - QUIC stream multiplexing allows concurrent blob requests to the same node without additional connection overhead — one handshake cost regardless of how many blobs are fetched

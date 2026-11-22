@@ -586,7 +586,8 @@ pub struct CacheConfig {
     pub relay_foreign_namespaces: Option<bool>,
     /// The lifetime, in seconds, this node signs into the origin attestations
     /// it issues for content its own backend holds (ADR 022 § Origin
-    /// Attestation). Read only when the operator holds an origin seat. It is
+    /// Attestation). It takes effect only when the operator holds an origin
+    /// seat. It is
     /// the takedown latency of a hash this origin stops attesting, and the
     /// time its content outlives the origin going offline. Must lie in
     /// `[3600, 86400]`. Absent =>

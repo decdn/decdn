@@ -2249,8 +2249,38 @@ async fn sign_served_carries_the_live_attestation_or_refuses_unattested() -> any
     assert_eq!(ext.origin_attestation, Some(attestation));
     assert!(handler.attested_now(hash));
 
+    // The empty blob carries no content to attest: it serves with none.
+    let empty = decdn_bao_range::encode_outboard(&[][..], 0)?.size_proof;
+    assert!(handler.cache.keep_size_proof(Hash::EMPTY, 0, &empty).await);
+    let (resp, ext) = signed(
+        handler
+            .sign_served(&req(*Hash::EMPTY.as_bytes()), 1, 0, one())
+            .await?,
+    )?;
+    assert!(resp.body.ok);
+    assert_eq!(ext.origin_attestation, None);
     assert!(handler.attested_now(Hash::EMPTY));
+    assert!(handler.attested(Hash::EMPTY).await);
     Ok(())
+}
+
+/// A hash the node is asked to serve with no attestation held is refused and
+/// marked wanted, so the refresh task looks one up in the DHT.
+#[tokio::test]
+async fn an_unattested_hash_is_refused_and_wanted() {
+    use crate::dht::attestation::test_support::verifier;
+
+    let metrics = Arc::new(Metrics::new());
+    let store = Arc::new(crate::attestations::Attestations::in_memory(
+        verifier(),
+        None,
+    ));
+    let (handler, _dir) =
+        handler_for_tests_with(&metrics, U256::ZERO, Some(Arc::clone(&store))).await;
+    let hash = Hash::new(b"held with no attestation");
+    assert!(!handler.attested(hash).await);
+    let now = crate::handlers::timestamp_skew::now_us();
+    assert_eq!(store.wanted_due(now, 8), vec![*hash.as_bytes()]);
 }
 
 // ---------------------------------------------------------------------------

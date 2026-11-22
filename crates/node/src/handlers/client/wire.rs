@@ -24,10 +24,12 @@ use super::{
 )]
 pub(super) enum Served {
     /// The signed `ok: true` response and its extension, which carries the
-    /// live origin attestation the node holds for the hash.
+    /// live origin attestation the node holds for the hash: none for the
+    /// empty blob, or on a node with no attestation store.
     Signed(StreamResponse, StreamResponseExt),
     /// The node no longer holds a live attestation for the hash: it expired,
-    /// or its signer lost its seat, after the open-time gate passed. The
+    /// or its signer lost its seat or came onto the origin deny-set, after the
+    /// open-time gate passed. The
     /// caller refuses with [`ServeRejectReason::Unattested`] instead of
     /// promising a stream it may not serve (ADR 005 § Serving rule).
     Unattested,
@@ -95,9 +97,15 @@ impl ClientHandler {
     /// Whether this node may serve `hash` (ADR 022 § Origin Attestation): it
     /// holds a live, valid origin attestation for it, or its operator holds an
     /// origin seat, its own backend holds the hash, and it signs its own now.
-    /// A seated origin re-signs from half the lifetime on. `true` for the
+    /// A seated origin re-signs from half the lifetime on, and a failed
+    /// re-sign falls back to the live attestation it holds. `true` for the
     /// empty blob, which carries no content to attest or take down, and when
     /// no attestation store is wired (tests without a DHT).
+    ///
+    /// Every caller holds the blob or proved its own backend does. A `false`
+    /// therefore marks the hash wanted ([`crate::attestations::Attestations::want`]),
+    /// so a blob whose attestation was lost serves again once the DHT yields
+    /// one.
     pub(super) async fn attested(&self, hash: Hash) -> bool {
         let Some(attestations) = &self.attestations else {
             return true;
@@ -117,12 +125,17 @@ impl ClientHandler {
             self.cache.origin_probe_presence(hash).await,
             decdn_cache::OriginPresence::Present(_)
         ) {
-            if own {
-                return attestations.attest_own(bytes).is_some();
+            if own && attestations.attest_own(bytes).is_some() {
+                return true;
             }
-            // The own backend holds content this node cannot attest: its
-            // operator may hold a seat the seat set has not read yet.
-            attestations.verifier().request_seat_refresh();
+            if !own {
+                // The own backend holds content this node cannot attest: its
+                // operator may hold a seat the seat set has not read yet.
+                attestations.verifier().request_seat_refresh();
+            }
+        }
+        if live.is_none() {
+            attestations.want(bytes);
         }
         live.is_some()
     }

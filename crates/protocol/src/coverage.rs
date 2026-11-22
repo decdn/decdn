@@ -46,7 +46,7 @@ pub const MAX_DISCOVERABLE_BLOB_BYTES: u64 = 100 << 30;
 /// coverage for one over the DHT.
 ///
 /// Without this cap a bonded publisher could pin arbitrary receiver memory:
-/// coverage length is otherwise bounded only by the 64 KiB DHT frame
+/// coverage length is otherwise bounded only by the 72 KiB DHT frame
 /// ([`crate::dht::MAX_DHT_FRAME`]), and the
 /// per-publisher record quota multiplies it (stored memory ≈ records × bitmap).
 /// The cap makes an oversized bitmap unrepresentable rather than defended after

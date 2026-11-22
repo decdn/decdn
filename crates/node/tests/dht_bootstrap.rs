@@ -426,6 +426,40 @@ async fn client_store_with_an_unverified_attestation_is_refused() -> anyhow::Res
     Ok(())
 }
 
+/// ADR 022 § Origin Attestation: a correctly signed attestation that has
+/// expired is refused at STORE, so a holder cannot advertise content whose
+/// origin stopped attesting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn client_store_with_an_expired_attestation_is_refused() -> anyhow::Result<()> {
+    let client_sk = fresh_key();
+    let client_id = client_sk.public();
+    let server = spin_up_server(HashSet::from([*client_id.as_bytes()])).await?;
+
+    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+    let target = EndpointAddr::new(server.id).with_ip_addr(server.addr);
+    let hash = [0x7Au8; 32];
+    // Signed by the seated origin for this hash, a full lifetime ago.
+    let lifetime_us = u64::from(decdn_protocol::DEFAULT_ATTESTATION_TTL_SEC) * 1_000_000;
+    let now_us = decdn_node::handlers::timestamp_skew::now_us();
+    let expired = test_support::attest_at(hash, now_us.saturating_sub(lifetime_us + 1_000_000));
+    let ack = client::store(
+        &dht_conns(&client_ep),
+        target,
+        ContentHash::from_bytes(hash),
+        NodeId::from_bytes(*client_id.as_bytes()),
+        Coverage::full(1),
+        expired,
+    )
+    .await?;
+    assert!(!ack.accepted, "an expired attestation must be refused");
+    assert_eq!(server.records.lock().unwrap().len(), 0);
+
+    client_ep.close().await;
+    server.endpoint.close().await;
+    server.accept_task.abort();
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn run_republish_publishes_immediately_on_cache_insert() -> anyhow::Result<()> {
     // ADR 022 §STORE Flow steps 2-3: a freshly cached blob MUST be

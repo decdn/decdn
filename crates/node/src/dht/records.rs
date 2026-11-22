@@ -235,6 +235,10 @@ impl RecordStore {
     /// valid origin attestation). This method enforces only the
     /// storage-level invariants (per-publisher quota with hard reject, global
     /// LRU with eviction, per-hash provider cap with oldest-provider eviction).
+    ///
+    /// A re-publish keeps the held attestation only while `valid` still
+    /// accepts it and it expires after the offered one, so an attestation
+    /// whose signer lost its seat never displaces a valid replacement.
     pub fn insert_at(
         &mut self,
         holder: NodeId,
@@ -242,6 +246,7 @@ impl RecordStore {
         coverage: Coverage,
         attested: AttestedBy,
         receive_us: u64,
+        valid: impl Fn(&OriginAttestation, &Address) -> bool,
     ) -> InsertOutcome {
         // Allocate one monotonic sequence per call. Stored on the entry
         // and used as the second component of the `global_lru` key, so
@@ -259,9 +264,11 @@ impl RecordStore {
         // update atomic, so there is no hand-rolled in-place mutation (and
         // no `get_mut` corruption branch) to keep in sync.
         if let Some(old) = self.remove_entry(holder, hash) {
-            // The record keeps the attestation that expires last, so a
-            // re-publish never trades a fresher attestation for a staler one.
+            // The record keeps the valid attestation that expires last, so a
+            // re-publish never trades a fresher attestation for a staler one,
+            // and a valid one always replaces one that is no longer valid.
             let attested = if old.attestation.expires_at_us() > attested.attestation.expires_at_us()
+                && valid(&old.attestation, &old.signer)
             {
                 AttestedBy {
                     attestation: old.attestation,

@@ -60,6 +60,7 @@ impl Fixture for RecordStore {
                 signer: SIGNER,
             },
             receive_us,
+            |_, _| true,
         )
     }
 
@@ -85,6 +86,52 @@ fn providers_leave_out_a_record_whose_attestation_is_no_longer_valid() {
     );
 }
 
+/// A re-publish replaces a held attestation that is no longer valid, even
+/// when the held one expires later: its signer lost its seat, so keeping it
+/// would hide the holder from every lookup until it expires.
+#[test]
+fn a_re_publish_replaces_an_attestation_that_is_no_longer_valid() {
+    let mut s = RecordStore::new(small_cfg());
+    let dead = OriginAttestation {
+        timestamp_us: 9,
+        ..att()
+    };
+    let live = att();
+    let dead_signer = Address::repeat_byte(0xDE);
+    let valid = |_: &OriginAttestation, signer: &Address| *signer != dead_signer;
+    s.insert_at(
+        nid(1),
+        h(1),
+        Coverage::full(1),
+        AttestedBy {
+            attestation: dead,
+            signer: dead_signer,
+        },
+        0,
+        valid,
+    );
+    assert_eq!(
+        s.insert_at(
+            nid(1),
+            h(1),
+            Coverage::full(1),
+            AttestedBy {
+                attestation: live.clone(),
+                signer: SIGNER,
+            },
+            1,
+            valid,
+        ),
+        InsertOutcome::Refreshed
+    );
+    assert_eq!(
+        s.providers_at(&h(1), 1, valid)
+            .first()
+            .map(|p| p.attestation.clone()),
+        Some(live)
+    );
+}
+
 #[test]
 fn a_re_publish_keeps_the_attestation_that_expires_last() {
     let mut s = RecordStore::new(small_cfg());
@@ -102,6 +149,7 @@ fn a_re_publish_keeps_the_attestation_that_expires_last() {
                 signer: SIGNER,
             },
             at,
+            |_, _| true,
         )
     };
     insert(&mut s, newer.clone(), 0);

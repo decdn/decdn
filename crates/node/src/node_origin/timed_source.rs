@@ -27,6 +27,22 @@ use decdn_client::{BlobSource, UpstreamPullHeader, VoucherProgress};
 use crate::attestations::Attestations;
 use crate::metrics::Metrics;
 
+/// An upstream served a leg with no valid origin attestation, and this node
+/// holds no live one of its own for the hash (ADR 005 § Serving rule). It
+/// states what this node reads from its seat set, not whether the peer is
+/// reachable, so `pull_verdict` rules it a transient refusal: the pair is
+/// suppressed briefly and the peer's reputation is not scored.
+#[derive(Debug)]
+pub(crate) struct UpstreamUnattested;
+
+impl std::fmt::Display for UpstreamUnattested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upstream served without a valid origin attestation")
+    }
+}
+
+impl std::error::Error for UpstreamUnattested {}
+
 /// Drive `open` to its header and wrap its reader in a [`TimedReader`] whose
 /// clock starts before `open` is first polled.
 ///
@@ -86,7 +102,7 @@ impl<S: BlobSource> BlobSource for TimedSource<S> {
             if let Some(attestations) = &self.attestations
                 && !attestations.keep_offered(hash, opened.0.origin_attestation.as_ref())
             {
-                anyhow::bail!("upstream served without a valid origin attestation");
+                return Err(UpstreamUnattested.into());
             }
             Ok(opened)
         })

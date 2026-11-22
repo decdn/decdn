@@ -498,11 +498,12 @@ pub struct StreamResponseExt {
     /// [`StreamResponseExt::validate`].
     pub outcome: StreamOutcome,
     /// The live origin attestation the serving node holds for the hash (ADR
-    /// 022 § Origin Attestation). A node serves a hash only while it holds
-    /// one, so every served answer carries it; a seated origin carries its
-    /// own. A pulling relay verifies it and keeps it to serve and publish
-    /// the hash, and refuses an upstream whose answer carries no valid one. A
-    /// client ignores it.
+    /// 022 § Origin Attestation). A node serves a non-empty hash only while
+    /// it holds one, so every served answer for one carries it; a seated
+    /// origin carries its own. A pulling relay verifies it and keeps it to
+    /// serve and publish the hash. A relay that holds no live attestation of
+    /// its own for the hash refuses an upstream whose answer carries no valid
+    /// one. A client ignores it.
     pub origin_attestation: Option<crate::dht::OriginAttestation>,
     /// Which 64 MiB discovery blocks ([`crate::coverage`]) the node holds or
     /// can serve. Unsigned: a hint, never a commitment, and nothing may let it

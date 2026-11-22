@@ -146,9 +146,11 @@ impl OriginAttestation {
         self.ttl_sec >= MIN_ATTESTATION_TTL_SEC && self.ttl_sec <= MAX_ATTESTATION_TTL_SEC
     }
 
-    /// Whether the attestation is live at `now_us`: `now − ttl < timestamp ≤
-    /// now + MAX_ATTESTATION_FUTURE_SKEW_US`. Says nothing about the
-    /// signature or the seat.
+    /// Whether the attestation is live at `now_us`: `now_us − ttl_sec × 10⁶ <
+    /// timestamp_us ≤ now_us + MAX_ATTESTATION_FUTURE_SKEW_US`. Says nothing
+    /// about the signature or the seat, nor whether `ttl_sec` is in bounds:
+    /// pair it with [`Self::ttl_in_bounds`] on an attestation not yet
+    /// verified.
     #[must_use]
     pub const fn is_live_at(&self, now_us: u64) -> bool {
         self.timestamp_us <= now_us.saturating_add(MAX_ATTESTATION_FUTURE_SKEW_US)
@@ -584,7 +586,7 @@ where
     let v = Vec::<u8>::deserialize(d)?;
     if v.len() != SLASH_SIG_LEN {
         return Err(de::Error::custom(format!(
-            "attestation slash_sig length {} is not {SLASH_SIG_LEN}",
+            "attestation signature length {} is not {SLASH_SIG_LEN}",
             v.len(),
         )));
     }

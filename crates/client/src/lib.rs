@@ -2965,7 +2965,8 @@ pub struct UpstreamPullHeader {
     /// The origin attestation this upstream offers for the hash (ADR 022
     /// § Origin Attestation), from its `StreamResponseExt`. Unverified here;
     /// a relay checks it against its seated-origin set before keeping it, and
-    /// refuses the upstream when it is missing or invalid. `None` on an
+    /// refuses the upstream when it is missing or invalid and the relay holds
+    /// no live attestation of its own for the hash. `None` on an
     /// unpaid source.
     pub origin_attestation: Option<decdn_protocol::OriginAttestation>,
 }

@@ -565,7 +565,9 @@ enum ServeRejectReason {
     ForeignNamespaceDeclined,
     /// The node holds the blob but no live, valid origin attestation for it,
     /// and cannot sign its own (ADR 022 § Origin Attestation): its origin
-    /// stopped attesting the hash, or lost its seat. Ships
+    /// stopped attesting the hash, lost its seat or came onto the origin
+    /// deny-set, or this node is an unseated origin serving its own backend.
+    /// Ships
     /// [`StreamError::Declined`] (see [`Self::wire_error`]): this node will not
     /// serve the hash until it holds a live attestation again.
     Unattested,

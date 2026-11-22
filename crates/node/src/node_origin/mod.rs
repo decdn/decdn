@@ -80,7 +80,7 @@ use decdn_client::{
 use decdn_common::redact::sanitize_err_chain;
 use decdn_protocol::client::{StreamError, VoucherRejectReason};
 use iroh::{Endpoint, EndpointAddr, PublicKey};
-use timed_source::{TimedSource, timed_open};
+use timed_source::{TimedSource, UpstreamUnattested, timed_open};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, debug, info, warn};
 
@@ -3845,6 +3845,12 @@ fn pull_verdict(err: &anyhow::Error) -> PullVerdict {
     // no cross-node propagation) on the strength of our own defect.
     if err.downcast_ref::<LocalPullFault>().is_some() {
         return PullVerdict::OurLocalFault;
+    }
+    // Ahead of the catch-all: the peer answered, and this node refused the
+    // attestation it offered by its own reading of the seat set. That is no
+    // evidence the peer is down, so it is a transient refusal, never scored.
+    if err.downcast_ref::<UpstreamUnattested>().is_some() {
+        return PullVerdict::Refused(RefusalVerdict::Transient);
     }
     if let Some(refused) = err.downcast_ref::<UpstreamRefused>() {
         // A `VoucherRejected` arriving as a mid-stream refusal is the SAME event as one

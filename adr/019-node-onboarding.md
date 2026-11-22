@@ -50,7 +50,8 @@ Before any on-chain or protocol activity:
    credentials and content set before proceeding. Cache-only serving is permissionless
    at the protocol layer — any staked node may serve cached blobs and pass them on for
    payment, while it holds a live origin attestation for each blob. An origin node
-   serves its own backend content only while its operator holds an origin seat. To be recognised as an *authorized origin* for a registered namespace, the
+   serves its own backend content only while its operator holds an origin seat, or while it holds a live
+   attestation for the hash from another origin. To be recognised as an *authorized origin* for a registered namespace, the
    namespace's publisher must seat the operator via `OriginAssignment.addOrigin`, which
    requires the publisher itself to have been vetted by governance ([ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)).
    Namespace 0 (`namespaceId == 0`) has no origin role — no operator can be an
