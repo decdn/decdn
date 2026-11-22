@@ -833,7 +833,8 @@ abstract contract BaseProtocolDeploy is Script {
     ///      by its GOVERNANCE_ROLE, so handing off GOVERNANCE_ROLE gives the
     ///      Timelock control of the vetter set too.
     function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[6] memory) {
-        return [IAccessControl(address(d.router)), d.bond, d.blacklist, d.registry, d.originAssignment, d.vettingPolicy];
+        IAccessControl router = IAccessControl(address(d.router));
+        return [router, d.bond, d.blacklist, d.registry, d.originAssignment, d.vettingPolicy];
     }
 
     // -----------------------------------------------------------------
