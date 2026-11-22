@@ -21,9 +21,11 @@ pub const PRUNE_FLOOR: usize = 16;
 /// A dead entry stays in the map until a prune, or until a `get` of its key
 /// replaces it. A `get` that inserts prunes first when the map has reached
 /// its prune size, then sets the next prune size to twice the live entries
-/// (at least [`PRUNE_FLOOR`]). Pruning so costs amortized O(1) per insert,
-/// and the map holds at most about twice the most live entries it has held,
-/// or [`PRUNE_FLOOR`] when that is more.
+/// (at least [`PRUNE_FLOOR`]) and shrinks the table to fit it. A prune scans
+/// the whole table, so the shrink keeps a finished burst from making every
+/// later prune scan the burst's table. Pruning so costs amortized O(1) per
+/// insert, and the map holds at most about twice the most live entries it
+/// has held, or [`PRUNE_FLOOR`] when that is more.
 pub struct Flights<K, V> {
     inner: Mutex<FlightMap<K, V>>,
 }
@@ -85,6 +87,8 @@ impl<K: Eq + Hash, V> Flights<K, V> {
         if flights.map.len() >= flights.prune_at {
             flights.map.retain(|_, w| w.strong_count() > 0);
             flights.prune_at = flights.map.len().saturating_mul(2).max(PRUNE_FLOOR);
+            let prune_at = flights.prune_at;
+            flights.map.shrink_to(prune_at);
         }
         let flight = Arc::new(V::default());
         flights.map.insert(key, Arc::downgrade(&flight));

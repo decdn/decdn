@@ -120,3 +120,22 @@ fn a_value_of_any_default_type_is_shared() {
     assert_eq!(flights.get("b").0.load(Ordering::Relaxed), 0);
     assert_eq!(flights.holders(&"a"), 2);
 }
+
+#[test]
+fn a_finished_burst_leaves_no_large_table() {
+    let flights = LockFlights::default();
+    let burst: Vec<_> = (0..10_000).map(|key| flights.get(key)).collect();
+    drop(burst);
+    // Short-lived flights of new keys: the first prune drops the burst.
+    let mut log = PruneLog::default();
+    let mut key = 10_000;
+    while log.prunes == 0 {
+        drop(log.get(&flights, key));
+        key += 1;
+    }
+    for key in key..key + 1_000 {
+        drop(flights.get(key));
+    }
+    let capacity = flights.lock().map.capacity();
+    assert!(capacity <= 4 * PRUNE_FLOOR, "capacity {capacity}");
+}
