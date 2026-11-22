@@ -158,8 +158,8 @@ use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, U256};
@@ -183,7 +183,7 @@ use tokio::io::{AsyncReadExt as _, DuplexStream};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc, oneshot};
 
-use decdn_cache::{CacheEngine, CacheMetrics};
+use decdn_cache::{CacheEngine, CacheMetrics, Flights};
 
 use super::capability_pool::{CapabilityPoolError, capability_pool, read_pool_owner};
 use super::fetch::{
@@ -266,10 +266,6 @@ const MAX_NOT_MANIFESTS: usize = 1024;
 /// manifest buffers only: a fill's worker slot and its first-chunk read
 /// buffer fall outside it.
 const MANIFEST_BUFFER_BYTES: usize = 4 * MAX_MANIFEST_BYTES;
-
-/// The size at which the manifest fill map first prunes the locks of
-/// finished fills ([`ManifestFills::prune_at`]).
-const FLIGHT_PRUNE_FLOOR: usize = 16;
 
 /// The most bytes of text a not-manifest verdict keeps. A parse error quotes
 /// the publisher's paths and hash strings, which a manifest under the cap can
@@ -355,7 +351,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         cache: cache.clone(),
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
-        manifest_fills: std::sync::Mutex::default(),
+        manifest_fills: Flights::default(),
         manifest_buffer: Semaphore::new(MANIFEST_BUFFER_BYTES),
         hosts: allowed_hosts(args.listen),
         sites,
@@ -747,8 +743,10 @@ struct Gateway {
     /// no second pull.
     not_manifests: std::sync::Mutex<NotManifests>,
     /// The fill locks of the manifests being pulled, one per hash and routing
-    /// namespace.
-    manifest_fills: std::sync::Mutex<ManifestFills>,
+    /// namespace: held while that missing manifest is pulled, so concurrent
+    /// requests for it pull and pay once, and a stalled pull delays no other
+    /// hash or namespace. Cache hits never wait on a fill.
+    manifest_fills: Flights<FlightKey, Flight>,
     /// The manifest bytes left to buffer, out of [`MANIFEST_BUFFER_BYTES`]:
     /// one permit per byte of a fill buffer's capacity.
     manifest_buffer: Semaphore,
@@ -972,21 +970,6 @@ struct Flight {
     /// The lock a fill holds while it pulls, with the upstream failure of the
     /// fill that ended last, when that failure is shared.
     failed: Mutex<Option<String>>,
-}
-
-/// One fill lock per manifest hash and routing namespace with a fill in
-/// flight: held while that missing manifest is pulled, so concurrent
-/// requests for it pull and pay once, and a stalled pull delays no other
-/// hash or namespace. Cache hits never wait on a fill.
-#[derive(Default)]
-struct ManifestFills {
-    /// Each lock by its key, held as `Weak`. Requests hold `Arc` clones, so
-    /// an entry lives while a request holds or waits on its lock.
-    flights: HashMap<FlightKey, Weak<Flight>>,
-    /// The map size at which the next new entry first prunes the dead ones,
-    /// then moves to twice what is left (at least [`FLIGHT_PRUNE_FLOOR`]), so
-    /// pruning costs amortized O(1) per new entry.
-    prune_at: usize,
 }
 
 /// Hashes found to be no bundle manifest, with their verdicts, least recently
@@ -2178,24 +2161,7 @@ impl Gateway {
     /// ([`Gateway::manifest_fills`]). The caller locks it, re-checks the
     /// cache, and only then pulls.
     fn manifest_flight(&self, key: FlightKey) -> Arc<Flight> {
-        let mut fills = self
-            .manifest_fills
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(live) = fills.flights.get(&key).and_then(Weak::upgrade) {
-            return live;
-        }
-        if fills.flights.len() >= fills.prune_at {
-            fills.flights.retain(|_, w| w.strong_count() > 0);
-            fills.prune_at = fills
-                .flights
-                .len()
-                .saturating_mul(2)
-                .max(FLIGHT_PRUNE_FLOOR);
-        }
-        let flight = Arc::new(Flight::default());
-        fills.flights.insert(key, Arc::downgrade(&flight));
-        flight
+        self.manifest_fills.get(key)
     }
 
     /// `n` bytes of the manifest buffer budget ([`MANIFEST_BUFFER_BYTES`]),

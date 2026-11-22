@@ -1,6 +1,7 @@
 use super::*;
 use crate::commands::fetch::{MALFORMED_MANIFEST, MAX_MANIFEST_MB};
 use alloy::signers::local::PrivateKeySigner;
+use decdn_cache::flights::PRUNE_FLOOR;
 use http_body_util::Full;
 
 fn manifest() -> Arc<BundleManifest> {
@@ -230,7 +231,7 @@ async fn test_gateway_cached(
         cache,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
-        manifest_fills: std::sync::Mutex::default(),
+        manifest_fills: decdn_cache::Flights::default(),
         manifest_buffer: Semaphore::new(MANIFEST_BUFFER_BYTES),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
@@ -3345,13 +3346,7 @@ async fn pulls_reach(caps: &Log<u64>, count: usize) {
 async fn fill_holders_reach(gateway: &Gateway, key: FlightKey, count: usize) {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let holders = gateway
-                .manifest_fills
-                .lock()
-                .unwrap()
-                .flights
-                .get(&key)
-                .map_or(0, Weak::strong_count);
+            let holders = gateway.manifest_fills.holders(&key);
             if holders >= count {
                 return;
             }
@@ -3508,7 +3503,7 @@ async fn a_spent_buffer_budget_fails_a_fill_fast() {
 /// not keep one entry per hash ever filled.
 #[tokio::test]
 async fn the_fill_map_prunes_finished_fills() {
-    let blobs = slot_blobs(FLIGHT_PRUNE_FLOOR + 4);
+    let blobs = slot_blobs(PRUNE_FLOOR + 4);
     let replies = blobs
         .iter()
         .map(|&h| (h, Reply::Bytes(noindex_manifest())))
@@ -3518,13 +3513,8 @@ async fn the_fill_map_prunes_finished_fills() {
         let (status, body) = get(&gateway, &format!("/{}/", alloy::hex::encode(h))).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
-    let fills = gateway.manifest_fills.lock().unwrap();
-    assert!(
-        fills.flights.len() <= FLIGHT_PRUNE_FLOOR,
-        "{}",
-        fills.flights.len()
-    );
-    assert_eq!(fills.prune_at, FLIGHT_PRUNE_FLOOR);
+    let len = gateway.manifest_fills.len();
+    assert!(len <= PRUNE_FLOOR, "{len}");
 }
 
 /// A public gateway on [`Recording`] that answers each blob in `replies`,

@@ -1145,13 +1145,28 @@ async fn intake_rejects_zero_expiry_capability() {
 }
 
 /// Every `reason` label of `decdn_capability_intake_dropped_total`.
-const INTAKE_DROP_LABELS: [&str; 5] = [
+const INTAKE_DROP_LABELS: [&str; 6] = [
     "expiry_zero",
     "not_eoa_signature",
     "malformed_signature",
     "wrong_owner",
     "invalid_signature",
+    "store_failed",
 ];
+
+/// Assert that `decdn_capability_intake_dropped_total` reads one on `dropped`
+/// and zero on every other `reason`, or zero on every `reason` for `None`.
+fn assert_intake_dropped(metrics: &Metrics, dropped: Option<&str>) {
+    let text = metrics.encode().expect("metrics encode");
+    for label in INTAKE_DROP_LABELS {
+        let want = u64::from(dropped == Some(label));
+        let line = format!("decdn_capability_intake_dropped_total{{reason=\"{label}\"}} {want}");
+        assert!(
+            text.lines().any(|l| l == line),
+            "after drop {dropped:?}, expected `{line}`:\n{text}"
+        );
+    }
+}
 
 /// The wire form of `capability`, with its owner signature from `key`.
 fn signed_wire(
@@ -1210,15 +1225,7 @@ async fn assert_intake_drop(
         matches!(store.get(lane_key), Ok(None)),
         "a {label} drop never reaches the lane store"
     );
-    let text = metrics.encode().expect("metrics encode");
-    for other in INTAKE_DROP_LABELS {
-        let want = u64::from(other == label);
-        let line = format!("decdn_capability_intake_dropped_total{{reason=\"{other}\"}} {want}");
-        assert!(
-            text.lines().any(|l| l == line),
-            "after a {label} drop, expected `{line}`:\n{text}"
-        );
-    }
+    assert_intake_dropped(&metrics, Some(label));
 }
 
 #[tokio::test]
@@ -1265,6 +1272,67 @@ async fn intake_counts_a_wrong_owner_drop() {
         signed_wire(&PrivateKeySigner::random(), capability)
     })
     .await;
+}
+
+/// A lane store whose `record` always fails.
+struct FailingRecordStore {
+    inner: decdn_incentive::MemoryPoolStateStore,
+}
+
+impl PoolStateStore for FailingRecordStore {
+    fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
+        self.inner.load_all()
+    }
+
+    fn record(&self, _state: &LaneState) -> Result<(), StoreError> {
+        Err(StoreError::Backend("record refused".into()))
+    }
+
+    fn forget(&self, key: LaneKey) -> Result<(), StoreError> {
+        self.inner.forget(key)
+    }
+
+    fn get(&self, key: LaneKey) -> Result<Option<LaneState>, StoreError> {
+        self.inner.get(key)
+    }
+}
+
+/// A verified grant whose lane the store refuses to record registers no lane
+/// and counts on `store_failed` only (#2824).
+#[tokio::test]
+async fn intake_counts_a_lane_store_failure() {
+    let metrics = Arc::new(Metrics::new());
+    let store = Arc::new(FailingRecordStore {
+        inner: decdn_incentive::MemoryPoolStateStore::new(),
+    });
+    let (handler, _dir) = handler_over_store(&metrics, store as Arc<dyn PoolStateStore>).await;
+    let owner = PrivateKeySigner::random();
+    let pool_id = B256::repeat_byte(0x5C);
+    let signer = Address::repeat_byte(0x5D);
+    let wire = signed_wire(
+        &owner,
+        Capability {
+            signer,
+            spending_cap: 1_000_000,
+            pool_id,
+            expiry: 1_900_000_000,
+        },
+    );
+    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+
+    let lane_key = LaneKey {
+        pool_id,
+        signer,
+        provider: handler.eth_signer.address(),
+    };
+    assert!(
+        !handler.lanes.contains_key(&LaneId {
+            deployment: TEST_DEPLOYMENT,
+            key: lane_key,
+        }),
+        "a lane the store refuses never enters the live map"
+    );
+    assert_intake_dropped(&metrics, Some("store_failed"));
 }
 
 /// A signature with `r = s = 0` parses but recovers to no address.
@@ -1513,6 +1581,7 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
         Some(genuine_sig),
         "the genuine owner_sig rides the lane record after the repeated intake"
     );
+    assert_intake_dropped(&metrics, None);
 
     // A tampered re-send: the SAME capability payload signed by a
     // different key — a well-formed signature that is a distinct cache
