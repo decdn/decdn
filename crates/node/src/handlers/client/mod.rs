@@ -1706,8 +1706,9 @@ impl ClientHandler {
     /// pool owners.
     ///
     /// Each drop logs and counts on one `reason` of
-    /// `decdn_capability_intake_dropped_total`: to the client, a dropped grant
-    /// is an unknown-lane refusal, the same as an ordinary miss.
+    /// `decdn_capability_intake_dropped_total`, and so does a verified grant
+    /// whose lane the store refuses to record (`store_failed`): to the client,
+    /// either is an unknown-lane refusal, the same as an ordinary miss.
     ///
     /// Best-effort and off the durability path otherwise: a persist failure never
     /// fails the stream. Lane registration is idempotent — a re-observed grant for
@@ -1836,6 +1837,8 @@ impl ClientHandler {
         lane.owner_sig = Some(signature.as_bytes());
         if let Err(e) = self.register_lane(route.deployment, lane) {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
+            self.metrics
+                .capability_intake_dropped(CapabilityIntakeDropReason::StoreFailed);
         }
     }
 

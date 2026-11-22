@@ -142,9 +142,10 @@ struct StreamLabels {
     direction: StreamDirection,
 }
 
-/// Why capability intake dropped an owner-signed capability, as the `reason`
-/// label on `decdn_capability_intake_dropped_total`. A dropped capability
-/// registers no lane, so the client hears the same unknown-lane refusal as an
+/// Why capability intake dropped an owner-signed capability or failed to
+/// register its lane, as the `reason` label on
+/// `decdn_capability_intake_dropped_total`. A dropped capability registers no
+/// lane, so the client hears the same unknown-lane refusal as an
 /// ordinary miss; each drop site also logs its cause, and this label is the
 /// operator's only aggregate view of it. The derive renders variants in
 /// `snake_case`.
@@ -173,22 +174,27 @@ pub enum CapabilityIntakeDropReason {
     MalformedSignature,
     /// The owner signature recovers to an address other than the pool owner.
     /// Usually a client that still signs for an owner the pool has transferred
-    /// away from. The one drop the node logs at `warn`.
+    /// away from. One of the two drops the node logs at `warn`.
     WrongOwner,
     /// The owner signature recovers to no address, for example a high-`s`
     /// signature outside the contract's verifiable set.
     InvalidSignature,
+    /// The owner signature verifies, but the node's lane store refuses to
+    /// record the lane, so no lane registers. The other drop the node logs at
+    /// `warn`. A rising value points at the node's lane store, not the client.
+    StoreFailed,
 }
 
 impl CapabilityIntakeDropReason {
     /// Every variant. [`Metrics::new`] materializes one child per entry, so
     /// each `reason` series exports at zero from startup.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::ExpiryZero,
         Self::NotEoaSignature,
         Self::MalformedSignature,
         Self::WrongOwner,
         Self::InvalidSignature,
+        Self::StoreFailed,
     ];
 }
 
@@ -1580,8 +1586,13 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_withdrawn_total`.
     pub serve_stream_rejected_withdrawn: Counter,
     /// `serve_stream` requests refused because the blob is absent and
-    /// pull-through was unavailable or failed to fill it. Visible name:
+    /// pull-through was unavailable or failed to fill it, or because the own-origin
+    /// range probe after a deferred admission finds the range unusable. A miss on a request
+    /// with no lane in the pool counts here too: the node does not pull for it.
+    /// Visible name:
     /// `decdn_serve_stream_rejected_cache_miss_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_cache_miss: Counter,
     /// `serve_stream` requests refused because their `payment_pool` names a
     /// pool this node does not accept (ADR 005 § Payment pool routing). Signed
@@ -1589,21 +1600,29 @@ pub struct DecdnMetrics {
     /// `decdn_serve_stream_rejected_unaccepted_pool_total`.
     pub serve_stream_rejected_unaccepted_pool: Counter,
     /// `serve_stream` requests refused by a local store fault (`has`/`inspect`
-    /// error, or a present blob reporting no size) — signed to the client as
-    /// `Declined`, not a signed absence. Visible name:
+    /// error, a present blob reporting no size, or a faulted own-origin range
+    /// probe after a deferred admission). Wire class `Declined`, never an absence. Visible name:
     /// `decdn_serve_stream_rejected_internal_error_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_internal_error: Counter,
-    /// `serve_stream` requests refused on an unknown / never-opened lane
-    /// (#848). Wire-indistinguishable from `cache_miss`/`owner_mismatch` (all
-    /// signed as `NotFound` to avoid leaking lane existence), so this
-    /// server-side counter is the only place the distinction lives — a rising
-    /// value isolates an unknown-lane abuse campaign. Visible name:
+    /// `serve_stream` requests refused on an unknown / never-opened lane, for a
+    /// blob the node holds or a fill lands. A request with no lane for an absent
+    /// blob counts on `cache_miss`. Wire-indistinguishable from
+    /// `cache_miss`/`owner_mismatch` (all `NotFound` on the wire to avoid leaking
+    /// lane existence), so this server-side counter is the only place the
+    /// distinction lives. Visible name:
     /// `decdn_serve_stream_rejected_unknown_lane_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_unknown_lane: Counter,
     /// `serve_stream` requests refused because they carry no verified client
     /// binding, so they cannot name a lane (#327). A binding for a signer with no
-    /// lane counts as `unknown_lane`. Visible name:
+    /// lane counts as `unknown_lane` when the node holds the blob, and as
+    /// `cache_miss` when it does not. Visible name:
     /// `decdn_serve_stream_rejected_owner_mismatch_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_owner_mismatch: Counter,
     /// `serve_stream` requests reset because the client binding failed to
     /// verify: the signature is invalid, or it recovers a different address
@@ -1618,17 +1637,18 @@ pub struct DecdnMetrics {
     pub serve_stream_rejected_timestamp_skew: Counter,
     /// `serve_stream` requests refused before any bytes are served because the
     /// requesting pool's remaining deposit could not cover what the node
-    /// would front at its rate. (The refusal itself is signed — as an `ok: false`
-    /// response; what is never signed is an `ok: true`.) **Two** guards bump
-    /// this, and both ask whether the pool's `remaining − M` covers one chunk
-    /// (capped by the request's aligned span): the pull-through tiers' guard
-    /// (#856, #1519), which runs before any tier fronts origin egress or upstream
-    /// USDC, and the **direct-serve** guard (#1516). It does not distinguish them,
-    /// so a spike cannot be attributed to a guard from this series alone — the log
-    /// line at the refusal site is what says which.
-    /// Signed as `Unfunded`: every guard runs past the lane-ownership proof, so
+    /// would front at its rate. **Four** gates bump
+    /// this, and each asks whether the pool's `remaining − M` covers the
+    /// request's aligned span, capped at one chunk: the pre-fill gate before any
+    /// fill tier, the pull-through tier's gate before it fronts origin egress or
+    /// upstream USDC, the direct-serve admission gate, and the post-fill gate on
+    /// the landed blob's size. Neither this series nor the shared log line names
+    /// the gate.
+    /// Wire class `Unfunded`: every guard runs past the lane-ownership proof, so
     /// its audience is the proven requester (ADR 005 §Open-time refusal classes).
     /// Visible name: `decdn_serve_stream_rejected_insufficient_deposit_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_insufficient_deposit: Counter,
     /// Delivery refused at admission because a wired `PoolView` could not confirm
     /// the pool on-chain — the pool has no on-chain record, is closed/reclaimed, or
@@ -1636,42 +1656,50 @@ pub struct DecdnMetrics {
     /// the admit-path `getAuthorization` faulted and the node holds no cached
     /// registered read of the signer. Either read also refuses when it finds no
     /// free read slot in time, which `serve_admit_read_slot_timeouts` counts
-    /// apart. Signed as `NotFound`, like a cache miss,
+    /// apart. Wire class `NotFound`, like a cache miss,
     /// so this counter is the only place the reason lives;
     /// kept distinct from `insufficient_deposit` so a real drained-pool refusal is
     /// not conflated with an unconfirmed or unreachable pool. Visible name:
     /// `decdn_serve_stream_rejected_pool_unconfirmed_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_pool_unconfirmed: Counter,
     /// Delivery refused at admission because the request's pool is `Closing`
     /// on-chain: it takes no top-up, and its redemption ends at the dispute
-    /// deadline (ADR 003 §Pool solvency). Signed as `Unfunded` to a requester
+    /// deadline (ADR 003 §Pool solvency). Wire class `Unfunded` for a requester
     /// that holds a lane on the pool, so its owner opens a new pool, and as
-    /// `NotFound` to anyone else. Visible name:
+    /// `NotFound` for anyone else. Visible name:
     /// `decdn_serve_stream_rejected_pool_closing_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_pool_closing: Counter,
     /// Delivery refused at admission because the request's voucher signer
     /// cannot pay: its live on-chain registration has `cap − spent` below a
     /// serve floor (a "spent" capability the node could never cash). A
     /// `getAuthorization` fault never counts here (see `pool_unconfirmed`), and
-    /// an expired registration counts on `capability_expired`. Signed as
+    /// an expired registration counts on `capability_expired`. Wire class
     /// `Unfunded`: the requester holds a verified binding for a registered
     /// signer, so it is proven (ADR 005 §Open-time refusal classes). A rising
     /// value flags capabilities presented whose signer has drained its shared
     /// `cap` at other nodes; the owner raises the signer's cap or delegates a
     /// fresh capability. Visible name:
     /// `decdn_serve_stream_rejected_signer_cap_exhausted_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_signer_cap_exhausted: Counter,
     /// Delivery refused at admission because the request's voucher signer holds
     /// an on-chain registration at or past its expiry, or its lane's capability
-    /// is inside the node's expiry margin (ADR 003 §Revocation). Signed as
+    /// is inside the node's expiry margin (ADR 003 §Revocation). Wire class
     /// `Unfunded`, like `signer_cap_exhausted`, so off the wire the split lives
     /// in this counter and in the `serve_stream` span's `reason`. The remedy
     /// differs: a larger cap does not help, and the owner delegates a fresh
     /// capability with a later expiry. Visible name:
     /// `decdn_serve_stream_rejected_capability_expired_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_capability_expired: Counter,
     /// `decdn_capability_intake_dropped_total{reason}`: owner-signed
-    /// capabilities that intake dropped before it registered a lane. The
+    /// capabilities that intake dropped or failed to register as a lane. The
     /// client then hears an unknown-lane refusal, the same as an ordinary miss,
     /// so this counter is the operator's only aggregate view of intake drops.
     /// See [`CapabilityIntakeDropReason`] for each value. Every child exports at
@@ -1750,8 +1778,10 @@ pub struct DecdnMetrics {
     pub serve_stream_rejected_chain_hash_denied: Counter,
     /// Delivery refused because the pool's funding address is blacklisted as
     /// an origin — local `denied_origins` or the on-chain `ContentBlacklist`
-    /// (ADR 011 §On Blacklist Event). Signed as `Declined`. Visible
+    /// (ADR 011 §On Blacklist Event). Wire class `Declined`. Visible
     /// name: `decdn_serve_stream_rejected_origin_denied_total`.
+    /// A deferred admission (ADR 005 §Deferred admission) sends the refusal as a
+    /// `StreamError` after the signed answer, not as a signed `ok: false`.
     pub serve_stream_rejected_origin_denied: Counter,
     /// Delivery declined by the origin-only policy (#1759,
     /// `cache.relay_foreign_namespaces = false`): a memoized live probe of this
@@ -1773,15 +1803,18 @@ pub struct DecdnMetrics {
     /// an operator sees the staleness refusals. Visible name:
     /// `decdn_serve_stream_rejected_chain_stale_total`.
     pub serve_stream_rejected_chain_stale: Counter,
-    /// An ALREADY-RUNNING delivery cut off at an MB boundary because a takedown
-    /// landed after the stream opened (ADR 011 §On Blacklist Event). Visible
-    /// name: `decdn_serve_stream_terminated_takedown_total`.
+    /// An ALREADY-RUNNING delivery reset before its next frame because the blob
+    /// or the pool's funder became refused after the stream opened (ADR 011 §On
+    /// Blacklist Event): the blob is on the local denylist or the governance
+    /// blacklist, or the node evicted or quarantined it, or the funder is on an
+    /// origin blacklist. Visible name:
+    /// `decdn_serve_stream_terminated_takedown_total`.
     ///
     /// Distinct from the `rejected_*` family above, which counts refusals at
-    /// stream open. This one is the operator's evidence that the compliance
-    /// window was honored for traffic already in flight — the case that would
-    /// otherwise keep a multi-GB blob flowing for minutes after the order took
-    /// effect, which is the slashable one.
+    /// stream open. During a takedown, this one is the operator's evidence that
+    /// the compliance window held for traffic already in flight — the case that
+    /// would otherwise keep a multi-GB blob flowing for minutes after the order
+    /// took effect, which is the slashable one.
     pub serve_stream_terminated_takedown: Counter,
     /// `decdn_serve_stream_rejected_load_shed_hit_total`: cache-hit serves shed
     /// under node overload (egress saturation).

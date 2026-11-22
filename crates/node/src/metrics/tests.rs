@@ -466,6 +466,7 @@ fn capability_intake_dropped_exports_every_reason_and_moves_only_the_named_one()
             CapabilityIntakeDropReason::InvalidSignature,
             "invalid_signature",
         ),
+        (CapabilityIntakeDropReason::StoreFailed, "store_failed"),
     ];
     assert_eq!(labels.len(), CapabilityIntakeDropReason::ALL.len());
     let series =

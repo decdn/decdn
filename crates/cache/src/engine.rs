@@ -32,6 +32,7 @@ use crate::circuit_breaker::{
 };
 use crate::error::{CacheError, CacheResult, OriginPullError};
 use crate::fill_session::{FillClaim, FillRegistry, FillSession};
+use crate::flights::Flights;
 use crate::metrics::CacheMetrics;
 use crate::origin::{Origin, OriginFetch, OriginKind, OutboardFetch};
 use crate::origin_probe::{OriginProbeMemo, OriginProbePolicy, Presence};
@@ -522,20 +523,18 @@ struct Inner {
     /// its proof from both.
     size_proofs: SizeProofMemo,
     /// One async lock per hash whose origin presence a live walk is reading
-    /// ([`CacheEngine::origin_presence`]), held as `Weak` like
-    /// `outboard_flights`, so concurrent opens of a cold hash read the origin
-    /// once.
-    presence_flights: Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>,
+    /// ([`CacheEngine::origin_presence`]), so concurrent opens of a cold hash
+    /// read the origin once. The lock lives while a walk holds or waits on it.
+    presence_flights: Flights<Hash, tokio::sync::Mutex<()>>,
     /// Whether the open-time recency seed walked the whole store, so the
     /// access times name every blob it holds. The orphan proof sweep runs only
     /// then ([`CacheEngine::sweep_orphan_size_proofs`]).
     recency_seeded: AtomicBool,
     /// One async lock per hash whose outboard an origin read is fetching, so
     /// concurrent cold misses of one hash wait for the first read and reuse its
-    /// cached copy instead of each downloading it. Held as `Weak`: an entry
-    /// lives while a fetch holds its lock, and dead entries are pruned on the
-    /// next lookup.
-    outboard_flights: Mutex<HashMap<Hash, Weak<tokio::sync::Mutex<()>>>>,
+    /// cached copy instead of each downloading it. The lock lives while a
+    /// fetch holds or waits on it.
+    outboard_flights: Flights<Hash, tokio::sync::Mutex<()>>,
     /// Head start, in milliseconds, of the time budget for one origin read of
     /// the range-pull path. `0` means no budget. Set once at bring-up by
     /// [`CacheEngine::set_origin_read_budget`].
@@ -1725,9 +1724,9 @@ impl CacheEngine {
                 )),
                 outboards: OutboardCache::new(OUTBOARD_CACHE_BYTES, OUTBOARD_CACHE_ENTRIES),
                 size_proofs: SizeProofMemo::new(SIZE_PROOF_ENTRIES),
-                presence_flights: Mutex::new(HashMap::new()),
+                presence_flights: Flights::default(),
                 recency_seeded: AtomicBool::new(false),
-                outboard_flights: Mutex::new(HashMap::new()),
+                outboard_flights: Flights::default(),
                 origin_read_head_start_ms: AtomicU64::new(0),
                 origin_read_min_bps: AtomicU64::new(0),
             }),
@@ -2499,18 +2498,7 @@ impl CacheEngine {
     /// The per-hash lock of the live presence walk
     /// ([`Inner::presence_flights`]).
     fn presence_flight(&self, hash: Hash) -> Arc<tokio::sync::Mutex<()>> {
-        let mut flights = self
-            .inner
-            .presence_flights
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(live) = flights.get(&hash).and_then(Weak::upgrade) {
-            return live;
-        }
-        flights.retain(|_, w| w.strong_count() > 0);
-        let flight = Arc::new(tokio::sync::Mutex::new(()));
-        flights.insert(hash, Arc::downgrade(&flight));
-        flight
+        self.inner.presence_flights.get(hash)
     }
 
     /// Lock the origin-probe memo, recovering a poisoned mutex rather than
@@ -3475,18 +3463,7 @@ impl CacheEngine {
     /// ([`Inner::outboard_flights`]). The caller locks it, re-checks the cache,
     /// and only then reads from the origin.
     fn outboard_flight(&self, hash: Hash) -> Arc<tokio::sync::Mutex<()>> {
-        let mut flights = self
-            .inner
-            .outboard_flights
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(live) = flights.get(&hash).and_then(Weak::upgrade) {
-            return live;
-        }
-        flights.retain(|_, w| w.strong_count() > 0);
-        let flight = Arc::new(tokio::sync::Mutex::new(()));
-        flights.insert(hash, Arc::downgrade(&flight));
-        flight
+        self.inner.outboard_flights.get(hash)
     }
 
     /// The origin read budget as `(head_start, min_bps)`, or `None` when
