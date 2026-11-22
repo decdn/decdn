@@ -31,7 +31,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use decdn_client::Cumulative;
 use decdn_common::admin::{BuyerLaneSnapshot, BuyerPoolsResponse};
 use decdn_common::cli::ClientFetchArgs;
@@ -59,6 +59,10 @@ pub(super) struct Job {
     pub(super) writer: DuplexStream,
     /// The pull's result, sent once `writer` is closed.
     pub(super) done: oneshot::Sender<anyhow::Result<()>>,
+    /// What lists the pull as in flight. The worker drops it when the pull
+    /// ends, before it sends `done`, so a caller that has the result no
+    /// longer counts the pull.
+    pub(super) listing: Box<dyn Send>,
 }
 
 /// What the worker's buyer-pool store holds.
@@ -318,8 +322,8 @@ pub(super) struct PullWorker {
 
 impl PullWorker {
     /// Start the worker thread, build `backend`'s host on it, and run up to
-    /// `max_pulls` pulls at once. A pull whose response takes no bytes for
-    /// `stall` ends ([`StallLimit`]).
+    /// `max_pulls` pulls at once. A pull whose write to its response waits
+    /// for `stall` ends ([`StallLimit`]).
     ///
     /// # Errors
     ///
@@ -521,6 +525,7 @@ async fn pull<B: Backend>(
         paying,
         writer,
         done,
+        listing,
     } = job;
     let Ok(_slot) = slots.acquire().await else {
         return;
@@ -529,16 +534,18 @@ async fn pull<B: Backend>(
     let payer = match payer_for(&*backend, &payers, id, paying) {
         Ok(payer) => payer,
         Err(e) => {
+            drop(listing);
             let _ = done.send(Err(e));
             return;
         }
     };
-    let mut sink = Sink::Writer(Box::new(StallLimit::new(writer, stall)));
+    let mut sink = Sink::Writer(Box::new(StallLimit::new(writer, stall, blob.hash)));
     let result = backend.pull(&host, &payer, &blob, &mut sink).await;
     // The gateway reads the pipe to its end before it waits for the result.
     drop(sink);
     release(&payers, id, &payer);
     drop(payer);
+    drop(listing);
     let _ = done.send(result);
 }
 
@@ -552,28 +559,31 @@ async fn pull<B: Backend>(
 /// such a pull. It counts only the time a write waits on the response; the
 /// time between writes, while the holders are slow, is the progress clock's
 /// to judge. Each write the response lets through restarts the limit, so a
-/// response keeps its pull while it takes the next frame (up to
-/// `CHUNK_BYTES`) within the limit: a client that reads slower than one
-/// frame per limit loses it.
+/// response keeps its pull while it reads each frame (up to
+/// [`CHUNK_BYTES`](super::CHUNK_BYTES)) within the limit: a response that
+/// reads slower than one frame per limit loses it.
 struct StallLimit<W> {
     inner: W,
     limit: Duration,
-    /// Armed when an operation first returns `Pending`, cleared when one
-    /// completes.
+    /// The blob the pull writes, for the log line when the limit fires.
+    hash: [u8; 32],
+    /// Armed when an operation first returns `Pending`; cleared when one
+    /// completes or the limit fires.
     stalled: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<W> StallLimit<W> {
-    const fn new(inner: W, limit: Duration) -> Self {
+    const fn new(inner: W, limit: Duration, hash: [u8; 32]) -> Self {
         Self {
             inner,
             limit,
+            hash,
             stalled: None,
         }
     }
 
     /// `poll` as it is, unless it has stayed `Pending` for the limit.
-    fn bound<T>(
+    fn limit_pending<T>(
         &mut self,
         cx: &mut Context<'_>,
         poll: Poll<std::io::Result<T>>,
@@ -591,12 +601,13 @@ impl<W> StallLimit<W> {
         }
         self.stalled = None;
         tracing::info!(
+            hash = %B256::from(self.hash),
             limit_secs = limit.as_secs_f64(),
-            "a gateway response took no bytes; its pull ends"
+            "a gateway response read nothing while its pull waited; the pull ends"
         );
         Poll::Ready(Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
-            format!("the response took no bytes for {limit:?}"),
+            format!("the response read nothing for {limit:?}"),
         )))
     }
 }
@@ -609,19 +620,19 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for StallLimit<W> {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
-        this.bound(cx, poll)
+        this.limit_pending(cx, poll)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_flush(cx);
-        this.bound(cx, poll)
+        this.limit_pending(cx, poll)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_shutdown(cx);
-        this.bound(cx, poll)
+        this.limit_pending(cx, poll)
     }
 }
 
