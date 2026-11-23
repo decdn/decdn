@@ -1768,7 +1768,7 @@ fn counts_line(rep: &PullReport) -> String {
 }
 
 /// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files —
-/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges` — whose hash is not in
+/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges`, `<hex>.assembly` — whose hash is not in
 /// `keep`, and total the disk space they take ([`allocated_bytes`]). Other
 /// names (a record's temporary file) are not counted. A missing or unreadable
 /// directory holds nothing.
@@ -1786,6 +1786,7 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
         let stem = name
             .strip_suffix(".partial.ranges")
             .or_else(|| name.strip_suffix(".partial"))
+            .or_else(|| name.strip_suffix(".assembly"))
             .unwrap_or(name);
         let Ok(hash) = blake3::Hash::from_hex(stem) else {
             continue;
@@ -1808,7 +1809,7 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
     }
 }
 
-/// The disk space a file takes. A range-dedup `.partial` is sized to the whole
+/// The disk space a file takes. A range-dedup `.assembly` is sized to the whole
 /// blob before any byte lands, so its length can be far above the space that
 /// deleting it frees. On Unix the allocated blocks give that space; elsewhere
 /// the length is the best figure.

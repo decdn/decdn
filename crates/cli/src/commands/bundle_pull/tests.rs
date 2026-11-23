@@ -503,6 +503,7 @@ fn leftover_partials_counts_only_unselected_blobs() {
     // An orphan partial and its record, and a finalized orphan blob.
     write(format!("{}.partial", hex(3)), 1000);
     write(format!("{}.partial.ranges", hex(3)), 10);
+    write(format!("{}.assembly", hex(3)), 700);
     write(hex(4), 200);
     // A record's temporary file and a stray name.
     write(".tmpAbC123".into(), 50);
@@ -513,6 +514,7 @@ fn leftover_partials_counts_only_unselected_blobs() {
         |name: String| allocated_bytes(&std::fs::metadata(dir.join(name)).expect("metadata"));
     let expected = on_disk(format!("{}.partial", hex(3)))
         + on_disk(format!("{}.partial.ranges", hex(3)))
+        + on_disk(format!("{}.assembly", hex(3)))
         + on_disk(hex(4));
     let leftovers = leftover_partials(tmp.path(), &keep);
     assert_eq!(
