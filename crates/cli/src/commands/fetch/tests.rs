@@ -940,23 +940,28 @@ impl tokio::io::AsyncWrite for FailAfter {
 
 /// A streamed fetch whose writer fails mid-stream returns the writer's error
 /// at once. `copy_verified` fails on the write, `StreamDrive::alongside`
-/// returns that result while the drive is parked on the read-ahead window,
-/// and `copy_stream` returns before it awaits the drive, so the parked drive
-/// drops. Awaiting the drive instead would wait on a reader that no longer
-/// reads. This is what frees a gateway pull slot when its response stops
-/// taking bytes (#2838).
+/// returns that result without waiting for the drive, and `copy_stream`
+/// returns before it awaits the drive, so the unfinished drive drops. The
+/// read-ahead window is smaller than the blob, so the drive cannot finish on
+/// its own: awaiting it would wait on a live reader that no longer reads. Any
+/// write error takes this path, a gateway `StallLimit` timeout as much as a
+/// broken pipe. This is what frees a gateway pull slot when its response
+/// stops taking bytes (#2838).
 #[tokio::test]
 async fn a_streamed_fetch_whose_writer_fails_returns_without_waiting_on_the_drive()
 -> anyhow::Result<()> {
     use bao_tree::io::outboard::PreOrderMemOutboard;
     use decdn_bao_range::{CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE};
     use decdn_client::{
-        Cumulative, FakeFunder, PoolLedger, Recovery, ScriptedSource, StaticSources,
-        StreamCandidate,
+        Cumulative, FakeFunder, PULL_WINDOW_FLOOR, PoolLedger, Recovery, ScriptedSource,
+        StaticSources, StreamCandidate,
     };
 
     let scratch = tempfile::tempdir()?;
-    let len = usize::try_from(96 * CHUNK_GROUP_BYTES)?;
+    // Four read-ahead windows of whole chunk groups: the drive cannot reach
+    // the end of the blob while the reader stands still.
+    let len =
+        usize::try_from((4 * PULL_WINDOW_FLOOR).div_ceil(CHUNK_GROUP_BYTES) * CHUNK_GROUP_BYTES)?;
     let data: Vec<u8> = (0..len)
         .map(|i| u8::try_from(i % 251).unwrap_or_default())
         .collect();
@@ -980,7 +985,7 @@ async fn a_streamed_fetch_whose_writer_fails_returns_without_waiting_on_the_driv
     let streamer =
         Streamer::with_stores(sources, funder, ScratchStores::new(scratch.path())).holders(holders);
 
-    let pull_config = PullConfig::new().with_read_ahead_bytes(CHUNK_GROUP_BYTES);
+    let pull_config = PullConfig::new().with_read_ahead_bytes(PULL_WINDOW_FLOOR);
     let stop = StopPolicy::new(false, None, Arc::new(ProgressClock::new()));
     let timings = FetchTimings::start();
     let mut sink = Sink::Writer(Box::new(FailAfter::new(usize::try_from(
@@ -1000,15 +1005,15 @@ async fn a_streamed_fetch_whose_writer_fails_returns_without_waiting_on_the_driv
     .await;
 
     let Ok(Err(e)) = outcome else {
-        panic!("the stream must fail with the writer's error in time, got {outcome:?}");
+        anyhow::bail!("the stream must fail with the writer's error in time, got {outcome:?}");
     };
     let msg = format!("{e:#}");
     assert!(msg.contains("write verified bytes"), "{msg}");
     assert!(msg.contains("broken pipe"), "{msg}");
+    let paid = ledger.paid_bytes();
     assert!(
-        ledger.wire_bytes() < total,
-        "the drive stops short of the blob: {} of {total} bytes",
-        ledger.wire_bytes()
+        paid < U256::from(total),
+        "the drive stops short of the blob: paid {paid} of {total} bytes"
     );
     Ok(())
 }
