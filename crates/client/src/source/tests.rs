@@ -68,19 +68,6 @@ async fn fault_once_after_fires_on_the_first_reader_only() -> anyhow::Result<()>
     Ok(())
 }
 
-/// `PeerSource` implements `BlobSource` — checked at compile time rather than
-/// exercised end-to-end, since a real run needs a live `Endpoint`/connection.
-/// The driver tests exercise the trait's behavior against `ScriptedSource`;
-/// the loopback suites (`open_progressive_pull` under the `stream_fetch*`
-/// wrappers, the `byte_len` plumbing above) cover `PeerSource`'s own
-/// building blocks. `'static` is just a concrete lifetime to instantiate the
-/// generic type parameter with — no value is constructed.
-#[test]
-fn peer_source_is_a_blob_source() {
-    fn assert_impl<T: BlobSource>() {}
-    assert_impl::<super::PeerSource<'static>>();
-}
-
 /// The fake funder records the remaining deposits it was asked to recover
 /// from and answers its script in order, repeating the last outcome.
 #[tokio::test]

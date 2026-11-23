@@ -228,13 +228,25 @@ fn split_evenly_splits_a_span_into_k_aligned_pieces_below_no_size_floor() -> any
 }
 
 #[test]
-fn split_evenly_caps_at_the_span_size() -> anyhow::Result<()> {
-    // A single 8 MiB span with k=4 yields at most pieces sized >= one
-    // group each, never more pieces than make sense; every piece is
-    // non-empty.
-    let segs = super::split_evenly(0, 8 * 1024 * 1024, 4, 8 * 1024 * 1024)?;
-    assert!(!segs.is_empty() && segs.len() <= 4);
-    assert!(segs.iter().all(|s| s.fetch_end() > s.fetch_start()));
+fn split_evenly_splits_a_span_into_k_contiguous_pieces() -> anyhow::Result<()> {
+    // A single 8 MiB span with k=4 yields exactly four contiguous 2 MiB
+    // pieces that cover the span.
+    let total = 8 * 1024 * 1024;
+    let piece = total / 4;
+    let segs = super::split_evenly(0, total, 4, total)?;
+    let spans: Vec<(u64, u64)> = segs
+        .iter()
+        .map(|s| (s.fetch_start(), s.fetch_end()))
+        .collect();
+    assert_eq!(
+        spans,
+        vec![
+            (0, piece),
+            (piece, 2 * piece),
+            (2 * piece, 3 * piece),
+            (3 * piece, total),
+        ]
+    );
     Ok(())
 }
 

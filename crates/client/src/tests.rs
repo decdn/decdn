@@ -10,28 +10,6 @@ use super::{
 };
 use std::assert_matches;
 
-/// The `LocalPullFault` marker must ride out on the errors the range helpers ACTUALLY
-/// raise — not on one a test hand-built (#1145 review).
-///
-/// This distinction is the whole point of the test: a test that calls the real
-/// `sign_client_binding`, throws away its `Ok` result, and hand-builds
-/// `anyhow!("...").context(LocalPullFault)` before asserting the ladder finds
-/// `LocalPullFault` in it is true by construction. Attaching the marker and then
-/// finding it proves nothing — such a test cannot fail even if every
-/// `.context(LocalPullFault)` call site is stripped from the crate, so a synthetic
-/// `anyhow!(...)` passes it while production silently fails to score the peer.
-///
-/// So: real functions, real errors, marker never touched by the test. `align_range`
-/// rejects an offset at or past the end of the blob (never clamps — ADR 005), which is
-/// the one local-fault trigger reachable without mocking a signer, and
-/// `aligned_wire_len` is the one site every pull passes it through.
-///
-/// The stakes, and why an unguarded marker here is not cosmetic: every arm BELOW
-/// `LocalPullFault` in the ladder blames the peer to some degree, and the catch-all
-/// scores `Unreachable` in the local per-peer EWMA (ADR 008). A fault in this
-/// node is not evidence about a provider, and a node in this state meets every candidate
-/// in turn, so losing the marker does not mis-score one peer: it defames the whole
-/// candidate list on the strength of our own defect.
 /// `capped` must refuse a cap that cannot outlast its own stages (#1145 review).
 ///
 /// This is the enforcement of record. The CLI's `ClientFetchArgs::validate` restates the

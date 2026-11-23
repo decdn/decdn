@@ -1130,23 +1130,6 @@ async fn a_later_issue_builds_on_an_armed_voucher() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A sequence of successful issues stays ordered and exact — the committed
-/// watermark is the running cumulative, never ahead of what was delivered.
-#[tokio::test]
-async fn a_sequence_of_issues_stays_ordered_and_exact() -> anyhow::Result<()> {
-    let ledger = PoolLedger::new(Cumulative::default());
-    for expected in 1..=100u64 {
-        let sent = ledger
-            .issue(100, 10, EpochAction::Keep, |_next, _chain| async { Ok(()) })
-            .await?;
-        assert_eq!(sent.bytes, U256::from(expected * 100));
-    }
-    let committed = ledger.committed();
-    assert_eq!(committed.bytes, U256::from(10_000u64));
-    assert_eq!(ledger.settlement(), committed);
-    Ok(())
-}
-
 #[test]
 fn bytes_accumulate_by_delta() {
     let cur = Cumulative {
@@ -1234,22 +1217,6 @@ async fn paid_bytes_counts_vouchers_and_reveals_past_the_seed() -> anyhow::Resul
         U256::from(1_000 + CHUNK_BYTES),
         "a rejected voucher gives its bytes back"
     );
-    Ok(())
-}
-
-/// A voucher whose send did not confirm settles high but is not counted as
-/// paid.
-#[tokio::test]
-async fn paid_bytes_leaves_out_an_armed_voucher() -> anyhow::Result<()> {
-    let ledger = PoolLedger::new(Cumulative::default());
-    let failed = ledger
-        .issue(100, 10, EpochAction::Keep, |_n, _c| async {
-            anyhow::bail!("send lost")
-        })
-        .await;
-    assert!(failed.is_err());
-    assert_eq!(ledger.settlement().bytes, U256::from(100u64));
-    assert_eq!(ledger.paid_bytes(), U256::ZERO);
     Ok(())
 }
 

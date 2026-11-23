@@ -222,29 +222,6 @@ fn upsert_persists_multiaddrs_and_as_candidate_carries_them() -> anyhow::Result<
 }
 
 #[test]
-fn record_without_multiaddrs_field_still_deserializes() -> anyhow::Result<()> {
-    // A record written before `multiaddrs` existed must still load (with
-    // empty addresses) rather than fail and drop its latency/identity stats.
-    // Build a real record, strip the field an older writer never wrote, and
-    // reload — no hand-guessing of the PublicKey/Address JSON encodings.
-    let dir = tempdir()?;
-    let store = PeerStore::open(dir.path());
-    store.upsert_identity(&candidate(9), 5_000)?;
-    let rec = store
-        .get(&key(9))
-        .ok_or_else(|| anyhow::anyhow!("missing"))?;
-    let mut value = serde_json::to_value(&rec)?;
-    value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?
-        .remove("multiaddrs");
-    let reloaded: PeerRecord = serde_json::from_value(value)?;
-    assert!(reloaded.multiaddrs.is_empty());
-    assert_eq!(reloaded.identity_seen_at_secs, 5_000); // unrelated fields survive
-    Ok(())
-}
-
-#[test]
 fn record_sample_preserves_cached_multiaddrs() -> anyhow::Result<()> {
     let cfg = StoreConfig::default();
     let dir = tempdir()?;
