@@ -123,6 +123,7 @@ impl UdpPortClaim {
     /// Claim a free UDP port in `low..high`, trying [`UDP_CLAIM_ATTEMPTS`]
     /// random picks.
     fn claim_in(low: u16, high: u16) -> anyhow::Result<Self> {
+        anyhow::ensure!(low < high, "empty UDP claim range {low}..{high}");
         let span = u64::from(high - low);
         for _ in 0..UDP_CLAIM_ATTEMPTS {
             let offset = std::hash::RandomState::new().build_hasher().finish() % span;

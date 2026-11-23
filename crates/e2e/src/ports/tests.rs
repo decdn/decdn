@@ -19,8 +19,9 @@ const EPHEMERAL_PICKS: usize = 5000;
 /// [`UdpPortClaim`] picks a port below `ephemeral_low()` because the kernel
 /// hands out no UDP port there. On Linux and macOS `ephemeral_low()` reads the
 /// range the kernel uses, so the test checks that read: had it returned a
-/// value 100 ports above the real start, a run this size would land below it
-/// about six times.
+/// value 100 ports above the start of the default macOS range (49152..65535),
+/// a run this size would land below it about six times. Other platforms use a
+/// fixed 49152, so there the test checks that constant.
 const ZERO_BINDS: usize = 1000;
 
 /// The bind `decdn-node`'s `net::bind_reuseaddr` makes for its admin and
