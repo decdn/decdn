@@ -430,10 +430,6 @@ pub struct LaneSnapshot {
     /// derived for its data dir, and a `decdn get --capability` signs with
     /// the delegate key the capability names, so both differ from the owner.
     pub voucher_signer: String,
-    /// Sequence number of the most-recently-accepted voucher. Not tracked
-    /// in the shared-pool model (a pool has no per-lane nonce), so this
-    /// always reports `0`.
-    pub last_nonce: u64,
     /// What the node is owed on this lane, in micro-USDC
     /// (`LaneState::owed`): the cumulative amount of the last signed voucher
     /// plus the chain frontier verified under it. This is the node's total

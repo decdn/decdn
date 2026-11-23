@@ -1403,7 +1403,7 @@ fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
 /// constructor the open stage uses — rather than a hand-built value, which
 /// #1377's newtype makes impossible outside this crate.
 #[test]
-fn an_open_stage_refusal_preserves_the_signed_stream_response()-> anyhow::Result<()> {
+fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::capacity_bond_domain;
     use decdn_incentive::stream_sig::StreamSigData;

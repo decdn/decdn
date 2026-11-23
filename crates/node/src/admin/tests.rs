@@ -928,7 +928,6 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
     let first = snaps.first().expect("first snapshot");
     assert_eq!(first.outstanding_micro_usdc, 2_500_000);
     assert_eq!(first.deposit_micro_usdc, 0);
-    assert_eq!(first.last_nonce, 0);
     assert!(
         first.pool_id.starts_with("0x"),
         "pool_id must be 0x-hex: {}",

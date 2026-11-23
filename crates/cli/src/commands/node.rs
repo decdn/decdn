@@ -918,16 +918,15 @@ fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result
         return writeln!(w, "(no open lanes)");
     }
     // Fixed-column layout: pool contract | lane preview | counterparty
-    // preview | voucher signer preview | nonce | outstanding | unredeemed |
-    // deposit | last-voucher age | eligible.
+    // preview | voucher signer preview | outstanding | unredeemed | deposit |
+    // last-voucher age | eligible.
     writeln!(
         w,
-        "{:<22} {:<14} {:<14} {:<14} {:>6} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
+        "{:<22} {:<14} {:<14} {:<14} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
         "POOL",
         "LANE",
         "COUNTERPARTY",
         "SIGNER",
-        "NONCE",
         "OUTSTANDING",
         "UNREDEEMED",
         "DEPOSIT",
@@ -965,9 +964,8 @@ fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
     let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
         w,
-        "{pool:<22} {lane:<14} {counterparty:<14} {signer:<14} {:>6} {:>12} {:>12} {:>12} \
+        "{pool:<22} {lane:<14} {counterparty:<14} {signer:<14} {:>12} {:>12} {:>12} \
          {last_voucher:>12} {eligible}",
-        c.last_nonce,
         format_usdc(c.outstanding_micro_usdc),
         format_usdc(c.unredeemed_micro_usdc),
         format_usdc(c.deposit_micro_usdc),
