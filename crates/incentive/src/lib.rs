@@ -132,8 +132,8 @@ pub use pool_open_error::{
 };
 pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 pub use store::{
-    MemoryPoolStateStore, MemorySettlementLedger, PendingSettle, PendingSettleStore,
-    PoolStateStore, SettlementKey, SettlementLedger, SettlementRecord, StoreError,
+    MemoryPoolStateStore, MemorySettlementLedger, PoolStateStore, SettlementKey, SettlementLedger,
+    SettlementRecord, StoreError,
 };
 pub use stream_sig::{STREAM_RESPONSE_TYPEHASH, StreamSigData, StreamSigError};
 pub use voucher::{

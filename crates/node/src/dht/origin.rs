@@ -123,25 +123,13 @@ pub struct StaticOriginDirectory {
     /// Taken as-is from the caller, so `lookup_origins` is a single
     /// `HashMap::get` clone-and-return.
     origins: HashMap<U256, Vec<NodeId>>,
-    /// Operator address → `NodeId`, for [`OriginDirectory::origin_nodes`].
-    operators: HashMap<Address, NodeId>,
 }
 
 impl StaticOriginDirectory {
     /// Build from a `namespace → origins` map.
     #[must_use]
-    pub fn new(origins: HashMap<U256, Vec<NodeId>>) -> Self {
-        Self {
-            origins,
-            operators: HashMap::new(),
-        }
-    }
-
-    /// Also resolve these origin operators to their `NodeId`s.
-    #[must_use]
-    pub fn with_operators(mut self, operators: HashMap<Address, NodeId>) -> Self {
-        self.operators = operators;
-        self
+    pub const fn new(origins: HashMap<U256, Vec<NodeId>>) -> Self {
+        Self { origins }
     }
 }
 
@@ -151,11 +139,9 @@ impl OriginDirectory for StaticOriginDirectory {
         self.origins.get(&namespace_id).cloned().unwrap_or_default()
     }
 
-    fn origin_nodes(&self, operators: &[Address]) -> Vec<NodeId> {
-        operators
-            .iter()
-            .filter_map(|op| self.operators.get(op).copied())
-            .collect()
+    /// Resolves no operator: the map holds origins by namespace only.
+    fn origin_nodes(&self, _operators: &[Address]) -> Vec<NodeId> {
+        Vec::new()
     }
 }
 

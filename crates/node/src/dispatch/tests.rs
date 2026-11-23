@@ -73,15 +73,16 @@ fn acquire_admits_many_connections_from_one_address() {
 
 #[test]
 fn permit_drop_decrements_in_flight_metric() {
-    // We can't read the gauge value directly without scraping, so the
-    // contract is verified indirectly: permits must be released so that
-    // a strictly-bounded global semaphore can be re-acquired after Drop.
+    // Dropping a permit lowers the in-flight gauge and frees its slot in a
+    // strictly-bounded global semaphore.
     let metrics = Arc::new(Metrics::new());
     let limiter = ConnectionLimiter::new(&security(2), Arc::clone(&metrics));
     let p1 = limiter.acquire_inner(Some(ip(10, 0, 0, 1))).unwrap();
     let p2 = limiter.acquire_inner(Some(ip(10, 0, 0, 2))).unwrap();
+    assert_eq!(metrics.dispatch_in_flight_value(), 2);
     // Global is full. Drop one and re-acquire.
     drop(p1);
+    assert_eq!(metrics.dispatch_in_flight_value(), 1);
     let _p3 = limiter
         .acquire_inner(Some(ip(10, 0, 0, 3)))
         .expect("slot should be free after dropping p1");

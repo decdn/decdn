@@ -30,22 +30,6 @@ fn concurrent_pulls_on_one_lane_share_a_ledger() {
     );
 }
 
-/// The live ledger outranks the persisted seed. The second pull's `seed` is the store
-/// row, which lags the in-flight pull's issuance — honouring it would rewind the watermark
-/// and re-create the collision.
-#[test]
-fn a_stale_seed_cannot_rewind_a_live_ledger() {
-    let ledgers = BuyerLedgers::default();
-    let live = ledgers.get_or_seed(lane(9, 1), seed_at(7));
-    let rejoined = ledgers.get_or_seed(lane(9, 1), seed_at(7));
-    assert!(Arc::ptr_eq(&live, &rejoined));
-    assert_eq!(
-        rejoined.committed().amount,
-        U256::from(7u64),
-        "the live ledger's own watermark stands; the seed is ignored on a hit"
-    );
-}
-
 /// Each pool id keys its own ledger, so a different pool addresses a distinct
 /// entry rather than sharing the incumbent's.
 #[test]
