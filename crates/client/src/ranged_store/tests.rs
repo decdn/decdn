@@ -458,6 +458,35 @@ async fn a_one_chunk_blob_is_proven_and_finalizes() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A destination relative to the working directory exports like an absolute
+/// one: the store takes only absolute paths, so `finalize` resolves it.
+#[cfg(unix)]
+#[tokio::test]
+async fn finalize_exports_to_a_relative_destination() -> anyhow::Result<()> {
+    let total = 2 * GROUP + 5;
+    let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("out.bin");
+    // The same file, named from the working directory: one `..` per
+    // component below the root, then the absolute path without its root.
+    let cwd = std::env::current_dir()?;
+    let mut relative = std::path::PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(dest.strip_prefix("/")?);
+    assert!(relative.is_relative());
+
+    let store = fresh_store(root, total).exporting_to(relative);
+    let whole = decdn_bao_range::align_range(0, total, total)?;
+    store
+        .admit(whole.clone(), bao_for(root, &plaintext, outboard, &whole))
+        .await?;
+    store.finalize().await?;
+    assert_eq!(std::fs::read(&dest)?, plaintext);
+    Ok(())
+}
+
 /// Every byte of the bound present is not enough: `finalize` needs a
 /// proven size.
 #[tokio::test]

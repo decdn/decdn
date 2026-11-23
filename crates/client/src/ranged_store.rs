@@ -911,12 +911,15 @@ impl RangedStore for ClientRangedStore {
                 return Err(RangedStoreError::Incomplete);
             }
             if let Some(path) = &self.export_to {
+                // The store exports only to an absolute path; a download's
+                // destination can be relative to the working directory.
+                let target = std::path::absolute(path).map_err(backend)?;
                 self.store
                     .blobs()
                     .export_with_opts(ExportOptions {
                         hash: self.hash,
                         mode: ExportMode::TryReference,
-                        target: path.clone(),
+                        target,
                     })
                     .finish()
                     .await

@@ -89,6 +89,34 @@ async fn a_reopened_store_holds_what_an_earlier_run_admitted() {
     reopened.close().await.expect("close");
 }
 
+/// A blob small enough that the file store keeps it in its database exports
+/// to its destination like any other.
+#[tokio::test]
+async fn a_small_blob_exports_to_its_destination() {
+    for total in [1u64, 200, 1024, 4000, 20_000] {
+        let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+        let dir = tempfile::tempdir().expect("tmp dir");
+        let dest = dir.path().join("out.bin");
+        let store = ClientRangedStore::on_disk(&dir.path().join("store"), root, total)
+            .await
+            .expect("open")
+            .exporting_to(dest.clone());
+        let aligned = decdn_bao_range::align_range(0, total, total).expect("align");
+        let bao = bao_for(root, &plaintext, outboard, &aligned);
+        store.admit(aligned, bao).await.expect("admit");
+        store
+            .finalize()
+            .await
+            .unwrap_or_else(|e| panic!("finalize a {total}-byte blob: {e}"));
+        assert_eq!(
+            std::fs::read(&dest).expect("read export"),
+            plaintext,
+            "{total} bytes"
+        );
+        store.close().await.expect("close");
+    }
+}
+
 /// A store that holds the whole blob exports it to its destination at
 /// `finalize`, byte for byte, and a second `finalize` keeps it.
 #[tokio::test]
