@@ -2268,10 +2268,9 @@ fn planned_downloads_match_the_run_total() {
 }
 
 /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` opens
-/// the entry's ranged store the way the real drive does (`open_or_create`, so
-/// a `.partial` without its `.ranges` record is truncated exactly as in
-/// production), then writes the requested ranges' correct bytes into
-/// `<staging>.partial`, pre-sized, never finalizing `<hex>` itself — so
+/// the entry's ranged store the way the real drive does (`open_or_create`) and
+/// admits each requested range's bao-verified bytes into it, so the store's
+/// record names them present. It never finalizes `<hex>` itself, so
 /// `reassemble_dedup` exercises its splice + whole-file verify + promote path.
 /// Records every driven range.
 struct RecordingDriver {
@@ -2292,28 +2291,203 @@ impl RangeDriver for RecordingDriver {
         ranges: &'a [(u64, u64)],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
         Box::pin(async move {
-            use std::io::{Seek, SeekFrom, Write};
+            use decdn_bao_range::RangedStore as _;
             let total = u64::try_from(self.content.len()).expect("content len fits u64");
             let (dir, stem) = ranged_store_location(&self.staging).expect("location");
-            ClientRangedStore::open_or_create(&dir, &stem, self.hash, total)
+            let store = ClientRangedStore::open_or_create(&dir, &stem, self.hash, total)
                 .expect("open ranged store");
-            let partial = self.staging.with_extension("partial");
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&partial)
-                .expect("open partial");
-            f.set_len(total).expect("size partial");
+            let outboard = bao_tree::io::outboard::PreOrderMemOutboard::create(
+                &self.content,
+                decdn_bao_range::IROH_BLOCK_SIZE,
+            );
+            let outboard = bytes::Bytes::from(outboard.data);
             for &(off, len) in ranges {
                 self.driven.lock().expect("driven lock").push((off, len));
-                let start = usize::try_from(off).expect("offset fits usize");
-                let end = usize::try_from(off + len).expect("end fits usize");
-                f.seek(SeekFrom::Start(off)).expect("seek");
-                f.write_all(&self.content[start..end]).expect("write range");
+                let aligned = decdn_bao_range::align_range(off, len, total).expect("align");
+                let start = usize::try_from(aligned.fetch_start()).expect("start fits usize");
+                let end = usize::try_from(aligned.fetch_end()).expect("end fits usize");
+                let bao = decdn_bao_range::encode_verified_range(
+                    self.hash,
+                    &aligned,
+                    &self.content[start..end],
+                    outboard.clone(),
+                )
+                .expect("encode range");
+                store.admit(aligned, bao).await.expect("admit range");
             }
-            f.sync_all().expect("sync partial");
             Ok(())
         })
     }
+}
+
+/// A [`RangeDriver`] whose every drive fails, as an interrupted run's would.
+struct FailingDriver {
+    hash: [u8; 32],
+    staging: PathBuf,
+}
+impl RangeDriver for FailingDriver {
+    fn hash(&self) -> [u8; 32] {
+        self.hash
+    }
+    fn staging(&self) -> &Path {
+        &self.staging
+    }
+    fn drive<'a>(
+        &'a self,
+        _ranges: &'a [(u64, u64)],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+        Box::pin(async { Err(anyhow!("interrupted")) })
+    }
+}
+
+/// Spliced donor bytes never enter the entry's ranged store: the store holds
+/// only bao-verified bytes, so an interrupted entry leaves no donor byte in
+/// its `.partial` for a later run to resume from.
+#[tokio::test]
+async fn spliced_bytes_never_enter_the_store() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let total = 4 * GROUP;
+    let content: Vec<u8> = (0..total)
+        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8") | 1)
+        .collect();
+    let whole = *blake3::hash(&content).as_bytes();
+    let half = usize::try_from(2 * GROUP).expect("fits usize");
+
+    let donor_path = tmp.path().join("donor");
+    std::fs::write(&donor_path, &content[..half]).expect("write donor");
+    let donor_hash = *blake3::hash(&content[..half]).as_bytes();
+    let deferred_hash = *blake3::hash(&content[half..]).as_bytes();
+
+    let staging = tmp.path().join("blob");
+    let driver = FailingDriver {
+        hash: whole,
+        staging: staging.clone(),
+    };
+    let plan = ReassemblePlan {
+        donor: vec![DonorRange {
+            dst: (0, 2 * GROUP),
+            refetch: (0, 2 * GROUP),
+            source: donor_path,
+            src_offset: 0,
+            chunk_hash: donor_hash,
+            chunk_src_offset: 0,
+            chunk_len: 2 * GROUP,
+        }],
+        deferred: vec![whole_deferred(Hint {
+            hash: deferred_hash,
+            offset: 2 * GROUP,
+            len: 2 * GROUP,
+        })],
+        drive: Vec::new(),
+    };
+    let index = ChunkIndex::default();
+    let mut fetch_plan = FetchPlan::default();
+    fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
+    index.mark_finished([0xaa; 32]);
+
+    let res = reassemble_dedup(
+        &driver,
+        &plan,
+        total,
+        &[],
+        None,
+        &index,
+        &fetch_plan,
+        None,
+        &|| {},
+    )
+    .await;
+    assert!(res.is_err(), "the fallback drive fails: {res:?}");
+    assert!(!staging.exists(), "nothing is promoted");
+    let partial = std::fs::read(partial_path(&staging)).unwrap_or_default();
+    assert!(
+        partial.iter().all(|&b| b == 0),
+        "the store's `.partial` holds no spliced byte"
+    );
+}
+
+/// Bytes the ranged store holds are bao-verified, so they win over a splice
+/// at the same offsets. A donor whose own chunk verifies but whose placement
+/// in this entry is wrong over a range the store already holds costs nothing:
+/// the whole-file hash matches and no self-heal re-drive runs.
+#[tokio::test]
+async fn verified_store_bytes_win_over_a_spliced_byte() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let total = 4 * GROUP;
+    let content: Vec<u8> = (0..total)
+        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
+        .collect();
+    let whole = *blake3::hash(&content).as_bytes();
+    let (group, half) = (
+        usize::try_from(GROUP).expect("fits usize"),
+        usize::try_from(2 * GROUP).expect("fits usize"),
+    );
+
+    // An earlier run fetched `[0, GROUP)` into the store.
+    let staging = tmp.path().join("blob");
+    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
+        .expect("seed the resume record");
+    let resumed = resumed_spans(&staging, whole);
+    assert_eq!(resumed, vec![(0, GROUP)]);
+
+    // The donor's chunk verifies against its own hint, but its first group
+    // is not this entry's bytes.
+    let mut donor_bytes = content[..half].to_vec();
+    for b in &mut donor_bytes[..group] {
+        *b = b.wrapping_add(1);
+    }
+    let donor_path = tmp.path().join("donor");
+    std::fs::write(&donor_path, &donor_bytes).expect("write donor");
+    let donor_hash = *blake3::hash(&donor_bytes).as_bytes();
+
+    let driver = RecordingDriver {
+        hash: whole,
+        staging: staging.clone(),
+        content: content.clone(),
+        driven: std::sync::Mutex::new(Vec::new()),
+    };
+    let plan = ReassemblePlan {
+        donor: vec![DonorRange {
+            dst: (0, 2 * GROUP),
+            refetch: (0, 2 * GROUP),
+            source: donor_path,
+            src_offset: 0,
+            chunk_hash: donor_hash,
+            chunk_src_offset: 0,
+            chunk_len: 2 * GROUP,
+        }],
+        deferred: Vec::new(),
+        drive: vec![(2 * GROUP, 2 * GROUP)],
+    };
+    let index = ChunkIndex::default();
+
+    reassemble_dedup(
+        &driver,
+        &plan,
+        total,
+        &resumed,
+        None,
+        &index,
+        &FetchPlan::default(),
+        None,
+        &|| {},
+    )
+    .await
+    .expect("reassembly must succeed");
+    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
+    assert_eq!(
+        driver.driven.lock().expect("driven lock").clone(),
+        vec![(2 * GROUP, 2 * GROUP)],
+        "no self-heal re-drive"
+    );
+    assert!(
+        !assembly_path(&staging).exists(),
+        "the assembly file is promoted"
+    );
+    assert!(
+        !partial_path(&staging).exists(),
+        "the store's `.partial` is removed once the entry is promoted"
+    );
 }
 
 /// An entry with nothing to pay for up front splices its donors into a store

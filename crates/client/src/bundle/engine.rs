@@ -2851,11 +2851,13 @@ impl<P: Provider + Clone> PullCtx<P> {
     ///   whole-file [`Self::fetch_to_staging`] path.
     /// - Otherwise the dedup path: pay through an [`AcquireRangeDriver`] for only
     ///   the *complement* (the group-aligned bytes no donor covers) into `staging`'s
-    ///   `.partial`, then splice each donor range from its sibling's on-disk blob.
+    ///   ranged store, then splice each donor range from its sibling's on-disk blob
+    ///   into the entry's assembly file ([`assembly_path`]).
     ///   Each donor chunk is confirmed present at the recorded source offset by
     ///   re-hashing the whole chunk against its hint hash before its bytes are
     ///   trusted; a chunk that fails (a lying donor hint, a short read) is added to
-    ///   a re-fetch list and driven normally. The reassembled `.partial` is then
+    ///   a re-fetch list and driven normally. The store's verified bytes then go
+    ///   over the splices, and the assembly is
     ///   verified whole against the authoritative `hash`; on a match it is promoted
     ///   to `staging`, and on a mismatch (a lying *recipient* hint mis-placed a
     ///   chunk) the whole blob is re-driven and re-verified before the entry fails.
@@ -3395,20 +3397,24 @@ fn ranges_at_proven_size(
 /// are for reporting only: a record it cannot read logs at `debug` and gives
 /// no spans, and the fetch that follows surfaces the fault.
 fn resumed_spans(staging: &Path, hash: [u8; 32]) -> Vec<(u64, u64)> {
-    let read = || -> anyhow::Result<Vec<(u64, u64)>> {
-        let (dir, stem) = ranged_store_location(staging)?;
-        if !ClientRangedStore::has_record(&dir, &stem)? {
-            return Ok(Vec::new());
-        }
-        Ok(ClientRangedStore::open(&dir, &stem, hash)?.present_byte_ranges())
-    };
-    read().unwrap_or_else(|e| {
+    present_spans(staging, hash).unwrap_or_else(|e| {
         tracing::debug!(
             "could not read the resume record beside {}: {e:#}",
             staging.display()
         );
         Vec::new()
     })
+}
+
+/// The byte spans `staging`'s ranged store records present, as `(offset, len)`.
+/// No record gives no spans. Call it with `staging` absent: opening a store
+/// whose final file exists hashes that file.
+fn present_spans(staging: &Path, hash: [u8; 32]) -> anyhow::Result<Vec<(u64, u64)>> {
+    let (dir, stem) = ranged_store_location(staging)?;
+    if !ClientRangedStore::has_record(&dir, &stem)? {
+        return Ok(Vec::new());
+    }
+    Ok(ClientRangedStore::open(&dir, &stem, hash)?.present_byte_ranges())
 }
 
 /// [`resumed_spans`] on the blocking pool. A failed join gives no spans.
@@ -3434,19 +3440,19 @@ fn span_bytes(spans: &[(u64, u64)]) -> u64 {
 /// exactly `ranges` into the entry's `.partial` (bao-verified against the
 /// whole-file hash), or let the ranged store finalize `staging` when they complete
 /// it. Abstracted from the reassembly control flow so that flow — which must treat
-/// a drive that finalized the blob as done, rather than open a now-renamed
-/// `.partial` — is unit-testable without a live endpoint or pool.
+/// a drive that finalized the blob as done — is unit-testable without a live
+/// endpoint or pool.
 trait RangeDriver {
     /// The entry's authoritative whole-file BLAKE3 hash.
     fn hash(&self) -> [u8; 32];
 
     /// The entry's finalized staging path (`<out_root>/.decdn-partial/<hex>`); its
-    /// `.partial` is what the splice writes into.
+    /// ranged store and assembly file sit beside it.
     fn staging(&self) -> &Path;
 
     /// Drive `ranges` for the entry. On return the entry's `staging` is either
     /// finalized (the store completed and renamed `<hex>.partial` -> `<hex>`) or
-    /// still a `.partial` the caller splices into.
+    /// still a store the caller assembles from.
     fn drive<'a>(
         &'a self,
         ranges: &'a [(u64, u64)],
@@ -3477,7 +3483,7 @@ trait RangeDriver {
 /// ends on done, a fault only the user can fix, a unanimous verdict of the
 /// holders, or the command's [`StopPolicy`]. Each drive works to the size
 /// its holders prove, and its ranges hold only when the manifest's size is
-/// that size ([`ranges_at_proven_size`]). The spliced donor bytes are never marked present in the
+/// that size ([`ranges_at_proven_size`]). Spliced donor bytes never enter the
 /// store, so a drive promotes the entry only once fetched bytes fill the
 /// whole store: a resumed store that already held the rest, or the self-heal
 /// re-drive of the whole blob.
@@ -3543,65 +3549,108 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, '_, P> {
     }
 }
 
-/// Ensure `staging`'s ranged store exists with its `.partial` at the whole-file
-/// size, so a splice can seek and write into it.
-///
-/// A drive normally creates the store; an entry with nothing to drive (every
-/// chunk is a donor or deferred) has no drive, so this creates it. It always
-/// makes a real store with its `.ranges` record, never a bare `.partial`: a
-/// later drive into the same entry (a donor re-fetch, a deferred fallback, the
-/// self-heal re-drive) calls `open_or_create`, which keys resume on the
-/// `.ranges` record and truncates a `.partial` that lacks one, which wipes
-/// every byte already spliced into it. A store that already has its record (a drive
-/// made it, or a resumed run) is reopened as is. The data file is then extended
-/// to `total`, sparsely, because the whole-file hash reads its full length.
-///
-/// It runs on the blocking pool: reopening a store can hash a final file.
-async fn ensure_partial_off_runtime(
-    staging: &Path,
-    hash: [u8; 32],
-    total: u64,
-) -> anyhow::Result<PathBuf> {
-    let staging = staging.to_path_buf();
-    tokio::task::spawn_blocking(move || ensure_partial(&staging, hash, total))
-        .await
-        .map_err(|e| anyhow!("ensure partial task: {e}"))?
+/// Create `staging`'s assembly file ([`assembly_path`]) empty and sized to
+/// `total`, sparsely, so splices can seek and write into it. A leftover from
+/// an interrupted run is truncated: donors are re-checked every run, and the
+/// store keeps the paid bytes.
+async fn create_assembly_off_runtime(staging: &Path, total: u64) -> anyhow::Result<PathBuf> {
+    let assembly = assembly_path(staging);
+    let path = assembly.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let f =
+            std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        f.set_len(total)
+            .with_context(|| format!("size {}", path.display()))
+    })
+    .await
+    .map_err(|e| anyhow!("create assembly task: {e}"))??;
+    Ok(assembly)
 }
 
-/// [`ensure_partial_off_runtime`]'s body, on the blocking pool.
-fn ensure_partial(staging: &Path, hash: [u8; 32], total: u64) -> anyhow::Result<PathBuf> {
-    let (dir, stem) = ranged_store_location(staging)?;
-    ClientRangedStore::open_or_create(&dir, &stem, hash, total)
-        .with_context(|| format!("open the ranged store for {}", staging.display()))?;
-    let partial = partial_path(staging);
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&partial)
-        .with_context(|| format!("open {}", partial.display()))?;
-    if f.metadata()
-        .with_context(|| format!("stat {}", partial.display()))?
-        .len()
-        < total
-    {
-        f.set_len(total)
-            .with_context(|| format!("size {}", partial.display()))?;
+/// Best-effort removal of `staging`'s assembly file, on the blocking pool,
+/// once the entry no longer needs it (its store finalized `staging` itself).
+async fn discard_assembly_off_runtime(staging: &Path) {
+    let assembly = assembly_path(staging);
+    let removed = tokio::task::spawn_blocking(move || match std::fs::remove_file(&assembly) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!("failed to remove {}: {e}", assembly.display());
+        }
+        _ => {}
+    })
+    .await;
+    if let Err(e) = removed {
+        tracing::warn!("assembly removal task: {e}");
     }
-    Ok(partial)
+}
+
+/// Copy every byte span `staging`'s ranged store holds into `assembly` at its
+/// offset, then BLAKE3 the whole `assembly`, reporting progress to
+/// `progress`. Store bytes are bao-verified, so they go in after every splice
+/// and win over a spliced byte at the same offset.
+fn overlay_store_and_hash(
+    staging: &Path,
+    hash: [u8; 32],
+    assembly: &Path,
+    progress: Option<&(dyn Fn(u64) + Send + Sync)>,
+) -> anyhow::Result<[u8; 32]> {
+    use std::io::{Seek, SeekFrom};
+    let spans = present_spans(staging, hash)?;
+    if !spans.is_empty() {
+        let partial = partial_path(staging);
+        let mut src =
+            std::fs::File::open(&partial).with_context(|| format!("open {}", partial.display()))?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .open(assembly)
+            .with_context(|| format!("open {}", assembly.display()))?;
+        for (offset, len) in spans {
+            src.seek(SeekFrom::Start(offset))
+                .and_then(|_| out.seek(SeekFrom::Start(offset)))
+                .and_then(|_| copy_exact(&mut src, &mut out, len))
+                .with_context(|| {
+                    format!(
+                        "copy [{offset}, +{len}) of {} into the assembly",
+                        partial.display()
+                    )
+                })?;
+        }
+    }
+    hash_partial_with_progress(assembly, progress)
+}
+
+/// [`overlay_store_and_hash`] on the blocking pool, driving `file`'s
+/// `reconstructing…` bar: hashing a multi-GB blob is the slow tail of a
+/// mostly-spliced entry.
+async fn overlay_store_and_hash_off_runtime(
+    staging: &Path,
+    hash: [u8; 32],
+    assembly: &Path,
+    file: Option<&FileBar>,
+) -> anyhow::Result<[u8; 32]> {
+    let reporter = file.and_then(FileBar::reconstruct_reporter);
+    let (staging, assembly) = (staging.to_path_buf(), assembly.to_path_buf());
+    tokio::task::spawn_blocking(move || {
+        overlay_store_and_hash(&staging, hash, &assembly, reporter.as_deref())
+    })
+    .await
+    .map_err(|e| anyhow!("whole-file hash task: {e}"))?
 }
 
 /// Reassemble one dedup entry's blob into `staging`: drive the pay-now ranges,
-/// splice the donor ranges from disk, reconcile the deferred (sibling-assigned)
-/// ranges at the tail, verify the whole-file BLAKE3, and promote — using `driver`
+/// splice the donor ranges from disk into the assembly file, reconcile the
+/// deferred (sibling-assigned) ranges at the tail, copy the store's verified bytes
+/// over the splices, verify the whole-file BLAKE3, and promote — using `driver`
 /// for every paid range drive.
 ///
-/// The authoritative gate throughout is the whole-file BLAKE3; a bad or lying hint
+/// The store holds only bao-verified bytes; splices land in the assembly file
+/// ([`assembly_path`]), which is rebuilt each run. The authoritative gate
+/// throughout is the whole-file BLAKE3; a bad or lying hint
 /// only ever costs a re-download, never a corrupt output or a spuriously-failed
 /// entry. After EVERY range drive (pay-now, a donor re-fetch, a deferred fallback,
 /// and the whole-blob re-drive) the store may have completed — `drive` then
 /// finalized and renamed `<hex>.partial` -> `<hex>`. Each such point checks
-/// `staging.try_exists()` and returns success rather than opening a `.partial` that
-/// no longer exists: a resumed run whose prior `.partial` already held every range
-/// hits this on the very FIRST pay-now drive.
+/// `staging.try_exists()`, drops the assembly and returns success: a resumed run
+/// whose store already held every range hits this on the very FIRST pay-now drive.
 ///
 /// The deferred ranges are chunks this run assigned to a smaller sibling
 /// ([`build_fetch_plan`]). They are NOT driven up front; the tail loop waits on the
@@ -3644,15 +3693,15 @@ async fn reassemble_dedup(
     // and the partial groups at spliced-run ends); donors are spliced and deferred
     // ranges wait.
     // An entry with nothing to drive (every chunk is a donor or deferred) skips the
-    // drive entirely and splices into a freshly-sized `.partial`.
+    // drive entirely.
     if !plan.drive.is_empty() {
         driver.drive(&plan.drive).await?;
-        // A resumed run may already hold every range in `.partial`, so this first
+        // A resumed run's store may already hold every other range, so this first
         // drive can COMPLETE the store: `drive` then ran its whole-file hash
         // against `hash` and renamed `<hex>.partial` -> `<hex>`. The blob is
-        // finalized and verified; splicing would open a `.partial` that no longer
-        // exists. Register the donor chunks and return. No splice ran this run,
-        // so every resumed byte counts as resumed.
+        // finalized and verified, so there is nothing to splice. Register the
+        // donor chunks and return. No splice ran this run, so every resumed byte
+        // counts as resumed.
         if staging.try_exists()? {
             finish_progress();
             index.register(hints, staging);
@@ -3660,19 +3709,22 @@ async fn reassemble_dedup(
         }
     }
 
-    let partial = ensure_partial_off_runtime(staging, hash, total).await?;
+    // Splices land in the assembly file, never in the store: the store holds
+    // only bao-verified bytes, which the assembly takes last.
+    let assembly = create_assembly_off_runtime(staging, total).await?;
 
     // Verify + splice each initially-available donor range off the executor. A donor
     // whose chunk no longer hashes to its hint (a lying donor hint, or a short read)
     // is re-fetched normally rather than trusted.
     // Each re-fetched donor is a dropped hint.
     let mut ledger = SpliceLedger::default();
-    let refetch = splice_off_runtime(&partial, plan.donor.clone(), &mut ledger).await?;
+    let refetch = splice_off_runtime(&assembly, plan.donor.clone(), &mut ledger).await?;
     let mut hints_ignored = u64::try_from(refetch.len()).unwrap_or(u64::MAX);
     if !refetch.is_empty() {
         driver.drive(&refetch).await?;
         ledger.driven.extend_from_slice(&refetch);
         if staging.try_exists()? {
+            discard_assembly_off_runtime(staging).await;
             finish_progress();
             index.register(hints, staging);
             return Ok(DedupOutcome::of(
@@ -3690,7 +3742,7 @@ async fn reassemble_dedup(
     // and paid here instead, so the run never hangs.
     let tail_ignored = reconcile_deferred(
         driver,
-        &partial,
+        &assembly,
         &plan.deferred,
         index,
         fetch_plan,
@@ -3701,26 +3753,19 @@ async fn reassemble_dedup(
     hints_ignored = hints_ignored.saturating_add(tail_ignored);
     let mut spliced = ledger.spliced_spans(total);
     if staging.try_exists()? {
+        discard_assembly_off_runtime(staging).await;
         finish_progress();
         index.register(hints, staging);
         return Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored));
     }
 
-    // The authoritative check: the whole reassembled blob must hash to `hash`. This
-    // hash of the full blob is the slow tail of a mostly-spliced entry, so it drives
-    // the file row's `reconstructing…` bar with its running byte count — otherwise
-    // the row would sit frozen while a multi-GB blob verifies.
-    let reporter = file.and_then(FileBar::reconstruct_reporter);
-    let partial_for_hash = partial.clone();
-    let got = tokio::task::spawn_blocking(move || {
-        hash_partial_with_progress(&partial_for_hash, reporter.as_deref())
-    })
-    .await
-    .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
+    // The authoritative check: the store's verified bytes go over the splices,
+    // and the whole assembled blob must hash to `hash`.
+    let got = overlay_store_and_hash_off_runtime(staging, hash, &assembly, file).await?;
     if got != hash {
         // A lying recipient hint placed a chunk at the wrong offset. Drop the
         // spliced ranges by re-driving the whole blob (the ranged store fetches
-        // exactly the bytes the splice wrote, bao-verified against `hash`) and
+        // exactly the bytes it lacks, bao-verified against `hash`) and
         // re-verify. Every donor is discarded, so nothing was saved and all of them
         // count as ignored. The resumed bytes stay present in the store, so the
         // re-drive does not fetch them again.
@@ -3733,19 +3778,18 @@ async fn reassemble_dedup(
             blake3::Hash::from_bytes(hash).to_hex()
         );
         driver.drive(&[(0, total)]).await?;
-        // The whole-blob re-drive covers `[0, total)`, so `drive` finalized it: its
-        // whole-file hash verified the bytes against `hash` and renamed `.partial` ->
-        // `staging`. The blob is verified — do not re-hash a `.partial` that no
-        // longer exists; register the donor chunks and return.
+        // The whole-blob re-drive covers `[0, total)`, so `drive` normally
+        // finalized it: the store verified its bytes against `hash` and renamed
+        // `.partial` -> `staging`.
         if staging.try_exists()? {
+            discard_assembly_off_runtime(staging).await;
             finish_progress();
             index.register(hints, staging);
             return Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored));
         }
-        let partial_for_hash = partial.clone();
-        let got = tokio::task::spawn_blocking(move || hash_partial(&partial_for_hash))
-            .await
-            .map_err(|e| anyhow!("whole-file hash task: {e}"))??;
+        // Otherwise assemble from the store alone.
+        let assembly = create_assembly_off_runtime(staging, total).await?;
+        let got = overlay_store_and_hash_off_runtime(staging, hash, &assembly, None).await?;
         if got != hash {
             bail!(
                 "reconstructed blob {} does not match its whole-file hash after a full re-fetch",
@@ -3754,22 +3798,19 @@ async fn reassemble_dedup(
         }
     }
 
-    // Promote the verified `.partial` to the plain staging file and clean up the
-    // ranged-store sidecars, then register this blob's chunks as donors.
-    let partial_for_promote = partial.clone();
+    // Promote the verified assembly to the plain staging file and remove the
+    // entry's ranged store, then register this blob's chunks as donors.
     let staging_for_promote = staging.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        promote_partial(&partial_for_promote, &staging_for_promote)
-    })
-    .await
-    .map_err(|e| anyhow!("promote task: {e}"))??;
+    tokio::task::spawn_blocking(move || promote_assembly(&assembly, &staging_for_promote))
+        .await
+        .map_err(|e| anyhow!("promote task: {e}"))??;
     finish_progress();
     index.register(hints, staging);
     Ok(DedupOutcome::of(&spliced, resumed, total, hints_ignored))
 }
 
 /// Tail reconcile for one entry's deferred (sibling-assigned) chunks: splice each
-/// as its assigned fetcher registers it in `index`, waiting on the index progress
+/// into `assembly` as its assigned fetcher registers it in `index`, waiting on the index progress
 /// signal between scans rather than polling on a clock. A deferred chunk whose
 /// assigned fetcher FINISHES without registering it (a failed fetcher, or one with
 /// no recorded assignee) — or one registered under a length that disagrees with the
@@ -3779,7 +3820,7 @@ async fn reassemble_dedup(
 /// back to a paid drive.
 async fn reconcile_deferred(
     driver: &dyn RangeDriver,
-    partial: &Path,
+    assembly: &Path,
     deferred: &[DeferredChunk],
     index: &ChunkIndex,
     fetch_plan: &FetchPlan,
@@ -3832,7 +3873,7 @@ async fn reconcile_deferred(
         }
 
         if !ready.is_empty() {
-            let refetch = splice_off_runtime(partial, ready, ledger).await?;
+            let refetch = splice_off_runtime(assembly, ready, ledger).await?;
             ignored = ignored.saturating_add(u64::try_from(refetch.len()).unwrap_or(u64::MAX));
             fallback.extend(refetch);
         }
@@ -4317,13 +4358,19 @@ fn span_in_runs(runs: &[(u64, u64)], offset: u64, len: u64) -> Option<(u64, u64)
 }
 
 /// The `.partial` data file the ranged store keeps beside a finalized `staging`
-/// blob — `<hex>.partial` — where driven ranges and spliced donor bytes land
-/// before promotion.
+/// blob — `<hex>.partial` — where driven ranges land before promotion.
 fn partial_path(staging: &Path) -> PathBuf {
     staging.with_extension("partial")
 }
 
-/// Verify and splice every donor range into `partial`, returning the donors that
+/// The file a dedup entry assembles in beside `staging` — `<hex>.assembly`:
+/// spliced donor bytes, then the store's verified bytes over them. It is
+/// promoted to `staging` once it hashes to the entry's hash.
+fn assembly_path(staging: &Path) -> PathBuf {
+    staging.with_extension("assembly")
+}
+
+/// Verify and splice every donor range into `out`, returning the donors that
 /// could NOT be trusted (a donor whose chunk no longer hashes to its hint, or an
 /// unreadable source): the caller re-fetches and pays for each one's
 /// [`DonorRange::refetch`] span.
@@ -4331,19 +4378,17 @@ fn partial_path(staging: &Path) -> PathBuf {
 /// A donor's bytes are trusted only after the WHOLE chunk at its recorded source
 /// offset re-hashes to the chunk hash — a donor's own chunk placement is an
 /// unverified manifest claim until then. The trusted `dst` span is then written
-/// at the recipient offset; the whole-file BLAKE3 the caller runs next is the
-/// authoritative backstop against a lying recipient placement. A span that lands
-/// in a group the ranged store already holds (a resumed run, or a neighbour's
-/// re-fetch) writes the same verified bytes; if a lying placement wrote others,
-/// the store's finalize verify drops that group and a drive fetches it again.
-fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<DonorRange>> {
+/// at the recipient offset in `out`, the entry's assembly file. The ranged
+/// store's verified bytes go over it before the whole-file BLAKE3, which is
+/// the authoritative backstop against a lying recipient placement.
+fn splice_donors(out_path: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<DonorRange>> {
     use std::io::{Seek, SeekFrom};
 
     let mut refetch = Vec::new();
     let mut out = std::fs::OpenOptions::new()
         .write(true)
-        .open(partial)
-        .with_context(|| format!("open {}", partial.display()))?;
+        .open(out_path)
+        .with_context(|| format!("open {}", out_path.display()))?;
     for d in donors {
         let (dst_offset, len) = d.dst;
         // An unreadable donor source is not trusted — pay to fetch it.
@@ -4356,12 +4401,11 @@ fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<Do
             continue;
         }
         // The chunk is confirmed present at `chunk_src_offset`; copy its `dst`
-        // span into the recipient's `.partial`. A seek/copy error here (a
-        // truncated or racing donor file, an I/O fault) is not fatal: the donor
-        // bytes are simply not trusted, so queue the donor for a paid,
-        // bao-verified re-fetch that overwrites every group it touches — nothing
-        // torn by a partial copy survives, and the whole-file BLAKE3 the caller
-        // runs next is the authoritative backstop.
+        // span into the assembly. A seek/copy error here (a truncated or racing
+        // donor file, an I/O fault) is not fatal: the donor bytes are simply not
+        // trusted, so queue the donor for a paid, bao-verified re-fetch. Its
+        // bytes land in the store, which goes over every group it touches —
+        // nothing torn by a partial copy survives.
         let copied = src
             .seek(SeekFrom::Start(d.src_offset))
             .and_then(|_| out.seek(SeekFrom::Start(dst_offset)))
@@ -4370,8 +4414,6 @@ fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<Do
             refetch.push(d.clone());
         }
     }
-    out.sync_all()
-        .with_context(|| format!("sync {}", partial.display()))?;
     Ok(refetch)
 }
 
@@ -4379,14 +4421,14 @@ fn splice_donors(partial: &Path, donors: &[DonorRange]) -> anyhow::Result<Vec<Do
 /// it spliced in `ledger`, and returns the [`DonorRange::refetch`] span of each
 /// untrusted donor, which the caller drives and pays for.
 async fn splice_off_runtime(
-    partial: &Path,
+    assembly: &Path,
     donors: Vec<DonorRange>,
     ledger: &mut SpliceLedger,
 ) -> anyhow::Result<Vec<(u64, u64)>> {
-    let partial = partial.to_path_buf();
+    let assembly = assembly.to_path_buf();
     let planned: Vec<((u64, u64), (u64, u64))> =
         donors.iter().map(|d| (d.dst, d.refetch)).collect();
-    let failed = off_runtime("donor splice", move || splice_donors(&partial, &donors)).await?;
+    let failed = off_runtime("donor splice", move || splice_donors(&assembly, &donors)).await?;
     let failed_dst: HashSet<(u64, u64)> = failed.iter().map(|d| d.dst).collect();
     ledger.spliced.extend(
         planned
@@ -4531,22 +4573,27 @@ fn hash_partial_with_progress(
     Ok(*hasher.finalize().as_bytes())
 }
 
-/// Promote a verified `.partial` to the plain `staging` blob (an atomic
-/// same-directory rename) and best-effort remove the ranged-store sidecars the
-/// dedup path no longer needs. `staging` is then the finalized blob `fetch_group`
-/// materializes at each destination — the same shape the whole-file path's
-/// ranged store leaves on its own finalize.
-fn promote_partial(partial: &Path, staging: &Path) -> anyhow::Result<()> {
-    std::fs::rename(partial, staging)
-        .with_context(|| format!("promote {} -> {}", partial.display(), staging.display()))?;
-    let sidecar = staging.with_extension("partial.ranges");
-    if let Err(e) = std::fs::remove_file(&sidecar)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(
-            "failed to remove staging sidecar {}: {e}",
-            sidecar.display()
-        );
+/// Promote a verified assembly file to the plain `staging` blob (an atomic
+/// same-directory rename) and best-effort remove the entry's ranged store
+/// (`.partial` and its `.partial.ranges` record), which the promoted blob
+/// covers. `staging` is then the finalized blob `fetch_group` materializes at
+/// each destination — the same shape the whole-file path's ranged store
+/// leaves on its own finalize.
+fn promote_assembly(assembly: &Path, staging: &Path) -> anyhow::Result<()> {
+    std::fs::rename(assembly, staging)
+        .with_context(|| format!("promote {} -> {}", assembly.display(), staging.display()))?;
+    for sidecar in [
+        partial_path(staging),
+        staging.with_extension("partial.ranges"),
+    ] {
+        if let Err(e) = std::fs::remove_file(&sidecar)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                "failed to remove staging sidecar {}: {e}",
+                sidecar.display()
+            );
+        }
     }
     Ok(())
 }
@@ -4652,7 +4699,7 @@ async fn remove_staging_off_runtime(staging: &Path) {
 /// Best-effort cleanup of a finalized staging blob whose content is safely
 /// elsewhere (materialized to disk, or read into memory) and so has nothing left
 /// to resume. Removes the plain `<hex>` finalized blob itself and, best-effort,
-/// any leftover `<hex>.partial{,.ranges}` sidecars: the ranged store's
+/// any leftover `<hex>.partial{,.ranges}` and `<hex>.assembly` sidecars: the ranged store's
 /// `finalize` normally clears those on success, but this is the belt to that
 /// brace and never runs on an errored entry (whose sidecars are the resume
 /// prefix a rerun needs). A leftover here is harmless clutter, not a
@@ -4663,6 +4710,7 @@ fn remove_staging(staging: &Path) {
         staging.to_path_buf(),
         staging.with_extension("partial"),
         staging.with_extension("partial.ranges"),
+        assembly_path(staging),
     ];
     for path in paths_to_remove {
         if let Err(e) = std::fs::remove_file(&path)
