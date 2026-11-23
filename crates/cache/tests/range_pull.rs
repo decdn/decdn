@@ -176,9 +176,19 @@ fn encode_verified_range_roundtrips_for_honest_bytes() -> anyhow::Result<()> {
     let aligned = align_range(64 * 1024, 32 * 1024, blob_size)?;
     let data = sub(&blob, aligned.fetch_start(), aligned.fetch_end())?;
 
-    // Honest range + honest outboard verifies and produces a non-empty stream.
+    // Honest range + honest outboard verifies and produces the combined
+    // encoding: the 8-byte LE size header, then exactly `wire_len` bytes.
     let encoded = encode_verified_range(root, &aligned, &data, ob.data.clone().into())?;
-    anyhow::ensure!(!encoded.is_empty());
+    anyhow::ensure!(
+        encoded.get(..8) == Some(&blob_size.to_le_bytes()[..]),
+        "header must be the blob size"
+    );
+    anyhow::ensure!(
+        u64::try_from(encoded.len())? == 8 + aligned.wire_len(),
+        "encoded {} bytes, expected 8 + {}",
+        encoded.len(),
+        aligned.wire_len()
+    );
     Ok(())
 }
 

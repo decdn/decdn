@@ -201,17 +201,6 @@ impl PinnedHashes {
     pub fn iter(&self) -> Iter<'_, Hash> {
         self.0.iter()
     }
-
-    /// Compute counts of additions / removals between `prev` (older
-    /// snapshot) and `self` (newer). Used by the SIGHUP reload path to
-    /// log a diff line — operators pin/unpin individual hashes and want
-    /// to see the delta in the success log without scraping the full set.
-    #[must_use]
-    pub fn diff(&self, prev: &Self) -> PinDiff {
-        let added = self.0.iter().filter(|h| !prev.0.contains(*h)).count();
-        let removed = prev.0.iter().filter(|h| !self.0.contains(*h)).count();
-        PinDiff { added, removed }
-    }
 }
 
 impl<'a> IntoIterator for &'a PinnedHashes {

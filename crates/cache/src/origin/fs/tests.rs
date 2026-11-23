@@ -280,8 +280,9 @@ async fn fetch_outboard_missing_sibling_is_not_found() -> anyhow::Result<()> {
 }
 
 /// An outboard over `outboard_max_bytes` is a permanent fault that names
-/// its path, its length and the cap — a hostile/foreign `{H}.obao4` can't
-/// force a huge read.
+/// its path, its length (read from metadata, before any read) and the cap —
+/// a hostile/foreign `{H}.obao4` can't force a huge read.
+/// `read_capped_stops_one_byte_past_the_cap` covers the read's own bound.
 #[tokio::test]
 async fn fetch_outboard_oversize_is_permanent() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
@@ -289,44 +290,20 @@ async fn fetch_outboard_oversize_is_permanent() -> anyhow::Result<()> {
     let canonical = tokio::fs::canonicalize(tmp.path()).await?;
     let hash = seed_blob_with_outboard(&canonical, &vec![3u8; 64 * 1024]).await?;
     let obao4 = origin.obao4_path_for(hash);
+    let len = tokio::fs::metadata(&obao4).await?.len();
     // Cap the outboard read at 1 byte — the real outboard is larger.
     let err = origin.fetch_outboard(hash, 1).await.err();
     ensure_permanent("fetch_outboard", err, "over its 1-byte cap")?;
     ensure_permanent(
         "fetch_outboard",
         origin.fetch_outboard(hash, 1).await.err(),
+        &format!("is {len} bytes"),
+    )?;
+    ensure_permanent(
+        "fetch_outboard",
+        origin.fetch_outboard(hash, 1).await.err(),
         &obao4.display().to_string(),
     )
-}
-
-/// OOM guard: a multi-megabyte `{H}.obao4` against a tiny cap is rejected
-/// on its metadata length, before any read; `read_capped_stops_one_byte_past_the_cap`
-/// covers the read's own bound.
-#[tokio::test]
-async fn fetch_outboard_oversize_rejected_before_read() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let origin = FilesystemOrigin::new(tmp.path()).await?;
-    let canonical = tokio::fs::canonicalize(tmp.path()).await?;
-    // Seed a real data object so only the outboard size is the gate.
-    let payload = vec![3u8; 64 * 1024];
-    let hash = Hash::new(&payload);
-    let hex = hash.to_hex();
-    let shard = hex
-        .get(..2)
-        .ok_or_else(|| anyhow::anyhow!("hex too short"))?;
-    let shard_dir = canonical.join(shard);
-    tokio::fs::create_dir_all(&shard_dir).await?;
-    tokio::fs::write(shard_dir.join(hex.as_str()), &payload).await?;
-    // 8 MiB foreign/hostile outboard.
-    tokio::fs::write(
-        shard_dir.join(format!("{}{OBAO4_SUFFIX}", hex.as_str())),
-        vec![0x5Au8; 8 * 1024 * 1024],
-    )
-    .await?;
-
-    // 4 KiB cap — the 8 MiB outboard is rejected on its metadata length.
-    let err = origin.fetch_outboard(hash, 4 * 1024).await.err();
-    ensure_permanent("fetch_outboard", err, "is 8388608 bytes")
 }
 
 /// A published `{hex}.sizeproof` is read verbatim; a missing one is `None`.
