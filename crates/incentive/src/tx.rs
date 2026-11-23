@@ -425,22 +425,6 @@ pub async fn send_for_receipt<C: CallDecoder, P: Provider>(
     Ok(receipt)
 }
 
-/// [`send`] for callers with no outcome to record — a step whose hash they do
-/// not report. The in-flight hash still reaches the operator through the error
-/// message; this only drops the structured record.
-///
-/// # Errors
-///
-/// As [`send`].
-pub async fn send_unrecorded<C: CallDecoder, P: Provider>(
-    call: CallBuilder<P, C>,
-    label: &str,
-    hint: Option<&str>,
-) -> anyhow::Result<B256> {
-    let mut ignored = None;
-    send(call, label, hint, &mut ignored).await
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

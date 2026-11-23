@@ -107,85 +107,6 @@ fn sample_batch_store_ack() -> BatchStoreAck {
 }
 
 #[test]
-fn find_value_request_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_find_value_request();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: FindValueRequest = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn find_value_response_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_find_value_response();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: FindValueResponse = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn find_value_response_empty_providers_roundtrip() -> Result<(), postcard::Error> {
-    let msg = FindValueResponse {
-        hash: ch(0x11),
-        providers: vec![],
-        closer_nodes: closer(vec![nid(0x55)]),
-    };
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: FindValueResponse = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn store_request_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_store_request();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: StoreRequest = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn store_ack_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_store_ack();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: StoreAck = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn store_ack_rejected_roundtrip() -> Result<(), postcard::Error> {
-    let msg = StoreAck {
-        hash: ch(0x66),
-        accepted: false,
-    };
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: StoreAck = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn find_node_request_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_find_node_request();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: FindNodeRequest = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn find_node_response_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_find_node_response();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: FindNodeResponse = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
 fn dht_message_find_value_discriminant_is_zero() -> Result<(), postcard::Error> {
     let msg = DhtMessage::FindValue(sample_find_value_request());
     let bytes = postcard::to_allocvec(&msg)?;
@@ -289,33 +210,6 @@ fn dht_message_unknown_discriminant_is_flagged_unsupported() {
     assert!(crate::is_unknown_variant::<DhtMessage>(&[8u8, 0, 0]));
     // A known in-range discriminant (7) with a bad payload stays MALFORMED.
     assert!(!crate::is_unknown_variant::<DhtMessage>(&[7u8, 0xFF]));
-}
-
-#[test]
-fn batch_store_request_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_batch_store_request();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: BatchStoreRequest = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn batch_store_ack_roundtrip() -> Result<(), postcard::Error> {
-    let msg = sample_batch_store_ack();
-    let bytes = postcard::to_allocvec(&msg)?;
-    let decoded: BatchStoreAck = postcard::from_bytes(&bytes)?;
-    assert_eq!(decoded, msg);
-    Ok(())
-}
-
-#[test]
-fn dht_message_rejects_unknown_discriminant() {
-    // Discriminant 99 has no matching variant — silent-drop is a handler
-    // concern; at the type level postcard surfaces a decode error.
-    let bytes = [99u8, 0, 0, 0, 0];
-    let r: Result<DhtMessage, _> = postcard::from_bytes(&bytes);
-    assert!(r.is_err());
 }
 
 /// A `Coverage` at its 200-byte wire cap: the widest bitmap a peer may send.

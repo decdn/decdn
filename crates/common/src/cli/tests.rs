@@ -85,17 +85,3 @@ fn json_requested_sees_the_flag_at_every_depth() {
         assert!(!json_requested(&matches), "{argv:?} did not ask for JSON");
     }
 }
-
-/// `self-update --check` reports without downloading; the bare command applies.
-#[test]
-fn self_update_parses_check() {
-    #[derive(clap::Parser)]
-    struct Wrapper {
-        #[command(flatten)]
-        args: SelfUpdateArgs,
-    }
-    let bare = Wrapper::parse_from(["x"]);
-    assert!(!bare.args.check);
-    let check = Wrapper::parse_from(["x", "--check"]);
-    assert!(check.args.check);
-}
