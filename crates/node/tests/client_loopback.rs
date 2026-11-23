@@ -3014,8 +3014,8 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
 /// The serve emits no `ChunkData` and no voucher (0 wire bytes), the requester
 /// proves the empty stream against the empty root `Hash::new(&[])` and returns
 /// empty bytes, and the lane does NOT advance (0 bytes delivered).
-/// Before the fix, `align_range(0, 0, 0)` rejected the whole-empty serve/receive
-/// with `RangeOutOfBounds`.
+/// `align_range(0, 0, 0)` accepts the whole-empty range on both the serve and
+/// the receive side.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_delivers_empty_blob() -> anyhow::Result<()> {
     empty_blob_delivery(0).await

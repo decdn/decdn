@@ -11,7 +11,7 @@
 //!   linking it would break a `buyer-store-core`-only doc build.)
 //! - `decdn-node`'s `pool_store::PersistentPoolStateStore` owns the buyer
 //!   table in its own `buyer.redb`, one of the per-family redb files it opens
-//!   under `data_dir` (the seller lane, pending-settle, and watcher-checkpoint
+//!   under `data_dir` (the seller lane, settlement, and watcher-checkpoint
 //!   families each get their own file too, so no family's commit waits on
 //!   another's writer slot).
 //!

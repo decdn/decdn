@@ -1166,20 +1166,6 @@ async fn decode_to_vec_rejects_wrong_root() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An open-stage refusal must carry the upstream's **signed** `StreamResponse`
-/// out with it, not just the wire code (#1042).
-///
-/// This is the seam that keeps real daemon output attributable. The
-/// `operator_sig` here is produced by the same `StreamSigData` signer the node
-/// uses, so what the assertion actually proves is that the operator's signed
-/// statement survives the client's error path intact — byte-for-byte, still
-/// recovering to the signer. A `refusal()` that kept only `response.error`
-/// would drop the body and signature on the floor.
-///
-/// Deliberately routed through the private [`UpstreamRefused::open`] — the one
-/// constructor the open stage uses — rather
-/// than a hand-built value, which #1377's newtype now makes impossible outside
-/// this crate anyway.
 /// The wire bound on a size proof is the codec's longest proof: a proof the
 /// codec builds always decodes, and the decode bound admits no longer one.
 #[test]
@@ -1403,8 +1389,21 @@ fn a_pool_refusal_names_the_accepted_pools() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An open-stage refusal must carry the upstream's **signed** `StreamResponse`
+/// out with it, not just the wire code (#1042).
+///
+/// This is the seam that keeps real daemon output attributable. The
+/// `operator_sig` here is produced by the same `StreamSigData` signer the node
+/// uses, so what the assertion actually proves is that the operator's signed
+/// statement survives the client's error path intact — byte-for-byte, still
+/// recovering to the signer. A `refusal()` that kept only `response.error`
+/// would drop the body and signature on the floor.
+///
+/// Deliberately routed through the private [`UpstreamRefused::open`] — the one
+/// constructor the open stage uses — rather than a hand-built value, which
+/// #1377's newtype makes impossible outside this crate.
 #[test]
-fn an_open_stage_refusal_preserves_the_signed_stream_response() -> anyhow::Result<()> {
+fn an_open_stage_refusal_preserves_the_signed_stream_response()-> anyhow::Result<()> {
     use alloy::signers::local::PrivateKeySigner;
     use decdn_incentive::capacity_bond_domain;
     use decdn_incentive::stream_sig::StreamSigData;
