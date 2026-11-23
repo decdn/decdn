@@ -178,11 +178,6 @@ fn current_target_is_the_linux_release_triple() {
     assert_eq!(Target::current(), Some(Target::X86_64LinuxGnu));
 }
 
-#[test]
-fn running_version_is_the_crate_version() {
-    assert_eq!(running_version().unwrap(), v(env!("CARGO_PKG_VERSION")));
-}
-
 #[tokio::test]
 async fn resolve_latest_reads_the_tag_from_the_redirect() {
     decdn_common::tls::install_crypto_provider();

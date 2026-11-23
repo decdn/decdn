@@ -45,21 +45,3 @@ pub async fn mine_past_snapshot_margin<P: Provider>(provider: &P) -> anyhow::Res
     .await
     .context("mine past the snapshot lag margin")
 }
-
-/// Advance the chain clock so `block.timestamp >= ready_at`, then mine. A
-/// no-op (still mines once) if the head is already past `ready_at`. Useful for
-/// timelock `readyAt` gates (namespace transfer, publisher vetting).
-pub async fn advance_to<P: Provider>(provider: &P, ready_at: u64) -> anyhow::Result<()> {
-    let head = provider
-        .get_block(alloy::eips::BlockId::latest())
-        .await
-        .context("get latest block")?
-        .ok_or_else(|| anyhow::anyhow!("no latest block"))?
-        .header
-        .timestamp;
-    if ready_at > head {
-        increase_time(provider, ready_at - head + 1).await
-    } else {
-        mine(provider).await
-    }
-}

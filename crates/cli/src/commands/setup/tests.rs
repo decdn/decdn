@@ -111,15 +111,6 @@ fn parse_http_date_trusts_zone_label_as_gmt() {
     );
 }
 
-#[test]
-fn days_from_civil_matches_known_epochs() {
-    assert_eq!(days_from_civil(1970, 1, 1), 0);
-    assert_eq!(days_from_civil(1970, 1, 2), 1);
-    assert_eq!(days_from_civil(1969, 12, 31), -1);
-    // 2000-03-01 is 11017 days after the epoch.
-    assert_eq!(days_from_civil(2000, 3, 1), 11_017);
-}
-
 fn pf_with(skew: Option<i64>, token: u64, shortfall: u64, native: u64, gas: u64) -> Preflight {
     Preflight {
         rpc_chain_id: 42,

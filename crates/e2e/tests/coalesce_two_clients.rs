@@ -12,17 +12,11 @@
 //! This is an **own-origin** coalescing proof: the node's single upstream fill is
 //! its own configured fs origin (the own-origin case — the node eats
 //! the origin egress once, a real dollar saving), not a paid upstream peer. The
-//! node-to-node *paid* upstream variant is not expressible in this harness: a
-//! `NodeFixture` is funded only for its seller/operator role (a TOKEN capacity
-//! bond via `ChainFixture::onboard_operator`), never with USDC or a
-//! `PaymentPool` approval for a *buyer* role, and there is no fixture to fund a
-//! node as an upstream-paying buyer, nor cross-node DHT / on-chain
-//! `OriginAssignment` discovery wiring between two `NodeFixture`s. Building either
-//! would be net-new harness infrastructure. The own-origin path exercises the
-//! IDENTICAL `claim_fill` / `FillSession` coalescing machinery
-//! (`serve_via_backend_origin`, the peer twin's own-origin sibling), so the
-//! downstream money property this test proves — N independent per-pool ledgers,
-//! no cross-client leakage — is exactly the same on both paths.
+//! node-to-node *paid* upstream variant is `node_to_node_coalesce.rs`. Both
+//! paths run the same `claim_fill` / `FillSession` coalescing machinery (here
+//! through `serve_via_backend_origin`), so the downstream money property this
+//! test proves — N independent per-pool ledgers, no cross-client leakage — is
+//! the same on both paths.
 //!
 //! What this test asserts (executable proof of incentive sign-off point (b)):
 //!   1. Both concurrent same-hash misses enter the own-origin coalescing serve
@@ -45,9 +39,9 @@
 //!     bound are discharged at the layer that actually spends by the node-level
 //!     test `window_pull_through_concurrent_same_hash_single_upstream_pull`
 //!     (asserts a single upstream watermark via a gated stub upstream) and by the
-//!     `crates/cache/src/fill_session.rs` unit tests
-//!     (`same_range_coalesces_to_one_pull`, `claim_first_owns_second_attaches_same_range`,
-//!     `last_observer_leaving_cancels`, `last_observer_leaving_removes_session`).
+//!     `crates/cache/src/fill_session/fill_registry_tests.rs` unit tests
+//!     (`claim_same_range_attaches`, `claim_make_session_not_called_on_attach`,
+//!     `last_observer_leaving_cancels_and_removes`).
 //!     The own-origin e2e cannot assert the count directly: entering the serve
 //!     tier is metered per request (owner AND observer both bump it), and there is
 //!     no owner-vs-observer counter, so `decdn_local_outboard_serves_total` alone

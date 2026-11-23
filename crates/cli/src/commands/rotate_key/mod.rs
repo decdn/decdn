@@ -50,8 +50,7 @@ pub async fn run(args: &cli::RotateKeyArgs, global_config: Option<&Path>) -> any
 }
 
 /// What the confirmation gate decides, before any IO. Split from
-/// [`confirm_or_bail`] the way `deregister::decide_confirmation` is, so the
-/// gate is testable without a TTY.
+/// [`confirm_or_bail`] so the gate is testable without a TTY.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Confirmation {
     /// `--yes` supplied: disclose the consequences, but skip the prompt.
@@ -62,8 +61,8 @@ pub(crate) enum Confirmation {
     NeedFlag,
 }
 
-/// Decide whether to prompt. Same rule as `decdn node deregister`: every run
-/// that reaches the gate is about to submit, so there is no "not needed" arm.
+/// Decide whether to prompt. Every run that reaches the gate is about to
+/// submit, so there is no "not needed" arm.
 pub(crate) const fn decide_confirmation(yes: bool, interactive: bool) -> Confirmation {
     if yes {
         Confirmation::Bypassed
@@ -77,9 +76,10 @@ pub(crate) const fn decide_confirmation(yes: bool, interactive: bool) -> Confirm
 /// Disclose the consequences and, on a terminal, wait for `y`.
 ///
 /// `--yes` suppresses the *prompt*, never the disclosure — "don't ask" must not
-/// silently become "don't tell", the rule `unbond` and `deregister` both
-/// follow. `disclosure` writes the path-specific wording; `subject` names the
-/// operation in the two refusal messages ("rotation cancelled" and so on).
+/// silently become "don't tell". `rotate-key`, `unbond` and `deregister` all
+/// confirm through this gate. `disclosure` writes the command-specific wording;
+/// `subject` names the operation in the two refusal messages ("rotation
+/// cancelled" and so on).
 ///
 /// # Errors
 ///

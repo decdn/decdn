@@ -52,7 +52,6 @@ alloy::sol! {
     contract CapacityBond {
         function bond(uint256 amount) external;
         function pause() external;
-        function unpause() external;
         function currentTermsHash() external view returns (bytes32);
         function registerNode(
             bytes32 nodeId,
@@ -79,12 +78,11 @@ alloy::sol! {
         function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
         function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
-        // Key-rotation surface (#1034, G-NODE-07). `bindNodeId` is the rebind
-        // itself; the two raw mappings are what the journey asserts on, and
-        // they are read directly rather than through `nodeIdOf`/`isActiveNode`
-        // because a rotation swaps the binding alone — an assertion routed
-        // through a liveness-aware helper would not be testing the binding.
-        function bindNodeId(bytes32 nodeId, bytes bindingSignature, bytes ed25519Signature) external;
+        // Key-rotation surface (#1034, G-NODE-07). The two raw mappings are
+        // what the journey asserts on, and they are read directly rather than
+        // through `nodeIdOf`/`isActiveNode` because a rotation swaps the binding
+        // alone — an assertion routed through a liveness-aware helper would not
+        // be testing the binding.
         function nodeIdToAddress(bytes32 nodeId) external view returns (address);
         function addressToNodeId(address operator) external view returns (bytes32);
         function deregisterNode() external;
@@ -105,23 +103,17 @@ alloy::sol! {
         // `registerNode` decodes to a *named* error rather than an opaque
         // selector, and so `crate::assert::expect_revert_anyhow` can match on
         // `E::SELECTOR` — compiler-checked against the ABI instead of a
-        // hand-copied hex literal. Same reasoning as the `PublisherRegistry`
-        // error block below.
+        // hand-copied hex literal.
         //
-        // The ORDER these fire in is what the journey's negatives depend on:
-        // `registerNode` runs `_checkRegistrationPreconditions` (which raises
-        // `BondBelowMinimum`) BEFORE `_checkBindingOneToOne` (which raises
+        // The ORDER the guards fire in is what the journey's negative depends
+        // on: `registerNode` runs `_checkRegistrationPreconditions` (the bond
+        // floor) BEFORE `_checkBindingOneToOne` (which raises
         // `NodeIdAlreadyBound`), so an under-bonded impostor never reaches the
         // binding guard.
-        error BondBelowMinimum(uint256 bond, uint256 required);
         error BondBelowCurve(uint256 bond, uint256 required);
         /// Someone else's address already owns this node id — the one-to-one
         /// binding rule. `currentOwner` names the operator that holds it.
         error NodeIdAlreadyBound(address currentOwner);
-        /// This address is already bound to a DIFFERENT node id. The mirror of
-        /// `NodeIdAlreadyBound`; declared alongside it so a negative that trips
-        /// the wrong half of `_checkBindingOneToOne` reports which half.
-        error AddressAlreadyBound(bytes32 currentNodeId);
     }
 
     /// `FeeRouter.bytesPerEpoch` — governance-canonical served-bytes counter
@@ -137,24 +129,6 @@ alloy::sol! {
     contract PublisherRegistry {
         function createNamespace() external returns (uint256 namespaceId);
         function ownerOf(uint256 namespaceId) external view returns (address);
-        // Timelocked 2-step namespace ownership transfer (ADR 002). No CLI
-        // subcommand drives these yet, so the G-ORIGIN-01 transfer leg (#1038)
-        // calls them directly. `pendingTransfer` is the public mapping getter.
-        function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external;
-        function finalizeNamespaceTransfer(uint256 namespaceId) external;
-        function cancelNamespaceTransfer(uint256 namespaceId) external;
-        function pendingTransfer(uint256 namespaceId)
-            external
-            view
-            returns (address newOwner, uint64 readyAt);
-        function namespaceTransferTimelock() external view returns (uint64);
-        // Declared so a reverted `.call()` decodes to a *named* error rather
-        // than an opaque selector — the negatives assert the specific guard
-        // that fired, not merely that something reverted.
-        error NotNamespaceOwner(uint256 namespaceId, address caller);
-        error NoPendingTransfer(uint256 namespaceId);
-        error TransferNotReady(uint256 readyAt);
-        error NotPendingOwner(uint256 namespaceId, address caller);
     }
 
     /// `OriginAssignment` origin seating (publisher) + reads (ADR 011). Whether a
@@ -173,8 +147,7 @@ alloy::sol! {
         // A vetted namespace owner seats one origin. Instant: `getOrigins`
         // reflects it in the same transaction.
         function addOrigin(uint256 namespaceId, address operator) external;
-        // Publisher (own namespace) or governance removes one operator, closing
-        // the authorized-origin gate for a fresh backend-only hash (#1373).
+        // Publisher (own namespace) or governance unseats one origin operator.
         function removeOrigin(uint256 namespaceId, address operator) external;
         function getOrigins(uint256 namespaceId) external view returns (address[] memory);
         function isAuthorizedOrigin(uint256 namespaceId, address operator) external view returns (bool);
@@ -223,7 +196,6 @@ alloy::sol! {
     #[sol(rpc)]
     contract AccessControl {
         function grantRole(bytes32 role, address account) external;
-        function hasRole(bytes32 role, address account) external view returns (bool);
     }
 
     /// `PaymentPool` construction parameters, read back so a redeployed pool
