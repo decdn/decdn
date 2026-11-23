@@ -697,7 +697,7 @@ jobs:
       # journeys run.
       - name: Build daemon + CLI for cross-layer fixtures
         run: cargo build -p decdn-node -p decdn-cli
-      # Cross-layer journeys (smoke, G-NODE-04 blacklist compliance #1031, the
+      # Cross-layer journeys (G-NODE-04 blacklist compliance #1031, the
       # CLI journeys and the rest of `crates/e2e/tests`).
       # --test-threads 2: each journey runs its own anvil + forge deploy +
       # daemon(s); more at once oversubscribes the 4-core runner and turns
