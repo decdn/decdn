@@ -4,8 +4,8 @@
 //! deCDN streams every blob as bao's interleaved verified encoding, so a
 //! receiver checks each chunk group against the blob's BLAKE3 root as it lands
 //! ([ADR 038 § Wire format]). This crate holds the range arithmetic both sides
-//! share. It depends on `bao-tree` and not on `iroh-blobs`, so the client SDK
-//! links no blob store.
+//! share. It depends on `bao-tree` and not on `iroh-blobs`, so it stays a
+//! leaf every crate can link.
 //!
 //! # Entry points
 //!
@@ -65,8 +65,8 @@ pub use size_proof::{
 
 /// `iroh-blobs`' canonical on-disk block size (16 KiB chunk groups,
 /// `from_chunk_log(4)`). Declared from the `bao-tree` primitive rather than
-/// re-exported from `iroh-blobs`, because this crate must stay iroh-blobs-free
-/// so the CLI's pull path can link it. The value is
+/// re-exported from `iroh-blobs`, because this crate stays iroh-blobs-free.
+/// The value is
 /// **identical by construction** to `iroh_blobs::store::IROH_BLOCK_SIZE` (which
 /// is also `BlockSize::from_chunk_log(4)`); `decdn-cache` carries a lock-step
 /// test asserting the two stay equal, so a divergence across an iroh-blobs bump

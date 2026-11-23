@@ -4,8 +4,9 @@
 Cargo enforces acyclicity and nothing more. The direction the workspace's
 crates depend on each other is a design decision — four leaves that pull in
 no sibling, `cli`, `e2e`, `sponsord` and `sponsord-e2e` as sinks nothing
-depends on, a publisher CLI and two sponsord servers that link no blob store
-or AWS SDK — and CLAUDE.md § Crate Structure states it.
+depends on, a publisher CLI and two sponsord servers that link no AWS SDK,
+and a sponsord onramp that links no blob store either — and CLAUDE.md § Crate
+Structure states it.
 Without this check nothing enforces it: an edge added the wrong way compiles
 green, and the first thing to notice is a `decdn` binary that has grown an S3
 client.
@@ -24,13 +25,13 @@ Two passes:
   `sponsord` and `sponsord-onramp` servers. Their
   transitive normal and build dependencies must not include the blob store,
   the AWS SDK, the aws-lc crypto library or the JSON-RPC server
-  (MUST_NOT_LINK), except what MAY_LINK grants one of them: the CLI's gateway
-  cache is the blob store. The direct table cannot see this: `client → common` is
-  allowed, so `common` quietly growing an `iroh-blobs` edge would pass the
-  first pass and still put the blob store in the SDK and the CLI. The SDK is
-  guarded on its own, not only through the CLI, because a third party links it
-  without the CLI. A walk that visits nothing is a failure, not a clean
-  closure.
+  (MUST_NOT_LINK), except what MAY_LINK grants one of them: the SDK keeps each
+  download in the blob store, so it and the crates built on it may link it.
+  The direct table cannot see this: `onramp → api` is allowed, so `api`
+  quietly growing an `iroh-blobs` edge would pass the first pass and still put
+  the blob store in the onramp. The SDK is guarded on its own, not only through
+  the CLI, because a third party links it without the CLI. A walk that visits
+  nothing is a failure, not a clean closure.
 
   The closure is resolved per crate, never from `cargo metadata`: metadata
   resolves features once for the whole workspace, so the daemon's own
@@ -105,13 +106,14 @@ ALLOWED: dict[str, frozenset[str]] = {
 }
 # Nothing may depend on these, dev-deps aside.
 SINKS = frozenset({"decdn-cli", "decdn-e2e", "sponsord", "sponsord-e2e"})
-# The client SDK is iroh-blobs-free and AWS-free (#578, #1150): it links no
-# blob store or S3 SDK, so a crate built on `decdn-client` inherits none. The
-# CLI links the blob store for `decdn gateway`'s cache (#2881) and no S3 SDK.
-# All of them link one TLS backend, ring, and no JSON-RPC server (#2454):
-# aws-lc is a second crypto library and a C build on every client target, and
-# only the daemon serves the admin RPC. The sponsord daemon and onramp are
-# built on the client SDK and the wire types, and ship the same way.
+# The client SDK is AWS-free (#578, #1150): it links no S3 SDK, so a crate
+# built on `decdn-client` inherits none. It links the blob store, a download's
+# resumable store (#2881), and so does every crate built on it: the CLI, whose
+# gateway cache is the blob store too, and the sponsord daemon. The onramp is
+# built on the wire types alone and links none. All of them link one TLS
+# backend, ring, and no JSON-RPC server (#2454): aws-lc is a second crypto
+# library and a C build on every client target, and only the daemon serves the
+# admin RPC.
 FOOTPRINT_GUARDED = ("decdn-cli", "decdn-client", "sponsord", "sponsord-onramp")
 MUST_NOT_LINK = frozenset(
     {
@@ -127,9 +129,13 @@ MUST_NOT_LINK = frozenset(
 # By prefix: the AWS SDK's service and smithy crates, and aws-lc (`aws-lc-rs`,
 # `aws-lc-sys`, `aws-lc-fips-sys`).
 MUST_NOT_LINK_PREFIXES = ("aws-sdk-", "aws-smithy-", "aws-lc-")
-# What a guarded crate may link despite MUST_NOT_LINK: the CLI's gateway cache
-# is the blob store.
-MAY_LINK: dict[str, frozenset[str]] = {"decdn-cli": frozenset({"iroh-blobs"})}
+# What a guarded crate may link despite MUST_NOT_LINK: the blob store, which
+# the client SDK keeps each download in and the crates built on it inherit.
+MAY_LINK: dict[str, frozenset[str]] = {
+    "decdn-cli": frozenset({"iroh-blobs"}),
+    "decdn-client": frozenset({"iroh-blobs"}),
+    "sponsord": frozenset({"iroh-blobs"}),
+}
 # A build script compiles the crate too, so a build-dependency is an edge the
 # design has to allow; only dev-dependencies are exempt.
 EDGE_KINDS = frozenset({None, "build"})
@@ -273,9 +279,10 @@ def check_closure(root: str, tree: str) -> list[str]:
                 path.append(via)
                 via = parent[via]
             errors.append(
-                f"{root} links {name} via " + " ← ".join(path) + " — the client SDK links "
-                "no blob store, the CLI and the SDK link no AWS SDK (#578), and none links "
-                "aws-lc or a JSON-RPC server (#2454); the edge that introduced it must go"
+                f"{root} links {name} via " + " ← ".join(path) + " — only the client SDK, "
+                "the CLI and the crates built on the SDK link the blob store (#2881), none "
+                "links the AWS SDK (#578), and none links aws-lc or a JSON-RPC server "
+                "(#2454); the edge that introduced it must go"
             )
     return errors
 

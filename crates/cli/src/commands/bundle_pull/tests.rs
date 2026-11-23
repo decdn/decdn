@@ -496,26 +496,34 @@ fn leftover_partials_counts_only_unselected_blobs() {
     let write = |name: String, len: usize| {
         std::fs::write(dir.join(name), vec![0u8; len]).expect("write");
     };
+    // A store directory holding `files` of the given lengths, nested as a
+    // file store nests its data.
+    let store = |name: String, files: &[usize]| {
+        let data = dir.join(name).join("data");
+        std::fs::create_dir_all(&data).expect("store dir");
+        for (i, len) in files.iter().enumerate() {
+            std::fs::write(data.join(format!("f{i}")), vec![0u8; *len]).expect("write");
+        }
+    };
     // The run's selected entry and the manifest blob: kept for this run.
-    write(format!("{}.partial", hex(1)), 500);
-    write(format!("{}.partial.ranges", hex(1)), 5);
-    write(format!("{}.partial", hex(2)), 300);
-    // An orphan partial and its record, and a finalized orphan blob.
-    write(format!("{}.partial", hex(3)), 1000);
-    write(format!("{}.partial.ranges", hex(3)), 10);
+    store(format!("{}.decdn", hex(1)), &[500, 5]);
+    store(format!("{}.decdn", hex(2)), &[300]);
+    // An orphan store and assembly, and a finalized orphan blob.
+    store(format!("{}.decdn", hex(3)), &[1000, 10]);
     write(format!("{}.assembly", hex(3)), 700);
     write(hex(4), 200);
-    // A record's temporary file and a stray name.
-    write(".tmpAbC123".into(), 50);
+    // A stray name.
     write("notes.txt".into(), 50);
 
     let keep: HashSet<[u8; 32]> = [[1; 32], [2; 32]].into_iter().collect();
-    let on_disk =
-        |name: String| allocated_bytes(&std::fs::metadata(dir.join(name)).expect("metadata"));
-    let expected = on_disk(format!("{}.partial", hex(3)))
-        + on_disk(format!("{}.partial.ranges", hex(3)))
-        + on_disk(format!("{}.assembly", hex(3)))
-        + on_disk(hex(4));
+    let on_disk = |path: std::path::PathBuf| {
+        allocated_bytes(&std::fs::metadata(dir.join(path)).expect("metadata"))
+    };
+    let orphan_data = std::path::PathBuf::from(format!("{}.decdn", hex(3))).join("data");
+    let expected = on_disk(orphan_data.join("f0"))
+        + on_disk(orphan_data.join("f1"))
+        + on_disk(format!("{}.assembly", hex(3)).into())
+        + on_disk(hex(4).into());
     let leftovers = leftover_partials(tmp.path(), &keep);
     assert_eq!(
         leftovers,
@@ -558,17 +566,17 @@ fn leftover_partials_counts_only_unselected_blobs() {
     );
 }
 
-/// A range-dedup `.partial` sized to the whole blob before its bytes land
+/// A range-dedup `.assembly` sized to the whole blob before its bytes land
 /// counts only the space it takes, not its length (#2190).
 #[cfg(unix)]
 #[test]
-fn leftover_partials_count_a_sparse_partial_by_its_allocated_space() {
+fn leftover_partials_count_a_sparse_assembly_by_its_allocated_space() {
     let tmp = tempfile::tempdir().expect("tmp");
     let dir = tmp.path().join(STAGING_DIR);
     std::fs::create_dir_all(&dir).expect("staging dir");
     let hex = blake3::Hash::from_bytes([9; 32]).to_hex().to_string();
-    let file = std::fs::File::create(dir.join(format!("{hex}.partial"))).expect("create");
-    file.set_len(64 * 1024 * 1024).expect("size the partial");
+    let file = std::fs::File::create(dir.join(format!("{hex}.assembly"))).expect("create");
+    file.set_len(64 * 1024 * 1024).expect("size the assembly");
     let leftovers = leftover_partials(tmp.path(), &HashSet::new());
     assert_eq!(leftovers.blobs, 1);
     assert!(

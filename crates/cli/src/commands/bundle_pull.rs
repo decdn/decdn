@@ -721,8 +721,8 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// includes the bao proof overhead (a clean pull pays a little more than
 /// `downloaded`). Content delivered twice, or paid for and then dropped after
 /// a lane fault, counts each time it is paid. An entry that fails or is
-/// interrupted counts here but not in `downloaded`; a later run resumes its
-/// `.partial` and reports it as `resumed_bytes`.
+/// interrupted counts here but not in `downloaded`; a later run resumes from
+/// its store and reports it as `resumed_bytes`.
 ///
 /// `wire_bytes` is the `ChunkData` wire bytes this run's lanes read, verified
 /// or not, bao proof overhead included. Payment follows verification, so it
@@ -732,8 +732,8 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// unpaid. The figure is net against `paid_bytes`: a voucher armed before the
 /// pull can confirm during it, so `paid_bytes` can come out above it.
 ///
-/// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
-/// interrupted run fetched and paid for, which this run resumed rather than
+/// `resumed_bytes` is the content bytes that an earlier, interrupted run
+/// fetched into an entry's store and paid for, which this run resumed rather than
 /// fetched again. It is never part of `downloaded`. A byte that this run also
 /// spliced from disk counts only in `spliced_bytes`.
 ///
@@ -779,8 +779,8 @@ struct PullReport {
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
-    /// Content bytes of `.partial` prefixes that earlier runs fetched and this
-    /// run resumed; never part of `downloaded`.
+    /// Content bytes that earlier runs fetched into entry stores and this run
+    /// resumed; never part of `downloaded`.
     resumed_bytes: u64,
     /// Count of distinct blobs materialized from an on-disk whole-file donor;
     /// extra destinations of the same blob are counted in `linked`.
@@ -1285,7 +1285,7 @@ impl PullObserver {
     }
 
     /// End a run that has nothing to fetch, for `reason`: say so, warn of
-    /// the `.partial` files earlier runs left under `out`, and record the
+    /// the partial downloads earlier runs left under `out`, and record the
     /// `excluded` entries, so the run's record shows how many it dropped.
     /// Under `--json`, the run says so with its [`PullReport`], the same
     /// object every real run prints: no entry fetched, the `excluded` count,
@@ -1767,11 +1767,11 @@ fn counts_line(rep: &PullReport) -> String {
     )
 }
 
-/// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files —
-/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges`, `<hex>.assembly` — whose hash is not in
-/// `keep`, and total the disk space they take ([`allocated_bytes`]). Other
-/// names (a record's temporary file) are not counted. A missing or unreadable
-/// directory holds nothing.
+/// Scan `<out_root>/.decdn-partial` for leftover per-hash staging entries —
+/// the `<hex>` blob, its `<hex>.assembly` file and its `<hex>.decdn` store
+/// directory — whose hash is not in `keep`, and total the disk space they take
+/// ([`allocated_bytes`], every file under a store directory included). Other
+/// names are not counted. A missing or unreadable directory holds nothing.
 fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
     let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
         return Leftovers::default();
@@ -1784,8 +1784,7 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
             continue;
         };
         let stem = name
-            .strip_suffix(".partial.ranges")
-            .or_else(|| name.strip_suffix(".partial"))
+            .strip_suffix(".decdn")
             .or_else(|| name.strip_suffix(".assembly"))
             .unwrap_or(name);
         let Ok(hash) = blake3::Hash::from_hex(stem) else {
@@ -1801,12 +1800,31 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
         if meta.is_file() {
             blobs.insert(hash);
             bytes = bytes.saturating_add(allocated_bytes(&meta));
+        } else if meta.is_dir() {
+            blobs.insert(hash);
+            bytes = bytes.saturating_add(tree_bytes(&entry.path()));
         }
     }
     Leftovers {
         blobs: u64::try_from(blobs.len()).unwrap_or(u64::MAX),
         bytes,
     }
+}
+
+/// The disk space every file under `dir` takes ([`allocated_bytes`]). An
+/// unreadable entry counts nothing.
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries.flatten().fold(0u64, |sum, entry| {
+        let size = match entry.metadata() {
+            Ok(meta) if meta.is_dir() => tree_bytes(&entry.path()),
+            Ok(meta) => allocated_bytes(&meta),
+            Err(_) => 0,
+        };
+        sum.saturating_add(size)
+    })
 }
 
 /// The disk space a file takes. A range-dedup `.assembly` is sized to the whole

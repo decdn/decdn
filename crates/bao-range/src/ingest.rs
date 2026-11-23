@@ -5,8 +5,8 @@
 //!
 //! The contract lives here, beside [`RangedStore`], so a store and the pull
 //! that fills it need not depend on each other: `decdn-client` drives these
-//! traits, and both `decdn-client` (a `.partial` file) and `decdn-cache` (the
-//! iroh-blobs store) implement them.
+//! traits, and both `decdn-client` (a download's store) and `decdn-cache` (the
+//! node's cache) implement them.
 
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;

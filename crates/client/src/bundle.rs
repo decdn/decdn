@@ -6,7 +6,7 @@
 //! once, from one shared payment pool, and lands it at every path that names
 //! it. It resumes from what an earlier run left: a file already on disk is
 //! skipped, a byte-identical file elsewhere in the output directory is linked,
-//! a range a sibling entry shares is spliced from disk, and a `.partial` an
+//! a range a sibling entry shares is spliced from disk, and the store an
 //! interrupted run left is the next fetch's prefix.
 //!
 //! # A pull, end to end
@@ -70,8 +70,9 @@ mod tests;
 pub use crate::lane_sources::FaultContext;
 
 /// The directory under the output root where a pull stages the blobs it
-/// fetches: `<hex>.partial` and its resume record while a blob is in flight,
-/// and `<hex>` once it is verified and before it lands at its paths.
+/// fetches: the `<hex>.decdn` store (and a dedup entry's `<hex>.assembly`)
+/// while a blob is in flight, and `<hex>` once it is verified and before it
+/// lands at its paths.
 pub const STAGING_DIR: &str = ".decdn-partial";
 
 /// The largest bundle manifest a pull fetches, in bytes. A manifest fetch
@@ -899,7 +900,7 @@ pub struct BundleReport {
     /// include the bao proof overhead. Content delivered twice, or paid for and
     /// then dropped after a lane fault, counts each time it is paid. An entry
     /// that fails or is interrupted counts here but not in `downloaded`; a
-    /// later pull resumes its `.partial` and reports it as `resumed_bytes`.
+    /// later pull resumes from its store and reports it as `resumed_bytes`.
     pub paid_bytes: u64,
     /// The `ChunkData` wire bytes this pull's lanes read, verified or not,
     /// summed over every lane ([`crate::PoolLedger::wire_bytes`]). They
@@ -912,7 +913,7 @@ pub struct BundleReport {
     pub wire_bytes: u64,
     /// The bytes written to disk: every landed copy of every blob.
     pub reconstructed: u64,
-    /// The bytes of `.partial` prefixes earlier pulls fetched, which this pull
+    /// The bytes earlier pulls fetched into entry stores, which this pull
     /// resumed. Never part of `downloaded`.
     pub resumed_bytes: u64,
     /// The bytes spliced from files already on disk. Never downloaded.

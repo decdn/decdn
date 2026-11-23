@@ -47,6 +47,26 @@ fn candidate<S>(source: S, ledger: Arc<PoolLedger>, provider: u8) -> StreamCandi
     }
 }
 
+/// In-memory fill stores. Their store runs on the test's runtime, so a test
+/// on a paused clock sees all of their work.
+struct MemStores(iroh_blobs::api::Store);
+
+impl MemStores {
+    fn new() -> Self {
+        Self(iroh_blobs::api::Store::from(
+            iroh_blobs::store::mem::MemStore::new(),
+        ))
+    }
+}
+
+impl StreamStores for MemStores {
+    type Store = crate::ClientRangedStore;
+
+    async fn open(&self, hash: [u8; 32], total_bytes: u64) -> anyhow::Result<Self::Store> {
+        crate::ClientRangedStore::open_in(self.0.clone(), hash, total_bytes, None).await
+    }
+}
+
 /// A streamer over the static lanes `candidates`, filling into `scratch`.
 fn streamer<S: BlobSource>(
     candidates: Vec<StreamCandidate<S>>,
@@ -529,8 +549,9 @@ async fn a_paused_consumer_does_not_give_up() -> anyhow::Result<()> {
         read_ahead_bytes: PULL_WINDOW_FLOOR,
         ..PullConfig::default()
     };
-    let scratch = tempfile::tempdir()?;
-    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
+    let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;
+    let holders = sources.holders();
+    let streamer = Streamer::with_stores(sources, funder(), MemStores::new()).holders(holders);
     let limit = Duration::from_secs(30);
     let stop = StopPolicy::new(false, Some(limit), Arc::new(ProgressClock::new()));
     let (mut reader, mut drive) = streamer
@@ -569,12 +590,11 @@ async fn a_parked_lane_holds_the_clock_only_while_bytes_wait_unread() -> anyhow:
     let root = *PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE)
         .root
         .as_bytes();
-    let dir = tempfile::tempdir()?;
-    crate::ClientRangedStore::seed_checkpointed_prefix(dir.path(), "s", &blob, total / 2)?;
     let limit = Duration::from_secs(30);
 
     for cursor_at_frontier in [true, false] {
-        let store = crate::ClientRangedStore::open(dir.path(), "s", root)?;
+        let store = crate::ClientRangedStore::in_memory(root, total);
+        store.admit_prefix(&blob, total / 2).await?;
         let frontier = super::present_frontier(&store, 0).await?;
         anyhow::ensure!(frontier > 0 && frontier < total, "a partial store");
         let cursor = if cursor_at_frontier { frontier } else { 0 };
@@ -803,8 +823,7 @@ async fn finish_reports_a_late_lane_build_escrow_after_the_last_byte() -> anyhow
         lanes,
         late: Address::repeat_byte(0xB2),
     };
-    let scratch = tempfile::tempdir()?;
-    let streamer = Streamer::new(provider, funder(), scratch.path()).holders(holders);
+    let streamer = Streamer::with_stores(provider, funder(), MemStores::new()).holders(holders);
     let (mut reader, mut drive) = streamer
         .open(
             root,
@@ -1318,9 +1337,9 @@ impl StreamStore for WrappedStore {
     }
 }
 
-/// Opens a [`WrappedStore`] in `dir` and counts the opens.
+/// Opens a [`WrappedStore`] in its scratch stores and counts the opens.
 struct WrappedStores {
-    dir: std::path::PathBuf,
+    inner: ScratchStores<'static>,
     opened: std::sync::atomic::AtomicUsize,
 }
 
@@ -1330,10 +1349,7 @@ impl StreamStores for WrappedStores {
     async fn open(&self, hash: [u8; 32], total_bytes: u64) -> anyhow::Result<WrappedStore> {
         self.opened
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let store = ScratchStores::new(&self.dir)
-            .open(hash, total_bytes)
-            .await?;
-        Ok(WrappedStore(store))
+        Ok(WrappedStore(self.inner.open(hash, total_bytes).await?))
     }
 }
 
@@ -1346,7 +1362,7 @@ async fn a_stream_fills_the_store_its_stores_open() -> anyhow::Result<()> {
     let root = source.root();
     let scratch = tempfile::tempdir()?;
     let stores = WrappedStores {
-        dir: scratch.path().to_path_buf(),
+        inner: ScratchStores::new(Box::leak(scratch.path().to_path_buf().into_boxed_path())),
         opened: std::sync::atomic::AtomicUsize::new(0),
     };
     let sources = StaticSources::new(vec![candidate(source, ledger, 0xA1)])?;

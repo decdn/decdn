@@ -30,22 +30,21 @@ public-api-test = []
 decdn-protocol = { workspace = true }
 decdn-incentive = { workspace = true }
 # `endpoint` resolves relays + `[network.discovery]` from the shared config
-# schema and reuses the identity/redaction helpers. `decdn-common` is
-# iroh-blobs-free (config-vocabulary lives in the `decdn-config-types` leaf,
-# #578), so depending on it here does not regress the CLI's iroh-blobs-free
-# invariant — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
+# schema and reuses the identity/redaction helpers. `decdn-common` links no
+# AWS SDK (config-vocabulary lives in the `decdn-config-types` leaf, #578).
 decdn-common = { workspace = true }
-# Iroh-blobs-free bao verified-range helpers (alignment / encoded-size) shared
-# with the serve side, plus the bao codec for the receive-side verifying decoder
-# (#915, ADR 038). Both are pure `bao-tree`, so the CLI stays iroh-blobs-free
-# (#578) — verify with `cargo tree -p decdn-cli -e normal -i iroh-blobs`.
+# Bao verified-range helpers (alignment / encoded-size) shared with the serve
+# side, plus the store contract a paid pull fills (#915, ADR 038).
 decdn-bao-range = { workspace = true }
 # `tokio_fsm` is what exposes `io::fsm::ResponseDecoder`, the INCREMENTAL
 # decoder the streaming/resumable fetch drives (#1120). Requested explicitly
-# rather than relied on from workspace feature unification: `decdn-cli` must
-# build without any iroh-blobs crate in the graph to turn the feature on for us.
+# rather than relied on from workspace feature unification.
 bao-tree = { workspace = true, features = ["tokio_fsm"] }
 iroh-io = { workspace = true }
+# The download store (#2881): a download keeps its verified bytes, outboard and
+# present ranges in an iroh-blobs file store beside its destination, and a
+# resumed download reads them back from it.
+iroh-blobs = { workspace = true }
 # `FuturesUnordered` drives one worker future per lane concurrently on the
 # caller's task (the acquire loop, ADR 039): no `tokio::spawn`, so the `!Send`
 # `ingest_stream` decode future is fine.
@@ -103,6 +102,18 @@ proptest = { workspace = true }
 name = "public_api"
 path = "tests/public_api.rs"
 required-features = ["public-api-test"]
+
+# The store tests open stores through the `test-util` constructors
+# (`ClientRangedStore::on_disk`, `in_memory`).
+[[test]]
+name = "ranged_store_client"
+path = "tests/ranged_store_client.rs"
+required-features = ["test-util"]
+
+[[test]]
+name = "ranged_store_conformance"
+path = "tests/ranged_store_conformance.rs"
+required-features = ["test-util"]
 
 [lints]
 workspace = true

@@ -2,7 +2,7 @@ use super::super::{
     BundleManifest, MAX_MANIFEST_BYTES, MalformedManifest, ManifestChunk, NotAManifest,
 };
 use super::*;
-use crate::ProvenSize;
+use crate::{ClientRangedStore, ProvenSize};
 use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
 use std::assert_matches;
@@ -1834,13 +1834,13 @@ fn plan_dedup_skips_a_donor_whose_claimed_length_disagrees() {
 /// Review #2 (money-band): a per-donor copy that would run past the donor
 /// file's end (a mismatched aligned span, a truncated or racing donor) is not a
 /// hard failure — `splice_donors` queues the aligned range for a paid,
-/// bao-verified re-fetch and leaves `.partial` untouched for it, rather than
+/// bao-verified re-fetch and leaves the assembly untouched for it, rather than
 /// returning `Err` and failing the whole entry.
 #[test]
 fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
     let tmp = tempfile::tempdir().expect("tmp");
     let donor_path = tmp.path().join("donor");
-    let partial = tmp.path().join("out.partial");
+    let partial = tmp.path().join("out.assembly");
 
     // The donor holds exactly ONE group of bytes, so its chunk verifies — but
     // the donor range below asks to copy TWO groups from offset 0, which EOFs.
@@ -1872,7 +1872,7 @@ fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
     let refetch: Vec<(u64, u64)> = failed.iter().map(|d| d.refetch).collect();
     assert_eq!(refetch, vec![(GROUP, 2 * GROUP)]);
 
-    // Nothing was written into `.partial` for the untrusted donor — the whole
+    // Nothing was written into the assembly for the untrusted donor — the whole
     // file stays at its pre-sized zero value, so the coming re-fetch overwrites
     // clean bytes.
     let got = std::fs::read(&partial).expect("read partial");
@@ -1883,16 +1883,15 @@ fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
 }
 
 /// Review #1 (money-band): when a range drive COMPLETES the store — a resumed
-/// run whose `.partial` already held the donor-overlap ranges, so the very first
-/// complement drive finalizes and renames `<hex>.partial` -> `<hex>` —
-/// `reassemble_dedup` must treat the entry as done and NOT open a `.partial`
-/// that no longer exists. The [`FinalizingDriver`] simulates that finalize on
-/// its first drive; without the post-drive `staging.try_exists()` guard the
-/// reassembly would call `splice_donors` on the absent `.partial` and fail.
+/// run whose store already held the donor-overlap ranges, so the very first
+/// complement drive finalizes and exports `<hex>` — `reassemble_dedup` must
+/// treat the entry as done and splice nothing. The [`FinalizingDriver`]
+/// simulates that finalize on its first drive; the post-drive
+/// `staging.try_exists()` guard ends the entry there.
 #[tokio::test]
 async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
     // A driver that, on its first (complement) drive, finalizes the blob by
-    // creating the plain `<hex>` staging file and leaving no `.partial`.
+    // creating the plain `<hex>` staging file.
     struct FinalizingDriver {
         hash: [u8; 32],
         staging: PathBuf,
@@ -1959,8 +1958,7 @@ async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
 
     assert!(
         res.is_ok(),
-        "a first pay-now drive that finalizes the blob must succeed, not \
-         fail on a missing .partial: {res:?}"
+        "a first pay-now drive that finalizes the blob must succeed: {res:?}"
     );
     assert_eq!(driver.drives.get(), 1, "only the pay-now drive ran");
     assert!(staging.try_exists().expect("stat staging"));
@@ -2268,9 +2266,9 @@ fn planned_downloads_match_the_run_total() {
 }
 
 /// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` opens
-/// the entry's ranged store the way the real drive does (`open_or_create`) and
-/// admits each requested range's bao-verified bytes into it, so the store's
-/// record names them present. It never finalizes `<hex>` itself, so
+/// the entry's store the way the real drive does (`<staging>.decdn`) and
+/// admits each requested range's bao-verified bytes into it, so the store
+/// holds them present. It never finalizes `<hex>` itself, so
 /// `reassemble_dedup` exercises its splice + whole-file verify + promote path.
 /// Records every driven range.
 struct RecordingDriver {
@@ -2293,9 +2291,10 @@ impl RangeDriver for RecordingDriver {
         Box::pin(async move {
             use decdn_bao_range::RangedStore as _;
             let total = u64::try_from(self.content.len()).expect("content len fits u64");
-            let (dir, stem) = ranged_store_location(&self.staging).expect("location");
-            let store = ClientRangedStore::open_or_create(&dir, &stem, self.hash, total)
-                .expect("open ranged store");
+            let dir = BlobDir::open(&store_dir_for(&self.staging).expect("store dir"))
+                .await
+                .expect("open store");
+            let store = dir.blob(self.hash, total, None).await.expect("open entry");
             let outboard = bao_tree::io::outboard::PreOrderMemOutboard::create(
                 &self.content,
                 decdn_bao_range::IROH_BLOCK_SIZE,
@@ -2315,6 +2314,7 @@ impl RangeDriver for RecordingDriver {
                 .expect("encode range");
                 store.admit(aligned, bao).await.expect("admit range");
             }
+            dir.shutdown().await.expect("shut down store");
             Ok(())
         })
     }
@@ -2342,7 +2342,7 @@ impl RangeDriver for FailingDriver {
 
 /// Spliced donor bytes never enter the entry's ranged store: the store holds
 /// only bao-verified bytes, so an interrupted entry leaves no donor byte in
-/// its `.partial` for a later run to resume from.
+/// it for a later run to resume from.
 #[tokio::test]
 async fn spliced_bytes_never_enter_the_store() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -2399,10 +2399,9 @@ async fn spliced_bytes_never_enter_the_store() {
     .await;
     assert!(res.is_err(), "the fallback drive fails: {res:?}");
     assert!(!staging.exists(), "nothing is promoted");
-    let partial = std::fs::read(partial_path(&staging)).unwrap_or_default();
     assert!(
-        partial.iter().all(|&b| b == 0),
-        "the store's `.partial` holds no spliced byte"
+        resumed_spans(&staging, whole).await.is_empty(),
+        "the store holds no spliced byte"
     );
 }
 
@@ -2425,9 +2424,10 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
 
     // An earlier run fetched `[0, GROUP)` into the store.
     let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, whole);
+    ClientRangedStore::seed_download_prefix(&staging, &content, GROUP)
+        .await
+        .expect("seed the store");
+    let resumed = resumed_spans(&staging, whole).await;
     assert_eq!(resumed, vec![(0, GROUP)]);
 
     // The donor's chunk verifies against its own hint, but its first group
@@ -2485,16 +2485,15 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
         "the assembly file is promoted"
     );
     assert!(
-        !partial_path(&staging).exists(),
-        "the store's `.partial` is removed once the entry is promoted"
+        !store_dir_for(&staging).expect("store dir").exists(),
+        "the store is removed once the entry is promoted"
     );
 }
 
-/// An entry with nothing to pay for up front splices its donors into a store
-/// that `ensure_partial` created, and a later fallback drive into the same
-/// entry must keep those spliced bytes. A bare `.partial` with no `.ranges`
-/// record would be truncated by that drive's `open_or_create`, the whole-file
-/// hash would then fail, and the self-heal would pay for the whole blob.
+/// An entry with nothing to pay for up front splices its donors into its
+/// assembly, and a later fallback drive into the same entry keeps those
+/// spliced bytes: the whole-file hash matches and no self-heal pays for the
+/// whole blob.
 #[tokio::test]
 async fn a_fallback_drive_keeps_the_bytes_spliced_before_it() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -2565,9 +2564,9 @@ async fn a_fallback_drive_keeps_the_bytes_spliced_before_it() {
     assert_eq!(outcome.resumed_bytes, 0);
 }
 
-/// An entry resumed from an earlier run's `.partial` whose splice then
-/// covers part of that prefix: the overlap counts once, as spliced, and only
-/// the bytes neither resumed nor spliced count as paid (#2236).
+/// An entry resumed from an earlier run's store whose splice then covers part
+/// of that prefix: the overlap counts once, as spliced, and only the bytes
+/// neither resumed nor spliced count as paid (#2236).
 #[tokio::test]
 async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -2580,9 +2579,10 @@ async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
 
     // An earlier, interrupted run fetched `[0, 3*GROUP)` into the store.
     let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, 3 * GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, whole);
+    ClientRangedStore::seed_download_prefix(&staging, &content, 3 * GROUP)
+        .await
+        .expect("seed the store");
+    let resumed = resumed_spans(&staging, whole).await;
     assert_eq!(resumed, vec![(0, 3 * GROUP)]);
 
     // This run splices `[0, 2*GROUP)` from a donor and pays for the deferred
@@ -2660,11 +2660,11 @@ fn a_self_heal_outcome_counts_the_whole_resumed_prefix() {
     assert_eq!(EntryBytes::dedup(4 * GROUP, outcome).paid, GROUP);
 }
 
-/// The whole-blob path reads what an earlier run fetched from the resume
-/// record and pays only for the rest (#2236). A fresh entry and an
-/// unreadable record resume nothing.
-#[test]
-fn resumed_spans_read_the_record_an_earlier_run_left() {
+/// The whole-blob path reads what an earlier run fetched from the entry's
+/// store and pays only for the rest (#2236). A fresh entry and an unreadable
+/// store resume nothing.
+#[tokio::test]
+async fn resumed_spans_read_the_store_an_earlier_run_left() {
     let tmp = tempfile::tempdir().expect("tmp");
     let content: Vec<u8> = (0..3 * GROUP + 99)
         .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
@@ -2674,13 +2674,14 @@ fn resumed_spans_read_the_record_an_earlier_run_left() {
     let staging = tmp.path().join("blob");
 
     assert!(
-        resumed_spans(&staging, hash).is_empty(),
-        "no record, no spans"
+        resumed_spans(&staging, hash).await.is_empty(),
+        "no store, no spans"
     );
 
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, hash);
+    ClientRangedStore::seed_download_prefix(&staging, &content, GROUP)
+        .await
+        .expect("seed the store");
+    let resumed = resumed_spans(&staging, hash).await;
     assert_eq!(resumed, vec![(0, GROUP)]);
     assert_eq!(
         EntryBytes::whole_blob(len, span_bytes(&resumed)),
@@ -2694,10 +2695,12 @@ fn resumed_spans_read_the_record_an_earlier_run_left() {
     assert_eq!(EntryBytes::whole_blob(10, 20).paid, 0);
     assert_eq!(EntryBytes::whole_blob(10, 20).resumed, 10);
 
-    std::fs::write(tmp.path().join("blob.partial.ranges"), b"not json").expect("corrupt");
+    let store = store_dir_for(&staging).expect("store dir");
+    std::fs::remove_dir_all(&store).expect("drop the store");
+    std::fs::write(&store, b"not a store").expect("corrupt");
     assert!(
-        resumed_spans(&staging, hash).is_empty(),
-        "an unreadable record resumes nothing"
+        resumed_spans(&staging, hash).await.is_empty(),
+        "an unreadable store resumes nothing"
     );
 }
 
@@ -3502,13 +3505,13 @@ fn chunk_index_seeded_source_survives_sweep() {
 
 /// `splice_donors` happy path: a donor file holds a verified chunk at some
 /// offset (with padding on both sides), and the aligned subset lands at the
-/// correct recipient offset in `.partial` — nothing else in `.partial` is
-/// touched, and nothing is queued for refetch.
+/// correct recipient offset in the assembly — nothing else in it is touched,
+/// and nothing is queued for refetch.
 #[test]
-fn splice_donors_copies_a_verified_subset_into_partial() {
+fn splice_donors_copies_a_verified_subset_into_the_assembly() {
     let tmp = tempfile::tempdir().expect("tmp");
     let donor_path = tmp.path().join("donor");
-    let partial = tmp.path().join("out.partial");
+    let partial = tmp.path().join("out.assembly");
 
     // The chunk occupies exactly one group, padded on both sides in the donor
     // file so the source offset is not trivially zero.
@@ -3523,8 +3526,8 @@ fn splice_donors_copies_a_verified_subset_into_partial() {
 
     let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
     let total = 2 * GROUP;
-    // splice_donors only opens `partial` for write, so pre-size it (zeros)
-    // the way the ranged store would before splicing runs.
+    // splice_donors only opens the assembly for write, so pre-size it (zeros)
+    // the way the reassembly does before splicing runs.
     std::fs::File::create(&partial)
         .and_then(|f| f.set_len(total))
         .expect("presize partial");
@@ -3553,13 +3556,13 @@ fn splice_donors_copies_a_verified_subset_into_partial() {
 
 /// A donor whose recorded chunk bytes no longer hash to the hint's chunk hash
 /// (corruption, or a stale/overwritten donor file) is never trusted: its range
-/// is pushed to the refetch list and no bytes are written into `.partial` for
-/// it.
+/// is pushed to the refetch list and no bytes are written into the assembly
+/// for it.
 #[test]
 fn splice_donors_refetches_a_corrupted_donor_chunk() {
     let tmp = tempfile::tempdir().expect("tmp");
     let donor_path = tmp.path().join("donor");
-    let partial = tmp.path().join("out.partial");
+    let partial = tmp.path().join("out.assembly");
 
     let chunk_bytes: Vec<u8> = (0..GROUP)
         .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
@@ -4000,7 +4003,7 @@ fn group_transfer_downloads_only_the_paid_bytes_of_a_spliced_blob() {
     assert_eq!(t.reconstructed, 100);
 }
 
-/// A blob resumed from an earlier run's `.partial` downloads only what this
+/// A blob resumed from an earlier run's store downloads only what this
 /// run fetched; the resumed prefix is tallied apart and counted once per
 /// blob, however many paths it lands at (#2236).
 #[test]
@@ -5355,20 +5358,21 @@ fn root(blob: &[u8]) -> [u8; 32] {
     *blake3::hash(blob).as_bytes()
 }
 
-/// `len` bytes at `offset` of the entry's `.partial` beside `dest`: a
-/// range entry that fetched only some ranges stays unpromoted.
-fn read_range(dest: &Path, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
-    use std::io::{Read as _, Seek as _};
-    let mut f = std::fs::File::open(partial_path(dest))?;
-    f.seek(std::io::SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; usize::try_from(len)?];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+/// `len` bytes at `offset` of `blob`'s entry in the store beside `dest`: a
+/// range entry that fetched only some ranges stays in its store.
+async fn read_range(dest: &Path, blob: &[u8], offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+    let dir = BlobDir::open(&store_dir_for(dest)?).await?;
+    let store = dir
+        .blob(root(blob), u64::try_from(blob.len())?, None)
+        .await?;
+    let bytes = store.read(offset, len).await;
+    dir.shutdown().await?;
+    Ok(bytes?.to_vec())
 }
 
 /// A range-dedup entry fetches only the ranges no donor supplies, through
 /// the acquire loop. Its one blipping holder cools while the other holder
-/// carries the range, and the entry stays a `.partial` for the splice.
+/// carries the range, and the entry stays in its store for the splice.
 #[tokio::test(start_paused = true)]
 async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
     let blob = test_blob(6 * 1024 * 1024);
@@ -5402,7 +5406,7 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
         "holder 0xA1 reset a stream mid-range"
     );
     assert_eq!(
-        read_range(&dest, 1024 * 1024, 2 * 1024 * 1024)?,
+        read_range(&dest, &blob, 1024 * 1024, 2 * 1024 * 1024).await?,
         blob[1024 * 1024..3 * 1024 * 1024]
     );
     assert!(

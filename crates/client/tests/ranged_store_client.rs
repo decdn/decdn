@@ -1,17 +1,7 @@
-//! Client-specific tests for `ClientRangedStore` (#1621): lock the
-//! "trust records, verify once" resume invariant that distinguishes the
-//! client backend and isn't covered by the shared conformance suite (see
-//! `ranged_store_conformance.rs`) or the `src`-local `admit`/`finalize` unit
-//! tests.
-//!
-//! `ClientRangedStore::open` reconstructs `present` from the persisted
-//! `.partial.ranges` record in O(1): it does NOT re-hash the `.partial` data.
-//! That's the load-bearing shortcut documented on `ranged_store.rs::open`: the
-//! ONE whole-file check is `finalize`'s BLAKE3 of `[0, proven)`, already
-//! locked by the unit test `finalize_hashes_the_whole_file`. These tests prove
-//! the other half — that `open` trusts the record rather than re-deriving it,
-//! and that resume continues from the persisted frontier without re-listing
-//! (and so without re-fetching/re-paying for) the held prefix.
+//! Client-specific tests for `ClientRangedStore` over a file store (#2881):
+//! what a resumed download reads back from the store an earlier run left,
+//! and the export a finished blob ends in. The shared conformance suite
+//! (`ranged_store_conformance.rs`) covers the cross-backend contract.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -19,17 +9,16 @@
     clippy::indexing_slicing
 )] // tests
 
+use bao_tree::{ChunkNum, ChunkRanges};
 use bytes::Bytes;
 use decdn_bao_range::{AlignedRange, CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, RangedStore};
 use decdn_client::ClientRangedStore;
-use std::assert_matches;
 
 const GROUP: u64 = CHUNK_GROUP_BYTES;
 
 /// Deterministic blob of `len` bytes plus its bao root and full pre-order
-/// outboard. Mirrors `crates/cache/tests/range_pull.rs::make_blob` /
-/// `crates/client/src/ranged_store.rs::tests::synth_blob` — an xorshift
-/// fill, not random, so runs are reproducible.
+/// outboard. Mirrors `crates/cache/tests/range_pull.rs::make_blob` — an
+/// xorshift fill, not random, so runs are reproducible.
 fn synth_blob(len: usize) -> ([u8; 32], Vec<u8>, Bytes) {
     let mut plaintext = vec![0u8; len];
     let mut x: u32 = 0x9e37_79b9;
@@ -53,134 +42,81 @@ fn bao_for(root: [u8; 32], plaintext: &[u8], outboard: Bytes, aligned: &AlignedR
     decdn_bao_range::encode_verified_range(root, aligned, data, outboard).expect("verifies")
 }
 
-#[tokio::test]
-async fn resume_trusts_record_without_rehashing() {
-    let total = 3 * GROUP;
-    let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
-    let dir = tempfile::tempdir().expect("tmp dir");
-
-    let k = GROUP; // one full group prefix
-    {
-        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
-        let aligned = decdn_bao_range::align_range(0, k, total).expect("align prefix");
-        let bao_bytes = bao_for(root, &plaintext, outboard.clone(), &aligned);
-        store.admit(aligned, bao_bytes).await.expect("admit prefix");
-        // Drop the store, releasing the tempdir's inner handles but not the
-        // directory itself (`dir` outlives this block).
-    }
-
-    // Corrupt the already-recorded `[0, K)` prefix directly on disk, leaving
-    // the `.partial.ranges` record untouched (it still claims `[0, K)`
-    // present). If `open` re-hashed the data it would discover this and drop
-    // the prefix from `present`.
-    let partial_path = dir.path().join("blob.partial");
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&partial_path)
-            .expect("open partial data file");
-        f.seek(SeekFrom::Start(0)).expect("seek");
-        let zeros = vec![0u8; usize::try_from(k).expect("fits")];
-        f.write_all(&zeros).expect("corrupt prefix");
-    }
-
-    let reopened =
-        ClientRangedStore::open(dir.path(), "blob", root).expect("open after corruption");
-
-    // Presence is unchanged by the on-disk corruption: `open` trusted the
-    // record instead of re-deriving it from (now-corrupt) data.
-    let present = reopened.present_ranges().await.expect("present_ranges");
-    let expected_prefix = decdn_bao_range::align_range(0, k, total)
-        .expect("align prefix")
-        .chunk_ranges()
-        .clone();
-    assert_eq!(
-        present, expected_prefix,
-        "open must trust the persisted record, not re-hash the (now corrupt) data"
-    );
-
-    let missing = reopened.missing_ranges(0, 0).await.expect("missing_ranges");
-    let expected_missing = decdn_bao_range::align_range(0, 0, total)
-        .expect("align whole blob")
-        .chunk_ranges()
-        .clone()
-        - &expected_prefix;
-    assert_eq!(missing, expected_missing);
-
-    // The safety net: `finalize`'s whole-file hash DOES catch the corruption,
-    // once the record claims completeness. Admit the remaining bytes (over
-    // the still-corrupt-on-disk prefix) so `is_complete` is true, then let
-    // `finalize`'s hash discover the drift. It keeps the partial.
-    let rest_aligned = decdn_bao_range::align_range(k, total - k, total).expect("align rest");
-    let rest_bao = bao_for(root, &plaintext, outboard, &rest_aligned);
-    reopened
-        .admit(rest_aligned, rest_bao)
-        .await
-        .expect("admit rest");
-    assert!(
-        reopened.is_complete().await.expect("is_complete"),
-        "record claims every group present"
-    );
-
-    let err = reopened
-        .finalize()
-        .await
-        .expect_err("finalize's whole-file hash must catch the corrupted prefix");
-    assert_matches!(
-        err,
-        decdn_bao_range::RangedStoreError::Backend(_),
-        "{err:?}"
-    );
-    assert!(partial_path.exists(), "a failed finalize keeps the partial");
+/// The chunk range of `[start, end)` bytes.
+fn chunks(start: u64, end: u64) -> ChunkRanges {
+    ChunkRanges::from(ChunkNum::full_chunks(start)..ChunkNum::chunks(end))
 }
 
+/// A store reopened in the directory an earlier run left holds what that run
+/// admitted, and only that: a resume lists only the missing middle, so it
+/// fetches and pays for nothing twice. The final group proved the size.
 #[tokio::test]
-async fn resume_continues_from_record_without_refetching_prefix() {
-    let total = 3 * GROUP;
+async fn a_reopened_store_holds_what_an_earlier_run_admitted() {
+    let total = 4 * GROUP + 99;
     let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
     let dir = tempfile::tempdir().expect("tmp dir");
 
-    let k = GROUP;
-    {
-        let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
-        let aligned = decdn_bao_range::align_range(0, k, total).expect("align prefix");
-        let bao_bytes = bao_for(root, &plaintext, outboard.clone(), &aligned);
-        store.admit(aligned, bao_bytes).await.expect("admit prefix");
-    }
-
-    let reopened = ClientRangedStore::open(dir.path(), "blob", root).expect("open");
-
-    // The held prefix must NOT be re-listed as missing: a resumed fetch
-    // driven by `missing_ranges` would skip it entirely, so it's never
-    // re-fetched or re-paid for.
-    let missing = reopened.missing_ranges(0, 0).await.expect("missing_ranges");
-    let expected_missing = decdn_bao_range::align_range(0, 0, total)
-        .expect("align whole blob")
-        .chunk_ranges()
-        .clone()
-        - decdn_bao_range::align_range(0, k, total)
-            .expect("align prefix")
-            .chunk_ranges();
-    assert_eq!(
-        missing, expected_missing,
-        "held prefix must not be re-listed as missing"
-    );
-
-    // Resume by admitting only the gap the record reports.
-    let rest_aligned = decdn_bao_range::align_range(k, total - k, total).expect("align rest");
-    let rest_bao = bao_for(root, &plaintext, outboard, &rest_aligned);
-    reopened
-        .admit(rest_aligned, rest_bao)
+    let store = ClientRangedStore::on_disk(dir.path(), root, total)
         .await
-        .expect("admit rest");
+        .expect("open");
+    for (start, len) in [(0, GROUP), (4 * GROUP, 99)] {
+        let aligned = decdn_bao_range::align_range(start, len, total).expect("align");
+        let bao = bao_for(root, &plaintext, outboard.clone(), &aligned);
+        store.admit(aligned, bao).await.expect("admit");
+    }
+    store.close().await.expect("close");
 
-    reopened.finalize().await.expect("finalize promotes");
-
-    let final_path = dir.path().join("blob");
-    let on_disk = std::fs::read(&final_path).expect("read promoted final file");
+    let reopened = ClientRangedStore::on_disk(dir.path(), root, total)
+        .await
+        .expect("reopen");
+    let present = reopened.present_ranges().await.expect("present");
+    assert_eq!(present, chunks(0, GROUP) | chunks(4 * GROUP, total));
     assert_eq!(
-        on_disk, plaintext,
-        "promoted file must hold the exact full plaintext"
+        reopened.proven(),
+        Some(total),
+        "the final group proved the size"
     );
+    assert_eq!(
+        reopened.missing_ranges(0, 0).await.expect("missing"),
+        chunks(GROUP, 4 * GROUP),
+        "a resume fetches only the middle"
+    );
+    let head = reopened.read(0, GROUP).await.expect("read the held head");
+    assert_eq!(
+        head.as_ref(),
+        &plaintext[..usize::try_from(GROUP).expect("fits")]
+    );
+    reopened.close().await.expect("close");
+}
+
+/// A store that holds the whole blob exports it to its destination at
+/// `finalize`, byte for byte, and a second `finalize` keeps it.
+#[tokio::test]
+async fn a_finished_blob_exports_to_its_destination() {
+    let total = 3 * GROUP + 7;
+    let (root, plaintext, outboard) = synth_blob(usize::try_from(total).expect("fits"));
+    let dir = tempfile::tempdir().expect("tmp dir");
+    let dest = dir.path().join("out.bin");
+
+    let store = ClientRangedStore::on_disk(&dir.path().join("store"), root, total)
+        .await
+        .expect("open")
+        .exporting_to(dest.clone());
+    assert!(
+        matches!(
+            store.finalize().await,
+            Err(decdn_bao_range::RangedStoreError::Incomplete)
+        ),
+        "nothing to export yet"
+    );
+    let aligned = decdn_bao_range::align_range(0, total, total).expect("align");
+    let bao = bao_for(root, &plaintext, outboard, &aligned);
+    store.admit(aligned, bao).await.expect("admit");
+    assert!(store.is_complete().await.expect("complete"));
+
+    store.finalize().await.expect("finalize");
+    assert_eq!(std::fs::read(&dest).expect("read export"), plaintext);
+    store.finalize().await.expect("finalize again");
+    assert_eq!(std::fs::read(&dest).expect("read export"), plaintext);
+    store.close().await.expect("close");
 }

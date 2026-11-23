@@ -42,6 +42,7 @@ use crate::credential::CredentialSlot;
 use crate::driver::{PacingWait, WaitReason};
 use crate::health::PeerHealth;
 use crate::pacer::{DownstreamFrontier, PULL_WINDOW_FLOOR, WindowPacer};
+use crate::ranged_store::BlobDir;
 use crate::recovery::RecoveryGate;
 use crate::scheduler::{AcquireEnv, AcquireTarget, ConsumptionPacing, LaneLease, acquire};
 use crate::sink::BlobCache;
@@ -97,25 +98,30 @@ impl<T: StreamStores + Sync> StreamStores for &T {
     }
 }
 
-/// The [`Streamer`]'s default fill stores: a [`ClientRangedStore`] named by
-/// the blob's hash in a scratch directory.
+/// The [`Streamer`]'s default fill stores: one iroh-blobs store in a scratch
+/// directory, opened on the first stream, holding a [`ClientRangedStore`] per
+/// blob.
 ///
 /// The caller owns the directory and its cleanup. A streamed blob is not
-/// kept, so a temporary directory is the usual choice. The store's `.partial`
-/// grows to the whole blob as the stream advances (a window's `.partial` is
-/// sparse outside the window), so the directory needs room for all of it.
-/// Every call for one hash returns the same store, so two concurrent streams
-/// of one blob need two directories.
-#[derive(Debug, Clone, Copy)]
+/// kept, so a temporary directory is the usual choice. A blob's data grows to
+/// the whole blob as the stream advances (a window's data is sparse outside
+/// the window), so the directory needs room for all of it. Every call for one
+/// hash returns a view of the same entry, so two concurrent streams of one
+/// blob need two directories. One process holds the directory at a time.
+#[derive(Debug)]
 pub struct ScratchStores<'a> {
     scratch: &'a Path,
+    dir: tokio::sync::OnceCell<BlobDir>,
 }
 
 impl<'a> ScratchStores<'a> {
     /// Fill stores in `scratch`.
     #[must_use]
     pub const fn new(scratch: &'a Path) -> Self {
-        Self { scratch }
+        Self {
+            scratch,
+            dir: tokio::sync::OnceCell::const_new(),
+        }
     }
 }
 
@@ -123,15 +129,11 @@ impl StreamStores for ScratchStores<'_> {
     type Store = ClientRangedStore;
 
     async fn open(&self, hash: [u8; 32], total_bytes: u64) -> anyhow::Result<ClientRangedStore> {
-        let stem = blake3::Hash::from_bytes(hash).to_hex().to_string();
-        let scratch = self.scratch.to_path_buf();
-        // Off the runtime: opening a finalized blob hashes its final file.
-        tokio::task::spawn_blocking(move || {
-            ClientRangedStore::open_or_create(&scratch, &stem, hash, total_bytes)
-                .map_err(|e| anyhow::anyhow!("open stream store for {stem}: {e}"))
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("open stream store task: {e}"))?
+        let dir = self
+            .dir
+            .get_or_try_init(|| BlobDir::open(self.scratch))
+            .await?;
+        dir.blob(hash, total_bytes, None).await
     }
 }
 

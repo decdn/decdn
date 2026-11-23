@@ -1,8 +1,8 @@
 //! The `(hash, total_bytes)` blob view every range-aware backend implements.
 //!
 //! [`RangedStore`] is what keeps this crate iroh-blobs-free: it speaks byte
-//! offsets and `ChunkRanges` only, so the node's iroh-blobs cache and the
-//! CLI's `.partial` sidecar can both satisfy it (#578).
+//! offsets and `ChunkRanges` only, so the node's cache and the client's
+//! download store can both satisfy it without depending on each other (#578).
 
 /// A boxed future returned by a [`RangedStore`] method, borrowing the store
 /// for `'a`.
@@ -31,9 +31,9 @@ pub enum RangedStoreError {
 
 /// A source-agnostic, range-aware view of ONE blob `(hash, total_bytes)`.
 /// Speaks `ChunkRanges` + byte offsets only — no hash type — so `bao-range`
-/// stays iroh-blobs-free (#578). Both the node (iroh-blobs cache) and the
-/// client (`.partial` sidecar) backends implement it and pass one shared
-/// conformance suite.
+/// stays iroh-blobs-free (#578). Both the node (its cache) and the client (a
+/// download's store) backends implement it and pass one shared conformance
+/// suite.
 pub trait RangedStore: Send + Sync {
     /// The blob length in bytes the store currently works to. A backend keyed
     /// by size fixes it at construction. A backend keyed by offset reports its

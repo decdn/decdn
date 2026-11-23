@@ -2852,6 +2852,7 @@ dependencies = [
  "icu_normalizer",
  "insta",
  "iroh",
+ "iroh-blobs",
  "iroh-io",
  "proptest",
  "public-api",
