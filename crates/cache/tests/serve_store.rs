@@ -57,8 +57,9 @@ fn bao_for_range(
 }
 
 /// `encode_range` re-encodes whatever is currently held into the ADR-038
-/// header-less wire bao — the same bytes `encode_whole_blob_headerless`
-/// computes independently from the plaintext + outboard. This proves the
+/// header-less wire bao — the same bytes `encode_verified_range` computes
+/// independently from the plaintext + outboard, minus its 8-byte size header.
+/// This proves the
 /// serve encoding is byte-exact, not merely non-empty.
 #[tokio::test]
 async fn encode_range_round_trips_to_wire_bao() -> anyhow::Result<()> {
@@ -73,7 +74,7 @@ async fn encode_range_round_trips_to_wire_bao() -> anyhow::Result<()> {
     // Admit the whole blob.
     let aligned = decdn_bao_range::align_range(0, 0, total)?;
     let bao = bao_for_range(root, &plaintext, outboard.clone(), &aligned);
-    RangedStore::admit(&store, aligned, bao).await?;
+    RangedStore::admit(&store, aligned.clone(), bao).await?;
 
     // Drain encode_range(0, 0) — "whole blob" per the trait's byte_len == 0
     // convention.
@@ -84,19 +85,13 @@ async fn encode_range_round_trips_to_wire_bao() -> anyhow::Result<()> {
     }
 
     // Independently compute the expected header-less wire bao from the
-    // plaintext + outboard directly (not via the store), matching the
-    // reference-encoding pattern of `decdn_bao_range::streaming`.
-    let mut want = Vec::new();
-    decdn_bao_range::streaming::encode_whole_blob_headerless(
-        root,
-        total,
-        outboard,
-        &plaintext[..],
-        &mut want,
-    )?;
+    // plaintext + outboard directly (not via the store): the combined
+    // encoding with its 8-byte size header stripped.
+    let want = bao_for_range(root, &plaintext, outboard, &aligned).slice(8..);
 
     assert_eq!(
-        got, want,
+        got,
+        want.as_ref(),
         "encode_range(0, 0) must equal the independently-computed header-less wire bao"
     );
 

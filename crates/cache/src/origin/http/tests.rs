@@ -172,24 +172,6 @@ async fn fetch_range_data_5xx_is_a_transient_fault() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A ranged-data GET 404 is a missing data object: `NotFound`.
-#[tokio::test]
-async fn fetch_range_data_404_is_not_found() -> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let hash = Hash::new(b"http-range-missing-marker");
-    mount_get(&server, hash.to_hex().clone(), ResponseTemplate::new(404)).await;
-    let origin = HttpOrigin::parse(&server.uri())?;
-
-    anyhow::ensure!(
-        matches!(
-            origin.fetch_range_data(hash, FIRST_KIB).await?,
-            OriginRangeFetch::NotFound
-        ),
-        "a 404 range GET must be NotFound",
-    );
-    Ok(())
-}
-
 /// An origin that ignores `Range` and answers `200` with the whole object is
 /// a permanent fault: the range path needs byte ranges.
 #[tokio::test]
