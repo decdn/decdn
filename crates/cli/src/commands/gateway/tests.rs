@@ -1060,7 +1060,7 @@ fn directory_index_names_a_bundle_directorys_index() {
         // An empty segment stays one, for the URI parser to refuse.
         (format!("{h}//"), format!("{h}//index.html")),
     ] {
-        assert_eq!(directory_index(&rest), (named, true), "{rest}");
+        assert_eq!(directory_index(&rest), (named, Named::Directory), "{rest}");
     }
     for same in [
         format!("{h}/"),
@@ -1068,7 +1068,7 @@ fn directory_index_names_a_bundle_directorys_index() {
         format!("{h}/a.txt?ns=7"),
         format!("{h}/?ns=7"),
     ] {
-        assert_eq!(directory_index(&same), (same.clone(), false));
+        assert_eq!(directory_index(&same), (same.clone(), Named::AsIs));
     }
 }
 

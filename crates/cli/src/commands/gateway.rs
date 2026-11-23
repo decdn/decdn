@@ -1185,8 +1185,13 @@ impl Gateway {
             (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
             (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
             (&Method::HEAD, _) => {
-                self.head_blob(target.trim_start_matches('/'), Present::Bare, None, false)
-                    .await
+                self.head_blob(
+                    target.trim_start_matches('/'),
+                    Present::Bare,
+                    None,
+                    Named::AsIs,
+                )
+                .await
             }
             _ => return Err(Box::new(req)),
         })
@@ -1254,15 +1259,15 @@ impl Gateway {
         let query = req.uri().query();
         if head {
             return match decdn {
-                Some((rest, directory)) => {
-                    self.head_blob(&rest, Present::Site, scoped_bundle, directory)
+                Some((rest, named)) => {
+                    self.head_blob(&rest, Present::Site, scoped_bundle, named)
                         .await
                 }
                 None => self.head_site(&site, path, query, pointer).await,
             };
         }
         let range = range_header(headers);
-        if let Some((rest, directory)) = decdn {
+        if let Some((rest, named)) = decdn {
             let uri: DecdnUri = match format!("decdn:{rest}").parse() {
                 Ok(uri) => uri,
                 Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
@@ -1275,7 +1280,7 @@ impl Gateway {
             // Another bundle's pages run on their own origin; a blob has none.
             return match uri.target {
                 UriTarget::Blob => self.paid(pointer, &uri, Present::Download, get).await,
-                _ => self.to_site(&uri, directory),
+                _ => self.to_site(&uri, named),
             };
         }
         // The query belongs to the page's scripts: the gateway reads none of
@@ -1393,9 +1398,9 @@ impl Gateway {
     }
 
     /// A redirect to the site that serves bundle `uri`, at its entry path.
-    /// `directory` says the request named a directory, whose `index.html`
-    /// `uri` names: the redirect goes to the directory itself.
-    fn to_site(&self, uri: &DecdnUri, directory: bool) -> Response<Body> {
+    /// A request that `named` a directory, whose `index.html` `uri` names,
+    /// goes to the directory itself.
+    fn to_site(&self, uri: &DecdnUri, named: Named) -> Response<Body> {
         let site = Site {
             hash: uri.hash,
             namespace: uri.namespace,
@@ -1405,7 +1410,7 @@ impl Gateway {
             UriTarget::BundleEntry(path) => {
                 let link = entry_link(uri.hash, path);
                 match link.strip_suffix("index.html") {
-                    Some(dir) if directory => dir.to_owned(),
+                    Some(dir) if named == Named::Directory => dir.to_owned(),
                     _ => link,
                 }
             }
@@ -1672,7 +1677,7 @@ impl Gateway {
         if matches!(uri.target, UriTarget::Bundle | UriTarget::BundleEntry(_))
             && (navigation || self.public())
         {
-            return self.to_site(&uri, false);
+            return self.to_site(&uri, Named::AsIs);
         }
         let get = Ask::Get {
             range: range_header(headers),
@@ -2356,8 +2361,8 @@ impl Gateway {
     /// size as its `GET` would ([`Self::learn_size`]), paid as [`Self::paid`]
     /// pays. A bundle or an entry redirects to its site, at no pull, where
     /// `GET` under `/_decdn/` would serve a page's request for it inline; a
-    /// `directory` (`rest` names its `index.html`) redirects to the directory
-    /// on the site.
+    /// request that `named` a directory (`rest` names its `index.html`)
+    /// redirects to the directory on the site.
     ///
     /// `scoped_bundle` is a pointer's namespace and the bundle it names, on
     /// that namespace's host: a capability scoped to the namespace pays for
@@ -2367,7 +2372,7 @@ impl Gateway {
         rest: &str,
         present: Present,
         scoped_bundle: Option<(u64, [u8; 32])>,
-        directory: bool,
+        named: Named,
     ) -> Response<Body> {
         let uri: DecdnUri = match format!("decdn:{rest}").parse() {
             Ok(uri) => uri,
@@ -2384,7 +2389,7 @@ impl Gateway {
                 }
                 None => self.paid(namespace, &uri, present, Ask::Head).await,
             },
-            UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri, directory),
+            UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri, named),
             _ => text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
         }
     }
@@ -2963,11 +2968,20 @@ fn entry_link(hash: [u8; 32], path: &str) -> String {
     uri.get(ENTRY_PATH_OFFSET..).unwrap_or_default().to_owned()
 }
 
-/// A site's `/_decdn/<rest>` as the rest of a `decdn:` URI, and whether it
-/// names a directory: a directory in a bundle (`<hash>/<dir>/`) names its
-/// `index.html`, as a site's own directory paths do. The bundle root
-/// (`<hash>/`) and the query stay as they are.
-fn directory_index(rest: &str) -> (String, bool) {
+/// What a request's path names, where a redirect to a site keeps its form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Named {
+    /// A directory (`<dir>/`), which the gateway reads as its `index.html`.
+    Directory,
+    /// What the path spells out.
+    AsIs,
+}
+
+/// A site's `/_decdn/<rest>` as the rest of a `decdn:` URI, and what it
+/// names: a directory in a bundle (`<hash>/<dir>/`) names its `index.html`,
+/// as a site's own directory paths do. The bundle root (`<hash>/`) and the
+/// query stay as they are.
+fn directory_index(rest: &str) -> (String, Named) {
     let (path, query) = match rest.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (rest, None),
@@ -2980,7 +2994,12 @@ fn directory_index(rest: &str) -> (String, bool) {
         Some(query) => format!("{path}{index}?{query}"),
         None => format!("{path}{index}"),
     };
-    (rest, directory)
+    let named = if directory {
+        Named::Directory
+    } else {
+        Named::AsIs
+    };
+    (rest, named)
 }
 
 /// A redirect from entry `path` of bundle `hash` to the directory it names,
