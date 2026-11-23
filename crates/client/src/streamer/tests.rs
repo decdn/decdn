@@ -974,11 +974,11 @@ async fn a_window_past_the_end_stops_at_the_proven_size() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// A window that starts past the size claim is refused at open: the caller
-/// knows the size (a manifest entry) and answers its own "range not
-/// satisfiable" before any fetch.
+/// A window that starts at or past the proven size is refused at open: the
+/// caller knows the size and answers its own "range not satisfiable" before
+/// any fetch.
 #[tokio::test]
-async fn a_window_past_the_claim_is_refused_at_open() -> anyhow::Result<()> {
+async fn a_window_past_the_proven_size_is_refused_at_open() -> anyhow::Result<()> {
     let blob = payload(100_000);
     let (source, ledger) = paying_source(blob)?;
     let root = source.root();
@@ -998,7 +998,7 @@ async fn a_window_past_the_claim_is_refused_at_open() -> anyhow::Result<()> {
         .await;
     anyhow::ensure!(
         opened.is_err(),
-        "a window at or past the claim must not open"
+        "a window at or past the proven size must not open"
     );
     anyhow::ensure!(
         probe.opened_ranges().is_empty(),
@@ -1095,10 +1095,10 @@ async fn a_window_past_a_short_first_size_streams_once_the_size_is_proven() -> a
     Ok(())
 }
 
-/// A window needs a size: only offset `0` opens against a zero claim (the
-/// empty blob, or a stream that learns the size from its first leg).
+/// Against a proven size of zero (the empty blob) only offset `0` opens: a
+/// deeper window starts past the end.
 #[tokio::test]
-async fn a_window_past_zero_needs_a_size_claim() -> anyhow::Result<()> {
+async fn a_window_past_zero_is_refused_for_an_empty_blob() -> anyhow::Result<()> {
     let blob = payload(100_000);
     let (source, ledger) = paying_source(blob)?;
     let root = source.root();
@@ -1115,7 +1115,10 @@ async fn a_window_past_zero_needs_a_size_claim() -> anyhow::Result<()> {
             stop(),
         )
         .await;
-    anyhow::ensure!(opened.is_err(), "a deep window with no size must not open");
+    anyhow::ensure!(
+        opened.is_err(),
+        "a deep window into an empty blob must not open"
+    );
     anyhow::ensure!(
         probe.opened_ranges().is_empty(),
         "nothing is fetched for it"
