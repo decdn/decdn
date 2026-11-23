@@ -5046,6 +5046,21 @@ async fn size_snapshot_counts_tail_bearing_partial_by_present_bytes_not_total() 
     Ok(())
 }
 
+/// The store lists the empty blob, which the client reports complete at size
+/// 0. It is never a cache entry, so the size walk leaves it out.
+#[tokio::test]
+async fn size_snapshot_leaves_out_the_empty_blob() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+    let hash = engine.insert_blob(b"snapshot-a".to_vec()).await?;
+    let sizes = engine.size_snapshot().await?;
+    anyhow::ensure!(
+        sizes.keys().copied().collect::<Vec<_>>() == vec![hash],
+        "expected only {hash}, got {sizes:?}"
+    );
+    Ok(())
+}
+
 /// The walk re-observes a partial only once its memoized count is a TTL
 /// old: within the TTL it reuses the count, after it it measures the new
 /// bytes. A hash that stops being partial leaves the memo.

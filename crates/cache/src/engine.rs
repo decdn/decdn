@@ -1383,6 +1383,10 @@ async fn snapshot_blob_sizes(
     let mut partials = HashSet::new();
     while let Some(hash) = stream.next().await {
         let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        // Size-proof tags hold the empty blob, which is never a cache entry.
+        if hash == Hash::EMPTY {
+            continue;
+        }
         let status = blobs
             .status(hash)
             .await
@@ -4784,7 +4788,8 @@ impl CacheEngine {
         let mut out = Vec::new();
         while let Some(hash) = stream.next().await {
             let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
-            if self.refuses(hash) {
+            // Size-proof tags hold the empty blob, which is never a cache entry.
+            if hash == Hash::EMPTY || self.refuses(hash) {
                 continue;
             }
             let status = match blobs.status(hash).await {
