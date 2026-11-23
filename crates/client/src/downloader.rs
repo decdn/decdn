@@ -544,18 +544,41 @@ enum Pass {
     Drifted,
 }
 
-/// Whether `dest` already holds the blob `hash`: an earlier run exported it.
-/// Hashed off the runtime; a file that cannot be read does not hold it.
+/// The bytes [`dest_holds`] reads at once: large enough that hashing each
+/// read on every core keeps them all busy.
+const HASH_READ_BYTES: usize = 16 * 1024 * 1024;
+
+/// Whether `dest` holds the blob `hash`: an earlier run exported it, or this
+/// run's export kept its bytes. Hashed off the runtime, in large reads each
+/// hashed on every core, so a multi-GB blob costs one fast read; a file that
+/// cannot be read does not hold it.
 async fn dest_holds(dest: &Path, hash: [u8; 32]) -> bool {
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        use std::io::Read as _;
         let mut file = match std::fs::File::open(&dest) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
         };
         let mut hasher = blake3::Hasher::new();
-        std::io::copy(&mut file, &mut hasher)?;
+        let mut buf = vec![0u8; HASH_READ_BYTES];
+        loop {
+            // Fill the buffer before hashing it, so every `update_rayon`
+            // call but the last sees a whole read.
+            let mut filled = 0;
+            while filled < buf.len() {
+                let n = file.read(buf.get_mut(filled..).unwrap_or_default())?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            hasher.update_rayon(buf.get(..filled).unwrap_or_default());
+            if filled < buf.len() {
+                break;
+            }
+        }
         Ok(*hasher.finalize().as_bytes() == hash)
     })
     .await

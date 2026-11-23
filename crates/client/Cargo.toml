@@ -51,7 +51,9 @@ iroh-blobs = { workspace = true }
 futures-util = { workspace = true }
 alloy = { workspace = true }
 anyhow = { workspace = true }
-blake3 = { workspace = true }
+# `rayon`: a finished download's whole-file hash runs on every core
+# (`Hasher::update_rayon`).
+blake3 = { workspace = true, features = ["rayon"] }
 bytes = { workspace = true }
 # A bundle pull lands every entry beneath the output directory's handle, so a
 # symlink in an entry's parent chain cannot move the write outside it (#2439).

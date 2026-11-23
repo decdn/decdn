@@ -599,6 +599,31 @@ async fn an_export_that_fails_its_hash_fetches_again() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The whole-file hash spans every read: a file several reads long that
+/// holds the blob matches, one with a byte changed in its last read does not,
+/// and a missing file holds nothing.
+#[tokio::test]
+async fn dest_holds_hashes_every_read_of_the_file() -> anyhow::Result<()> {
+    let len = 2 * super::HASH_READ_BYTES + 12_345;
+    let blob = payload(len);
+    let hash = *blake3::hash(&blob).as_bytes();
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("big.bin");
+    anyhow::ensure!(!super::dest_holds(&dest, hash).await, "no file");
+    std::fs::write(&dest, &blob)?;
+    anyhow::ensure!(super::dest_holds(&dest, hash).await, "the blob matches");
+    let mut changed = blob;
+    if let Some(b) = changed.last_mut() {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&dest, &changed)?;
+    anyhow::ensure!(
+        !super::dest_holds(&dest, hash).await,
+        "a changed last read does not match"
+    );
+    Ok(())
+}
+
 /// A finished download exports its blob and removes its store.
 #[tokio::test]
 async fn a_finished_download_removes_its_store() -> anyhow::Result<()> {
