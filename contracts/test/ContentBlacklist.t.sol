@@ -68,10 +68,6 @@ contract MockEjector is ICapacityBondEjector, ICapacityBondRegionView {
         _regionLastChanged[op] = lastChanged;
     }
 
-    function setWindow(uint256 window_) external {
-        window = window_;
-    }
-
     function regionScopeData(address operator)
         external
         view
@@ -131,7 +127,7 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
-    function test_addHashRegional_globalTakesPrecedence() public {
+    function test_addHashRegional_doesNotSetGlobal() public {
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-TEST");
         assertTrue(blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US));
@@ -235,10 +231,6 @@ contract ContentBlacklistTest is Test {
         assertTrue(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
-    // -----------------------------------------------------------------
-    // ADR 011 § Standing path-2 (Operator) region match (ADR 030)
-    // -----------------------------------------------------------------
-
     bytes32 internal constant REGION_EU = bytes32("EU");
 
     // -----------------------------------------------------------------
@@ -273,10 +265,6 @@ contract ContentBlacklistTest is Test {
         bondMock.setRegion(operator, "EU", "US", uint64(block.timestamp - 8 days));
         assertFalse(blacklist.isHashBlacklistedForOperator(SAMPLE_HASH, operator));
     }
-
-    // --- Publisher path ---
-
-    // --- TokenHolder path ---
 
     // -----------------------------------------------------------------
     // #1180 — on-chain `reason` audit trail (ADR 011 § Reason field)
@@ -430,8 +418,6 @@ contract ContentBlacklistTest is Test {
         assertFalse(blacklist.isHashBlacklisted(SAMPLE_HASH));
     }
 
-    /// @notice Governance ratification: re-adding under `addHashGlobal` clears
-    ///         `emergency`, so the entry stops self-expiring.
     /// @notice Re-adding or ratifying a live entry keeps `addedAt` and
     ///         `effectiveAt`, so evidence of a serve made after the entry took
     ///         effect stays valid. Only the reason and the emergency flag move.
@@ -456,6 +442,8 @@ contract ContentBlacklistTest is Test {
         assertEq(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).effectiveAt, before.effectiveAt);
     }
 
+    /// @notice Governance ratification: re-adding under `addHashGlobal` clears
+    ///         `emergency`, so the entry stops self-expiring.
     function test_emergencyAdd_ratifiedByGovernanceSurvivesExpiry() public {
         vm.prank(multisig);
         blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
@@ -594,17 +582,6 @@ contract ContentBlacklistTest is Test {
         blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.CSAM), "CSAM");
         vm.stopPrank();
         assertEq(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).category, uint8(ContentBlacklist.Category.CSAM));
-    }
-
-    /// @notice Ratification still works in the other direction: governance
-    ///         re-adding over an emergency entry makes it permanent. The guard
-    ///         constrains only the emergency entry point.
-    function test_addHashGlobal_stillRatifiesAnEmergencyEntry() public {
-        vm.prank(multisig);
-        blacklist.emergencyAdd(SAMPLE_HASH, uint8(ContentBlacklist.Category.GENERAL), "DMCA");
-        vm.prank(admin);
-        blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-RATIFIED");
-        assertFalse(blacklist.getHashEntry(GLOBAL_REGION, SAMPLE_HASH).emergency);
     }
 
     /// @notice REGRESSION, origin side: same escalation via
@@ -774,6 +751,11 @@ contract ContentBlacklistTest is Test {
         vm.prank(regionalBody);
         vm.expectRevert(abi.encodeWithSelector(ContentBlacklist.NotRegionalBodyFor.selector, REGION_US, regionalBody));
         blacklist.addHashRegional(REGION_US, bytes32(uint256(0xB9)), "DMCA-TEST");
+
+        // Deregistering the body leaves its entries live too.
+        vm.prank(admin);
+        blacklist.deregisterRegionalBody(REGION_US);
+        assertTrue(blacklist.isHashBlacklistedInRegion(SAMPLE_HASH, REGION_US));
     }
 
     function test_suspendRegionalBody_revertsWithoutMultisigRole() public {
