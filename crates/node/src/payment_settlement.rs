@@ -441,7 +441,9 @@ fn record_receipt_paid(
 /// `redeemMany` write path). Cheap to construct; owns its background tasks.
 pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     contract: PaymentPool::PaymentPoolInstance<P>,
-    redeem_tx: mpsc::Sender<LaneKey>,
+    /// A sender on the redeemer's hint channel, held so the channel stays open
+    /// while the service lives.
+    _redeem_tx: mpsc::Sender<LaneKey>,
     store: Arc<dyn PoolStateStore>,
     paid: PaidWatermarks,
     self_address: Address,
@@ -582,7 +584,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
 
         Ok(Self {
             contract,
-            redeem_tx,
+            _redeem_tx: redeem_tx,
             store,
             paid,
             self_address,
@@ -602,15 +604,6 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     #[must_use]
     pub fn redeem_schedule(&self) -> RedeemSchedule {
         self.schedule.clone()
-    }
-
-    /// Sender the voucher-accept path uses to hint that a lane's accrued claim
-    /// may be ready to plan into a chunk whose aggregate clears the redemption
-    /// floor. Cloneable; dropping all senders simply ends the redemption task
-    /// cleanly.
-    #[must_use]
-    pub fn redeem_hint_sender(&self) -> mpsc::Sender<LaneKey> {
-        self.redeem_tx.clone()
     }
 
     /// Graceful shutdown: stop the pool refresh, quiesce the redeemer, and run

@@ -25,8 +25,7 @@ use crate::lane::{LaneKey, LaneState, PoolId};
 /// [`LaneKey`] names a pool id, and a pool id repeats across deployments. A
 /// disk-backed implementation that keeps several deployments in one file
 /// prefixes every row key with the deployment, so a store opened for one
-/// deployment never reads or drops another's rows. [`PendingSettleStore`] is
-/// scoped the same way.
+/// deployment never reads or drops another's rows.
 ///
 /// The trait is intentionally synchronous. `record` and `forget` mutate a working
 /// set and MAY defer durability to [`flush`](PoolStateStore::flush); an
@@ -139,50 +138,6 @@ pub trait PoolStateStore: Send + Sync {
         let _ = (key, paid_cumulative);
         Ok(())
     }
-}
-
-/// A pool this node closed on-chain (graceful shutdown or grace-window sweep)
-/// that is awaiting the grace window to elapse before the provider's accrued
-/// claim finalizes (#327).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingSettle {
-    /// The pool awaiting finalization.
-    pub pool_id: B256,
-    /// Unix seconds after which the grace window has elapsed and the settle may
-    /// proceed. The sweep does not submit until `now >= settle_after`.
-    pub settle_after: u64,
-}
-
-/// Durable set of pools closed by this node that await finalization (#327).
-/// Separate from [`PoolStateStore`] because a settle needs only the pool id and
-/// a timestamp gate — not the voucher state — and the lifecycles differ.
-///
-/// Implementations MUST commit durably (fsync, on disk-backed impls) before
-/// returning `Ok` from `record_pending` / `forget_pending`.
-pub trait PendingSettleStore: Send + Sync {
-    /// Persist a closed pool awaiting settlement. Overwrites any existing entry
-    /// for the same pool (a re-close re-stamps the deadline).
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] if the durable write fails.
-    fn record_pending(&self, entry: &PendingSettle) -> Result<(), StoreError>;
-
-    /// Load every pool awaiting settlement. Called on each sweep tick (and once
-    /// at bring-up) to find pools whose grace window has elapsed.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] if the backing store is unreadable.
-    fn load_pending(&self) -> Result<Vec<PendingSettle>, StoreError>;
-
-    /// Drop the pending-settle entry for a finalized pool. Idempotent; a no-op
-    /// for an unknown pool.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`StoreError`] if the durable delete fails.
-    fn forget_pending(&self, pool_id: B256) -> Result<(), StoreError>;
 }
 
 /// Failure modes shared by every [`PoolStateStore`] implementation.

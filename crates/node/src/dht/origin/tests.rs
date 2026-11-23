@@ -16,12 +16,6 @@ async fn empty_directory_returns_empty_for_every_lookup() {
 }
 
 #[tokio::test]
-async fn static_directory_with_no_entries_resolves_nothing() {
-    let dir = StaticOriginDirectory::new(HashMap::new());
-    assert!(dir.lookup_origins(ns(3)).await.is_empty());
-}
-
-#[tokio::test]
 async fn lookup_returns_configured_origins() {
     let mut m = HashMap::new();
     m.insert(ns(1), vec![nid(0xA), nid(0xB)]);

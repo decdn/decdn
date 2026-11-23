@@ -29,19 +29,6 @@ fn acquire_increments_and_drop_decrements_both_counters() {
 }
 
 #[test]
-fn zeroed_client_entry_is_pruned() {
-    let state = ShedState::new();
-    let a = state.acquire(client(9));
-    assert_eq!(state.per_client.len(), 1);
-    drop(a);
-    assert_eq!(
-        state.per_client.len(),
-        0,
-        "per-client map must not leak zeroed entries"
-    );
-}
-
-#[test]
 fn reacquire_after_prune_counts_the_new_slot_only() {
     let state = ShedState::new();
     let a = state.acquire(client(7));

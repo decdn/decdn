@@ -75,7 +75,7 @@ fn a_whole_tail_runs_from_its_group_start_to_the_blob_end() {
 
 #[test]
 fn a_range_past_the_blob_end_clamps_to_the_blob() {
-    // The caller's bounds check rejects these, but the helper must not
-    // over-price if it is ever reached with a partial final group.
+    // An end past the blob is served clamped to the blob's end, so the price
+    // stops there too, partial final group included.
     assert_eq!(aligned_span(0, u64::MAX, 3 * G + 7), 3 * G + 7);
 }

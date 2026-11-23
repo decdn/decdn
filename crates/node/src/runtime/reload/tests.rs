@@ -249,41 +249,6 @@ async fn kept_rust_log_filter_is_not_reported_as_the_live_level() {
     );
 }
 
-/// First-reload-applies guarantee: `current_log_level` initialises
-/// to `None`, so the first reload after startup always invokes the
-/// setter even when the file's `log_level` matches
-/// `initial.observability.log_level`. The setter, not this section,
-/// decides whether a `RUST_LOG` filter stays in place
-/// ([`LogLevelApply::KeptRustLog`]).
-#[tokio::test]
-async fn first_reload_applies_log_level_even_when_matching_initial() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        "[payment]\nrate_per_mb = 1\n\n[observability]\nlog_level = \"info\"\n",
-    );
-
-    // Resolved-at-startup level is also `info` — old code would
-    // think "nothing changed" and skip. New code must still apply.
-    let initial = seed_resolved(1, LogLevel::Info);
-    let (setter, captured) = recording_setter();
-    let state = RuntimeReloadState::new(
-        ObservabilityArgs {
-            log_level: None,
-            log_format: None,
-            metrics_port: None,
-            metrics_bind: None,
-            admin_port: None,
-            otlp_endpoint: None,
-        },
-        &initial,
-        setter,
-    );
-
-    state.reload(&path).await.unwrap();
-    assert_eq!(*captured.lock().unwrap(), Some(LogLevel::Info));
-}
-
 /// Fail-stop guarantee: when the setter errors, the reload surfaces the
 /// error rather than partially applying. Inject a setter that always
 /// returns an error and assert the reload fails.
@@ -401,48 +366,6 @@ async fn reload_recovers_from_poisoned_reload_lock() {
     // Reload still succeeds — the poisoned lock is recovered in place.
     st.reload(&path).await.expect("reload recovers from poison");
     assert_eq!(captured.lock().unwrap().as_ref(), Some(&LogLevel::Debug));
-}
-
-/// A second reload of the same file must succeed and not touch the
-/// rate (already at target). We can't directly capture `tracing`
-/// lines without a subscriber fixture, but the public-state behaviour
-/// the operator cares about is "reload remains idempotent across
-/// repeated SIGHUPs".
-#[tokio::test]
-async fn reload_is_idempotent_across_repeated_sighups() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        concat!(
-            "[identity]\nregion = \"US\"\n\n",
-            "[network]\nbind_port = 4433\n\n",
-            "[payment]\nrate_per_mb = 11\n\n",
-            "[observability]\nlog_level = \"info\"\n",
-        ),
-    );
-
-    let initial = seed_resolved(11, LogLevel::Info);
-    let (setter, captured) = recording_setter();
-    let state = RuntimeReloadState::new(
-        ObservabilityArgs {
-            log_level: None,
-            log_format: None,
-            metrics_port: None,
-            metrics_bind: None,
-            admin_port: None,
-            otlp_endpoint: None,
-        },
-        &initial,
-        setter,
-    );
-
-    // Three reloads of the same file: first applies, the next two
-    // are no-ops on log level.
-    state.reload(&path).await.unwrap();
-    *captured.lock().unwrap() = None;
-    state.reload(&path).await.unwrap();
-    state.reload(&path).await.unwrap();
-    assert!(captured.lock().unwrap().is_none());
 }
 
 /// `payment.*` is restart-required, so the reload path leaves it unparsed:

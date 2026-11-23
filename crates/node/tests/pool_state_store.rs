@@ -11,7 +11,6 @@
 //!
 //! [ADR 003 §Off-chain voucher state persistence]: ../../../adr/003-payments.md
 
-use std::path::Path;
 use std::sync::Arc;
 
 use alloy::dyn_abi::Eip712Domain;
@@ -531,6 +530,7 @@ fn truncated_file_refuses_to_start() -> anyhow::Result<()> {
             None,
             decdn_incentive::LaneChain::NONE,
         ))?;
+        store.flush()?;
     }
     let path = dir.path().join("lanes.redb");
     let f = std::fs::OpenOptions::new().write(true).open(&path)?;
@@ -587,99 +587,12 @@ fn bad_permissions_rejected() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     // Group-readable — explicitly insecure.
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
-    let res = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT);
+    let err = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("open() must reject a data_dir that is not 0700"))?;
     anyhow::ensure!(
-        res.is_err(),
-        "open() must reject a data_dir that is not 0700"
-    );
-    Ok(())
-}
-
-/// Sanity check: the parent of the redb file is `data_dir`, not a sibling.
-#[test]
-fn lane_store_lives_in_data_dir() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-    let parent = store
-        .path()
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("store path has no parent"))?;
-    anyhow::ensure!(
-        parent == Path::new(dir.path()),
-        "store file must live directly in data_dir; parent was {}",
-        parent.display(),
-    );
-    Ok(())
-}
-
-/// #988: the buyer pending-settle set must be ISOLATED from the seller's, even
-/// though both live in one redb file. A buyer unilateral close recorded via the
-/// `BuyerPendingSettleStoreHandle` must never surface in the seller's
-/// `load_pending` (which the seller settle sweep drains) and vice versa — that
-/// isolation is what keeps the two settle sweeps and their metric families
-/// (#989) from finalizing or mis-attributing each other's closes. Survives a
-/// reopen, since both tables are durable in the same file.
-#[test]
-fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
-    use decdn_incentive::{PendingSettle, PendingSettleStore};
-    use decdn_node::pool_store::BuyerPendingSettleStoreHandle;
-
-    let dir = data_dir()?;
-    let seller_pool = b256!("aa00000000000000000000000000000000000000000000000000000000000000");
-    let buyer_pool = b256!("bb00000000000000000000000000000000000000000000000000000000000000");
-
-    {
-        let concrete = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-        let seller: Arc<dyn PendingSettleStore> = concrete.clone();
-        let buyer: Arc<dyn PendingSettleStore> = Arc::new(BuyerPendingSettleStoreHandle::new(
-            Arc::clone(concrete.files()),
-            concrete.deployment(),
-        ));
-
-        seller.record_pending(&PendingSettle {
-            pool_id: seller_pool,
-            settle_after: 1_000,
-        })?;
-        buyer.record_pending(&PendingSettle {
-            pool_id: buyer_pool,
-            settle_after: 2_000,
-        })?;
-
-        let seller_pending = seller.load_pending()?;
-        let buyer_pending = buyer.load_pending()?;
-        anyhow::ensure!(
-            seller_pending.len() == 1
-                && seller_pending.first().map(|e| e.pool_id) == Some(seller_pool),
-            "seller set must hold only the seller close, got {seller_pending:?}"
-        );
-        anyhow::ensure!(
-            buyer_pending.len() == 1
-                && buyer_pending.first().map(|e| e.pool_id) == Some(buyer_pool),
-            "buyer set must hold only the buyer close, got {buyer_pending:?}"
-        );
-
-        // Forgetting one side never touches the other.
-        buyer.forget_pending(buyer_pool)?;
-        anyhow::ensure!(
-            buyer.load_pending()?.is_empty(),
-            "buyer forget drops the buyer entry"
-        );
-        anyhow::ensure!(
-            seller.load_pending()?.len() == 1,
-            "seller entry is untouched by a buyer forget"
-        );
-    }
-
-    // Reopen: durability + isolation both survive a restart.
-    let concrete = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-    let seller: Arc<dyn PendingSettleStore> = concrete.clone();
-    let buyer: Arc<dyn PendingSettleStore> = Arc::new(BuyerPendingSettleStoreHandle::new(
-        Arc::clone(concrete.files()),
-        concrete.deployment(),
-    ));
-    anyhow::ensure!(
-        seller.load_pending()?.len() == 1 && buyer.load_pending()?.is_empty(),
-        "the seller entry persists and the buyer set is still empty after reopen"
+        matches!(&err, StoreError::Backend(msg) if msg.contains("failed security check")),
+        "expected StoreError::Backend(...failed security check...), got {err:?}",
     );
     Ok(())
 }

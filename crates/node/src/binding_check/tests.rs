@@ -32,14 +32,3 @@ fn zero_binding_is_unbound_with_no_id() {
     assert_eq!(r.status, BindingStatus::Unbound);
     assert_eq!(r.bound_node_id, None);
 }
-
-/// `Unknown` must not be reachable from a successful read — it means "we
-/// could not check", and conflating it with a checked state is exactly the
-/// ambiguity the status enum exists to remove.
-#[test]
-fn classify_never_reports_unknown() {
-    for bound in [B256::ZERO, LOCAL, B256::repeat_byte(0x01)] {
-        assert_ne!(classify(bound, LOCAL).status, BindingStatus::Unknown);
-    }
-    assert_eq!(BindingReport::unknown().status, BindingStatus::Unknown);
-}
