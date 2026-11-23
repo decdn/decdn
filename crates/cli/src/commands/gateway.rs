@@ -17,11 +17,12 @@
 //! are served as themselves, under a policy that confines the page to its
 //! origin. A site's `decdn:` URIs are rewritten as the page streams
 //! (`rewrite`) to `/_decdn/<hash>…` on the site's own origin, which serves
-//! that content to the page's own requests (a directory there its
-//! `index.html` too) and redirects a navigation to the other bundle's site.
-//! The browser's `Sec-Fetch-*` headers decide what may
-//! spend on a site origin (`site::may_spend`), and a site pays with the capabilities the gateway holds, as a content request
-//! does. The API paths answer on the gateway origin only.
+//! that content (and, for a directory, its `index.html`) to the page's own
+//! requests and redirects a navigation to the other bundle's site. The
+//! browser's `Sec-Fetch-*` headers decide what may spend on a site origin
+//! (`site::may_spend`), and a site pays with the capabilities the gateway
+//! holds, as a content request does. The API paths answer on the gateway
+//! origin only.
 //!
 //! **Capabilities.** A capability (ADR 003 § Capability delegation) lets a
 //! delegate key the gateway holds spend from a pool, so a pool owner funds a
@@ -1184,7 +1185,7 @@ impl Gateway {
             (&Method::PUT, "/_pointer") => self.put_pointer(req).await,
             (&Method::HEAD, "/" | "/favicon.ico") => text(StatusCode::OK, ""),
             (&Method::HEAD, _) => {
-                self.head_blob(target.trim_start_matches('/'), Present::Bare, None)
+                self.head_blob(target.trim_start_matches('/'), Present::Bare, None, false)
                     .await
             }
             _ => return Err(Box::new(req)),
@@ -1212,7 +1213,8 @@ impl Gateway {
     }
 
     /// A request on a site origin: the site's own entries, and `/_decdn/` for
-    /// content outside its bundle. `pointer` is the namespace whose pointer
+    /// any `decdn:` content, the site's own bundle included. `pointer` is the
+    /// namespace whose pointer
     /// named the site, when one did: a capability scoped to it pays for the
     /// site's own bundle, and for no other content on its host.
     async fn site<B>(
@@ -1249,33 +1251,35 @@ impl Gateway {
         // The pointer's own bundle, which a capability scoped to it pays for.
         let scoped_bundle = pointer.map(|ns| (ns, site.hash));
         let decdn = target.strip_prefix("/_decdn/").map(directory_index);
+        let query = req.uri().query();
         if head {
             return match decdn {
-                Some(rest) => self.head_blob(&rest, Present::Site, scoped_bundle).await,
-                None => self.head_site(&site, path, pointer).await,
+                Some((rest, directory)) => {
+                    self.head_blob(&rest, Present::Site, scoped_bundle, directory)
+                        .await
+                }
+                None => self.head_site(&site, path, query, pointer).await,
             };
         }
         let range = range_header(headers);
-        if let Some(rest) = decdn {
+        if let Some((rest, directory)) = decdn {
             let uri: DecdnUri = match format!("decdn:{rest}").parse() {
                 Ok(uri) => uri,
                 Err(e) => return text(StatusCode::BAD_REQUEST, &format!("{e}\n")),
             };
             let pointer = pointer.filter(|_| uri.hash == site.hash);
-            let get = Ask::Get {
-                range,
-                query: req.uri().query(),
-            };
+            let get = Ask::Get { range, query };
             if !site::is_navigation(headers) {
                 return self.paid(pointer, &uri, Present::Site, get).await;
             }
             // Another bundle's pages run on their own origin; a blob has none.
             return match uri.target {
                 UriTarget::Blob => self.paid(pointer, &uri, Present::Download, get).await,
-                _ => self.to_site(&uri),
+                _ => self.to_site(&uri, directory),
             };
         }
-        // The query belongs to the page's scripts; a directory serves its
+        // The query belongs to the page's scripts: the gateway reads none of
+        // it, and a directory's redirect keeps it. A directory serves its
         // `index.html`.
         let entry = if path.len() > 1 && path.ends_with('/') {
             format!("{path}index.html")
@@ -1287,13 +1291,8 @@ impl Gateway {
             Ok(uri) => DecdnUri::new(uri.hash, uri.target, site.namespace),
             Err(e) => return text(StatusCode::NOT_FOUND, &format!("{e}\n")),
         };
-        self.paid(
-            pointer,
-            &uri,
-            Present::Site,
-            Ask::Get { range, query: None },
-        )
-        .await
+        self.paid(pointer, &uri, Present::Site, Ask::Get { range, query })
+            .await
     }
 
     /// `PUT /_pointer`: store a namespace pointer signed by the namespace's
@@ -1394,14 +1393,22 @@ impl Gateway {
     }
 
     /// A redirect to the site that serves bundle `uri`, at its entry path.
-    fn to_site(&self, uri: &DecdnUri) -> Response<Body> {
+    /// `directory` says the request named a directory, whose `index.html`
+    /// `uri` names: the redirect goes to the directory itself.
+    fn to_site(&self, uri: &DecdnUri, directory: bool) -> Response<Body> {
         let site = Site {
             hash: uri.hash,
             namespace: uri.namespace,
         };
         let path = match &uri.target {
             UriTarget::Bundle => String::new(),
-            UriTarget::BundleEntry(path) => entry_link(uri.hash, path),
+            UriTarget::BundleEntry(path) => {
+                let link = entry_link(uri.hash, path);
+                match link.strip_suffix("index.html") {
+                    Some(dir) if directory => dir.to_owned(),
+                    _ => link,
+                }
+            }
             _ => return text(StatusCode::BAD_REQUEST, "a blob has no site\n"),
         };
         redirect(&format!(
@@ -1665,7 +1672,7 @@ impl Gateway {
         if matches!(uri.target, UriTarget::Bundle | UriTarget::BundleEntry(_))
             && (navigation || self.public())
         {
-            return self.to_site(&uri);
+            return self.to_site(&uri, false);
         }
         let get = Ask::Get {
             range: range_header(headers),
@@ -1937,7 +1944,7 @@ impl Gateway {
     /// lacks answers 404, and so does a blob that is not a manifest or a
     /// malformed one ([`Self::manifest`]). On a site, a path that names a
     /// directory with an `index.html` redirects to the directory, with the
-    /// request's query kept (under `/_decdn/`, its `ns=` hint). An entry
+    /// request's query kept ([`to_directory`]). An entry
     /// whose pull, by its declared size, passes `--max-blob-mb` answers 413
     /// before any pull, as a raw blob does ([`Self::over_blob_cap`]).
     async fn entry(
@@ -1976,14 +1983,7 @@ impl Gateway {
         }
         let index = format!("{path}/index.html");
         if present == Present::Site && manifest.entries.iter().any(|e| e.path == index) {
-            // Relative to the request, so it holds under `/_decdn/` too, with
-            // the request's `ns=` hint kept.
-            let link = entry_link(manifest_hash, path);
-            let last = link.rsplit('/').next().unwrap_or(&link);
-            return Ok(redirect(&match query {
-                Some(query) => format!("{last}/?{query}"),
-                None => format!("{last}/"),
-            }));
+            return Ok(to_directory(manifest_hash, path, query));
         }
         Ok(text(
             StatusCode::NOT_FOUND,
@@ -2355,7 +2355,9 @@ impl Gateway {
     /// ([`Self::blob_size`]), at no pull; a blob of unknown size learns its
     /// size as its `GET` would ([`Self::learn_size`]), paid as [`Self::paid`]
     /// pays. A bundle or an entry redirects to its site, at no pull, where
-    /// `GET` under `/_decdn/` would serve a page's request for it inline.
+    /// `GET` under `/_decdn/` would serve a page's request for it inline; a
+    /// `directory` (`rest` names its `index.html`) redirects to the directory
+    /// on the site.
     ///
     /// `scoped_bundle` is a pointer's namespace and the bundle it names, on
     /// that namespace's host: a capability scoped to the namespace pays for
@@ -2365,6 +2367,7 @@ impl Gateway {
         rest: &str,
         present: Present,
         scoped_bundle: Option<(u64, [u8; 32])>,
+        directory: bool,
     ) -> Response<Body> {
         let uri: DecdnUri = match format!("decdn:{rest}").parse() {
             Ok(uri) => uri,
@@ -2381,7 +2384,7 @@ impl Gateway {
                 }
                 None => self.paid(namespace, &uri, present, Ask::Head).await,
             },
-            UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri),
+            UriTarget::Bundle | UriTarget::BundleEntry(_) => self.to_site(&uri, directory),
             _ => text(StatusCode::BAD_REQUEST, "unsupported URI target\n"),
         }
     }
@@ -2390,11 +2393,14 @@ impl Gateway {
     /// which the gateway pulls once and caches, so the request costs no pull
     /// of the entry. A directory answers for its `index.html`, and the root
     /// for the bundle's; a response the gateway would rewrite has no length.
-    /// `pointer` is the namespace whose pointer named the site, if any.
+    /// A path that names a directory redirects to it with `query` kept, as
+    /// `GET` does. `pointer` is the namespace whose pointer named the site,
+    /// if any.
     async fn head_site(
         self: &Arc<Self>,
         site: &Site,
         path: &str,
+        query: Option<&str>,
         pointer: Option<u64>,
     ) -> Response<Body> {
         // The same resolution as `GET`: a directory is its `index.html`, and
@@ -2447,9 +2453,7 @@ impl Gateway {
         let Some(entry) = manifest.entries.iter().find(|e| e.path == path) else {
             let index = format!("{path}/index.html");
             if manifest.entries.iter().any(|e| e.path == index) {
-                let link = entry_link(site.hash, path);
-                let last = link.rsplit('/').next().unwrap_or(&link);
-                return redirect(&format!("{last}/"));
+                return to_directory(site.hash, path, query);
             }
             return text(
                 StatusCode::NOT_FOUND,
@@ -2959,11 +2963,11 @@ fn entry_link(hash: [u8; 32], path: &str) -> String {
     uri.get(ENTRY_PATH_OFFSET..).unwrap_or_default().to_owned()
 }
 
-/// A site's `/_decdn/<rest>` as the rest of a `decdn:` URI: a directory in
-/// a bundle (`<hash>/<dir>/`) names its `index.html`, as a site's own
-/// directory paths do. The bundle root (`<hash>/`) and the query stay as they
-/// are.
-fn directory_index(rest: &str) -> String {
+/// A site's `/_decdn/<rest>` as the rest of a `decdn:` URI, and whether it
+/// names a directory: a directory in a bundle (`<hash>/<dir>/`) names its
+/// `index.html`, as a site's own directory paths do. The bundle root
+/// (`<hash>/`) and the query stay as they are.
+fn directory_index(rest: &str) -> (String, bool) {
     let (path, query) = match rest.split_once('?') {
         Some((path, query)) => (path, Some(query)),
         None => (rest, None),
@@ -2972,10 +2976,23 @@ fn directory_index(rest: &str) -> String {
         .split_once('/')
         .is_some_and(|(_, entry)| !entry.is_empty() && entry.ends_with('/'));
     let index = if directory { "index.html" } else { "" };
-    match query {
+    let rest = match query {
         Some(query) => format!("{path}{index}?{query}"),
         None => format!("{path}{index}"),
-    }
+    };
+    (rest, directory)
+}
+
+/// A redirect from entry `path` of bundle `hash` to the directory it names,
+/// with the request's `query` kept. The location is relative to the request,
+/// so it holds on a site's own path and under `/_decdn/` alike.
+fn to_directory(hash: [u8; 32], path: &str, query: Option<&str>) -> Response<Body> {
+    let link = entry_link(hash, path);
+    let last = link.rsplit('/').next().unwrap_or(&link);
+    redirect(&match query {
+        Some(query) => format!("{last}/?{query}"),
+        None => format!("{last}/"),
+    })
 }
 
 /// Where an entry's path starts in its `decdn:` URI: past `decdn:<hash>/`.
@@ -3260,8 +3277,7 @@ enum Ask<'a> {
     Get {
         /// Its `Range` header.
         range: Option<&'a str>,
-        /// Its query, which a directory's redirect keeps: a `/_decdn/`
-        /// URI's `ns=` hint. `None` where the query is not the gateway's.
+        /// Its query, which a directory's redirect keeps.
         query: Option<&'a str>,
     },
     /// A `HEAD` of a blob: its headers alone.

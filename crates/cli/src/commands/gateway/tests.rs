@@ -982,6 +982,10 @@ async fn a_site_directory_serves_its_index() {
     let bare = request(&gateway, &host, "/docs", CLICK).await;
     assert_eq!(bare.status, StatusCode::FOUND);
     assert_eq!(bare.header(header::LOCATION), Some("docs/"));
+    // The query belongs to the page, and the redirect keeps it.
+    let queried = request(&gateway, &host, "/docs?tab=2", CLICK).await;
+    assert_eq!(queried.status, StatusCode::FOUND);
+    assert_eq!(queried.header(header::LOCATION), Some("docs/?tab=2"));
     let missing = request(&gateway, &host, "/nope.html", CLICK).await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
     assert!(
@@ -1031,6 +1035,14 @@ async fn a_directory_under_decdn_serves_its_index() {
         (hinted_docs.status, hinted_docs.body.as_str()),
         (StatusCode::OK, "<p>docs</p>")
     );
+    // A navigation opens the directory itself on the bundle's site.
+    let opened = request(&gateway, &host, &format!("/_decdn/{hex}/docs/"), CLICK).await;
+    assert_eq!(opened.status, StatusCode::FOUND, "{}", opened.body);
+    let docs_url = format!("{}/docs/", gateway.sites.origin(&host));
+    assert_eq!(opened.header(header::LOCATION), Some(docs_url.as_str()));
+    // A directory without an `index.html` has nothing to serve.
+    let bare_dir = request(&gateway, &host, &format!("/_decdn/{hex}/css/"), SAME_ORIGIN).await;
+    assert_eq!(bare_dir.status, StatusCode::NOT_FOUND, "{}", bare_dir.body);
 }
 
 /// A directory under `/_decdn/` names its `index.html`; the bundle root, a
@@ -1038,21 +1050,25 @@ async fn a_directory_under_decdn_serves_its_index() {
 #[test]
 fn directory_index_names_a_bundle_directorys_index() {
     let h = alloy::hex::encode(BLOB);
-    assert_eq!(
-        directory_index(&format!("{h}/docs/")),
-        format!("{h}/docs/index.html")
-    );
-    assert_eq!(
-        directory_index(&format!("{h}/docs/?ns=7")),
-        format!("{h}/docs/index.html?ns=7")
-    );
+    for (rest, named) in [
+        (format!("{h}/docs/"), format!("{h}/docs/index.html")),
+        (
+            format!("{h}/docs/?ns=7"),
+            format!("{h}/docs/index.html?ns=7"),
+        ),
+        (format!("{h}/a/b/"), format!("{h}/a/b/index.html")),
+        // An empty segment stays one, for the URI parser to refuse.
+        (format!("{h}//"), format!("{h}//index.html")),
+    ] {
+        assert_eq!(directory_index(&rest), (named, true), "{rest}");
+    }
     for same in [
         format!("{h}/"),
         h.clone(),
         format!("{h}/a.txt?ns=7"),
         format!("{h}/?ns=7"),
     ] {
-        assert_eq!(directory_index(&same), same);
+        assert_eq!(directory_index(&same), (same.clone(), false));
     }
 }
 
@@ -2481,7 +2497,7 @@ async fn a_site_answers_head_under_decdn() {
 }
 
 /// `HEAD` of a directory under a site's `/_decdn/` redirects to the
-/// directory's `index.html` on the bundle's site, at no pull.
+/// directory on the bundle's site, at no pull.
 #[tokio::test]
 async fn a_site_answers_head_for_a_directory_under_decdn() {
     let (gateway, logs, host) = public_gateway().await;
@@ -2497,7 +2513,7 @@ async fn a_site_answers_head_for_a_directory_under_decdn() {
     assert_eq!(docs.status, StatusCode::FOUND, "{}", docs.body);
     assert_eq!(
         docs.header(header::LOCATION),
-        Some(format!("https://{host}/docs/index.html").as_str())
+        Some(format!("https://{host}/docs/").as_str())
     );
     assert!(logs.caps.lock().unwrap().is_empty(), "HEAD pulls nothing");
 }
