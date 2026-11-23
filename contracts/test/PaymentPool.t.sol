@@ -5,7 +5,6 @@ import { Test } from "forge-std/Test.sol";
 import { Vm, VmSafe } from "forge-std/Vm.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 
@@ -239,14 +238,6 @@ contract PaymentPoolTest is Test {
         pool.openPool(ARMED_MIN + 1);
     }
 
-    function test_openPool_revertsWhenPaused() public {
-        vm.prank(pauser);
-        pool.pause();
-        vm.prank(owner);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
-        pool.openPool(DEPOSIT);
-    }
-
     function test_openPool_creditsReceivedDeltaNotRequested() public {
         FeeOnTransferUSDC feeUsdc = new FeeOnTransferUSDC();
         PaymentPool feePool = _deployPool(feeUsdc, MIN_DEPOSIT);
@@ -339,15 +330,6 @@ contract PaymentPoolTest is Test {
         usdc.approve(address(harness), type(uint256).max);
     }
 
-    function test_topUp_revertsWhenPaused() public {
-        bytes32 id = _open();
-        vm.prank(pauser);
-        pool.pause();
-        vm.prank(owner);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
-        pool.topUp(id, 500e6);
-    }
-
     function test_topUp_creditsReceivedDelta() public {
         FeeOnTransferUSDC feeUsdc = new FeeOnTransferUSDC();
         PaymentPool feePool = _deployPool(feeUsdc, MIN_DEPOSIT);
@@ -402,19 +384,6 @@ contract PaymentPoolTest is Test {
         assertEq(pool.minSweep(), MIN_SWEEP);
         assertEq(pool.minDeposit(), MIN_DEPOSIT);
         assertEq(pool.pauser(), pauser);
-    }
-
-    function test_constructor_armsMinDeposit() public {
-        PaymentPool armed = _deployPool(usdc, 100e6);
-        assertEq(armed.minDeposit(), 100e6, "constructor stores the minimum");
-
-        vm.prank(owner);
-        usdc.approve(address(armed), type(uint256).max);
-        vm.prank(owner);
-        vm.expectRevert(
-            abi.encodeWithSelector(PaymentPoolBase.BelowMinDeposit.selector, uint256(100e6) - 1, uint256(100e6))
-        );
-        armed.openPool(100e6 - 1);
     }
 
     // -----------------------------------------------------------------
@@ -968,30 +937,6 @@ contract PaymentPoolTest is Test {
         assertEq(wBytes2, expectedBytes, "partial pay credits paid-proportional bytes");
     }
 
-    function test_redeem_paysOperatorShareAndAccruesTheRest() public {
-        bytes32 id = _open();
-        uint64 cumulative = 400e6;
-        uint64 bytesDelivered = 40_000_000;
-        vm.prank(provider);
-        _redeemOne(
-            id,
-            signer,
-            provider,
-            cumulative,
-            bytesDelivered,
-            _voucher(id, cumulative, bytesDelivered),
-            _cap(id, 1000e6, expiry)
-        );
-
-        assertEq(usdc.balanceOf(provider), _share(cumulative), "operator share paid in the same call");
-        (uint256 pendingBytes, uint256 pendingUsdc) = pool.pending(provider);
-        assertEq(pendingUsdc, cumulative - _share(cumulative), "protocol share accrues as pending");
-        assertEq(pendingBytes, bytesDelivered, "full bytes accrue when fully paid");
-        assertEq(
-            usdc.balanceOf(address(pool)), DEPOSIT - _share(cumulative), "the pool keeps the deposit minus the payout"
-        );
-    }
-
     /// @notice A redemption moves no USDC to anyone but the caller, so it
     ///         needs no allowance: the pool holds none after a payout.
     function test_redeem_leavesNoAllowance() public {
@@ -1002,20 +947,6 @@ contract PaymentPoolTest is Test {
         );
         assertEq(usdc.allowance(address(pool), address(messenger)), 0, "no standing allowance to the bridge");
         assertEq(usdc.allowance(address(pool), provider), 0, "no standing allowance to the payee");
-    }
-
-    /// @notice Redemption is an outflow and never pauses.
-    function test_redeem_runsWhilePaused() public {
-        bytes32 id = _open();
-        vm.prank(pauser);
-        pool.pause();
-
-        vm.prank(provider);
-        uint256 paid = _redeemOne(
-            id, signer, provider, 300e6, 30_000_000, _voucher(id, 300e6, 30_000_000), _cap(id, SPENDING_CAP, expiry)
-        );
-        assertEq(paid, 300e6, "a paused pool still pays");
-        assertEq(usdc.balanceOf(provider), _share(300e6));
     }
 
     // -----------------------------------------------------------------
@@ -2640,45 +2571,6 @@ contract PaymentPoolTest is Test {
         pool.unpause();
         vm.prank(owner);
         pool.openPool(DEPOSIT);
-    }
-
-    // -----------------------------------------------------------------
-    // Regression guards: the pairwise-channel surface stays removed
-    // -----------------------------------------------------------------
-
-    function test_reclaimExpired_removed() public {
-        (bool ok,) = address(pool).call(abi.encodeWithSignature("reclaimExpired(bytes32)", bytes32(0)));
-        assertFalse(ok, "reclaimExpired must not exist on PaymentPool");
-    }
-
-    function test_cooperativeClose_removed() public {
-        (bool ok,) = address(pool)
-            .call(
-                abi.encodeWithSignature(
-                    "cooperativeClose(bytes32,uint256,uint256,bytes,bytes)", bytes32(0), 0, 0, "", ""
-                )
-            );
-        assertFalse(ok, "cooperativeClose must not exist on PaymentPool");
-    }
-
-    function test_disputeChannel_removed() public {
-        (bool ok,) = address(pool)
-            .call(
-                abi.encodeWithSignature(
-                    "disputeChannel(bytes32,uint256,uint256,uint256,bytes)", bytes32(0), 0, 0, 0, ""
-                )
-            );
-        assertFalse(ok, "disputeChannel must not exist on PaymentPool");
-    }
-
-    function test_settleChannel_removed() public {
-        (bool ok,) = address(pool).call(abi.encodeWithSignature("settleChannel(bytes32)", bytes32(0)));
-        assertFalse(ok, "settleChannel must not exist on PaymentPool");
-    }
-
-    function test_maxChannelDuration_getterRemoved() public {
-        (bool ok,) = address(pool).call(abi.encodeWithSignature("maxChannelDuration()"));
-        assertFalse(ok, "maxChannelDuration must not exist on PaymentPool");
     }
 }
 

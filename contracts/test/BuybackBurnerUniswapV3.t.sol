@@ -48,10 +48,6 @@ contract MockV3Pool {
         f = f_;
     }
 
-    function setSqrtPrice(uint160 sqrtP_) external {
-        sqrtP = sqrtP_;
-    }
-
     function slot0() external view returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
         return (sqrtP, int24(0), uint16(0), uint16(0), uint16(0), uint8(0), true);
     }

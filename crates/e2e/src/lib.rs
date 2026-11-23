@@ -24,7 +24,7 @@
 //! binary, so a journey that drives a real chain requires both Foundry and a
 //! prior `cargo build` of the workspace binaries. They always *compile*; only
 //! the tests that actually run a chain are gated (see the crate's `anvil-e2e`
-//! feature and `tests/smoke.rs`).
+//! feature).
 
 // Test-infra crate: second-scale timeouts read more clearly as `from_secs`, and
 // the ABI/CLI proper nouns in the docs (MintableUSDC, SIGKILL, …) aren't worth

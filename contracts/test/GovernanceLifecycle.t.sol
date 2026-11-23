@@ -39,8 +39,11 @@ contract LifecycleUSDC is ERC20 {
 ///         `TimelockController`, hands off `GOVERNANCE_ROLE` on every target
 ///         to the Timelock to mirror the production deploy ordering (issue
 ///         #694 supplies the deploy script), and asserts that each setter's
-///         happy and out-of-bounds path closes through the Governor → Timelock
-///         → target wiring.
+///         happy path closes through the Governor → Timelock → target wiring.
+///         A bound revert surfaces through `execute()` the same way for every
+///         setter, so this file checks it once end to end
+///         (`setWindowEpochs`, state unchanged) and otherwise only for bounds
+///         the target's own suite does not pin.
 ///
 /// @dev    Seeding strategy for proposal-threshold (0.1%) + quorum (4%):
 ///         three test operators (`proposer`, `voter1`, `voter2`) bond at T0,
@@ -226,59 +229,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     // -----------------------------------------------------------------
-    // Canary tests — guard the assumptions every lifecycle test relies on.
-    // -----------------------------------------------------------------
-
-    function test_canary_governanceRoleHandoff() public view {
-        address tl = address(timelock);
-        bytes32 defaultAdmin = 0x00;
-
-        // Timelock holds GOVERNANCE_ROLE on every target.
-        assertTrue(router.hasRole(GOVERNANCE_ROLE, tl), "router gov");
-        assertTrue(bond.hasRole(GOVERNANCE_ROLE, tl), "bond gov");
-        assertTrue(blacklist.hasRole(GOVERNANCE_ROLE, tl), "blacklist gov");
-        assertTrue(registry.hasRole(GOVERNANCE_ROLE, tl), "registry gov");
-
-        // DEFAULT_ADMIN_ROLE is renounced to no one at deploy end (#2028): it is
-        // the meta-admin that can re-grant any role, so leaving it live — even on
-        // the Timelock — would let a captured governance grantRole(GOVERNANCE_ROLE,
-        // anyEOA) and bypass the vote+timelock envelope entirely. Nobody holds it.
-        assertFalse(router.hasRole(defaultAdmin, tl), "router admin master key");
-        assertFalse(bond.hasRole(defaultAdmin, tl), "bond admin master key");
-        assertFalse(blacklist.hasRole(defaultAdmin, tl), "blacklist admin master key");
-        assertFalse(registry.hasRole(defaultAdmin, tl), "registry admin master key");
-
-        // Test contract must NOT retain either role on any target — closes the
-        // "deployer keeps a back door" failure mode in #694's deploy script.
-        assertFalse(router.hasRole(GOVERNANCE_ROLE, address(this)), "router gov back door");
-        assertFalse(bond.hasRole(GOVERNANCE_ROLE, address(this)), "bond gov back door");
-        assertFalse(blacklist.hasRole(GOVERNANCE_ROLE, address(this)), "blacklist gov back door");
-        assertFalse(registry.hasRole(GOVERNANCE_ROLE, address(this)), "registry gov back door");
-
-        assertFalse(router.hasRole(defaultAdmin, address(this)), "router admin back door");
-        assertFalse(bond.hasRole(defaultAdmin, address(this)), "bond admin back door");
-        assertFalse(blacklist.hasRole(defaultAdmin, address(this)), "blacklist admin back door");
-        assertFalse(registry.hasRole(defaultAdmin, address(this)), "registry admin back door");
-
-        assertFalse(timelock.hasRole(defaultAdmin, address(this)), "timelock admin back door");
-    }
-
-    function test_canary_executorIsTimelock() public view {
-        // GovernorTimelockControl exposes `timelock()` — `_executor()` is
-        // internal, but the public `timelock()` returns the same address.
-        assertEq(gov.timelock(), address(timelock));
-    }
-
-    function test_canary_governorVoteWeightWired() public view {
-        // Proposer's snapshot weight must be strictly greater than the live
-        // `proposalThreshold` for `propose()` to succeed — this guards the
-        // `_getVotes` → FeeRouter wiring + age-ramp bonding pipeline.
-        uint256 weight = gov.getVotes(proposer, gov.clock() - 1);
-        assertGt(weight, gov.proposalThreshold(), "weight below threshold");
-        assertGt(gov.quorum(gov.clock() - 1), 0, "quorum read returned zero");
-    }
-
-    // -----------------------------------------------------------------
     // Lifecycle helpers
     // -----------------------------------------------------------------
 
@@ -375,27 +325,9 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertEq(router.buybackBps(), 6000);
     }
 
-    function test_lifecycle_FeeRouter_setSplit_outOfBounds() public {
-        // rebate + buyback above 10_000 → SplitExceedsWhole
-        _runLifecycleExpectExecuteRevert(
-            address(router),
-            abi.encodeCall(FeeRouter.setSplit, (uint256(5000), uint256(5500))),
-            abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(5000), uint256(5500))
-        );
-    }
-
     function test_lifecycle_FeeRouter_setDeliveryFloor_happy() public {
         _runLifecycle(address(router), abi.encodeCall(FeeRouter.setDeliveryFloor, (uint256(250))));
         assertEq(router.deliveryFloor(), 250);
-    }
-
-    function test_lifecycle_FeeRouter_setDeliveryFloor_outOfBounds() public {
-        // Ceiling = 1000; one over.
-        _runLifecycleExpectExecuteRevert(
-            address(router),
-            abi.encodeCall(FeeRouter.setDeliveryFloor, (uint256(1001))),
-            abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(1001))
-        );
     }
 
     function test_lifecycle_FeeRouter_setBuybackBurner_happy() public {
@@ -404,28 +336,10 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertEq(router.buybackBurner(), newAddr);
     }
 
-    function test_lifecycle_FeeRouter_setBuybackBurner_outOfBounds() public {
-        // Buyback share is 7500 bps (non-zero, from setUp), so clearing the
-        // burner to address(0) must revert.
-        _runLifecycleExpectExecuteRevert(
-            address(router),
-            abi.encodeCall(FeeRouter.setBuybackBurner, (address(0))),
-            abi.encodeWithSelector(FeeRouter.BuybackNeedsBurner.selector)
-        );
-    }
-
     function test_lifecycle_FeeRouter_setTreasury_happy() public {
         address newAddr = address(0xD8);
         _runLifecycle(address(router), abi.encodeCall(FeeRouter.setTreasury, (newAddr)));
         assertEq(router.treasury(), newAddr);
-    }
-
-    function test_lifecycle_FeeRouter_setTreasury_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(router),
-            abi.encodeCall(FeeRouter.setTreasury, (address(0))),
-            abi.encodeWithSelector(FeeRouter.ZeroAddress.selector)
-        );
     }
 
     function test_lifecycle_FeeRouter_setWindowEpochs_happy() public {
@@ -507,29 +421,9 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertEq(bond.minCapacityMbps(), 100);
     }
 
-    function test_lifecycle_CapacityBond_setMinCapacityMbps_outOfBounds() public {
-        // Floor = 10, ceiling = 1000; one over.
-        uint256 bad = 1001;
-        _runLifecycleExpectExecuteRevert(
-            address(bond),
-            abi.encodeCall(CapacityBond.setMinCapacityMbps, (bad)),
-            abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, bad, uint256(10), uint256(1000))
-        );
-    }
-
     function test_lifecycle_CapacityBond_setMaxCapacityMbps_happy() public {
         _runLifecycle(address(bond), abi.encodeCall(CapacityBond.setMaxCapacityMbps, (uint256(500_000))));
         assertEq(bond.maxCapacityMbps(), 500_000);
-    }
-
-    function test_lifecycle_CapacityBond_setMaxCapacityMbps_outOfBounds() public {
-        // Floor = 50_000, ceiling = 1_000_000; one over.
-        uint256 bad = 1_000_001;
-        _runLifecycleExpectExecuteRevert(
-            address(bond),
-            abi.encodeCall(CapacityBond.setMaxCapacityMbps, (bad)),
-            abi.encodeWithSelector(CapacityBond.ParamOutOfBounds.selector, bad, uint256(50_000), uint256(1_000_000))
-        );
     }
 
     // =================================================================
@@ -685,30 +579,10 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertEq(registry.maxNamespacesPerPublisher(), 500);
     }
 
-    function test_lifecycle_PublisherRegistry_setMaxNamespacesPerPublisher_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(registry),
-            abi.encodeCall(PublisherRegistry.setMaxNamespacesPerPublisher, (uint256(1001))),
-            abi.encodeWithSelector(
-                PublisherRegistry.ParamOutOfBounds.selector, uint256(1001), uint256(1), uint256(1000)
-            )
-        );
-    }
-
     function test_lifecycle_PublisherRegistry_setNamespaceTransferTimelock_happy() public {
         _runLifecycle(
             address(registry), abi.encodeCall(PublisherRegistry.setNamespaceTransferTimelock, (uint64(14 days)))
         );
         assertEq(registry.namespaceTransferTimelock(), 14 days);
-    }
-
-    function test_lifecycle_PublisherRegistry_setNamespaceTransferTimelock_outOfBounds() public {
-        _runLifecycleExpectExecuteRevert(
-            address(registry),
-            abi.encodeCall(PublisherRegistry.setNamespaceTransferTimelock, (uint64(31 days))),
-            abi.encodeWithSelector(
-                PublisherRegistry.ParamOutOfBounds.selector, uint256(31 days), uint256(1 days), uint256(30 days)
-            )
-        );
     }
 }

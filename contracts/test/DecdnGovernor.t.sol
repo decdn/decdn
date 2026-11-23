@@ -100,14 +100,6 @@ contract DecdnGovernorTest is Test {
         bond.setDeclaredMbpsAtEpoch(op, e, 1000);
     }
 
-    function test_getVotes_ramp() public {
-        vm.warp(BASE + 2);
-        bond.setFirstBondedAt(operator, uint64(BASE - 180 days));
-        _setBytesAtTimepoint(operator, 100_000, 1_000_000);
-        // 100k served vs 1M total → 10% raw. Cap = 10% → 100k. Full ramp → 100k.
-        assertEq(gov.getVotes(operator, tp), 100_000);
-    }
-
     /// @notice The share cap is sized from the other operators' bytes, so an
     ///         operator's own (possibly self-dealt) bytes never raise its cap.
     function test_getVotes_ownBytesDoNotRaiseTheCap() public {

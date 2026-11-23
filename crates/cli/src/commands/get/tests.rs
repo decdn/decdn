@@ -151,17 +151,6 @@ fn bad_uri_is_an_error() {
 }
 
 #[test]
-fn the_old_commands_are_gone() {
-    let argvs: [&[&str]; 2] = [
-        &["decdn", "fetch", "--hash", HEX, "-o", "x"],
-        &["decdn", "bundle", "pull", "--hash", HEX, "-o", "x"],
-    ];
-    for argv in argvs {
-        assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
-    }
-}
-
-#[test]
 fn output_defaults_follow_the_uri_target() {
     let cases = [
         (

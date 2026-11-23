@@ -219,17 +219,6 @@ fn tier_step_declares_down_and_rejects_raising() {
     assert!(msg.contains("decdn node bond --mbps"), "{msg}");
 }
 
-/// The gate exists so an operator cannot leave the active set by accident,
-/// so the headless-and-unconfirmed case must REFUSE rather than assume
-/// consent — the one wrong answer here is expensive to undo.
-#[test]
-fn headless_unbond_without_yes_refuses() {
-    assert_eq!(decide_confirmation(false, false), Confirmation::NeedFlag);
-    assert_eq!(decide_confirmation(false, true), Confirmation::Prompt);
-    assert_eq!(decide_confirmation(true, false), Confirmation::Bypassed);
-    assert_eq!(decide_confirmation(true, true), Confirmation::Bypassed);
-}
-
 /// An `unbond` that may have taken effect outranks the `declareMbps` before
 /// it: an operator whose TOKEN may already be released must be told so, and
 /// told that a re-run of `--amount` releases the amount again.

@@ -76,7 +76,7 @@ const STOP_BUDGET: Duration = Duration::from_secs(60);
 /// Payload size for the paid leg. 2 MiB at the fixture's 10 micro-USDC/MiB is
 /// a 20 micro-USDC claim, above the fixture's 10 micro-USDC redeem threshold, so
 /// the seller really does redeem and on-chain served-bytes really do advance —
-/// the same sizing `smoke.rs` relies on.
+/// the same sizing `g_node_01_onboarding.rs` relies on.
 const PAYLOAD_LEN: usize = 2 * MIB;
 
 /// The Ethereum leg runs four sequential CLI invocations, the last of which
@@ -286,8 +286,8 @@ async fn run_rotation() -> anyhow::Result<()> {
     // Backwards: the delivery paid for under the OLD identity settles. Paid
     // bytes are WIRE bytes (content plus interleaved bao proof nodes, ADR 038
     // § Payment metering), and the closing partial-group voucher may or may not
-    // have landed by read time — so bound it on both sides the way `smoke.rs`
-    // does rather than asserting an exact figure (#1381).
+    // have landed by read time — so bound it on both sides the way
+    // `g_node_01_onboarding.rs` does rather than asserting an exact figure (#1381).
     let content_bytes = U256::from(payload.len());
     let wire_bytes = U256::from(
         decdn_bao_range::align_range(0, 0, u64::try_from(payload.len())?)

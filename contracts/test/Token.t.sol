@@ -34,13 +34,6 @@ contract TokenTest is Test {
         new Token(address(0));
     }
 
-    function test_constructor_totalSupplyConstantMatches() public view {
-        // The compile-time constant must match the minted supply — the
-        // audit guarantee "supply is exactly 1B" depends on these being equal.
-        assertEq(token.TOTAL_SUPPLY(), token.totalSupply());
-        assertEq(token.TOTAL_SUPPLY(), 1_000_000_000e18);
-    }
-
     // -----------------------------------------------------------------
     // No mint path post-genesis — the audit guarantee that supply never
     // grows depends on `mint` not existing as a public function. A

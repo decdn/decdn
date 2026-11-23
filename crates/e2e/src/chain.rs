@@ -31,9 +31,7 @@ use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use anyhow::Context;
-use decdn_incentive::{
-    binding_signing_hash, capacity_bond_domain, node_register, register_node_signing_hash,
-};
+use decdn_incentive::{capacity_bond_domain, node_register, register_node_signing_hash};
 use decdn_node::chain_events::snapshot::SNAPSHOT_LAG_MARGIN_BLOCKS;
 
 use crate::bindings::{
@@ -778,77 +776,6 @@ impl ChainFixture {
             .context("mint node-buyer USDC")
     }
 
-    /// Rebind `operator` to `new_secret`'s node id via `CapacityBond.bindNodeId`
-    /// — the iroh key-rotation path, driven directly rather than through the CLI
-    /// (#1034, G-NODE-07).
-    ///
-    /// The signature ingredients mirror [`Self::onboard_operator`] with two
-    /// differences that matter: the EIP-712 payload is the terms-free
-    /// `BindNodeId` (rebinding does not re-accept terms), and the ed25519 proof
-    /// is signed by the **new** key over `registrationNonce[newNodeId]` — not
-    /// the old key, and not the old id's nonce.
-    ///
-    /// Exists alongside the CLI-driven journey so a test can set up an
-    /// already-rotated chain state without paying for a CLI subprocess, and so a
-    /// CLI regression cannot silently make the fixture agree with it.
-    pub async fn rotate_node_id(
-        &self,
-        operator: &PrivateKeySigner,
-        new_secret: &iroh::SecretKey,
-    ) -> anyhow::Result<()> {
-        let op_addr = operator.address();
-        let new_node_id = B256::from_slice(new_secret.public().as_bytes());
-
-        let op_provider = self.provider_for(operator);
-        let bond = CapacityBond::new(self.addrs.capacity_bond, &op_provider);
-
-        let binding_nonce = bond
-            .bindingNonce(op_addr)
-            .call()
-            .await
-            .context("read bindingNonce")?;
-        // Keyed on the NEW id: a fresh key is usually 0, but an id that was
-        // bound and unbound before carries a bumped nonce, and signing over 0
-        // there reverts `InvalidEd25519Signature`.
-        let registration_nonce = bond
-            .registrationNonce(new_node_id)
-            .call()
-            .await
-            .context("read registrationNonce")?;
-
-        let domain = capacity_bond_domain(self.chain_id, self.addrs.capacity_bond);
-        let bind_hash = binding_signing_hash(new_node_id, binding_nonce, &domain);
-        let binding_sig = operator
-            .sign_hash_sync(&bind_hash)
-            .context("sign binding hash")?
-            .as_bytes()
-            .to_vec();
-
-        let digest = node_register::ownership_message_digest(
-            new_node_id,
-            op_addr,
-            self.chain_id,
-            registration_nonce,
-        );
-        let ed_sig = new_secret.sign(digest.as_slice()).to_bytes().to_vec();
-
-        let receipt = bond
-            .bindNodeId(new_node_id, Bytes::from(binding_sig), Bytes::from(ed_sig))
-            .send()
-            .await
-            .context("bindNodeId send")?
-            .get_receipt()
-            .await
-            .context("bindNodeId receipt")?;
-        crate::ensure_mined(&receipt, "bindNodeId")?;
-
-        anyhow::ensure!(
-            self.node_id_of(op_addr).await? == new_node_id,
-            "operator must be bound to the new node id after bindNodeId"
-        );
-        Ok(())
-    }
-
     /// The node id `operator` is bound to, or `B256::ZERO` when unbound.
     ///
     /// Reads `addressToNodeId` rather than `nodeIdOf`, deliberately: the raw
@@ -1066,18 +993,6 @@ impl ChainFixture {
             .await
             .context("CctpSweepReceiver.receiveSweep receipt")?;
         crate::ensure_mined(&receipt, "CctpSweepReceiver.receiveSweep")
-    }
-
-    /// Current chain head `block.timestamp` (seconds).
-    pub async fn head_timestamp(&self) -> anyhow::Result<u64> {
-        Ok(self
-            .admin
-            .get_block(alloy::eips::BlockId::latest())
-            .await
-            .context("get latest block")?
-            .ok_or_else(|| anyhow::anyhow!("no latest block"))?
-            .header
-            .timestamp)
     }
 
     /// Anvil-impersonate `who` and fund it for gas, so `from = who` transactions

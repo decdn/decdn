@@ -34,7 +34,7 @@
 //! what lets an ejected operator, or one who declared a tier without ever
 //! registering, reach a full exit with `--all` alone.
 
-use std::io::{self, IsTerminal, Write};
+use std::io;
 use std::path::Path;
 
 use alloy::primitives::{Address, B256, U256};
@@ -44,6 +44,7 @@ use decdn_common::cli;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 use crate::commands::chain_ctx;
+use crate::commands::rotate_key::confirm_or_bail;
 
 /// Entry point for `decdn node unbond`.
 pub async fn run(args: &cli::UnbondArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
@@ -68,7 +69,7 @@ pub async fn run(args: &cli::UnbondArgs, global_config: Option<&Path>) -> anyhow
         return Ok(());
     }
 
-    confirm_or_bail(&plan, args.yes)?;
+    confirm_or_bail(|w| write_disclosure(w, &plan), "unbond", args.yes)?;
 
     // The outcome is owned HERE, not inside `execute`, so a partially-applied
     // sequence survives the error. `execute` sends `declareMbps` then
@@ -499,75 +500,11 @@ pub(crate) async fn execute<P: Provider + Clone>(
     Ok(())
 }
 
-/// What the confirmation gate decides, before any IO. Split from
-/// [`confirm_or_bail`] the way `terms::decide` is split from
-/// `terms::ensure_accepted`, so the gate that protects an operator from an
-/// accidental exit is testable without a TTY.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Confirmation {
-    /// `--yes` supplied: disclose the consequences, but skip the prompt.
-    Bypassed,
-    /// Ask on the terminal.
-    Prompt,
-    /// Headless and unconfirmed: refuse rather than assume consent.
-    NeedFlag,
-}
-
-/// Decide how to confirm, from the two ambient signals.
-pub(crate) const fn decide_confirmation(yes: bool, interactive: bool) -> Confirmation {
-    if yes {
-        Confirmation::Bypassed
-    } else if interactive {
-        Confirmation::Prompt
-    } else {
-        Confirmation::NeedFlag
-    }
-}
-
-/// Confirm before the first send. An unbond can cost the operator active-set
-/// membership and its tenure when the retained bond is below its floor, and
-/// that is not obvious from the flags alone, so the consequences are always
-/// disclosed ([`write_disclosure`]), and a terminal run additionally waits for
-/// `y`.
-///
-/// `--yes` suppresses the *prompt*, never the disclosure. A scripted
-/// `--all --yes` can leave the node permanently inactive; "don't ask" must not
-/// silently become "don't tell", so the warning is written for `Bypassed` too.
-/// Every decision here comes from [`decide_confirmation`] — nothing is
-/// re-derived from `interactive`, so the tested function IS the enforcing one.
-fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
-    // Interactive only when BOTH streams are terminals: the warning goes to
-    // stderr and the answer is read from stdin, so if either is redirected the
-    // operator can't see what they'd be agreeing to (same rule as `terms`).
-    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
-    let decision = decide_confirmation(yes, interactive);
-
-    let mut err = io::stderr().lock();
-    write_disclosure(&mut err, plan)?;
-
-    match decision {
-        // Disclosed above; the operator asked not to be asked.
-        Confirmation::Bypassed => Ok(()),
-        Confirmation::NeedFlag => anyhow::bail!(
-            "unbond not confirmed: no interactive terminal detected — re-run with `--yes` \
-             (or `--dry-run` to preview)."
-        ),
-        Confirmation::Prompt => {
-            write!(err, "Proceed? [y/N] ")?;
-            err.flush()?;
-            let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-            // Allowlist, not denylist: an empty line (Ctrl-D / EOF) lands on the
-            // deny side rather than being read as assent.
-            let answer = line.trim().to_ascii_lowercase();
-            anyhow::ensure!(answer == "y" || answer == "yes", "unbond cancelled.");
-            Ok(())
-        }
-    }
-}
-
 /// The consequences of the planned unbond, pure so the wording is pinned by a
-/// test.
+/// test. An unbond can cost the operator active-set membership and its tenure
+/// when the retained bond is below its floor, and that is not obvious from the
+/// flags alone, so [`confirm_or_bail`] writes this on every run, `--yes`
+/// included: a scripted `--all --yes` can leave the node permanently inactive.
 pub(crate) fn write_disclosure(w: &mut dyn io::Write, plan: &Plan) -> io::Result<()> {
     writeln!(
         w,

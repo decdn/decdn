@@ -180,15 +180,6 @@ contract OriginAssignmentTest is Test {
         new OriginAssignment(bond, registry, IVettingPolicy(eoa), admin);
     }
 
-    function test_setVettingPolicy_onlyGovernance() public {
-        RejectAllVettingPolicy rejectAll = new RejectAllVettingPolicy();
-        vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, stranger, GOVERNANCE_ROLE)
-        );
-        oa.setVettingPolicy(IVettingPolicy(address(rejectAll)));
-    }
-
     // -----------------------------------------------------------------
     // addOrigin
     // -----------------------------------------------------------------
@@ -209,12 +200,6 @@ contract OriginAssignmentTest is Test {
         _vet(stranger);
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(OriginAssignment.NotNamespaceOwner.selector, NS, stranger));
-        oa.addOrigin(NS, opA);
-    }
-
-    function test_addOrigin_revertsUnvettedPublisher() public {
-        vm.prank(publisher);
-        vm.expectRevert(abi.encodeWithSelector(OriginAssignment.PublisherNotVetted.selector, publisher));
         oa.addOrigin(NS, opA);
     }
 
@@ -503,16 +488,12 @@ contract OriginAssignmentTest is Test {
         assertEq(oa.assignedNamespaces(0, 10)[0], NS);
     }
 
-    /// A second seat in the same namespace must not duplicate the key.
-    function test_assignedNamespaces_secondOriginDoesNotDuplicate() public {
-        _vetAndSeatBoth();
-        assertEq(oa.assignedNamespaceCount(), 1);
-    }
-
-    /// The key set tracks "has origins", not "was ever assigned": it survives
-    /// removal of one operator and is withdrawn only when the last one goes.
+    /// The key set tracks "has origins", not "was ever assigned": a second seat
+    /// does not duplicate the key, it survives removal of one operator, and is
+    /// withdrawn only when the last one goes.
     function test_assignedNamespaces_withdrawnOnlyWhenSetEmpties() public {
         _vetAndSeatBoth();
+        assertEq(oa.assignedNamespaceCount(), 1, "two seats, one key");
 
         vm.prank(publisher);
         oa.removeOrigin(NS, opA);
@@ -535,22 +516,6 @@ contract OriginAssignmentTest is Test {
         assertEq(oa.assignedNamespaceCount(), 1);
         oa.pruneInactiveOrigin(NS, opB);
         assertEq(oa.assignedNamespaceCount(), 0);
-    }
-
-    /// The index invariant, stated directly: a namespace is enumerated iff it
-    /// has origins.
-    function test_assignedNamespaces_matchesGetOriginsNonEmpty() public {
-        _vetAndSeatBoth();
-        assertEq(oa.assignedNamespaceCount(), 1);
-        assertGt(oa.getOrigins(NS).length, 0);
-
-        vm.startPrank(publisher);
-        oa.removeOrigin(NS, opA);
-        oa.removeOrigin(NS, opB);
-        vm.stopPrank();
-
-        assertEq(oa.assignedNamespaceCount(), 0);
-        assertEq(oa.getOrigins(NS).length, 0);
     }
 
     /// Same pagination contract as the other enumeration views, including the
