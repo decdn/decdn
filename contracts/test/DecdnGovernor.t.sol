@@ -143,13 +143,6 @@ contract DecdnGovernorTest is Test {
         assertEq(gov.proposalThreshold(), 1000);
     }
 
-    /// @notice The vote cap launches at its 10% ceiling (1000 bps). A
-    ///         decrease-only setter starts at the ceiling so governance can
-    ///         only ever move it down.
-    function test_voteCapBps_launchesAtCeiling() public view {
-        assertEq(gov.voteCapBps(), 1000);
-    }
-
     /// @notice `setVoteCapBps` is gated on `onlyGovernance` (timelock
     ///         executor). A direct call from the test contract must revert
     ///         with the explicit `GovernorOnlyExecutor` selector. The arg

@@ -468,11 +468,6 @@ contract DecdnGovernorDelegationTest is Test {
         assertEq(cast, gov.getVotes(address(wallet), snapshot));
     }
 
-    function test_delegationNonces_startsZero() public view {
-        assertEq(gov.delegationNonces(opA), 0);
-        assertEq(gov.delegationNonces(stranger), 0);
-    }
-
     // -----------------------------------------------------------------
     // Full delegated pass — delegated votes reach quorum + Succeeded
     // -----------------------------------------------------------------

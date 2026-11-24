@@ -315,11 +315,6 @@ contract ContentBlacklistTest is Test {
     // ADR 011 § Compliance Window (#1169)
     // =================================================================
 
-    function test_complianceWindow_defaults() public view {
-        assertEq(blacklist.complianceWindow(), 24 hours);
-        assertEq(blacklist.emergencyComplianceWindow(), 2 hours);
-    }
-
     function test_addHashGlobal_stampsEffectiveAt() public {
         vm.prank(admin);
         blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-TEST");

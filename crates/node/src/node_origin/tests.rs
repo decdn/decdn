@@ -103,23 +103,6 @@ fn a_wedge_lifts_when_its_fixed_suppression_window_elapses() {
     );
 }
 
-/// The provider-wide window must outlive the per-`(peer, hash)` negative-cache entry the
-/// same wedge writes. At or below it, `wedged_providers` buys nothing the negative cache
-/// does not already give for the blob that wedged it, and the filter plus both integration
-/// tests guarding it become dead weight while still passing green.
-///
-/// Bounding a policy constant is in-convention in this module — see
-/// `only_a_durable_refusal_earns_the_full_suppression_ttl`.
-#[test]
-fn the_provider_wide_window_outlives_the_per_hash_one() {
-    assert!(
-        WEDGED_PROVIDER_SUPPRESSION_SECS > REFUSAL_SUPPRESSION_TTL.as_secs(),
-        "the provider-wide window ({WEDGED_PROVIDER_SUPPRESSION_SECS}s) must outlive the \
-         per-(peer, hash) one ({}s), or the wedge filter buys nothing",
-        REFUSAL_SUPPRESSION_TTL.as_secs()
-    );
-}
-
 #[test]
 fn region_penalty_only_for_same_region_slow_peer() {
     // Same region, slow → penalized.

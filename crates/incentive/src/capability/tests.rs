@@ -149,9 +149,10 @@ fn capability_type_hash_matches_adr_003() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fixed-vector regression: a deterministic key + capability must recover
-/// the owner's address. Catches a Rust-side digest drift before the
-/// contract does.
+/// Fixed-vector regression: a fixed capability under a fixed domain has a
+/// known EIP-712 digest, and a deterministic key signs it to a signature that
+/// recovers the owner. A Rust-side digest drift fails the pinned digest
+/// before the contract rejects the signature.
 #[test]
 fn fixed_vector_recovers_expected_owner() -> anyhow::Result<()> {
     let pk_hex = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -159,6 +160,12 @@ fn fixed_vector_recovers_expected_owner() -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("parse test key: {e}"))?;
     let address = owner.address();
+    assert_eq!(
+        sample_capability().signing_hash(&sample_domain()),
+        alloy::primitives::b256!(
+            "bf282eeb39df6de4a401d1e0d6d7fce7f3b3c75e26d510b7811c68a2357d8af2"
+        )
+    );
     let signed = sample_capability().sign(&owner, &sample_domain())?;
     let recovered = signed.recover_owner(&sample_domain())?;
     anyhow::ensure!(

@@ -510,22 +510,6 @@ fn partial_holders_carry_their_own_coverage_and_are_admitted_like_full_holders()
     assert_ne!(cov1, Coverage::full(2), "op1 is a partial holder, not full");
 }
 
-#[test]
-fn retry_backoff_is_the_adr_012_schedule() {
-    // ADR 012 § Bootstrap step 3: "retry 3× exponential backoff
-    // (1 s, 5 s, 30 s)". A tripwire on the table, not coverage of the loop
-    // that reads it — that is `a_failing_page_is_retried_on_the_adr_schedule`
-    // below, which binds the two together.
-    assert_eq!(
-        REGISTRY_RETRY_BACKOFF,
-        [
-            Duration::from_secs(1),
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-        ]
-    );
-}
-
 /// A retryable transport failure — a refused connection, a reset, a timeout.
 fn transient() -> alloy::contract::Error {
     alloy::contract::Error::TransportError(alloy::transports::RpcError::NullResp)
