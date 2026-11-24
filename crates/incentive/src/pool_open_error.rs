@@ -52,9 +52,9 @@ sol! {
     /// classifier needs no live contract binding.
     ///
     /// This selector is NOT unique to `openPool`: `PaymentPool.topUp`
-    /// reverts it too, and `FeeRouter`, `CapacityBond` and `BuybackBurner`
-    /// each declare the identical argument-less signature, so all five
-    /// share one 4-byte selector. Safe here only because
+    /// reverts it too, and `FeeRouter` and `CapacityBond` each declare the
+    /// identical argument-less signature, so all four share one 4-byte
+    /// selector. Safe here only because
     /// [`PoolOpenFailureReason::classify_revert_data`] is called on the
     /// open path alone; widening its use would need this checked.
     error ZeroAmount();

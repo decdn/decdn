@@ -42,10 +42,6 @@ fn import_args(input: &Path, origin: &Path) -> OriginImportArgs {
         follow_symlinks: false,
         exclude: Vec::new(),
         json: false,
-        optimize: false,
-        chunk_avg: None,
-        chunk_min: None,
-        chunk_max: None,
         subfolder: None,
         dry_run: false,
     }
@@ -448,7 +444,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     reason = "test harness diagnostic surfaced in the nextest log"
 )]
 fn directory_import_refuses_paths_that_name_one_file() {
-    for (move_source, optimize) in [(false, false), (true, false), (true, true)] {
+    for move_source in [false, true] {
         let src = TempDir::new().unwrap();
         if !is_case_sensitive(src.path()) {
             eprintln!(
@@ -467,10 +463,9 @@ fn directory_import_refuses_paths_that_name_one_file() {
         let mut args = import_args(src.path(), origin.path());
         args.bundle = Some(out_bundle.clone());
         args.move_source = move_source;
-        args.optimize = optimize;
         let err = rt().block_on(origin_import(&args)).unwrap_err();
 
-        let case = format!("move={move_source} optimize={optimize}");
+        let case = format!("move={move_source}");
         let msg = format!("{err:#}");
         assert!(
             msg.contains(r#"no reader accepts a bundle of it: "README" and "readme""#),
@@ -529,42 +524,6 @@ fn directory_import_refuses_an_unportable_name() {
     }
 }
 
-// An optimized single-file import keys its one manifest entry by the file's
-// name, so a name no reader accepts is refused before the import: with or
-// without `--move`, the source stays and the store gets no blob.
-#[cfg(unix)]
-#[test]
-fn optimized_single_file_import_refuses_an_unportable_name() {
-    for move_source in [false, true] {
-        let src = TempDir::new().unwrap();
-        let origin = TempDir::new().unwrap();
-        let out = TempDir::new().unwrap();
-        let file = src.path().join("README.");
-        fs::write(&file, b"readme").unwrap();
-
-        let out_bundle = out.path().join("out.json");
-        let mut args = import_args(&file, origin.path());
-        args.bundle = Some(out_bundle.clone());
-        args.move_source = move_source;
-        args.optimize = true;
-        let err = rt().block_on(origin_import(&args)).unwrap_err();
-
-        let case = format!("move={move_source}");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains(r#"rejected component "README.""#),
-            "{case}: {msg}"
-        );
-        assert_eq!(
-            fs::read(&file).unwrap(),
-            b"readme",
-            "{case}: the source stays"
-        );
-        assert_eq!(files_under(origin.path()), Vec::<PathBuf>::new(), "{case}");
-        assert!(!out_bundle.exists(), "{case}: no manifest is written");
-    }
-}
-
 fn hash_from_hex(hex: &str) -> (Hash, String) {
     let mut raw = [0u8; 32];
     for (i, slot) in raw.iter_mut().enumerate() {
@@ -573,7 +532,7 @@ fn hash_from_hex(hex: &str) -> (Hash, String) {
     (Hash::from_bytes(raw), hex.to_string())
 }
 
-// --- `--optimize` / `--dry-run` wiring ---------------------------------------
+// --- `--dry-run` wiring ------------------------------------------------------
 //
 // These drive the real `decdn` binary so the actual process stdout/stderr and
 // exit code are observed — the dry-run contract is "the canonical manifest
@@ -588,21 +547,7 @@ fn decdn(args: &[&str]) -> Output {
         .expect("run decdn binary")
 }
 
-// Deterministic pseudo-random bytes so content-defined chunk boundaries form.
-fn pseudo(seed: u64, len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    let mut x = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    while out.len() < len {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
-// The exact canonical manifest bytes a whole-file (non-optimized) import of
+// The exact canonical manifest bytes a whole-file import of
 // `tree` produces, computed independently of the command under test.
 fn expected_whole_file_manifest(tree: &Path) -> Vec<u8> {
     // Two files placed by `two_file_tree`, sorted by path bytes.
@@ -688,343 +633,4 @@ fn to_required_unless_dry_run() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--to"), "stderr was: {err}");
-}
-
-#[test]
-fn chunk_flags_require_optimize() {
-    let tree = two_file_tree();
-    let origin = TempDir::new().unwrap();
-    let out = decdn(&[
-        "origin",
-        "import",
-        "-i",
-        tree.path().to_str().unwrap(),
-        "--to",
-        &origin.path().display().to_string(),
-        "--chunk-avg",
-        "2MiB",
-    ]);
-    assert!(!out.status.success());
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--optimize"), "stderr was: {err}");
-}
-
-// A tree of two files that share a >4 MiB identical middle region so CDC
-// produces at least one shared chunk that dedups across the two files.
-fn shared_region_tree() -> TempDir {
-    let tree = TempDir::new().unwrap();
-    let shared = pseudo(3, 8 * 1024 * 1024);
-    let mut f1 = pseudo(10, 4 * 1024 * 1024);
-    f1.extend_from_slice(&shared);
-    f1.extend_from_slice(&pseudo(11, 4 * 1024 * 1024));
-    let mut f2 = pseudo(20, 4 * 1024 * 1024);
-    f2.extend_from_slice(&shared);
-    f2.extend_from_slice(&pseudo(21, 4 * 1024 * 1024));
-    fs::write(tree.path().join("f1.bin"), &f1).unwrap();
-    fs::write(tree.path().join("f2.bin"), &f2).unwrap();
-    tree
-}
-
-#[test]
-fn optimize_stores_whole_file_blobs_and_chunk_hints() {
-    let tree = shared_region_tree();
-    let origin = TempDir::new().unwrap();
-
-    let out = decdn(&[
-        "origin",
-        "import",
-        "-i",
-        tree.path().to_str().unwrap(),
-        "--to",
-        &origin.path().display().to_string(),
-        "--optimize",
-        "--json",
-    ]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Status JSON is on stdout for a non-dry-run import.
-    let report: serde_json::Value = serde_json::from_slice(out.stdout.trim_ascii_end()).unwrap();
-    assert_eq!(report["optimized"].as_bool(), Some(true));
-    let total = report["chunks_total"].as_u64().unwrap();
-    assert!(total > 0, "expected at least one chunk hint, got {total}");
-    assert!(
-        report.get("chunks_written").is_none(),
-        "chunks_written must be dropped now that optimize stores no per-chunk blobs"
-    );
-
-    // The written manifest blob is retrievable; every entry's WHOLE-FILE hash
-    // (+ its .obao4 outboard) is stored, exactly like a plain import — the
-    // chunk list is manifest-only dedup hints, never separately stored blobs.
-    let bundle_hex = report["bundle_hash"]
-        .as_str()
-        .unwrap()
-        .strip_prefix("b3:")
-        .unwrap();
-    assert!(
-        data_object_path(origin.path(), bundle_hex).is_file(),
-        "manifest blob must be stored"
-    );
-    let manifest_bytes = fs::read(data_object_path(origin.path(), bundle_hex)).unwrap();
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
-    let entries = manifest["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2);
-
-    let mut whole_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut all_hint_hashes: Vec<String> = Vec::new();
-    for e in entries {
-        let whole_hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-        whole_hashes.insert(whole_hex.to_string());
-        let data = data_object_path(origin.path(), whole_hex);
-        let obao4 = origin
-            .path()
-            .join(&whole_hex[..2])
-            .join(format!("{whole_hex}.obao4"));
-        assert!(data.is_file(), "whole-file blob {whole_hex} must be stored");
-        assert!(
-            obao4.is_file(),
-            "whole-file outboard missing: {}",
-            obao4.display()
-        );
-
-        let size = e["size"].as_u64().unwrap();
-        let chunks = e["chunks"].as_array().expect("entry must carry hints");
-        assert!(!chunks.is_empty());
-        let sum: u64 = chunks.iter().map(|c| c["size"].as_u64().unwrap()).sum();
-        assert_eq!(sum, size, "chunk hint sizes must sum to the entry size");
-        for c in chunks {
-            let chex = c["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-            all_hint_hashes.push(chex.to_string());
-        }
-    }
-
-    // No stored object exists for a chunk-hash-only hint (one that isn't also
-    // some entry's whole-file hash) — optimize stores whole files, not chunks.
-    for chex in &all_hint_hashes {
-        if whole_hashes.contains(chex) {
-            continue;
-        }
-        assert!(
-            !data_object_path(origin.path(), chex).is_file(),
-            "chunk hint {chex} must NOT be stored as a data object"
-        );
-    }
-
-    // The two files share an identical middle region, so their hint lists
-    // must share at least one identical chunk hash.
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut shared = false;
-    for h in &all_hint_hashes {
-        if !seen.insert(h.as_str()) {
-            shared = true;
-        }
-    }
-    assert!(shared, "expected the two entries to share >=1 chunk hint");
-}
-
-// `--dry-run --optimize` must preview the chunk-hint count the same way a real
-// run would compute it, even though no blob is written.
-#[test]
-fn optimize_dry_run_previews_chunk_hints_without_writing() {
-    let tree = shared_region_tree();
-    let origin = TempDir::new().unwrap();
-    // A --to path that must NEVER be created by a dry run.
-    let ghost = origin.path().join("never-created");
-
-    let out = decdn(&[
-        "origin",
-        "import",
-        "-i",
-        tree.path().to_str().unwrap(),
-        "--optimize",
-        "--dry-run",
-        "--json",
-    ]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Status JSON is on stderr under --dry-run; stdout carries only the
-    // canonical manifest.
-    let report: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim()).unwrap();
-    assert_eq!(report["optimized"].as_bool(), Some(true));
-    let total = report["chunks_total"].as_u64().unwrap();
-    assert!(total > 0, "expected at least one chunk hint, got {total}");
-    assert!(
-        report.get("chunks_written").is_none(),
-        "chunks_written must be dropped"
-    );
-
-    // Stdout is still the clean manifest, carrying chunk hints.
-    let manifest: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let entries = manifest["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 2);
-    for e in entries {
-        assert!(e["chunks"].as_array().is_some(), "entry must carry hints");
-    }
-
-    // No blobs written, and the never-requested origin dir was never created.
-    assert!(!ghost.exists(), "dry-run must not create any origin dir");
-}
-
-#[test]
-fn optimize_single_file_emits_one_entry_manifest() {
-    let src = TempDir::new().unwrap();
-    let origin = TempDir::new().unwrap();
-    let out_dir = TempDir::new().unwrap();
-    let file = src.path().join("model.bin");
-    fs::write(&file, pseudo(42, 10 * 1024 * 1024)).unwrap();
-    let bundle = out_dir.path().join("m.json");
-
-    let out = decdn(&[
-        "origin",
-        "import",
-        "-i",
-        file.to_str().unwrap(),
-        "--to",
-        &origin.path().display().to_string(),
-        "--optimize",
-        "--bundle",
-        bundle.to_str().unwrap(),
-    ]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let manifest: serde_json::Value = serde_json::from_slice(&fs::read(&bundle).unwrap()).unwrap();
-    let entries = manifest["entries"].as_array().unwrap();
-    assert_eq!(entries.len(), 1, "single file → exactly one entry");
-    let e = &entries[0];
-    assert_eq!(e["path"].as_str(), Some("model.bin"));
-    let whole_hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-    assert!(
-        data_object_path(origin.path(), whole_hex).is_file(),
-        "whole-file blob {whole_hex} must be written"
-    );
-    let obao4 = origin
-        .path()
-        .join(&whole_hex[..2])
-        .join(format!("{whole_hex}.obao4"));
-    assert!(obao4.is_file(), "whole-file outboard must be written");
-
-    let chunks = e["chunks"].as_array().expect("entry must carry hints");
-    assert!(!chunks.is_empty());
-    let size = e["size"].as_u64().unwrap();
-    let sum: u64 = chunks.iter().map(|c| c["size"].as_u64().unwrap()).sum();
-    assert_eq!(sum, size, "chunk hint sizes must sum to the entry size");
-    for c in chunks {
-        let chex = c["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-        if chex == whole_hex {
-            continue;
-        }
-        assert!(
-            !data_object_path(origin.path(), chex).is_file(),
-            "chunk hint {chex} must NOT be stored as its own data object"
-        );
-    }
-}
-
-// `--optimize` composes with `--move`: the source is renamed into the store as
-// the whole-file blob, and the chunk-hint pass reads that stored object rather
-// than the (now gone) source. The source disappears, the whole-file blob lands
-// at its content address, and the manifest carries chunk hints.
-#[test]
-fn optimize_and_move_compose() {
-    let src = TempDir::new().unwrap();
-    let origin = TempDir::new().unwrap();
-    let file = src.path().join("blob.bin");
-    fs::write(&file, pseudo(1, 8 * 1024 * 1024)).unwrap();
-
-    let out = decdn(&[
-        "origin",
-        "import",
-        "-i",
-        file.to_str().unwrap(),
-        "--to",
-        &origin.path().display().to_string(),
-        "--optimize",
-        "--move",
-        "--json",
-    ]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // The source is gone — it was moved into the store.
-    assert!(!file.exists(), "source must be moved away");
-
-    let report: serde_json::Value = serde_json::from_slice(out.stdout.trim_ascii_end()).unwrap();
-    assert_eq!(report["moved"], serde_json::json!(true));
-    assert_eq!(report["optimized"], serde_json::json!(true));
-    assert!(
-        report["chunks_total"].as_u64().unwrap() > 0,
-        "optimize must produce chunk hints"
-    );
-
-    // The whole-file blob is stored at its content address and carries chunk hints.
-    let bundle_hex = report["bundle_hash"]
-        .as_str()
-        .unwrap()
-        .strip_prefix("b3:")
-        .unwrap();
-    let manifest_bytes = fs::read(data_object_path(origin.path(), bundle_hex)).unwrap();
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
-    let entry = &manifest["entries"].as_array().unwrap()[0];
-    let whole_hex = entry["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-    let stored = fs::read(data_object_path(origin.path(), whole_hex)).unwrap();
-    assert_eq!(blake3::hash(&stored).to_hex().as_str(), whole_hex);
-    assert!(
-        !entry["chunks"].as_array().unwrap().is_empty(),
-        "manifest entry must carry chunk hints"
-    );
-}
-
-// The stored whole-file blob is byte-identical to the source, and its content
-// hash is exactly the entry's `hash` and the BLAKE3 the chunker independently
-// computed over the same bytes — the two streaming passes (`import_one_file`
-// and `chunk_file`) agree on both hash and size.
-#[test]
-fn optimize_whole_file_blob_matches_entry_hash() {
-    let tree = shared_region_tree();
-    let origin = TempDir::new().unwrap();
-
-    let out = decdn(&[
-        "origin",
-        "import",
-        "-i",
-        tree.path().to_str().unwrap(),
-        "--to",
-        &origin.path().display().to_string(),
-        "--optimize",
-        "--json",
-    ]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let report: serde_json::Value = serde_json::from_slice(out.stdout.trim_ascii_end()).unwrap();
-    let bundle_hex = report["bundle_hash"]
-        .as_str()
-        .unwrap()
-        .strip_prefix("b3:")
-        .unwrap();
-    let manifest_bytes = fs::read(data_object_path(origin.path(), bundle_hex)).unwrap();
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
-
-    for e in manifest["entries"].as_array().unwrap() {
-        let whole_hex = e["hash"].as_str().unwrap().strip_prefix("b3:").unwrap();
-        let stored = fs::read(data_object_path(origin.path(), whole_hex)).unwrap();
-        assert_eq!(blake3::hash(&stored).to_hex().as_str(), whole_hex);
-        let source = fs::read(tree.path().join(e["path"].as_str().unwrap())).unwrap();
-        assert_eq!(stored, source, "stored blob must equal the source bytes");
-    }
 }

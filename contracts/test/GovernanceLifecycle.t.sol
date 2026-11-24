@@ -130,14 +130,8 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             currentTermsHash: TERMS_HASH,
             feeRouterEpochLength: EPOCH,
             feeRouterWindowEpochs: WINDOW_EPOCHS,
-            // Steady-state split (rebate 0, buyback 7500 from ADR 026 §
-            // FeeRouter split) so the setter / topology exercise covers the
-            // production-activated state, not the launch dormancy that
-            // DeployProtocol.s.sol ships.
-            feeRouterRebateBps: 0,
-            feeRouterBuybackBps: 7500,
+            feeRouterRebateBps: 7500,
             feeRouterDeliveryFloor: 1,
-            buybackBurner: address(0xBB),
             cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
             cctpTokenMessenger: address(cctp)
         });
@@ -316,24 +310,17 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     // =================================================================
-    // FeeRouter (5 setters)
+    // FeeRouter (4 setters)
     // =================================================================
 
     function test_lifecycle_FeeRouter_setSplit_happy() public {
-        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setSplit, (uint256(2000), uint256(6000))));
+        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setSplit, (uint256(2000))));
         assertEq(router.rebateBps(), 2000);
-        assertEq(router.buybackBps(), 6000);
     }
 
     function test_lifecycle_FeeRouter_setDeliveryFloor_happy() public {
         _runLifecycle(address(router), abi.encodeCall(FeeRouter.setDeliveryFloor, (uint256(250))));
         assertEq(router.deliveryFloor(), 250);
-    }
-
-    function test_lifecycle_FeeRouter_setBuybackBurner_happy() public {
-        address newAddr = address(0xBB02);
-        _runLifecycle(address(router), abi.encodeCall(FeeRouter.setBuybackBurner, (newAddr)));
-        assertEq(router.buybackBurner(), newAddr);
     }
 
     function test_lifecycle_FeeRouter_setTreasury_happy() public {

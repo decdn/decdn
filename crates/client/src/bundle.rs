@@ -1,13 +1,12 @@
 //! Pull a whole bundle: every blob a bundle manifest names, into an output
 //! directory, over the paid `cdn/client/v1` path.
 //!
-//! A bundle is a JSON manifest of `(path, hash, size, chunks)` entries
+//! A bundle is a JSON manifest of `(path, hash, size)` entries
 //! (`adr/appendix-bundles.md`). [`BundlePuller`] fetches each distinct blob
 //! once, from one shared payment pool, and lands it at every path that names
 //! it. It resumes from what an earlier run left: a file already on disk is
 //! skipped, a byte-identical file elsewhere in the output directory is linked,
-//! a range a sibling entry shares is spliced from disk, and a `.partial` an
-//! interrupted run left is the next fetch's prefix.
+//! and the store an interrupted run left is the next fetch's prefix.
 //!
 //! # A pull, end to end
 //!
@@ -62,6 +61,7 @@ use crate::{
 mod engine;
 mod landing;
 mod manifest_cache;
+mod run_store;
 mod skip_cache;
 #[cfg(test)]
 mod tests;
@@ -70,8 +70,9 @@ mod tests;
 pub use crate::lane_sources::FaultContext;
 
 /// The directory under the output root where a pull stages the blobs it
-/// fetches: `<hex>.partial` and its resume record while a blob is in flight,
-/// and `<hex>` once it is verified and before it lands at its paths.
+/// fetches: the run's download store (`store/`, one for every entry) while a
+/// blob is in flight, and `<hex>` once it is verified and before it lands at
+/// its paths.
 pub const STAGING_DIR: &str = ".decdn-partial";
 
 /// The largest bundle manifest a pull fetches, in bytes. A manifest fetch
@@ -156,7 +157,7 @@ impl BundleManifest {
     ///
     /// [`NotAManifest`] when the bytes are not a manifest or name a version
     /// other than 1. [`MalformedManifest`] when a v1 manifest holds an entry
-    /// or chunk hash that does not parse, an entry path with a segment that is
+    /// hash that does not parse, an entry path with a segment that is
     /// not a portable file name ([`path_segment_problem`]), or two entries
     /// whose paths name one file on a case- or normalization-insensitive file
     /// system ([`path_collision`]). One bad entry makes the whole manifest
@@ -411,7 +412,7 @@ impl std::fmt::Display for NotAManifest {
 
 impl std::error::Error for NotAManifest {}
 
-/// A v1 bundle manifest with an entry or chunk hash that does not parse, an
+/// A v1 bundle manifest with an entry hash that does not parse, an
 /// entry path segment that is not a portable file name
 /// ([`path_segment_problem`]), or two entry paths that name one file
 /// ([`path_collision`]):
@@ -438,52 +439,28 @@ pub struct ManifestEntry {
     /// The file's whole-file BLAKE3 hash, which the fetch verifies.
     pub hash: [u8; 32],
     /// The file's declared size. Optional on the wire: the pull uses it for
-    /// progress totals, and its chunk hints hold only when it equals the size
-    /// a holder proves. It sizes no store and plans no range.
+    /// progress totals. It sizes no store and plans no range.
     pub size: Option<u64>,
-    /// The file's ordered chunk decomposition, a range-dedup hint. Chunks it
-    /// shares with a sibling entry are spliced from disk instead of paid for
-    /// twice. The whole file is still verified by `hash`.
-    pub chunks: Option<Vec<ManifestChunk>>,
     /// The manifest `path` of an entry that [`Self::land_at`] moved, or `None`
     /// when `path` is still the manifest path.
     landed_from: Option<String>,
 }
 
-/// The wire form of a [`ManifestEntry`]: its hashes as the manifest writes
-/// them, before they parse.
+/// The wire form of a [`ManifestEntry`]: its hash as the manifest writes it,
+/// before it parses. A key the entry does not name is ignored.
 #[derive(Deserialize)]
 struct WireEntry {
     path: String,
     hash: String,
     #[serde(default)]
     size: Option<u64>,
-    #[serde(default)]
-    chunks: Option<Vec<WireChunk>>,
-}
-
-/// The wire form of a [`ManifestChunk`].
-#[derive(Deserialize)]
-struct WireChunk {
-    hash: String,
-    size: u64,
 }
 
 impl WireEntry {
-    /// This entry with its hashes parsed, or the error naming the entry and
-    /// the first hash that does not parse.
+    /// This entry with its hash parsed, or the error naming the entry and why
+    /// it is malformed.
     fn parse(self) -> Result<ManifestEntry, MalformedManifest> {
-        let Self {
-            path,
-            hash,
-            size,
-            chunks,
-        } = self;
-        let malformed = |what: &str, e: anyhow::Error| {
-            MalformedManifest(format!(
-                "bundle entry {path:?} has a malformed {what}: {e:#}"
-            ))
-        };
+        let Self { path, hash, size } = self;
         if let Some((segment, why)) = path
             .split('/')
             .find_map(|seg| path_segment_problem(seg).map(|why| (seg, why)))
@@ -492,40 +469,26 @@ impl WireEntry {
                 "bundle entry {path:?} has an unsafe path segment {segment:?}: {why}"
             )));
         }
-        let hash = parse_hash(&hash).map_err(|e| malformed("hash", e))?;
-        let chunks = chunks
-            .map(|chunks| {
-                chunks
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        parse_hash(&c.hash)
-                            .map(|hash| ManifestChunk { hash, size: c.size })
-                            .map_err(|e| malformed(&format!("chunk {i} hash"), e))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?;
+        let hash = parse_hash(&hash).map_err(|e| {
+            MalformedManifest(format!("bundle entry {path:?} has a malformed hash: {e:#}"))
+        })?;
         Ok(ManifestEntry {
             path,
             hash,
             size,
-            chunks,
             landed_from: None,
         })
     }
 }
 
 impl ManifestEntry {
-    /// An entry for the file at `path` with whole-file `hash` and `size`, and
-    /// no chunk hints.
+    /// An entry for the file at `path` with whole-file `hash` and `size`.
     #[must_use]
     pub fn new(path: impl Into<String>, hash: [u8; 32], size: Option<u64>) -> Self {
         Self {
             path: path.into(),
             hash,
             size,
-            chunks: None,
             landed_from: None,
         }
     }
@@ -548,32 +511,6 @@ impl ManifestEntry {
     #[must_use]
     pub fn manifest_path(&self) -> &str {
         self.landed_from.as_deref().unwrap_or(&self.path)
-    }
-
-    /// This entry with the chunk decomposition `chunks`.
-    #[must_use]
-    pub fn with_chunks(mut self, chunks: Vec<ManifestChunk>) -> Self {
-        self.chunks = Some(chunks);
-        self
-    }
-}
-
-/// One chunk of a [`ManifestEntry`]: an independently BLAKE3-addressed run of
-/// the file's bytes, placed at the running sum of the earlier chunks' sizes.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct ManifestChunk {
-    /// The chunk's BLAKE3 hash.
-    pub hash: [u8; 32],
-    /// The chunk's length in bytes. The sizes sum to the entry's size.
-    pub size: u64,
-}
-
-impl ManifestChunk {
-    /// A chunk of `size` bytes with BLAKE3 `hash`.
-    #[must_use]
-    pub const fn new(hash: [u8; 32], size: u64) -> Self {
-        Self { hash, size }
     }
 }
 
@@ -678,30 +615,25 @@ pub(crate) async fn registry_nodes(
     Ok((registry.nodes, registry.outage_fallback))
 }
 
-/// One distinct blob of a manifest and the content bytes a fresh pull of
-/// it pays for ([`planned_downloads`]).
+/// One distinct blob of a manifest and the bytes a fresh pull of it pays for
+/// ([`planned_downloads`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PlannedBlob {
     /// The blob's hash.
     pub hash: [u8; 32],
-    /// The blob's size as its manifest entries declare it; `None` when none
-    /// does.
+    /// The blob's size as its manifest entries declare it: the content bytes
+    /// a pull fetches for it. `None` when no entry declares one.
     pub size: Option<u64>,
-    /// The content bytes a pull fetches for it: its whole size, less the
-    /// chunks it shares with a smaller entry, which that entry fetches. At
-    /// most `size`, and `0` for a blob with no declared size.
-    pub download: u64,
-    /// The wire bytes that download pays for: each range it fetches, with
-    /// the bao proof path from the blob's own tree, as the nodes meter it
-    /// (ADR 038 § Payment metering). `0` for a blob with no declared size.
+    /// The wire bytes that fetch pays for: the whole blob with its bao proof
+    /// tree, as the nodes meter it (ADR 038 § Payment metering). `0` for a
+    /// blob with no declared size.
     pub wire: u64,
 }
 
 /// Each distinct blob of `entries`, in first-seen order, with the bytes a
-/// fresh pull of them all pays for. A blob two paths name counts once, and
-/// so does a chunk two blobs share, under the plan a pull runs
-/// ([`BundleObserver::run_started`] reports the same total).
+/// fresh pull of them all pays for. A blob two paths name counts once
+/// ([`BundleObserver::run_started`] reports the same content total).
 #[must_use]
 pub fn planned_downloads(entries: &[ManifestEntry]) -> Vec<PlannedBlob> {
     engine::planned_downloads(entries)
@@ -710,24 +642,18 @@ pub fn planned_downloads(entries: &[ManifestEntry]) -> Vec<PlannedBlob> {
 /// Where a bundle pull reports its progress. Every method has a default
 /// that does nothing. The pull calls them from the task that awaits it.
 pub trait BundleObserver: Send + Sync {
-    /// The pull starts on the entries it was given. `download_total` is the
-    /// content bytes it plans to pay for, after shared chunks and duplicate
-    /// files count once; `content_total` is the bytes that land on disk.
-    /// Either is `None` when no entry declares a size.
-    fn run_started(&self, download_total: Option<u64>, content_total: Option<u64>) {
-        let _ = (download_total, content_total);
+    /// The pull starts on the entries it was given. `total` is the content
+    /// bytes of their distinct blobs, a blob two paths name counted once;
+    /// `None` when no entry declares a size.
+    fn run_started(&self, total: Option<u64>) {
+        let _ = total;
     }
 
-    /// One blob starts: it lands at every one of `paths`. `download_total` is
-    /// the bytes it plans to pay for, and `reconstruct_total` the bytes it
-    /// plans to splice from disk. The returned observer follows that blob.
-    fn file_started(
-        &self,
-        paths: &[String],
-        download_total: u64,
-        reconstruct_total: u64,
-    ) -> Arc<dyn FileObserver> {
-        let _ = (paths, download_total, reconstruct_total);
+    /// One blob starts: it lands at every one of `paths`. `total` is its
+    /// declared size, or `0` without one. The returned observer follows that
+    /// blob.
+    fn file_started(&self, paths: &[String], total: u64) -> Arc<dyn FileObserver> {
+        let _ = (paths, total);
         Arc::new(NoFileObserver)
     }
 
@@ -761,18 +687,6 @@ pub trait FileObserver: Send + Sync {
     /// The blob discovers its holders before any byte arrives.
     fn discovering(&self) {}
 
-    /// The blob's own bytes are in, and it waits for a sibling to land the
-    /// chunks it shares.
-    fn pending(&self) {}
-
-    /// The blob is assembled, and its whole-file hash runs.
-    fn reconstructing(&self) {}
-
-    /// The whole-file hash has read `bytes` bytes.
-    fn hashed(&self, bytes: u64) {
-        let _ = bytes;
-    }
-
     /// The blob's pull settled, landed or failed.
     fn finished(&self) {}
 }
@@ -783,7 +697,7 @@ struct NoFileObserver;
 impl FileObserver for NoFileObserver {}
 
 /// One blob that landed ([`BundleObserver::entry_landed`]). No byte counts in
-/// more than one of `paid`, `spliced` and `resumed`.
+/// both `paid` and `resumed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EntryLanded {
@@ -793,12 +707,9 @@ pub struct EntryLanded {
     pub size: u64,
     /// The content bytes this pull fetched and paid for.
     pub paid: u64,
-    /// The bytes spliced from a file already on disk.
-    pub spliced: u64,
     /// The bytes an earlier, interrupted pull fetched, which this pull resumed.
     pub resumed: u64,
-    /// How long the blob took: probing, every fetch, any splice and the
-    /// whole-file check.
+    /// How long the blob took: probing and every fetch.
     pub elapsed: Duration,
 }
 
@@ -891,7 +802,7 @@ pub struct BundleReport {
     /// The size of those blobs, once each.
     pub reused_bytes: u64,
     /// The content bytes this pull fetched and paid for, from entry sizes: a
-    /// blob counts once, less what it spliced or resumed.
+    /// blob counts once, less what it resumed.
     pub downloaded: u64,
     /// The lane bytes this pull's vouchers and hash-chain reveals paid for:
     /// how far it grew the claims the nodes can redeem, summed over every lane
@@ -899,7 +810,7 @@ pub struct BundleReport {
     /// include the bao proof overhead. Content delivered twice, or paid for and
     /// then dropped after a lane fault, counts each time it is paid. An entry
     /// that fails or is interrupted counts here but not in `downloaded`; a
-    /// later pull resumes its `.partial` and reports it as `resumed_bytes`.
+    /// later pull resumes from its store and reports it as `resumed_bytes`.
     pub paid_bytes: u64,
     /// The `ChunkData` wire bytes this pull's lanes read, verified or not,
     /// summed over every lane ([`crate::PoolLedger::wire_bytes`]). They
@@ -912,15 +823,9 @@ pub struct BundleReport {
     pub wire_bytes: u64,
     /// The bytes written to disk: every landed copy of every blob.
     pub reconstructed: u64,
-    /// The bytes of `.partial` prefixes earlier pulls fetched, which this pull
+    /// The bytes earlier pulls fetched into entry stores, which this pull
     /// resumed. Never part of `downloaded`.
     pub resumed_bytes: u64,
-    /// The bytes spliced from files already on disk. Never downloaded.
-    pub spliced_bytes: u64,
-    /// Range-dedup hints a fault dropped: a chunk list with no file size to
-    /// check it against, or whose sizes do not sum to it, or a donor that
-    /// failed its check.
-    pub hints_ignored: u64,
     /// Every failed entry, in manifest order.
     pub failures: Vec<EntryFailure>,
     /// Lines that do not fail the pull: a blob whose size differs from its
@@ -1065,7 +970,12 @@ impl BundlePuller {
         overwrite: bool,
         cancel: &CancellationToken,
     ) -> BundleOutcome {
-        Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await
+        self.ctx.run_store.pull_started();
+        let outcome = Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await;
+        if matches!(outcome.end, BundleEnd::Complete) && outcome.report.failed == 0 {
+            self.ctx.run_store.pull_settled();
+        }
+        outcome
     }
 
     /// Every pool replacement this puller's funding recovery steps made, in
@@ -1105,11 +1015,14 @@ impl BundlePuller {
         self.ctx.rate_hints()
     }
 
-    /// Wait for every queued peer-record and watermark write to land. Call it
-    /// before the process exits, after a cancelled pull too, so the next run
-    /// resumes each lane from what it paid.
+    /// Wait for every queued peer-record and watermark write to land, and close
+    /// the run's download store: it is removed once every pull settled every
+    /// entry, and kept for the next run otherwise. Call it before the process
+    /// exits, after a cancelled pull too, so the next run resumes each lane
+    /// from what it paid and each entry from what it fetched.
     pub async fn finish(self) {
         self.ctx.writes.settle().await;
+        self.ctx.run_store.close().await;
     }
 }
 
@@ -1287,7 +1200,6 @@ impl BundlePullerBuilder {
             max_blob_bytes: self.max_blob_bytes,
             deposit,
             namespace_id: namespace_id(self.namespace),
-            dedup_stats: engine::DedupStats::default(),
             open_lock: tokio::sync::Mutex::new(()),
             gate: engine::JobGate::new(self.jobs.max(1)),
             lane_cap: LaneStreamCap::new(self.max_lane_streams),
@@ -1305,6 +1217,7 @@ impl BundlePullerBuilder {
             hints: self.hints,
             evidence: self.evidence,
             rate_samples: std::sync::Mutex::default(),
+            run_store: run_store::RunStore::default(),
         };
         Ok(BundlePuller { ctx })
     }

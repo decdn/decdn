@@ -212,7 +212,7 @@ export interface RecentPullRow {
   downloaded: number;
   /** What earlier runs fetched and this one resumed. */
   resumed: number;
-  /** What came from files already on disk, whole or spliced. */
+  /** What came from whole files already on disk. */
   reused: number;
   /** A bundle or entry run's counts; null for a blob run, or a run that
    * ended before its summary or streamed to stdout. */

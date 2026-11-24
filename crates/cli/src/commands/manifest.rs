@@ -34,16 +34,8 @@ struct Bundle<'a> {
 }
 
 /// One manifest entry: a file's relative POSIX path, its `b3:<hex>` content
-/// address, and its byte length.
-///
-/// `hash`/`size` always describe the **whole file**, stored and served as one
-/// blob. When `chunks` is present it lists advisory `{hash, size}`
-/// range-dedup hints over that same file's byte layout, in content order; a
-/// hint's hash is never independently stored or fetched, only matched
-/// against bytes a client already holds. `hash` is the authoritative
-/// end-to-end validator regardless of whether hints are present. A plain
-/// (unhinted) entry omits `chunks` entirely and serializes byte-identically
-/// to a bundle with no chunk hints.
+/// address, and its byte length. `hash`/`size` describe the whole file, stored
+/// and served as one blob.
 #[derive(Serialize)]
 pub(crate) struct BundleEntry {
     /// Relative POSIX path within the bundle root (`a/b.txt`, never absolute).
@@ -51,28 +43,6 @@ pub(crate) struct BundleEntry {
     /// The whole file's BLAKE3 content address, `b3:<64 lowercase hex>`.
     pub(crate) hash: String,
     /// The whole file's length in bytes.
-    pub(crate) size: u64,
-    /// Optional ordered range-dedup hints over the file's bytes. The file is
-    /// always stored and fetched as the one whole-file blob named by `hash`;
-    /// a hint only lets a client recognize a byte range it already holds (a
-    /// sibling entry with a matching chunk hash) and skip re-downloading it.
-    /// Skipped from the serialized form when absent so plain entries keep
-    /// their pre-hints byte layout.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) chunks: Option<Vec<Chunk>>,
-}
-
-/// One range-dedup hint over a hinted [`BundleEntry`]'s bytes: a BLAKE3 over
-/// that byte range and its length. Hints are listed in content order — the
-/// range they cover, in sequence, spans the whole file — and a hint `hash`
-/// shared across entries tells a client the two files share that byte range,
-/// so it fetches and pays for it once and splices the other copy in locally.
-/// The hash is never independently stored, served, or fetched as a blob.
-#[derive(Serialize)]
-pub(crate) struct Chunk {
-    /// The BLAKE3 content address of this byte range, `b3:<64 lowercase hex>`.
-    pub(crate) hash: String,
-    /// The chunk's length in bytes. The chunk sizes sum to the entry's `size`.
     pub(crate) size: u64,
 }
 
@@ -142,10 +112,9 @@ fn keep_entry(rel: &Path, is_dir: bool, excluder: &GlobSet) -> bool {
 /// Walk `root` (already canonicalized by the caller), applying the exclude set
 /// and symlink-containment rules, and invoke `per_file` for every regular file
 /// kept. `per_file` receives the file's canonicalized path and its validated
-/// relative POSIX string, and returns the file's whole-file `b3:<hex>` address,
-/// size, and an optional chunk decomposition — a dry-run caller just hashes;
-/// `origin import` (without `--dry-run`) hashes **and** writes the blob; a
-/// plain (non-chunking) caller always returns `None` for the third element.
+/// relative POSIX string, and returns the file's whole-file `b3:<hex>` address
+/// and size. A dry-run caller just hashes; `origin import` (without
+/// `--dry-run`) hashes and writes the blob.
 ///
 /// The whole tree is walked before the first `per_file` call. A tree holding
 /// two paths that name one file on a case- or normalization-insensitive file
@@ -161,7 +130,7 @@ pub(crate) fn walk_and_collect<F>(
     mut per_file: F,
 ) -> anyhow::Result<WalkOutput>
 where
-    F: FnMut(&Path, &str) -> anyhow::Result<(String, u64, Option<Vec<Chunk>>)>,
+    F: FnMut(&Path, &str) -> anyhow::Result<(String, u64)>,
 {
     let mut kept: Vec<(PathBuf, String)> = Vec::new();
     let mut skipped_symlinks: u64 = 0;
@@ -262,7 +231,7 @@ where
     let mut entries: Vec<BundleEntry> = Vec::with_capacity(kept.len());
     let mut total_size: u64 = 0;
     for (canonical, rel_str) in kept {
-        let (hash, size, chunks) = per_file(&canonical, &rel_str)
+        let (hash, size) = per_file(&canonical, &rel_str)
             .with_context(|| format!("processing {}", canonical.display()))?;
 
         total_size = total_size.checked_add(size).ok_or_else(|| {
@@ -273,7 +242,6 @@ where
             path: rel_str,
             hash,
             size,
-            chunks,
         });
     }
 

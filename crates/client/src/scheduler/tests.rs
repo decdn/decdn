@@ -107,11 +107,11 @@ fn no_funding() -> FakeFunder {
     FakeFunder::new(Recovery::Unavailable)
 }
 
-/// A `.partial` store whose tempdir path is returned so the test can read
-/// the finalized blob back off disk.
+/// An in-memory store that exports to `b` in a tempdir, whose path is
+/// returned so the test can read the finalized blob back off disk.
 fn fresh_store(root: [u8; 32], total: u64) -> (ClientRangedStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tmp dir");
-    let store = ClientRangedStore::create(dir.path(), "b", root, total).expect("create");
+    let store = ClientRangedStore::in_memory(root, total).exporting_to(dir.path().join("b"));
     (store, dir)
 }
 
@@ -3194,9 +3194,9 @@ async fn wedged_source_is_ended_by_the_watchdog_and_its_tail_reassigned() -> any
     Ok(())
 }
 
-/// A dropped acquire keeps the bytes that landed recorded: the periodic
-/// flush writes the present record while lanes run, so a caller that drops
-/// the acquire mid-fetch (Ctrl-C, its own stop) resumes from there.
+/// A dropped acquire keeps the bytes that landed: each ingest batch is in the
+/// store and present as soon as it lands, so a caller that drops the acquire
+/// mid-fetch (Ctrl-C, its own stop) resumes from there.
 #[tokio::test(start_paused = true)]
 async fn a_dropped_acquire_keeps_landed_bytes_recorded() -> anyhow::Result<()> {
     let data = blob(32 * 1024 * 1024);
@@ -3211,7 +3211,7 @@ async fn a_dropped_acquire_keeps_landed_bytes_recorded() -> anyhow::Result<()> {
         .paying(Arc::clone(&ledger_b));
     let root = src_a.root();
     let total = src_a.total_bytes();
-    let (store, dir) = fresh_store(root, total);
+    let (store, _dir) = fresh_store(root, total);
     let provider = StaticSources::new(vec![
         candidate(src_a, ledger_a, 0xA1, None),
         candidate(src_b, ledger_b, 0xB2, None),
@@ -3219,16 +3219,14 @@ async fn a_dropped_acquire_keeps_landed_bytes_recorded() -> anyhow::Result<()> {
     {
         let (pacer, funder) = (BudgetPacer::new(), no_funding());
         let fetch = run_acquire(&store, &provider, root, total, &pacer, &funder, 2, None);
-        // Past one present-record flush, short of the lane watchdog.
+        // Well into the stall, short of the lane watchdog.
         tokio::select! {
             fetched = fetch => panic!("wedged lanes cannot finish: {fetched:?}"),
             () = tokio::time::sleep(LANE_WATCHDOG.saturating_sub(Duration::from_secs(2))) => {}
         }
     }
-    drop(store);
 
-    let reopened = ClientRangedStore::open(dir.path(), "b", root)?;
-    let recorded = ranges_content_len(&reopened.present_ranges().await?, total);
+    let recorded = ranges_content_len(&store.present_ranges().await?, total);
     let landed = 2 * ClientRangedStore::checkpointed_len(4 * 1024 * 1024);
     assert!(
         recorded >= landed,

@@ -56,8 +56,7 @@ fn disabled_file_bar_has_no_callback() {
     assert!(fb.cb.is_none());
     // A silent bar ignores every report.
     fb.delivered(10, 20);
-    fb.reconstructing();
-    fb.hashed(5);
+    fb.discovering();
     fb.finished();
 }
 
@@ -89,8 +88,8 @@ fn pad_holds_the_rows_cleared_file_bars_free_until_new_bars_take_them() {
     use decdn_client::bundle::FileObserver as _;
 
     let (pp, _total) = hidden_pp(100);
-    let a = pp.file_bar("a", 10, 0);
-    let b = pp.file_bar("b", 10, 0);
+    let a = pp.file_bar("a", 10);
+    let b = pp.file_bar("b", 10);
     assert_eq!(pad_rows(&pp), 0);
 
     a.finished();
@@ -100,7 +99,7 @@ fn pad_holds_the_rows_cleared_file_bars_free_until_new_bars_take_them() {
     drop(a);
     assert_eq!(pad_rows(&pp), 1);
 
-    let c = pp.file_bar("c", 10, 0);
+    let c = pp.file_bar("c", 10);
     assert_eq!(pad_rows(&pp), 0);
 
     // A bar dropped unfinished (a pull stopped early) frees its row too.
@@ -112,11 +111,10 @@ fn pad_holds_the_rows_cleared_file_bars_free_until_new_bars_take_them() {
 
 #[test]
 fn file_bar_download_folds_into_the_total_capped_at_download_bytes() {
-    // A blob that downloads 1000 and reconstructs 500 from disk. Its delivery
-    // callback advances the total's DOWNLOAD meter by the delivered bytes only,
-    // capped at the download size — a splice never inflates the download total.
+    // A blob of 1000 bytes. Its delivery callback advances the total's
+    // download meter by the delivered bytes, capped at the blob's size.
     let (pp, total) = hidden_pp(1000);
-    let fb = pp.file_bar("m", 1000, 500);
+    let fb = pp.file_bar("m", 1000);
     fb.delivered(400, 9999);
     assert_eq!(total.position(), 400);
     fb.delivered(1000, 9999);
@@ -133,7 +131,7 @@ fn unsized_file_bar_shows_stream_length_but_adds_nothing_to_the_total() {
     // borrows the stream's `expected` for display so the row still moves, but it
     // contributes nothing to the total bar's download meter.
     let (pp, total) = hidden_pp(1000);
-    let fb = pp.file_bar("m", 0, 0);
+    let fb = pp.file_bar("m", 0);
     fb.delivered(500, 2000);
     let bar = &fb.phase.as_ref().expect("enabled").bar;
     assert_eq!(bar.length(), Some(2000), "borrows the stream length");
@@ -149,47 +147,22 @@ fn unsized_file_bar_shows_stream_length_but_adds_nothing_to_the_total() {
 }
 
 #[test]
-fn file_bar_message_shows_download_counts_and_reconstruct_size() {
+fn file_bar_message_shows_download_counts() {
     let (pp, _total) = hidden_pp(1000);
-    let fb = pp.file_bar("m", 1000, 500);
+    let fb = pp.file_bar("m", 1000);
     let bar = &fb.phase.as_ref().expect("enabled").bar;
     fb.delivered(400, 0);
-    let msg = bar.message();
-    // "<downloaded>/<download-total> (<reconstruct>)".
-    assert!(msg.contains('/'), "{msg}");
-    assert!(msg.contains('('), "{msg}");
+    // "<downloaded>/<total>".
+    assert_eq!(bar.message(), "400 B/1000 B ");
 }
 
 #[test]
-fn file_bar_reconstructing_spans_the_whole_blob_and_tracks_hashed_bytes() {
+fn file_bar_discovering_shows_the_phase_word() {
     let (pp, _total) = hidden_pp(1000);
-    let fb = pp.file_bar("m", 1000, 500);
-    fb.reconstructing();
+    let fb = pp.file_bar("m", 1000);
+    fb.discovering();
     let bar = &fb.phase.as_ref().expect("enabled").bar;
-    // The bar now spans the whole blob (download + reconstruct) and fills with
-    // bytes hashed, so a multi-GB verify is never a frozen row.
-    assert_eq!(bar.length(), Some(1500));
-    fb.hashed(750);
-    assert_eq!(bar.position(), 750);
-    assert!(
-        bar.message().contains("reconstructing"),
-        "{}",
-        bar.message()
-    );
-}
-
-#[test]
-fn file_bar_pending_marks_the_download_done_and_waiting() {
-    let (pp, _total) = hidden_pp(1000);
-    let fb = pp.file_bar("m", 1000, 500);
-    fb.set_pending();
-    let bar = &fb.phase.as_ref().expect("enabled").bar;
-    assert_eq!(bar.position(), 1000, "download is complete while pending");
-    assert!(
-        bar.message().contains("pending siblings"),
-        "{}",
-        bar.message()
-    );
+    assert!(bar.message().contains("discovering"), "{}", bar.message());
 }
 
 #[test]

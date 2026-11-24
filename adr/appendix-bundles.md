@@ -37,12 +37,11 @@ fetch every entry by hash. No out-of-band file distribution.
 
 Top-level keys are `version` (integer, currently `1`) and `entries`
 (array). Each entry's keys come in this order: `path` (string), `hash`
-(string), `size` (integer), `chunks` (array). `path` and `hash` are
-required. `origin import` always emits `size`, but a reader treats it as
-optional and informational (see the `size` bullet). `chunks` is optional
-and present only for a chunked file. When a key is present it holds this
-order — field declaration order is load-bearing, see
-[Determinism](#determinism).
+(string), `size` (integer). `path` and `hash` are required. `origin
+import` always emits `size`, but a reader treats it as optional and
+informational (see the `size` bullet). When a key is present it holds
+this order — field declaration order is load-bearing, see
+[Determinism](#determinism). A reader ignores any key it does not know.
 
 - `path`: relative POSIX path (`/` separator on every platform), UTF-8.
   `..`, absolute paths, root prefixes, and non-UTF-8 components are
@@ -52,53 +51,16 @@ order — field declaration order is load-bearing, see
 - `size`: file size in bytes, unsigned 64-bit integer. Optional and
   declared, not proven, on the read side. A bundle pull uses it for the
   dry-run plan and progress totals, and fetches without it. It sizes no
-  store and plans no range: chunk-dedup ranges apply only when it equals
-  the proven size, and otherwise the entry fetches its whole blob.
+  store and plans no range.
   The first holder that serves the entry proves the true size with its size
   proof ([ADR 005 § Bounded byte ranges](005-protocol.md#bounded-byte-ranges)),
   and the fetch works to the proven size
   ([ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)).
   When the proven size differs from `size`, the entry succeeds and the
   pull prints `<path>: manifest says X bytes, the blob is Y bytes`.
-- `chunks`: optional ordered list of range-dedup hints over the file's
-  bytes. See [Chunked files](#chunked-files). When absent, the file is
-  one blob addressed by `hash`.
 
-## Chunked files
-
-A node stores and serves one file as one whole-file blob. It never
-stores or serves a chunk as its own blob. A chunk hash is not an
-address a client can fetch.
-
-A `chunks` array is a list of hints. Each hint names a byte range of
-the file and its BLAKE3 hash. A client uses a hint to recognize bytes
-it already holds from another file in the same pull. It skips the
-download of that byte range and splices its local copy in. The
-`hash` field stays the file's only fetchable and authoritative
-identity: the client verifies the assembled file against `hash`, and
-a wrong or stale hint only costs a re-download, never a wrong file.
-
-```json
-{"path":"model.safetensors","hash":"b3:whole...","size":100,"chunks":[{"hash":"b3:c0...","size":60},{"hash":"b3:c1...","size":40}]}
-```
-
-- `hash` and `size` always describe the **whole file**. `hash` is the
-  file's identity and the end-to-end validator. The client always
-  fetches (or completes, via splice) the whole file and always checks
-  it against `hash`.
-- Each element of `chunks` has `hash` (`b3:<hex>`, a hash over that
-  byte range) then `size` (the range's byte length). The sizes sum to
-  the entry `size`.
-- Hints are listed in **content order**: the ranges they name, in
-  sequence, cover the whole file. This order is load-bearing and never
-  sorted.
-
-A hint earns its keep only when two files in the same pull share a byte
-range (two textures that share a region, or two model checkpoints that
-share most of their weights). The client fetches that range once, pays
-for it once, and splices it into every file that names it. A file with
-no shared ranges costs the same as an unchunked file plus the manifest
-entry.
+Each entry is one whole-file blob, which a node stores and serves under
+`hash`.
 
 ## Hash format
 
@@ -112,13 +74,10 @@ publisher-side and free to set their own conventions.
 
 A reader also accepts a `0x` prefix, no prefix, and uppercase hex
 digits. A reader checks `version` first. Then it rejects a manifest
-when an entry hash or a chunk hash is not 64 hex characters after an
-optional `b3:` or `0x` prefix. One bad hash makes the whole manifest
-invalid. A retry does not help. The manifest is content-addressed, so
-every read gets the same bytes. This rule applies to a chunk hash too.
-A hint is advisory, but its syntax is not. A chunk list whose sizes do
-not sum to the entry `size` is a wrong hint, not a bad hash: the client
-ignores the hints and fetches the whole file. A reader also rejects a
+when an entry hash is not 64 hex characters after an optional `b3:` or
+`0x` prefix. One bad hash makes the whole manifest invalid. A retry
+does not help. The manifest is content-addressed, so every read gets
+the same bytes. A reader also rejects a
 manifest with two entry paths that name one file (§ Path-safety rules,
 rule 7), or with a path segment that is not a portable file name (rule 8).
 
@@ -199,11 +158,8 @@ bundle from the same source tree get the same hash. The exact axes:
   encoding, and matches every other content-addressed sort in the
   workspace.
 - **Key order.** Outer `(version, entries)`; per-entry `(path, hash,
-  size, chunks)`, with `chunks` omitted entirely when the file is
-  unchunked; per-chunk `(hash, size)`. `serde_json` serializes structs
-  in declaration order — the Rust struct definitions are the canonical
-  key-order spec. An unchunked entry serializes byte-identically to a
-  bundle that predates chunked entries.
+  size)`. `serde_json` serializes structs in declaration order — the
+  Rust struct definitions are the canonical key-order spec.
 - **Encoding.** UTF-8, no BOM.
 - **Single-line compact.** No whitespace between tokens, no indentation,
   no internal newlines. `jq .` pretty-prints when humans need it; the
@@ -296,31 +252,8 @@ A URI with the wrong form gives a clear result:
 ## Generation
 
 `decdn origin import` walks a local file or directory and emits the
-canonical bundle manifest for it (see [Determinism](#determinism)). By
-default each file becomes one whole-file blob, addressed by `hash`.
-
-With `--optimize`, `origin import` stores each file as one whole-file blob
-(as it always does) and additionally content-defines chunks (fastcdc
-v2020) over its bytes to compute the manifest's range-dedup hints.
-`--chunk-avg` is the primary dial: it sets the target chunk size and
-defaults to 4 MiB, the ceiling fastcdc's averaging window supports.
-`--chunk-min` and `--chunk-max` are advanced rails around that target;
-`--chunk-min` is pinned at a 1 MiB floor, matching `MB_BYTES`, the fixed
-payment interval — a hint smaller than one payment interval buys nothing.
-Each chunk becomes one hint: its BLAKE3 and its byte length. A chunk hash
-is never stored or served as its own blob; `origin import` writes only
-the one whole-file blob, and the hint exists solely so a later `bundle
-pull` can recognize the same bytes in another file (see
-[Chunked files](#chunked-files)).
-
-A single-file `--optimize` import produces one manifest entry with a
-`chunks` hint list; a directory import produces one entry per file, each
-with hints computed over that file alone. A shared range between two
-files is recognized at pull time, by hash equality between their hint
-lists, not at import time.
-
-A bundle pull consumes a chunked manifest exactly as it consumes an
-unchunked one — see [Chunked entries](#chunked-entries) under Pull.
+canonical bundle manifest for it (see [Determinism](#determinism)). Each
+file becomes one whole-file blob, addressed by `hash`.
 
 `--to <dir>` writes blobs into a local filesystem cache origin store and
 is normally required. The filesystem is the only write backend. To fill an
@@ -397,9 +330,7 @@ The rules below apply to every pull:
   evaluated **per destination**, so an already-present duplicate path
   triggers no fetch of its own (the group still fetches once if any
   sibling path needs bytes).
-- **Concurrency** is bounded by `--jobs` (over distinct blobs). An entry
-  that waits for a sibling to fetch the chunks it splices holds no slot
-  while it waits. It takes a slot again before it fetches. Fetches share a
+- **Concurrency** is bounded by `--jobs` (over distinct blobs). Fetches share a
   `LaneLedger` per `(pool, signer, provider)` lane. `--max-lane-streams`
   (default 4) caps how many streams run at once on one lane. The shared
   ledger keeps voucher issuance monotonic across concurrent streams on a
@@ -408,21 +339,17 @@ The rules below apply to every pull:
   co-stream. Distinct lanes proceed in parallel. Every entry runs the
   acquire loop of
   [ADR 039](039-multi-source-parallel-fetch.md#adr-039-multi-source-parallel-fetch-scheduling-on-cdnclientv1)
-  over the holders that answer its discovery opens. A whole-file entry fetches the whole blob. A
-  range-dedup entry fetches only the ranges that no donor supplies, through
-  the same loop. The entry opens its holders once and uses them for each
-  fetch of its ranges. A lane of a range-dedup entry can go to a
-  proxy-warming non-holder, as for a whole-file entry, and `--max-sources`
-  counts such a node as one of its sources. The loop admits one node per
+  over the holders that answer its discovery opens. An entry fetches its
+  whole blob. A lane of an entry can go to a proxy-warming non-holder,
+  and `--max-sources` counts such a node as one of its sources. The loop
+  admits one node per
   operator. Each lane holds one permit of its provider while its own stream
   runs. A lane takes a permit only when a permit is free. When no permit is
   free, the lane build backs off and tries again. A lane gives its permit
   back when its own stream stops. A lane that starts again takes a free
   permit first. When no permit is free, the lane tries again each second.
-  An entry holds no lane permit while it waits on a sibling entry. All lanes of an entry write into
-  one ranged store. The entry does not mark its donor ranges present in that
-  store, so the store promotes the blob only when the loop fetched every
-  byte. A pull is one fetch, so all entries share one
+  All lanes of an entry write into one ranged store, which promotes the
+  blob only when the loop fetched every byte. A pull is one fetch, so all entries share one
   [funding recovery](003-payments.md#funding-recovery) state. A verified
   byte of any entry counts as progress for a further recovery step.
 - **Failover and retry.** All entries of a pull share one holder health
@@ -452,8 +379,11 @@ The rules below apply to every pull:
   entry, so a stuck entry waits while other entries make progress. A pull in
   a terminal has no limit. A pull in a script stops after 10 minutes with no
   verified byte. `--give-up-after-secs` overrides both limits. When the limit
-  expires, the pull stops all entries and exits with code 75. Each entry
-  keeps its `.partial`, so a rerun pays for no byte twice.
+  expires, the pull stops all entries and exits with code 75. The pull
+  keeps one download store for all its entries
+  (`.decdn-partial/store/`), and the store keeps what each entry fetched, so
+  a rerun pays for no byte twice. A pull that lands every entry removes the
+  store.
 - **Output** files are written under the output directory at each entry's
   relative path, resolved with the § Path-safety rules above (`..`,
   absolute, and escaping paths rejected). The pull holds the output
@@ -527,50 +457,12 @@ Verification is intrinsic: content addressing means every fetched blob
 is BLAKE3-checked against its `entries[].hash` by the fetch path, so
 there is no separate verify toggle.
 
-### Chunked entries
-
-A `chunks` entry (see [Chunked files](#chunked-files)) is still one
-whole-file blob, fetched over the paid path. When a chunk hint hash
-appears in two or more entries, the run assigns that shared chunk to one
-entry — its smallest holder — and only that entry pays to fetch it. Every
-other entry that names the chunk splices the range from the assigned
-holder's on-disk bytes and pays nothing for it. A splice source is always
-the verified bytes of a completed, whole-file-hash-checked entry, never an
-independently fetched chunk.
-
-The run schedules entries smallest whole-file first, so a shared chunk's
-assigned holder starts — and finishes — before the larger entries that
-splice from it. Each entry drives and pays for its own ranges up front (its
-unique chunks, the chunks assigned to it, and the partial chunk groups at
-the edges of each spliced run); it does not drive the ranges it defers to a
-sibling. Adjacent spliced chunks form one run, so a boundary between two
-spliced chunks costs no fetch. A spliced chunk that fails its hash check is
-fetched again over the whole chunk groups that it touches. It reconciles
-those deferred ranges at its tail: it splices each one as the assigned
-holder registers it, and waits on the holder rather than a clock, because
-the deferred bytes are exactly what that holder is still downloading. A
-deferred range is driven and paid for by the waiting entry only if its
-assigned holder FINISHES without producing the chunk — a failed fetch — so
-the run always completes and never pays more than a direct fetch.
-
-The reassembled bytes are verified against the whole-file `hash` before
-the destination appears, by atomic rename, so a present file is
-verified-good and re-runs resume. A spliced range is re-checked against
-its own hint hash before it is trusted, so a donor entry whose bytes
-were tampered with cannot poison a recipient; the whole-file check is
-the final backstop against a hint that is individually valid but wrong
-or misordered — the client re-fetches the entry whole rather than trust
-it.
-
-Range-dedup holds within one pull. Reuse across separate pulls — v2 of a
-model skipping the ranges it already fetched for v1 — needs a persistent
-range-addressed cache and is a follow-up.
+### Report
 
 At the end of a pull, the report states these totals. `downloaded` is the
 content bytes that this pull fetched and paid for. `reconstructed` is the
 bytes that this pull wrote to disk. The totals differ when one blob goes to
-several paths, or when range-dedup splices part of a blob from disk. The
-report states the spliced bytes separately, as `spliced_bytes`.
+several paths.
 
 `paid_bytes` is the wire bytes that the vouchers and hash-chain reveals of
 this pull paid for, summed over every lane. It is the growth of the claims
@@ -601,10 +493,9 @@ When `wire_bytes` is more than `paid_bytes`, the report adds the line
 `received W on the wire, U more than paid for`. `U` is `wire_bytes` minus
 `paid_bytes`.
 
-A pull can resume a `.partial` prefix that an earlier, interrupted pull
-fetched. The earlier pull paid for those bytes, so they are not in
-`downloaded`. The report states them separately, as `resumed_bytes`. A
-byte that the pull also splices counts only in `spliced_bytes`.
+A pull can resume the bytes that an earlier, interrupted pull fetched into
+its download store. The earlier pull paid for those bytes, so they are not in
+`downloaded`. The report states them separately, as `resumed_bytes`.
 `downloaded` is a sum of content lengths. It is not an exact count of
 on-wire bytes.
 

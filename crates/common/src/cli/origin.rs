@@ -118,33 +118,9 @@ pub struct OriginImportArgs {
     /// carries the canonical manifest bytes. `origin` is the `--to` target, or
     /// the literal `(dry-run)` when a dry run runs without `--to`.
     /// Shape:
-    /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","files":{"<path>":"b3:<hex>",...},"bundle_hash":"b3:<hex>"|null,"moved":<bool>,"optimized":<bool>,"chunks_total":<n>,"skipped_symlinks":<n>}`.
+    /// `{"imported":<n>,"bytes":<total>,"origin":"<target>","files":{"<path>":"b3:<hex>",...},"bundle_hash":"b3:<hex>"|null,"moved":<bool>,"skipped_symlinks":<n>}`.
     #[arg(long)]
     pub json: bool,
-
-    /// Content-defined-chunk each file and record the chunk boundaries as
-    /// `{hash,size}` hints in the manifest entry; each file is still stored
-    /// as one whole-file blob. A pull uses the hints to splice ranges it
-    /// already holds instead of re-fetching them. Off by default (no hints).
-    #[arg(long)]
-    pub optimize: bool,
-
-    /// Target average chunk size (`--optimize` only). The primary dial. Must be
-    /// a power of two, at most 4 MiB (fastcdc's ceiling). Defaults to 4 MiB when
-    /// `--optimize` is set (applied in the import wiring, not by clap, so an
-    /// explicit `--chunk-avg` without `--optimize` is a detectable error).
-    #[arg(long, value_name = "SIZE", value_parser = super::parse_byte_size)]
-    pub chunk_avg: Option<u64>,
-
-    /// Minimum chunk size override (`--optimize` only). Defaults to `avg/4`.
-    /// At least 1 MiB (the payment interval), at most 1 MiB (fastcdc's ceiling).
-    #[arg(long, value_name = "SIZE", value_parser = super::parse_byte_size)]
-    pub chunk_min: Option<u64>,
-
-    /// Maximum chunk size override (`--optimize` only). Defaults to `2*avg`.
-    /// At most 16 MiB (fastcdc's ceiling).
-    #[arg(long, value_name = "SIZE", value_parser = super::parse_byte_size)]
-    pub chunk_max: Option<u64>,
 
     /// Compute and emit the manifest without writing any blobs. Prints the
     /// canonical manifest bytes to stdout (status goes to stderr). Makes `--to`

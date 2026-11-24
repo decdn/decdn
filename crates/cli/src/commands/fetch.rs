@@ -572,8 +572,8 @@ pub(crate) async fn fetch(
     timings.mark(Mark::Endpoint);
     let payer = Payer::keystore(delegation).with_receipt(Arc::clone(evidence));
     // A Ctrl-C drops the fetch mid-transfer: each drive's drop guard queues
-    // what it paid for recording, and the `.partial` is the next run's resume
-    // prefix. The handle outlives the fetch, so an `openPool` or `topUp` that a
+    // what it paid for recording, and the store beside the output is the next
+    // run's resume prefix. The handle outlives the fetch, so an `openPool` or `topUp` that a
     // Ctrl-C or a fault dropped before its record committed is still named.
     let mut interrupt = Interrupt::watch(host.escrows.clone());
     let result = tokio::select! {
@@ -1464,7 +1464,7 @@ pub(crate) async fn fetch_on(
     let mut pass_pool = resolved.first_pass(&passes);
     // Set once a funding recovery step's replacement ended the first pass of a
     // file fetch on a pool: the next pass then runs the remaining work against
-    // the new pool, and resumes the `.partial`.
+    // the new pool, and resumes from the store beside the output.
     let mut replaced: Option<PoolReplaced> = None;
     let mut first = true;
     loop {
@@ -1626,7 +1626,6 @@ pub(crate) async fn fetch_on(
                         hash,
                         total_bytes,
                         dest: &args.output,
-                        ranges: None,
                     },
                     &stop,
                     (common.max_sources, timings, args.progress.as_deref()),
@@ -1655,7 +1654,7 @@ pub(crate) async fn fetch_on(
             Some(Err(err)) if !streamed.get() => match passes.next() {
                 // The nodes routed to another pool, and those that refused
                 // this one and named another, are paid in that pool's pass.
-                // A file pass resumes the `.partial`.
+                // A file pass resumes from the store beside the output.
                 Some(next) => {
                     tracing::info!(
                         failed_pool = %pass_pool.pool_account(),
@@ -2072,8 +2071,8 @@ fn stream_error(read_err: anyhow::Error, fetch_err: Option<anyhow::Error>) -> an
 /// Fetch `hash` to `output` via the [`Downloader`] consumption face (#1848 4c),
 /// striping across `holders` with at most `max_sources` lanes at once (a
 /// holder discovery adds later can take a free lane), and print the summary
-/// line. The `.partial` beside `output` stays in place on a failure for a
-/// later resume. The caller persists each lane's voucher watermark after the
+/// line. The store beside `output` (`<output>.decdn`) stays in place on a
+/// failure for a later resume. The caller persists each lane's voucher watermark after the
 /// fetch. Returns the size of the finished file, which the verified bytes
 /// prove.
 async fn download_to_file<P>(

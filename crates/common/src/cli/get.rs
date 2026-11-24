@@ -76,12 +76,7 @@ pub struct GetArgs {
     pub receipt: Option<PathBuf>,
 
     /// Bundle only: maximum concurrent entry fetches across the whole run
-    /// [default: 4]. Each distinct blob is one unit of work holding one slot:
-    /// a plain whole-file entry, or a range-dedup entry across its complement
-    /// drive, donor splice, and any re-fetch. A range-dedup entry that only
-    /// waits for a sibling to finish the chunks it splices gives its slot to a
-    /// queued entry until then. A byte range a sibling entry already holds is
-    /// spliced from disk, not fetched, so it never takes a slot of its own.
+    /// [default: 4]. Each distinct blob is one unit of work holding one slot.
     #[arg(long, value_name = "N")]
     pub jobs: Option<usize>,
 

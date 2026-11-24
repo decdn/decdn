@@ -95,7 +95,6 @@ fn serialize_canonical_emits_struct_field_order_no_newline() {
         path: "a.txt".into(),
         hash: "b3:abc".into(),
         size: 12,
-        chunks: None,
     }];
     let bytes = serialize_canonical(&entries).unwrap();
     let s = std::str::from_utf8(&bytes).unwrap();
@@ -104,48 +103,6 @@ fn serialize_canonical_emits_struct_field_order_no_newline() {
         "{\"version\":1,\"entries\":[{\"path\":\"a.txt\",\"hash\":\"b3:abc\",\"size\":12}]}"
     );
     assert!(!s.ends_with('\n'));
-}
-
-#[test]
-fn serialize_canonical_emits_chunks_after_size() {
-    let entries = vec![BundleEntry {
-        path: "model.safetensors".into(),
-        hash: "b3:whole".into(),
-        size: 100,
-        chunks: Some(vec![
-            Chunk {
-                hash: "b3:c0".into(),
-                size: 60,
-            },
-            Chunk {
-                hash: "b3:c1".into(),
-                size: 40,
-            },
-        ]),
-    }];
-    let bytes = serialize_canonical(&entries).unwrap();
-    let s = std::str::from_utf8(&bytes).unwrap();
-    assert_eq!(
-        s,
-        "{\"version\":1,\"entries\":[{\"path\":\"model.safetensors\",\"hash\":\"b3:whole\",\"size\":100,\"chunks\":[{\"hash\":\"b3:c0\",\"size\":60},{\"hash\":\"b3:c1\",\"size\":40}]}]}"
-    );
-}
-
-#[test]
-fn serialize_canonical_omits_chunks_key_when_absent() {
-    // A plain (unchunked) entry must serialize byte-identically to the
-    // pre-chunks format: no `chunks` key at all.
-    let entries = vec![BundleEntry {
-        path: "a.txt".into(),
-        hash: "b3:abc".into(),
-        size: 12,
-        chunks: None,
-    }];
-    let bytes = serialize_canonical(&entries).unwrap();
-    assert_eq!(
-        std::str::from_utf8(&bytes).unwrap(),
-        "{\"version\":1,\"entries\":[{\"path\":\"a.txt\",\"hash\":\"b3:abc\",\"size\":12}]}"
-    );
 }
 
 #[test]
@@ -232,32 +189,9 @@ fn collect_paths(
     let excluder = build_excluder(&exclude.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())?;
     let out = walk_and_collect(&canonical, follow_symlinks, &excluder, |canon, _rel| {
         let (h, s) = hash_file_at(canon)?;
-        Ok((b3_hex_str(h), s, None))
+        Ok((b3_hex_str(h), s))
     })?;
     Ok(out.entries.into_iter().map(|e| e.path).collect())
-}
-
-#[test]
-fn walk_threads_chunks_from_closure_into_entry() {
-    let dir = tempfile::TempDir::new().unwrap();
-    std::fs::write(dir.path().join("a.bin"), b"abc").unwrap();
-    let canonical = std::fs::canonicalize(dir.path()).unwrap();
-    let excluder = build_excluder(&[]).unwrap();
-    let out = walk_and_collect(&canonical, false, &excluder, |_c, _r| {
-        Ok((
-            "b3:whole".to_string(),
-            3,
-            Some(vec![Chunk {
-                hash: "b3:c0".into(),
-                size: 3,
-            }]),
-        ))
-    })
-    .unwrap();
-    assert_eq!(out.entries.len(), 1);
-    let e = out.entries.first().unwrap();
-    assert_eq!(e.chunks.as_ref().unwrap().len(), 1);
-    assert_eq!(e.chunks.as_ref().unwrap().first().unwrap().hash, "b3:c0");
 }
 
 #[test]
@@ -355,21 +289,10 @@ fn collect_excluded_symlinked_dir_does_not_error() {
 #[test]
 fn serialize_canonical_output_parses_as_a_manifest() {
     let whole = blake3::hash(b"whole");
-    let (c0, c1) = (blake3::hash(b"c0"), blake3::hash(b"c1"));
     let entries = vec![BundleEntry {
         path: "model.safetensors".into(),
         hash: b3_hex_str(whole),
         size: 100,
-        chunks: Some(vec![
-            Chunk {
-                hash: b3_hex_str(c0),
-                size: 60,
-            },
-            Chunk {
-                hash: b3_hex_str(c1),
-                size: 40,
-            },
-        ]),
     }];
     let bytes = serialize_canonical(&entries).unwrap();
     let manifest = decdn_client::bundle::BundleManifest::parse(&bytes).unwrap();
@@ -379,11 +302,4 @@ fn serialize_canonical_output_parses_as_a_manifest() {
     assert_eq!(entry.path, "model.safetensors");
     assert_eq!(entry.hash, *whole.as_bytes());
     assert_eq!(entry.size, Some(100));
-    let chunks: Vec<_> = entry
-        .chunks
-        .iter()
-        .flatten()
-        .map(|c| (c.hash, c.size))
-        .collect();
-    assert_eq!(chunks, [(*c0.as_bytes(), 60), (*c1.as_bytes(), 40)]);
 }

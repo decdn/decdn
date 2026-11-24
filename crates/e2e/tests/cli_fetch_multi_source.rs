@@ -311,7 +311,7 @@ fn distinct_pool_ids(
 /// a loop that merely accumulated payments across attempts would pass on two
 /// single-source fetches that each paid a different holder, which is exactly the
 /// non-parallelized case this journey exists to rule out. Each attempt starts
-/// from a clean slate (output and `.partial` set removed) so a resumed fetch
+/// from a clean slate (output and store removed) so a resumed fetch
 /// cannot bill one lane for a remainder the previous attempt left.
 async fn run_fetch_until_both_lanes_bill(
     data_dir: &std::path::Path,
@@ -359,8 +359,9 @@ async fn run_fetch_until_both_lanes_bill(
     }
 }
 
-/// Remove the output and every `.partial` artifact beside it, so the next fetch
-/// attempt starts from an empty gap set rather than resuming the previous one.
+/// Remove the output and the store beside it (`<output>.decdn`), so the next
+/// fetch attempt starts from an empty gap set rather than resuming the
+/// previous one.
 fn reset_fetch_artifacts(out: &std::path::Path) -> anyhow::Result<()> {
     let stem = out
         .file_name()
@@ -368,16 +369,16 @@ fn reset_fetch_artifacts(out: &std::path::Path) -> anyhow::Result<()> {
         .context("output has no usable file name")?
         .to_string();
     let dir = out.parent().context("output has no parent directory")?;
-    for path in [
-        out.to_path_buf(),
-        dir.join(format!("{stem}.partial")),
-        dir.join(format!("{stem}.partial.ranges")),
-    ] {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
-        }
+    match std::fs::remove_file(out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", out.display())),
+    }
+    let store = dir.join(format!("{stem}.decdn"));
+    match std::fs::remove_dir_all(&store) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("remove {}", store.display())),
     }
     Ok(())
 }

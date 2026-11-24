@@ -145,8 +145,7 @@ pub struct ClientFetchArgs {
 
     /// Cap on concurrently-used holders (ADR 039): a fetch stripes a blob
     /// across at most this many holders at once. Enough to saturate typical
-    /// downlinks without paying for marginal lanes. It also caps how many
-    /// holders a bundle's range-dedup entry stripes its ranges across.
+    /// downlinks without paying for marginal lanes.
     #[arg(long, value_name = "N", default_value_t = 4)]
     pub max_sources: usize,
 

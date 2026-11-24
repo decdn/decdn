@@ -24,15 +24,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
-use decdn_bao_range::{EncodedOutboard, encode_outboard, shard_prefix};
+use decdn_bao_range::{EncodedOutboard, encode_outboard};
 use decdn_client::bundle::BundleManifest;
 use decdn_common::cli::{OriginArgs, OriginCommand, OriginImportArgs};
 use serde::Serialize;
 
-use super::chunker::{ChunkSizes, chunk_file};
 use super::manifest::{
-    BundleEntry, Chunk, b3_hex_str, build_excluder, hash_file_at, serialize_canonical,
-    validate_relpath, walk_and_collect, write_bundle,
+    BundleEntry, b3_hex_str, build_excluder, hash_file_at, serialize_canonical, validate_relpath,
+    walk_and_collect, write_bundle,
 };
 
 /// Dispatcher for `decdn origin ...`. Every subcommand is offline, config-free
@@ -110,28 +109,16 @@ struct ImportReport {
     /// `None` for a single file (which produces no manifest).
     bundle_hash: Option<String>,
     /// Whether sources were moved (`--move`) rather than copied. Always
-    /// `false` under `--dry-run`, since nothing is written; `--move` is
-    /// rejected together with `--optimize`, so this is never `true` for an
-    /// optimized import.
+    /// `false` under `--dry-run`, since nothing is written.
     moved: bool,
-    /// Whether content-defined chunking (`--optimize`) was applied — each file
-    /// is still stored as one whole-file blob, but the manifest also carries
-    /// its chunk decomposition as dedup hints.
-    optimized: bool,
-    /// Chunk hint count across every file (0 unless `--optimize`). Each file is
-    /// stored as one whole-file blob; the chunks are manifest-only dedup hints,
-    /// not separately stored blobs. Equals the sum of every entry's chunk count.
-    chunks_total: u64,
     /// Count of symlinks skipped during a directory walk (0 for a single-file
     /// import, and only non-zero without `--follow-symlinks`).
     skipped_symlinks: u64,
 }
 
-/// The resolved import context, threaded through the sync import paths. It
-/// captures the two axes that steer every write decision — `write` (whether
-/// blobs land on disk at all, false under `--dry-run`) and `optimize` (whether
-/// files are content-defined-chunked) — plus the shared flags and the resolved
-/// filesystem `base` (`Some` exactly when `write`).
+/// The resolved import context, threaded through the sync import paths: `write`
+/// (whether blobs land on disk at all, false under `--dry-run`), the shared
+/// flags, and the resolved filesystem `base` (`Some` exactly when `write`).
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent per-invocation toggles resolved from CLI flags, not modelled state"
@@ -153,11 +140,6 @@ struct ImportCtx {
     /// The `--to` target string surfaced in the report (a placeholder in a
     /// no-target dry run).
     origin_label: String,
-    /// Content-define-chunk each file and record its chunk decomposition as
-    /// manifest dedup hints, on top of the usual whole-file blob (`--optimize`).
-    optimize: bool,
-    /// The validated chunk-size triple, `Some` iff `optimize`.
-    sizes: Option<ChunkSizes>,
     /// The validated `--subfolder` prefix (a relative POSIX path, no trailing
     /// slash), prepended to every manifest entry's path so a pull lands the
     /// whole bundle under one directory. `None` when the flag is absent.
@@ -201,7 +183,7 @@ fn place_under(prefix: Option<&str>, rel: &str) -> String {
     }
 }
 
-/// Entry point. Resolves the target and chunk options, dispatches file vs
+/// Entry point. Resolves the target and options, dispatches file vs
 /// directory import inside `spawn_blocking`, and routes the status report —
 /// stdout normally, stderr under `--dry-run` (where stdout carries the manifest).
 pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
@@ -212,23 +194,6 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         (None, true) => None,
         (None, false) => bail!("--to <target> is required unless --dry-run"),
     };
-    // The chunk-size flags only mean something with `--optimize`; reject them
-    // otherwise so a typo like `--chunk-avg` without `--optimize` is not silently
-    // ignored.
-    if !args.optimize
-        && (args.chunk_avg.is_some() || args.chunk_min.is_some() || args.chunk_max.is_some())
-    {
-        bail!("--chunk-avg/--chunk-min/--chunk-max require --optimize");
-    }
-    // The 4 MiB avg default lives here, not in clap, so an explicit `--chunk-avg`
-    // without `--optimize` stays detectable as `Some` above.
-    let avg = args.chunk_avg.unwrap_or(4 * 1024 * 1024);
-    let sizes = if args.optimize {
-        Some(ChunkSizes::resolve(avg, args.chunk_min, args.chunk_max)?)
-    } else {
-        None
-    };
-
     let subfolder = resolve_subfolder(args.subfolder.as_deref())?;
 
     let write = !args.dry_run;
@@ -254,8 +219,6 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         force: args.force,
         bundle_out: args.bundle.clone(),
         origin_label,
-        optimize: args.optimize,
-        sizes,
         subfolder,
     };
 
@@ -279,11 +242,7 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
         if meta.is_dir() {
             import_directory(&ctx, &input, follow, &exclude)
         } else if meta.is_file() {
-            if ctx.optimize {
-                import_single_optimized(&ctx, &input)
-            } else {
-                import_single_plain(&ctx, &input)
-            }
+            import_single(&ctx, &input)
         } else {
             bail!(
                 "--input {} is neither a regular file nor a directory",
@@ -319,12 +278,9 @@ pub async fn origin_import(args: &OriginImportArgs) -> anyhow::Result<()> {
 }
 
 /// Import a whole directory tree and emit its canonical bundle manifest. Every
-/// regular file is stored as one whole-file blob, plain or `--optimize` alike;
-/// `--optimize` additionally content-defined-chunks each file and records the
-/// chunk list in the manifest as dedup hints — hints only, never separately
-/// stored blobs. Either way the manifest bytes are the same canonical bytes
-/// `--dry-run` would print, so the tree is retrievable by the reported bundle
-/// hash.
+/// regular file is stored as one whole-file blob. The manifest bytes are the
+/// same canonical bytes `--dry-run` would print, so the tree is retrievable by
+/// the reported bundle hash.
 fn import_directory(
     ctx: &ImportCtx,
     input: &Path,
@@ -335,139 +291,32 @@ fn import_directory(
     let root = std::fs::canonicalize(input)
         .map_err(|e| anyhow!("canonicalize --input {}: {e}", input.display()))?;
 
-    if ctx.optimize {
-        let sizes = ctx
-            .sizes
-            .as_ref()
-            .ok_or_else(|| anyhow!("internal: optimize without chunk sizes"))?;
-        let mut chunks_total: u64 = 0;
-        let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
-            let (hash_hex, size, chunks) = import_optimized_file(ctx, canonical, sizes)?;
-            let n = u64::try_from(chunks.len())
-                .map_err(|_| anyhow!("chunk count {} exceeds u64", chunks.len()))?;
-            chunks_total = chunks_total
-                .checked_add(n)
-                .ok_or_else(|| anyhow!("chunk count overflow"))?;
-            Ok((b3_hex_str_from_hex(&hash_hex), size, Some(chunks)))
-        })?;
-        emit_manifest(
-            ctx,
-            collected.entries,
-            collected.total_size,
-            true,
-            chunks_total,
-            collected.skipped_symlinks,
-        )
-    } else {
-        let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
-            if ctx.write {
-                let base = ctx
-                    .base
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("internal: write without a base"))?;
-                let blob = import_one_file(base, canonical, ctx.move_source, ctx.force)?;
-                Ok((b3_hex_str_from_hex(&blob.hash_hex), blob.size, None))
-            } else {
-                let (h, s) = hash_file_at(canonical)
-                    .map_err(|e| anyhow!("hash {}: {e}", canonical.display()))?;
-                Ok((b3_hex_str(h), s, None))
-            }
-        })?;
-        emit_manifest(
-            ctx,
-            collected.entries,
-            collected.total_size,
-            false,
-            0,
-            collected.skipped_symlinks,
-        )
-    }
-}
-
-/// Import one `--optimize` file: store its whole-file blob + `.obao4` outboard
-/// exactly like a plain import (`ctx.write` gates the write, same as
-/// `import_one_file`/`hash_file_at` elsewhere), then compute its chunk hints
-/// with a second, no-op-sink streaming pass over the same bytes. Returns the
-/// whole-file `(hex hash, size, chunk hints)`.
-///
-/// The chunk pass reads the just-written **stored object** at its
-/// content-addressed path, not the source. The store copy always exists after
-/// `import_one_file` — a `--move` renames the source into the store, a copy
-/// stages it there — so `--optimize` composes with `--move` for free, and
-/// chunking the immutable stored bytes rules out any read race between the two
-/// passes. Re-chunking those bytes must reproduce the whole-file hash and size;
-/// a mismatch would mean the stored object was corrupted between the write and
-/// the chunk pass, and is reported rather than emitting hints that don't
-/// describe the stored blob.
-fn import_optimized_file(
-    ctx: &ImportCtx,
-    path: &Path,
-    sizes: &ChunkSizes,
-) -> anyhow::Result<(String, u64, Vec<Chunk>)> {
-    if ctx.write {
-        let base = ctx
-            .base
-            .as_deref()
-            .ok_or_else(|| anyhow!("internal: write without a base"))?;
-        let blob = import_one_file(base, path, ctx.move_source, ctx.force)?;
-
-        let stored = base.join(shard_prefix(&blob.hash_hex)).join(&blob.hash_hex);
-        let file = File::open(&stored)
-            .map_err(|e| anyhow!("open stored object {}: {e}", stored.display()))?;
-        let cf = chunk_file(file, sizes, |_chash, _data| Ok(()))?;
-
-        if cf.whole_hash.to_hex().as_str() != blob.hash_hex || cf.total_size != blob.size {
-            bail!(
-                "stored object {} is corrupt: whole-file pass wrote {} bytes at {}, \
-                 chunk pass read {} bytes at {}",
-                stored.display(),
-                blob.size,
-                blob.hash_hex,
-                cf.total_size,
-                cf.whole_hash.to_hex()
-            );
+    let collected = walk_and_collect(&root, follow, &excluder, |canonical, _rel| {
+        if ctx.write {
+            let base = ctx
+                .base
+                .as_deref()
+                .ok_or_else(|| anyhow!("internal: write without a base"))?;
+            let blob = import_one_file(base, canonical, ctx.move_source, ctx.force)?;
+            Ok((b3_hex_str_from_hex(&blob.hash_hex), blob.size))
+        } else {
+            let (h, s) = hash_file_at(canonical)
+                .map_err(|e| anyhow!("hash {}: {e}", canonical.display()))?;
+            Ok((b3_hex_str(h), s))
         }
-        Ok((blob.hash_hex, blob.size, cf.chunks))
-    } else {
-        // A dry run writes nothing, so one streaming pass suffices for both the
-        // whole-file hash and the chunk hints.
-        let file = File::open(path).map_err(|e| anyhow!("open {}: {e}", path.display()))?;
-        let cf = chunk_file(file, sizes, |_chash, _data| Ok(()))?;
-        Ok((cf.whole_hash.to_hex().to_string(), cf.total_size, cf.chunks))
-    }
+    })?;
+    emit_manifest(
+        ctx,
+        collected.entries,
+        collected.total_size,
+        collected.skipped_symlinks,
+    )
 }
 
-/// Import a single file with `--optimize`: store its whole-file blob (exactly
-/// like a plain import) plus a manifest chunk-hint list, and emit a one-entry
-/// manifest keyed by the file's own name.
-fn import_single_optimized(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportReport> {
-    let sizes = ctx
-        .sizes
-        .as_ref()
-        .ok_or_else(|| anyhow!("internal: optimize without chunk sizes"))?;
-    // Key the one entry by the file's own name, validated to the same POSIX
-    // path rules a directory entry obeys. Validated before the import, so a
-    // name no reader accepts moves nothing and writes no blob.
-    let name = input
-        .file_name()
-        .ok_or_else(|| anyhow!("--input {} has no file name", input.display()))?;
-    let path = validate_relpath(Path::new(name))?;
-    let (hash_hex, total_size, chunks) = import_optimized_file(ctx, input, sizes)?;
-    let chunks_total =
-        u64::try_from(chunks.len()).map_err(|_| anyhow!("chunk count exceeds u64"))?;
-    let entry = BundleEntry {
-        path,
-        hash: b3_hex_str_from_hex(&hash_hex),
-        size: total_size,
-        chunks: Some(chunks),
-    };
-    emit_manifest(ctx, vec![entry], total_size, true, chunks_total, 0)
-}
-
-/// Import a single file without optimization: one whole-file blob, no manifest.
-/// Honors `--dry-run` (hash only, no write); the report keys the file by its own
-/// name and carries the one blob's content hash.
-fn import_single_plain(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportReport> {
+/// Import a single file: one whole-file blob, no manifest. Honors `--dry-run`
+/// (hash only, no write); the report keys the file by its own name and carries
+/// the one blob's content hash.
+fn import_single(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportReport> {
     let (hash_hex, size) = if ctx.write {
         let base = ctx
             .base
@@ -498,14 +347,11 @@ fn import_single_plain(ctx: &ImportCtx, input: &Path) -> anyhow::Result<ImportRe
         // A dry run writes nothing, so it never actually moved the source —
         // even though `--move` was passed, don't claim it happened.
         moved: ctx.move_source && ctx.write,
-        optimized: false,
-        chunks_total: 0,
         skipped_symlinks: 0,
     })
 }
 
-/// Shared manifest tail for every path that emits a bundle (a directory import
-/// and a single-file `--optimize`). Serializes the canonical manifest, then —
+/// Manifest tail for a directory import. Serializes the canonical manifest, then —
 /// gated on the context — imports the manifest blob (`write`), writes the
 /// `--bundle` file, and prints the exact canonical bytes to stdout (`--dry-run`,
 /// no trailing newline, so stdout equals the `--bundle` file equals the bundle
@@ -515,8 +361,6 @@ fn emit_manifest(
     ctx: &ImportCtx,
     mut entries: Vec<BundleEntry>,
     total_size: u64,
-    optimized: bool,
-    chunks_total: u64,
     skipped_symlinks: u64,
 ) -> anyhow::Result<ImportReport> {
     // Prefix every entry's path with `--subfolder` before serializing, so the
@@ -569,8 +413,6 @@ fn emit_manifest(
         // A dry run writes nothing, so it never actually moved a source;
         // gating on `ctx.write` keeps this line self-evidently truthful.
         moved: ctx.move_source && ctx.write,
-        optimized,
-        chunks_total,
         skipped_symlinks,
     })
 }
@@ -869,9 +711,6 @@ fn write_import_report(
             "{verb} {} file(s), {} bytes, into {}",
             report.imported, report.bytes, report.origin
         )?;
-        if report.optimized {
-            write!(w, ", {} chunk hint(s)", report.chunks_total)?;
-        }
         // A directory import is addressed by its bundle hash; a single-file
         // import has no manifest, so surface the one blob's content hash. The
         // full file→hash map is reserved for `--json`.

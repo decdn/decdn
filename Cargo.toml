@@ -119,8 +119,7 @@ positioned-io = "0.3"
 # (`io::fsm::ResponseDecoder`, behind its `tokio_fsm` feature) drives. Needed
 # by name to implement the trait over a live paid pull, and bao-tree re-exports
 # only `AsyncSliceReader`/`AsyncSliceWriter`, not this one. Pinned to what
-# bao-tree 0.17 carries. Unrelated to `iroh-blobs`, so the client SDK that
-# depends on it stays iroh-blobs-free (#578).
+# bao-tree 0.17 carries.
 iroh-io = { version = "0.6", default-features = false }
 
 # Async runtime
@@ -232,12 +231,6 @@ blake3 = "1"
 # Source parsing for the workspace guard that keeps every unit-test module in
 # its own file (`crates/e2e/tests/no_inline_test_modules.rs`, #2352).
 syn = { version = "3", default-features = false, features = ["full", "parsing", "visit"] }
-
-# Content-defined chunking (`decdn origin import --optimize`): fastcdc's
-# v2020 module implements the rolling-hash chunk-boundary algorithm and
-# publishes its own min/avg/max structural bounds as constants, which
-# `ChunkSizes::resolve` validates against directly.
-fastcdc = "5"
 
 # HTTP client (cache-origin backend, CLI probes, alloy's JSON-RPC transport).
 # `rustls-no-provider`, not `rustls`: the latter compiles in aws-lc-rs. reqwest

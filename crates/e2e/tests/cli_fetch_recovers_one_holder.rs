@@ -110,7 +110,7 @@ async fn run() -> anyhow::Result<()> {
         .context("mint buyer USDC")?;
 
     let out = client_dir.path().join("blob.bin");
-    let partial = client_dir.path().join("blob.bin.partial");
+    let partial = client_dir.path().join("blob.bin.decdn");
     let mut args = fetch_argv(
         &chain,
         &node,
@@ -128,7 +128,7 @@ async fn run() -> anyhow::Result<()> {
     let fetch = tokio::spawn(async move { cmd.output().await });
 
     // Let the transfer get solidly underway before pulling the rug: wait for
-    // the `.partial` scratch file to pass 8 MiB (well short of the 96 MiB
+    // the store beside the output to hold 8 MiB (well short of the 96 MiB
     // total), so the restart lands mid-stream rather than racing the open.
     wait_for_partial_bytes(&partial, 8 * 1024 * 1024, Duration::from_secs(60)).await?;
 
@@ -157,7 +157,7 @@ async fn run() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         !partial.exists(),
-        "the .partial scratch file must be promoted away, not left beside --output: {}",
+        "the store must be removed, not left beside --output: {}",
         partial.display()
     );
 
@@ -299,11 +299,12 @@ fn discovery_fetch_argv(
     ]
 }
 
-/// Poll `partial`'s size every 200ms until it is at least `min_bytes`, or fail
-/// once `deadline` elapses. The `.partial` scratch file is the gap-driven
-/// fetch's on-disk progress marker (ADR 038's `ClientRangedStore`), so watching
-/// it grow is how a test observes "the transfer is underway" without adding
-/// any observability to the client itself.
+/// Poll the data files in the store `partial` (a download's `<output>.decdn`)
+/// every 200ms until one is at least `min_bytes` long, or fail once `deadline`
+/// elapses. The store's data file is the gap-driven fetch's on-disk progress
+/// marker (`ClientRangedStore`), so watching it grow is how a test observes
+/// "the transfer is underway" without adding any observability to the client
+/// itself.
 async fn wait_for_partial_bytes(
     partial: &Path,
     min_bytes: u64,
@@ -311,7 +312,14 @@ async fn wait_for_partial_bytes(
 ) -> anyhow::Result<()> {
     let started = tokio::time::Instant::now();
     loop {
-        if std::fs::metadata(partial).is_ok_and(|meta| meta.len() >= min_bytes) {
+        let longest = std::fs::read_dir(partial.join("data")).map_or(0, |dir| {
+            dir.flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|meta| meta.len())
+                .max()
+                .unwrap_or(0)
+        });
+        if longest >= min_bytes {
             return Ok(());
         }
         anyhow::ensure!(

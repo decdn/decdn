@@ -3755,9 +3755,7 @@ const DEPLOYMENT_PREFLIGHT_BUDGET: Duration = Duration::from_mins(1);
 /// token), and that is the likeliest wrong-address typo. The two views are the
 /// probe because only a `PaymentPool` declares them. The
 /// `deployment_preflight_guard` e2e boots against every contract in the deploy
-/// manifest to catch a collision, and the `payment_pool_probe_selector` e2e
-/// fails if any contract in `contracts/src` other than a `PaymentPool` exposes
-/// the selectors, deployed or not. Runs BEFORE the lane store opens, so a typo
+/// manifest to catch a collision. Runs BEFORE the lane store opens, so a typo
 /// aborts bring-up before any row is written under a deployment that does not
 /// exist. The reads retry transient RPC errors on `retry`; the mismatch
 /// verdicts are deterministic and fail at once, and a non-`PaymentPool` target

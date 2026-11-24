@@ -403,16 +403,13 @@ mod sol_types {
         contract FeeRouter {
             /// Governance-chain entry for one swept protocol share: pulls
             /// `amount` USDC from the caller, pays the rebate to an active
-            /// `operator`, splits the rest into buyback and treasury, and
-            /// credits `servedBytes` toward the operator's vote weight.
+            /// `operator`, sends the rest to the treasury, and credits
+            /// `servedBytes` toward the operator's vote weight.
             /// Mirrors `contracts/src/FeeRouter.sol`.
             function deposit(address operator, uint256 servedBytes, uint256 amount) external;
 
             /// Share of each deposit rebated to an active operator, in bps.
             function rebateBps() external view returns (uint256);
-
-            /// Share of each deposit sent to the buyback, in bps.
-            function buybackBps() external view returns (uint256);
 
             /// USDC per MiB that prices a deposit's vote-weight byte credit.
             function deliveryFloor() external view returns (uint256);

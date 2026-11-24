@@ -12,7 +12,6 @@
     "timelockDelay": 172800
   },
   "contracts": {
-    "BuybackBurner": "0x0469046f2937df1d9C0686B4e972a0c656ddEC64",
     "CapacityBond": "0x65a9e38F41B9bE2fcB97950a0E3c33e506E6E353",
     "ContentBlacklist": "0x36487Eca107F85aD361Eb5802C47a25D0CB330A9",
     "DecdnGovernor": "0x07908658Eb29291CC382a651650328aCc93C2539",

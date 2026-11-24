@@ -289,10 +289,10 @@ async fn an_interrupted_bundle_counts_what_its_unlanded_blobs_fetched() {
     );
 }
 
-/// A landed blob counts what its pull says it fetched, spliced and resumed,
-/// not its position, which a splice moves to the blob's size.
+/// A landed blob counts what its pull says it fetched and resumed, not what
+/// its positions say.
 #[tokio::test]
-async fn a_landed_blob_counts_its_splice_as_reused() {
+async fn a_landed_blob_counts_what_its_pull_reports() {
     let dir = tempfile::tempdir().unwrap();
     let recorder = start(dir.path(), &format!("{BLOB}/"));
     plan_ab(&recorder);
@@ -303,9 +303,8 @@ async fn a_landed_blob_counts_its_splice_as_reused() {
     recorder.file_landed(Landed {
         hash: HASH_A,
         size: 100,
-        paid: 30,
-        spliced: 70,
-        resumed: 0,
+        paid: 70,
+        resumed: 30,
     });
     recorder.finish(&Ok(()), None).await;
     let ended = only(dir.path());
@@ -316,7 +315,7 @@ async fn a_landed_blob_counts_its_splice_as_reused() {
             ended.resumed_bytes,
             ended.reused_bytes
         ),
-        (100, 30, 0, 70)
+        (100, 70, 30, 0)
     );
     assert_eq!(bundle_of(&ended).1, 1);
 }
@@ -432,8 +431,7 @@ async fn an_entry_run_keeps_its_counts_and_no_file_progress() {
     recorder.file_landed(Landed {
         hash: HASH_A,
         size: 100,
-        paid: 22,
-        spliced: 70,
+        paid: 92,
         resumed: 8,
     });
     let counts = BundleCounts {
@@ -458,7 +456,7 @@ async fn an_entry_run_keeps_its_counts_and_no_file_progress() {
             record.resumed_bytes,
             record.reused_bytes
         ),
-        (100, 22, 8, 70)
+        (100, 92, 8, 0)
     );
     let json = serde_json::to_value(&record).unwrap();
     assert_eq!(json["kind"], "entry");

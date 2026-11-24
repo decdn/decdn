@@ -73,10 +73,10 @@ fn materialize_replaces_dest_and_keeps_staging() {
     assert_eq!(std::fs::read(&staging).unwrap(), b"new-content");
 }
 
-/// A non-donor blob's first write moves staging into place — no second copy
-/// of the blob — and replaces a stale destination atomically.
+/// `move_into_place` moves staging into place, with no second copy of the
+/// blob, and replaces a stale destination atomically.
 #[test]
-fn first_write_moves_a_non_donor_blob_into_place() {
+fn move_into_place_moves_the_blob_and_replaces_a_stale_dest() {
     let dir = tempfile::tempdir().unwrap();
     let landing = Landing::open(dir.path()).unwrap();
     let staging = dir.path().join("blob");
@@ -85,35 +85,11 @@ fn first_write_moves_a_non_donor_blob_into_place() {
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::fs::write(&dest, b"stale-old").unwrap();
 
-    let n = landing.first_write(&staging, &dest, false).unwrap();
+    let n = landing.move_into_place(&staging, &dest).unwrap();
 
     assert_eq!(n, b"new-content".len() as u64);
     assert_eq!(std::fs::read(&dest).unwrap(), b"new-content");
     assert!(!staging.exists(), "the blob moved, it was not copied");
-}
-
-/// A donor blob's first write keeps its staging name — later recipients
-/// still splice from it — and shares its storage with the destination.
-#[cfg(unix)]
-#[test]
-fn first_write_links_a_donor_blob_and_keeps_staging() {
-    use std::os::unix::fs::MetadataExt;
-    let dir = tempfile::tempdir().unwrap();
-    let landing = Landing::open(dir.path()).unwrap();
-    let staging = dir.path().join("blob");
-    std::fs::write(&staging, b"donor-bytes").unwrap();
-    let dest = dir.path().join("out.bin");
-
-    let n = landing.first_write(&staging, &dest, true).unwrap();
-
-    assert_eq!(n, b"donor-bytes".len() as u64);
-    assert_eq!(std::fs::read(&dest).unwrap(), b"donor-bytes");
-    assert!(staging.exists(), "a donor's staging name survives");
-    assert_eq!(
-        std::fs::metadata(&staging).unwrap().ino(),
-        std::fs::metadata(&dest).unwrap().ino(),
-        "the first destination is a hard link, not a copy"
-    );
 }
 
 /// An output directory that does not exist yet is created.
@@ -234,7 +210,7 @@ fn a_relative_symlink_inside_the_root_still_lands() {
     std::fs::write(&staging, b"bytes").unwrap();
 
     let n = landing
-        .first_write(&staging, &out.path().join("alias/file"), false)
+        .move_into_place(&staging, &out.path().join("alias/file"))
         .unwrap();
 
     assert_eq!(n, 5);
@@ -257,7 +233,7 @@ fn an_absolute_symlink_inside_the_root_is_an_escape() {
     std::fs::write(&staging, b"bytes").unwrap();
 
     let err = landing
-        .first_write(&staging, &out.path().join("alias/file"), false)
+        .move_into_place(&staging, &out.path().join("alias/file"))
         .unwrap_err();
 
     assert!(
@@ -361,32 +337,6 @@ fn a_directory_swapped_for_a_symlink_after_the_check_is_still_refused() {
     let linked = landing.link_or_copy_atomic(&src, &dest).unwrap_err();
     assert_refused(&linked, outside.path());
     assert!(staging.exists(), "the fetched blob is kept for a rerun");
-}
-
-/// A donor whose staging directory is a symlink the handle refuses still
-/// lands: the hard link is refused, and the copy fallback lands it with no
-/// staged name left beside the entry.
-#[cfg(unix)]
-#[test]
-fn a_donor_under_a_symlinked_staging_dir_lands_through_the_copy_fallback() {
-    let out = tempfile::tempdir().unwrap();
-    let elsewhere = tempfile::tempdir().unwrap();
-    std::os::unix::fs::symlink(elsewhere.path(), out.path().join(STAGING_DIR)).unwrap();
-    let landing = Landing::open(out.path()).unwrap();
-    let staging = out.path().join(STAGING_DIR).join("blob");
-    std::fs::write(&staging, b"donor-bytes").unwrap();
-    let dest = out.path().join("sub/file");
-
-    let n = landing.first_write(&staging, &dest, true).unwrap();
-
-    assert_eq!(n, 11);
-    assert_eq!(std::fs::read(&dest).unwrap(), b"donor-bytes");
-    assert!(staging.exists(), "a donor's staging name survives");
-    let names: Vec<String> = std::fs::read_dir(out.path().join("sub"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(names, ["file"]);
 }
 
 /// A symlink at the entry's own name is replaced by the landed file, never
