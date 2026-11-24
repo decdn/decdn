@@ -457,9 +457,20 @@ impl ClientRangedStore {
     /// `prefix_len` is past the blob's end, or `blob` is not this store's.
     #[cfg(any(test, feature = "test-util"))]
     pub async fn admit_prefix(&self, blob: &[u8], prefix_len: u64) -> anyhow::Result<()> {
+        self.admit_range(blob, 0, prefix_len).await
+    }
+
+    /// Admit the chunk-group-aligned range `[offset, offset + len)` of `blob`,
+    /// this store's blob, verified.
+    ///
+    /// # Errors
+    ///
+    /// The range is past the blob's end, or `blob` is not this store's.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn admit_range(&self, blob: &[u8], offset: u64, len: u64) -> anyhow::Result<()> {
         let total = u64::try_from(blob.len())?;
         let ob = bao_tree::io::outboard::PreOrderMemOutboard::create(blob, IROH_BLOCK_SIZE);
-        let aligned = decdn_bao_range::align_range(0, prefix_len, total)?;
+        let aligned = decdn_bao_range::align_range(offset, len, total)?;
         let start = usize::try_from(aligned.fetch_start())?;
         let end = usize::try_from(aligned.fetch_end())?;
         let data = blob

@@ -256,7 +256,6 @@ async fn fetch_to_paths_writes_each_blob_to_its_named_dest() -> anyhow::Result<(
                 hash: root,
                 total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
-                ranges: None,
             }],
             None,
         )
@@ -271,60 +270,6 @@ async fn fetch_to_paths_writes_each_blob_to_its_named_dest() -> anyhow::Result<(
     anyhow::ensure!(
         blake3::hash(&got).as_bytes() == &root,
         "written file is BLAKE3-identical to the entry hash"
-    );
-    Ok(())
-}
-
-/// A ranged target whose ranges complete the store is promoted: its `dest`
-/// exists and is in the result. A ranged target that leaves bytes missing
-/// stays a `.partial` and is not in the result.
-#[tokio::test]
-async fn a_ranged_target_is_promoted_only_when_its_store_completes() -> anyhow::Result<()> {
-    let blob = payload(1_500_000);
-    let total = u64::try_from(blob.len())?;
-    let dir = tempfile::tempdir()?;
-
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
-    let root = source.root();
-    let part = dir.path().join("part.bin");
-    let half = [(0, total / 2)];
-    let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
-        .fetch_to_paths(
-            &[DownloadTarget {
-                hash: root,
-                total_bytes: ProvenSize::assume_for_tests(total),
-                dest: &part,
-                ranges: Some(&half),
-            }],
-            None,
-        )
-        .await?;
-    anyhow::ensure!(paths.is_empty(), "an incomplete target is not returned");
-    anyhow::ensure!(!part.exists(), "an incomplete target is not promoted");
-
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
-    let whole = dir.path().join("whole.bin");
-    let all = [(0, total)];
-    let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
-        .fetch_to_paths(
-            &[DownloadTarget {
-                hash: root,
-                total_bytes: ProvenSize::assume_for_tests(total),
-                dest: &whole,
-                ranges: Some(&all),
-            }],
-            None,
-        )
-        .await?;
-    anyhow::ensure!(
-        paths == vec![whole.clone()],
-        "the promoted dest is returned"
-    );
-    anyhow::ensure!(
-        std::fs::read(&whole)? == blob,
-        "the promoted file is the blob"
     );
     Ok(())
 }
@@ -352,7 +297,6 @@ async fn fetch_to_paths_threads_a_shared_ledger_registry() -> anyhow::Result<()>
                 hash: root,
                 total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
-                ranges: None,
             }],
             &registry,
             None,
@@ -455,14 +399,13 @@ async fn a_pre_seeded_prefix_is_not_refetched() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fetch `ranges` of `blob` to `dest` under a first claim of `claim`,
-/// from one fresh source. Returns the source, so the test can read what it
-/// opened, and the promoted paths.
-async fn fetch_ranges(
+/// Fetch `blob` to `dest` under a first claim of `claim`, from one fresh
+/// source. Returns the source, so the test can read what it opened, and the
+/// exported paths.
+async fn fetch_whole(
     blob: &[u8],
     dest: &std::path::Path,
     claim: u64,
-    ranges: Option<&[(u64, u64)]>,
 ) -> anyhow::Result<(ScriptedSource, Vec<std::path::PathBuf>)> {
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let source = ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
@@ -473,7 +416,6 @@ async fn fetch_ranges(
                 hash: probe.root(),
                 total_bytes: ProvenSize::assume_for_tests(claim),
                 dest,
-                ranges,
             }],
             None,
         )
@@ -481,31 +423,7 @@ async fn fetch_ranges(
     Ok((probe, paths))
 }
 
-/// A resumed record finishes under the proven size: the file is the blob,
-/// and no byte the record holds is opened again.
-#[tokio::test]
-async fn a_resumed_record_opens_only_what_it_lacks() -> anyhow::Result<()> {
-    let blob = payload(3 * 1024 * 1024);
-    let total = u64::try_from(blob.len())?;
-    let held = 1024 * 1024;
-    let dir = tempfile::tempdir()?;
-    let dest = dir.path().join("model.bin");
-    // A first run lands `[0, held)` only.
-    let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&[(0, held)])).await?;
-    anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
-
-    let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
-    anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
-    anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
-    let opened = probe.opened_ranges();
-    anyhow::ensure!(
-        opened.iter().all(|&(start, _)| start >= held),
-        "no held byte is opened again: {opened:?}"
-    );
-    Ok(())
-}
-
-/// A resumed record that holds its head and its final group opens only the
+/// A resumed store that holds its head and its final group opens only the
 /// missing middle.
 #[tokio::test]
 async fn a_resumed_record_with_its_tail_opens_only_the_middle() -> anyhow::Result<()> {
@@ -515,12 +433,15 @@ async fn a_resumed_record_with_its_tail_opens_only_the_middle() -> anyhow::Resul
     let group = decdn_bao_range::CHUNK_GROUP_BYTES;
     let dir = tempfile::tempdir()?;
     let dest = dir.path().join("model.bin");
-    // A first run lands the head and the final group.
-    let first = [(0, held), (total - group, group)];
-    let (_, paths) = fetch_ranges(&blob, &dest, total, Some(&first)).await?;
-    anyhow::ensure!(paths.is_empty(), "the first run leaves a partial");
+    // An earlier, interrupted run landed the head and the final group.
+    let store_dir = BlobDir::open(&crate::ranged_store::store_dir_for(&dest)?).await?;
+    let root = *blake3::hash(&blob).as_bytes();
+    let store = store_dir.blob(root, total, None).await?;
+    store.admit_range(&blob, 0, held).await?;
+    store.admit_range(&blob, total - group, group).await?;
+    store_dir.shutdown().await?;
 
-    let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
+    let (probe, paths) = fetch_whole(&blob, &dest, total).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     let opened = probe.opened_ranges();
@@ -554,7 +475,6 @@ async fn an_exported_dest_is_not_fetched_again() -> anyhow::Result<()> {
         hash: probe.root(),
         total_bytes: ProvenSize::assume_for_tests(total),
         dest: &dest,
-        ranges: None,
     };
     let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
         .fetch_to_paths(&[target], None)
@@ -591,7 +511,7 @@ async fn an_export_that_fails_its_hash_fetches_again() -> anyhow::Result<()> {
     }
     std::fs::write(&data_file, &drifted)?;
 
-    let (probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
+    let (probe, paths) = fetch_whole(&blob, &dest, total).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the fetch exports");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     anyhow::ensure!(
@@ -634,7 +554,7 @@ async fn a_finished_download_removes_its_store() -> anyhow::Result<()> {
     let total = u64::try_from(blob.len())?;
     let dir = tempfile::tempdir()?;
     let dest = dir.path().join("model.bin");
-    let (_probe, paths) = fetch_ranges(&blob, &dest, total, None).await?;
+    let (_probe, paths) = fetch_whole(&blob, &dest, total).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the fetch exports");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     anyhow::ensure!(
@@ -653,7 +573,6 @@ async fn fetch_into(store: &BlobDir, blob: &[u8], dest: &Path) -> anyhow::Result
         hash: source.root(),
         total_bytes: ProvenSize::assume_for_tests(total),
         dest,
-        ranges: None,
     };
     downloader(vec![candidate(source, ledger, 0xA1)])?
         .store(store.clone())
@@ -756,7 +675,6 @@ async fn a_lone_stalled_source_recovers_after_it_cools() -> anyhow::Result<()> {
                 hash: root,
                 total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
-                ranges: None,
             }],
             None,
             &stop,
@@ -790,7 +708,6 @@ async fn a_download_with_no_progress_gives_up() -> anyhow::Result<()> {
                 hash: root,
                 total_bytes: ProvenSize::assume_for_tests(total),
                 dest: &dest,
-                ranges: None,
             }],
             None,
             &stop,
@@ -829,7 +746,6 @@ async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
         hash: root,
         total_bytes: ProvenSize::assume_for_tests(total),
         dest: &dest,
-        ranges: None,
     }];
     // Well inside the first periodic flush, so only the drop can record.
     let dropped = tokio::time::timeout(

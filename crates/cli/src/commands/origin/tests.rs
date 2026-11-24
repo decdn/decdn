@@ -108,15 +108,13 @@ fn import_report_json_shape_directory() {
         ]),
         bundle_hash: Some("b3:cafef00d".into()),
         moved: false,
-        optimized: false,
-        chunks_total: 0,
         skipped_symlinks: 0,
     };
     let mut buf: Vec<u8> = Vec::new();
     write_import_report(&mut buf, &report, true).unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
     let obj = parsed.as_object().unwrap();
-    assert_eq!(obj.len(), 9);
+    assert_eq!(obj.len(), 7);
     assert_eq!(obj["imported"].as_u64(), Some(3));
     assert_eq!(obj["bytes"].as_u64(), Some(42));
     assert_eq!(obj["origin"].as_str(), Some("/tmp/origin"));
@@ -124,8 +122,6 @@ fn import_report_json_shape_directory() {
     assert_eq!(obj["files"]["dir/b.txt"].as_str(), Some("b3:bbbb"));
     assert_eq!(obj["bundle_hash"].as_str(), Some("b3:cafef00d"));
     assert_eq!(obj["moved"].as_bool(), Some(false));
-    assert_eq!(obj["optimized"].as_bool(), Some(false));
-    assert_eq!(obj["chunks_total"].as_u64(), Some(0));
     assert_eq!(obj["skipped_symlinks"].as_u64(), Some(0));
 }
 
@@ -138,8 +134,6 @@ fn import_report_human_shows_skipped_symlinks_warning() {
         files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
         bundle_hash: Some("b3:cafef00d".into()),
         moved: false,
-        optimized: false,
-        chunks_total: 0,
         skipped_symlinks: 2,
     };
     let mut buf: Vec<u8> = Vec::new();
@@ -160,53 +154,12 @@ fn import_report_json_carries_skipped_symlinks() {
         files: BTreeMap::from([("a.txt".into(), "b3:aaaa".into())]),
         bundle_hash: Some("b3:cafef00d".into()),
         moved: false,
-        optimized: false,
-        chunks_total: 0,
         skipped_symlinks: 2,
     };
     let mut buf: Vec<u8> = Vec::new();
     write_import_report(&mut buf, &report, true).unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
     assert_eq!(parsed["skipped_symlinks"].as_u64(), Some(2));
-}
-
-#[test]
-fn import_report_json_optimized_carries_chunk_counter() {
-    let report = ImportReport {
-        imported: 2,
-        bytes: 100,
-        origin: "/tmp/origin".into(),
-        files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
-        bundle_hash: Some("b3:cafef00d".into()),
-        moved: false,
-        optimized: true,
-        chunks_total: 7,
-        skipped_symlinks: 0,
-    };
-    let mut buf: Vec<u8> = Vec::new();
-    write_import_report(&mut buf, &report, true).unwrap();
-    let parsed: serde_json::Value = serde_json::from_slice(buf.trim_ascii_end()).unwrap();
-    assert_eq!(parsed["optimized"].as_bool(), Some(true));
-    assert_eq!(parsed["chunks_total"].as_u64(), Some(7));
-}
-
-#[test]
-fn import_report_human_optimized_shows_chunk_hint_count() {
-    let report = ImportReport {
-        imported: 2,
-        bytes: 100,
-        origin: "/tmp/origin".into(),
-        files: BTreeMap::from([("a.bin".into(), "b3:aaaa".into())]),
-        bundle_hash: Some("b3:cafef00d".into()),
-        moved: false,
-        optimized: true,
-        chunks_total: 7,
-        skipped_symlinks: 0,
-    };
-    let mut buf: Vec<u8> = Vec::new();
-    write_import_report(&mut buf, &report, false).unwrap();
-    let line = String::from_utf8(buf).unwrap();
-    assert!(line.contains("7 chunk hint(s)"), "got: {line}");
 }
 
 #[test]
@@ -218,8 +171,6 @@ fn import_report_json_single_file_maps_name_to_hash_null_bundle_hash() {
         files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
         bundle_hash: None,
         moved: true,
-        optimized: false,
-        chunks_total: 0,
         skipped_symlinks: 0,
     };
     let mut buf: Vec<u8> = Vec::new();
@@ -239,8 +190,6 @@ fn import_report_human_single_file_shows_hash() {
         files: BTreeMap::from([("blob.bin".into(), "b3:deadbeef".into())]),
         bundle_hash: None,
         moved: false,
-        optimized: false,
-        chunks_total: 0,
         skipped_symlinks: 0,
     };
     let mut buf: Vec<u8> = Vec::new();
@@ -261,8 +210,6 @@ fn import_report_human_directory_shows_bundle_not_file_map() {
         ]),
         bundle_hash: Some("b3:cafef00d".into()),
         moved: false,
-        optimized: false,
-        chunks_total: 0,
         skipped_symlinks: 0,
     };
     let mut buf: Vec<u8> = Vec::new();

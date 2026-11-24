@@ -231,8 +231,8 @@ pub(crate) struct PullRecord {
     /// Content bytes earlier, interrupted runs fetched that this run resumed
     /// rather than fetched again.
     pub(crate) resumed_bytes: u64,
-    /// Bytes taken from files already on disk, whole or spliced: neither
-    /// fetched nor paid for.
+    /// Bytes taken from whole files already on disk: neither fetched nor paid
+    /// for.
     pub(crate) reused_bytes: u64,
     /// The content bytes the run plans to fetch; `None` until known.
     pub(crate) expected_bytes: Option<u64>,
@@ -446,7 +446,7 @@ impl ActivityRecorder {
         })
     }
 
-    /// A bundle blob landed, with what it fetched, spliced and resumed. An
+    /// A bundle blob landed, with what it fetched and resumed. An
     /// entry run records the bytes and no file count.
     pub(crate) fn file_landed(&self, landed: Landed) {
         self.files
@@ -556,9 +556,7 @@ impl ActivityRecorder {
             record.received_bytes = bytes.received;
             record.downloaded_bytes = bytes.downloaded;
             record.resumed_bytes = bytes.resumed;
-            record.reused_bytes = bytes
-                .reused
-                .saturating_add(self.whole_file_reused.load(Ordering::Relaxed));
+            record.reused_bytes = self.whole_file_reused.load(Ordering::Relaxed);
             record.updated_unix_ms = now_ms();
             record.clone()
         };
@@ -579,7 +577,7 @@ fn blob_key(hash: [u8; 32]) -> String {
 }
 
 /// One blob's bytes, as the run's record counts them. A blob that landed
-/// counts what the pull says it fetched, spliced and resumed. A blob that did
+/// counts what the pull says it fetched and resumed. A blob that did
 /// not counts its positions: its lowest position is what its store held
 /// before this run fetched (a fetch reports that first; a stream to stdout
 /// reports `0`; a pass that drops what the store held reports from `0`
@@ -594,8 +592,8 @@ struct BlobBytes {
     landed: Option<Landed>,
 }
 
-/// A bundle blob that landed, and what it fetched, spliced and resumed. No
-/// byte counts in more than one of `paid`, `spliced` and `resumed`.
+/// A bundle blob that landed, and what it fetched and resumed. No byte counts
+/// in both `paid` and `resumed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Landed {
     /// The blob's hash.
@@ -604,8 +602,6 @@ pub(crate) struct Landed {
     pub(crate) size: u64,
     /// The content bytes the run fetched and paid for.
     pub(crate) paid: u64,
-    /// The bytes spliced from a file already on disk.
-    pub(crate) spliced: u64,
     /// The bytes an earlier, interrupted run fetched, which this run resumed.
     pub(crate) resumed: u64,
 }
@@ -616,7 +612,6 @@ impl From<&EntryLanded> for Landed {
             hash: landed.hash,
             size: landed.size,
             paid: landed.paid,
-            spliced: landed.spliced,
             resumed: landed.resumed,
         }
     }
@@ -660,23 +655,21 @@ struct RunBytes {
     received: u64,
     downloaded: u64,
     resumed: u64,
-    reused: u64,
 }
 
 impl RunBytes {
     /// These tallies with `blob`'s added.
     const fn add(self, blob: &BlobBytes) -> Self {
-        let (downloaded, resumed, reused) = if let Some(l) = blob.landed {
-            (l.paid, l.resumed, l.spliced)
+        let (downloaded, resumed) = if let Some(l) = blob.landed {
+            (l.paid, l.resumed)
         } else {
             let base = if blob.base == NO_BASE { 0 } else { blob.base };
-            (blob.position.saturating_sub(base), base, 0)
+            (blob.position.saturating_sub(base), base)
         };
         Self {
             received: self.received.saturating_add(blob.position),
             downloaded: self.downloaded.saturating_add(downloaded),
             resumed: self.resumed.saturating_add(resumed),
-            reused: self.reused.saturating_add(reused),
         }
     }
 }
@@ -724,18 +717,6 @@ impl FileObserver for RecordedFile {
 
     fn discovering(&self) {
         self.inner.discovering();
-    }
-
-    fn pending(&self) {
-        self.inner.pending();
-    }
-
-    fn reconstructing(&self) {
-        self.inner.reconstructing();
-    }
-
-    fn hashed(&self, bytes: u64) {
-        self.inner.hashed(bytes);
     }
 
     fn finished(&self) {

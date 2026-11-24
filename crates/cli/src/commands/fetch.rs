@@ -1626,7 +1626,6 @@ pub(crate) async fn fetch_on(
                         hash,
                         total_bytes,
                         dest: &args.output,
-                        ranges: None,
                     },
                     &stop,
                     (common.max_sources, timings, args.progress.as_deref()),

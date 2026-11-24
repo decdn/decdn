@@ -1,11 +1,11 @@
 use super::*;
 
-/// Minimal `ManifestEntry` for the `--select` tests: path + size, no chunks.
+/// Minimal `ManifestEntry` for the `--select` tests: path + size.
 fn sel_entry(path: &str, size: u64) -> ManifestEntry {
     ManifestEntry::new(path, [0x00; 32], Some(size))
 }
 
-/// A plain manifest entry: path + a hash of `[hash; 32]`, no size or chunks.
+/// A plain manifest entry: path + a hash of `[hash; 32]`, no size.
 fn entry(path: &str, hash: u8) -> ManifestEntry {
     ManifestEntry::new(path, [hash; 32], None)
 }
@@ -485,10 +485,10 @@ fn leftover_partials_counts_only_unselected_blobs() {
         std::fs::write(dir.join(name), vec![0u8; len]).expect("write");
     };
     // The run's selected entry and the manifest blob: kept for this run.
-    write(format!("{}.assembly", hex(1)), 500);
+    write(hex(1), 500);
     write(hex(2), 300);
-    // An orphan assembly, and a finalized orphan blob.
-    write(format!("{}.assembly", hex(3)), 700);
+    // Two finalized orphan blobs.
+    write(hex(3), 1000);
     write(hex(4), 200);
     // The run's download store and a stray name.
     std::fs::create_dir_all(dir.join("store")).expect("store dir");
@@ -497,7 +497,7 @@ fn leftover_partials_counts_only_unselected_blobs() {
     let keep: HashSet<[u8; 32]> = [[1; 32], [2; 32]].into_iter().collect();
     let on_disk =
         |name: String| allocated_bytes(&std::fs::metadata(dir.join(name)).expect("metadata"));
-    let expected = on_disk(format!("{}.assembly", hex(3))) + on_disk(hex(4));
+    let expected = on_disk(hex(3)) + on_disk(hex(4));
     let leftovers = leftover_partials(tmp.path(), &keep);
     assert_eq!(
         leftovers,
@@ -540,22 +540,22 @@ fn leftover_partials_counts_only_unselected_blobs() {
     );
 }
 
-/// A range-dedup `.assembly` sized to the whole blob before its bytes land
-/// counts only the space it takes, not its length (#2190).
+/// A sparse staging file, whose length runs past the bytes it holds, counts
+/// only the space it takes, not its length (#2190).
 #[cfg(unix)]
 #[test]
-fn leftover_partials_count_a_sparse_assembly_by_its_allocated_space() {
+fn leftover_partials_count_a_sparse_file_by_its_allocated_space() {
     let tmp = tempfile::tempdir().expect("tmp");
     let dir = tmp.path().join(STAGING_DIR);
     std::fs::create_dir_all(&dir).expect("staging dir");
     let hex = blake3::Hash::from_bytes([9; 32]).to_hex().to_string();
-    let file = std::fs::File::create(dir.join(format!("{hex}.assembly"))).expect("create");
-    file.set_len(64 * 1024 * 1024).expect("size the assembly");
+    let file = std::fs::File::create(dir.join(hex)).expect("create");
+    file.set_len(64 * 1024 * 1024).expect("size the file");
     let leftovers = leftover_partials(tmp.path(), &HashSet::new());
     assert_eq!(leftovers.blobs, 1);
     assert!(
         leftovers.bytes < 1024 * 1024,
-        "a hole-only partial takes almost no space: {}",
+        "a hole-only file takes almost no space: {}",
         leftovers.bytes
     );
 }
@@ -838,7 +838,6 @@ fn entry_done_line_rates_a_plain_entry_on_its_download() {
         4 << 20,
         EntryBytes {
             paid: 4 << 20,
-            spliced: 0,
             resumed: 0,
         },
         std::time::Duration::from_secs(2),
@@ -846,76 +845,15 @@ fn entry_done_line_rates_a_plain_entry_on_its_download() {
     assert!(line.ends_with(": 4.00 MiB in 2.0s (2.00 MiB/s)"), "{line}");
 }
 
-/// A range-dedup entry's rate counts only its downloaded bytes, and its
-/// spliced bytes are reported apart (#2189).
-#[test]
-fn entry_done_line_splits_a_dedup_entrys_spliced_bytes() {
-    let line = entry_done_line(
-        [1; 32],
-        12 << 20,
-        EntryBytes {
-            paid: 2 << 20,
-            spliced: 10 << 20,
-            resumed: 0,
-        },
-        std::time::Duration::from_secs(2),
-    );
-    assert!(
-        line.ends_with(
-            ": 12.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 10.00 MiB spliced \
-             from disk)"
-        ),
-        "{line}"
-    );
-}
-
-/// An entry spliced whole from disk downloads nothing and has no rate.
-#[test]
-fn entry_done_line_renders_a_fully_spliced_entry() {
-    let line = entry_done_line(
-        [1; 32],
-        12 << 20,
-        EntryBytes {
-            paid: 0,
-            spliced: 12 << 20,
-            resumed: 0,
-        },
-        std::time::Duration::from_secs(2),
-    );
-    assert!(
-        line.ends_with(": 12.00 MiB in 2.0s (0 B downloaded at --, 12.00 MiB spliced from disk)"),
-        "{line}"
-    );
-}
-
 /// A resumed entry's rate counts only what this run downloaded, and its
-/// resumed and spliced bytes are reported apart (#2236).
+/// resumed bytes are reported apart (#2189).
 #[test]
 fn entry_done_line_splits_a_resumed_entrys_bytes() {
-    let line = entry_done_line(
-        [1; 32],
-        12 << 20,
-        EntryBytes {
-            paid: 2 << 20,
-            spliced: 6 << 20,
-            resumed: 4 << 20,
-        },
-        std::time::Duration::from_secs(2),
-    );
-    assert!(
-        line.ends_with(
-            ": 12.00 MiB in 2.0s (2.00 MiB downloaded at 1.00 MiB/s, 4.00 MiB resumed, \
-             6.00 MiB spliced from disk)"
-        ),
-        "{line}"
-    );
-
     let line = entry_done_line(
         [1; 32],
         6 << 20,
         EntryBytes {
             paid: 2 << 20,
-            spliced: 0,
             resumed: 4 << 20,
         },
         std::time::Duration::from_secs(2),
@@ -934,7 +872,6 @@ fn entry_done_line_guards_a_zero_elapsed() {
         1 << 20,
         EntryBytes {
             paid: 1 << 20,
-            spliced: 0,
             resumed: 0,
         },
         std::time::Duration::ZERO,
@@ -1717,8 +1654,8 @@ async fn the_observer_feeds_the_runs_record() {
     let activity =
         ActivityRecorder::start_in(dir.path(), &uri, &text, Path::new("."), &evidence).unwrap();
     let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
-    observer.run_started(Some(100), Some(120));
-    let file = observer.file_started(&["a.bin".to_owned()], 60, 0);
+    observer.run_started(Some(100));
+    let file = observer.file_started(&["a.bin".to_owned()], 60);
     file.delivered(10, 60);
     file.delivered(40, 60);
     let mut report = BundleReport::default();

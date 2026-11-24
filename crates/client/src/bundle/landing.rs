@@ -110,12 +110,11 @@ impl Landing {
         copy_into(staging, &parent, name, dest)
     }
 
-    /// Move the finalized `staging` blob to `dest`, returning its byte count. A
-    /// non-donor blob has no reader after its first destination lands, so a
-    /// rename replaces the full copy [`Self::materialize`] makes — no second
-    /// write of the blob and no second copy on disk. `staging` is already
-    /// verified: the store's export, or the dedup assembly's whole-file hash
-    /// before promotion. A rename the handle refuses (a staging directory
+    /// Move the finalized `staging` blob to `dest`, returning its byte count.
+    /// The blob has no reader after its first destination lands, so a rename
+    /// replaces the full copy [`Self::materialize`] makes — no second write of
+    /// the blob and no second copy on disk. `staging` is already verified: the
+    /// store's export checks it. A rename the handle refuses (a staging directory
     /// that is a symlink the handle refuses) or the filesystem cannot do (a
     /// destination on another filesystem, `EXDEV`) falls back to
     /// [`Self::materialize`], which leaves `staging` in place for the next
@@ -186,28 +185,6 @@ impl Landing {
             .rename(&candidate, &parent, name)
             .inspect_err(|_| remove_staged(&parent, &candidate))
             .with_context(|| format!("write {}", dest.display()))
-    }
-
-    /// Land a group's finalized `staging` blob at its first destination,
-    /// returning its byte count: a non-donor moves
-    /// ([`Self::move_into_place`]); a donor — a splice source the run-end
-    /// sweep still owns — is hard-linked (a copy only across filesystems), so
-    /// its staging name survives for later recipients.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::move_into_place`] and [`Self::link_or_copy_atomic`].
-    pub(super) fn first_write(
-        &self,
-        staging: &Path,
-        dest: &Path,
-        is_donor: bool,
-    ) -> anyhow::Result<u64> {
-        if !is_donor {
-            return self.move_into_place(staging, dest);
-        }
-        let len = file_len(staging)?;
-        self.link_or_copy_atomic(staging, dest).map(|()| len)
     }
 
     /// `path` as the root-relative path the handle resolves.

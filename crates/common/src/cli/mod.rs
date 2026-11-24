@@ -6,7 +6,6 @@
 //! or starting any tasks. The daemon's own clap shell lives in
 //! `crates/node/src/main.rs` and is not part of this module.
 
-pub mod byte_size;
 pub mod common;
 pub mod config_cmd;
 pub mod dashboard;
@@ -26,7 +25,6 @@ pub mod self_update;
 pub mod setup;
 pub mod whoami;
 
-pub use byte_size::parse_byte_size;
 pub use common::{
     CommonChainArgs, ConfigPathSource, GovernanceChainArgs, LogFormat, PoolSelectArgs,
     default_client_data_dir, default_config_path, default_data_dir,

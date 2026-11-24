@@ -2,7 +2,7 @@
 //! writes into an output directory. It indexes every file the bundle(s) have
 //! placed there — keyed by the POSIX path the file landed at under the output
 //! root, merged across runs — so a later pull skips unchanged files without
-//! re-hashing and splices unchanged byte ranges from bytes already on disk.
+//! re-hashing and links a byte-identical file already on disk.
 //! Each record names its source: the bundle and the manifest path the file
 //! came from, so a pull into a directory the user did not choose can tell its
 //! own files from another source's.
@@ -14,8 +14,8 @@
 //! written. A missing, corrupt, unreadable, or superseded record costs only a
 //! re-hash, and `--overwrite` (or deleting the file) forces a full re-fetch. The
 //! one residual trust is the fast path: a file edited in place without changing
-//! its size or mtime is not re-hashed. Every spliced donor chunk is always
-//! re-hashed before its bytes are used, so donor reuse never risks correctness.
+//! its size or mtime is not re-hashed. A whole-file donor is always re-hashed
+//! before it is linked, so donor reuse never risks correctness.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -58,9 +58,8 @@ impl SavedManifest {
 }
 
 /// One recorded file: the whole-file content address and size last materialized
-/// at this path, the mtime observed for it (the cheap change gate), its
-/// range-dedup chunks when the source manifest carried them, and the bundle
-/// entry it came from.
+/// at this path, the mtime observed for it (the cheap change gate), and the
+/// bundle entry it came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SavedFile {
     /// The whole-file BLAKE3 content address, `b3:<hex>`.
@@ -69,10 +68,6 @@ pub(crate) struct SavedFile {
     pub(crate) size: u64,
     /// The mtime observed for the materialized file.
     pub(crate) mtime: SavedMtime,
-    /// Ordered `{hash, size}` range-dedup chunks, when the source manifest
-    /// carried them; `None` for a plain (unhinted) entry.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) chunks: Option<Vec<SavedChunk>>,
     /// The bundle entry the pull wrote this file from.
     pub(crate) source: SavedSource,
 }
@@ -131,16 +126,6 @@ impl SavedSource {
     }
 }
 
-/// One range-dedup chunk of a [`SavedFile`]: a BLAKE3 over a byte range and its
-/// length. Chunk sizes sum to the file's `size`; offsets are the running sum.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct SavedChunk {
-    /// The chunk's BLAKE3 content address, `b3:<hex>`.
-    pub(crate) hash: String,
-    /// The chunk's length in bytes.
-    pub(crate) size: u64,
-}
-
 /// A file's modification time as whole seconds and sub-second nanos since the
 /// Unix epoch — the cheap gate the skip-cache compares before a re-hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,20 +146,6 @@ impl SavedMtime {
             nanos: d.subsec_nanos(),
         })
     }
-}
-
-/// Place a saved file's chunks at absolute offsets: `(hash, offset, len)` in
-/// content order. `None` when the file has no chunks or the sizes do not sum to
-/// its whole-file `size` (a malformed record — ignored, never fatal).
-pub(crate) fn saved_hints(rec: &SavedFile) -> Option<Vec<(String, u64, u64)>> {
-    let chunks = rec.chunks.as_ref()?;
-    let mut out = Vec::with_capacity(chunks.len());
-    let mut offset = 0u64;
-    for c in chunks {
-        out.push((c.hash.clone(), offset, c.size));
-        offset = offset.checked_add(c.size)?;
-    }
-    (offset == rec.size).then_some(out)
 }
 
 /// Load the skip-cache at `out_root`. A missing, unreadable, malformed, or

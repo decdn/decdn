@@ -9,8 +9,7 @@
 //! throughput. A source that faults cools and returns; the fetch ends on done,
 //! a fatal fault, or the stop policy. It then exports the blob to the final
 //! file and removes the store. So a resumed download re-pulls only what it
-//! lacks, and a bundle layer above can ask for only the ranges no donor
-//! covers.
+//! lacks.
 //!
 //! It is the download half of the same loop the `Streamer` (the
 //! consumption-paced single-blob face) uses — the Downloader just uncaps the
@@ -38,9 +37,8 @@ use crate::stop::{ProgressClock, StopPolicy};
 use decdn_bao_range::RangedStoreError;
 
 /// One blob to fetch and where to write it: the content `hash` (the bao root),
-/// its `total_bytes` (authoritative for sizing the store and the fetch), the
-/// caller-chosen `dest` path the store and the final file are keyed by, and the
-/// byte ranges to fill.
+/// its `total_bytes` (authoritative for sizing the store and the fetch), and
+/// the caller-chosen `dest` path the store and the final file are keyed by.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTarget<'a> {
     /// The blob's BLAKE3 content address (its bao root); every ingested byte is
@@ -51,11 +49,6 @@ pub struct DownloadTarget<'a> {
     /// Where to write the finished blob. The store sits beside it, in
     /// `<dest>.decdn`, and the finished file IS `dest`.
     pub dest: &'a Path,
-    /// The `(offset, len)` byte ranges to fill, or `None` for the whole blob.
-    /// The fetch exports the blob only when every byte is present, so the
-    /// ranges of a target that leaves bytes missing stay in its store for
-    /// the caller (a bundle entry that assembles the rest from donors).
-    pub ranges: Option<&'a [(u64, u64)]>,
 }
 
 /// Fetch content-addressed blobs — a bundle, or a single blob — to files in a
@@ -95,7 +88,7 @@ pub struct DownloadTarget<'a> {
 ///     dest: &Path,
 /// ) -> anyhow::Result<()> {
 ///     let downloader = Downloader::new(StaticSources::new(candidates)?, funder);
-///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
+///     let target = DownloadTarget { hash, total_bytes, dest };
 ///     downloader.fetch_to_paths(&[target], None).await?;
 ///     Ok(())
 /// }
@@ -273,7 +266,6 @@ where
                 hash,
                 total_bytes,
                 dest,
-                ranges: None,
             })
             .collect();
         self.fetch_to_paths(&targets, on_progress).await
@@ -294,21 +286,16 @@ where
         self.fetch_to_paths_until(targets, on_progress, &stop).await
     }
 
-    /// Fetch every [`DownloadTarget`] to its own `dest` path, returning the
-    /// `dest` of each target it exported, in target order. A target without
-    /// explicit ranges is always exported, so a whole-blob batch returns every
-    /// `dest`; a ranged target that leaves bytes missing is not in the result,
-    /// because no file exists at its `dest`. The parent directory of each
-    /// `dest` is created if missing.
+    /// Fetch every [`DownloadTarget`] to its own `dest` path, returning every
+    /// `dest`, in target order. The parent directory of each `dest` is created
+    /// if missing.
     ///
     /// Each target keeps its store in `<dest>.decdn` beside `dest`, so a
-    /// resumed download re-pulls only what it lacks. It fills its ranges
+    /// resumed download re-pulls only what it lacks. It fills the store
     /// through [`crate::acquire`] across a fresh [`SourceSet`] of the holders,
     /// then exports the blob to `dest` and removes the store. A `dest` that
     /// already holds the blob (an earlier run exported it) is not fetched
-    /// again. A target with explicit [`DownloadTarget::ranges`] that leave
-    /// bytes missing is not exported: its landed ranges stay in its store.
-    /// A downloader given a caller's store fetches every target into that one
+    /// again. A downloader given a caller's store fetches every target into that one
     /// instead, and leaves it in place.
     /// Writes land at their absolute offsets, so out-of-order and
     /// multi-source fills assemble correctly. The whole blob is fetched at full
@@ -374,18 +361,15 @@ where
         let pacer = BudgetPacer::new();
         let mut written = Vec::with_capacity(targets.len());
         for target in targets {
-            if self
-                .fetch_one(target, ledgers, &pacer, on_progress, stop)
-                .await?
-            {
-                written.push(target.dest.to_path_buf());
-            }
+            self.fetch_one(target, ledgers, &pacer, on_progress, stop)
+                .await?;
+            written.push(target.dest.to_path_buf());
         }
         Ok(written)
     }
 
     /// Fetch one target to its `dest` through its store: the caller's, or one
-    /// beside `dest`. Returns whether `dest` holds the blob.
+    /// beside `dest`.
     ///
     /// An exported file that does not hash to the blob holds bytes that
     /// changed on disk after they verified. A store beside `dest` went with
@@ -401,7 +385,7 @@ where
         pacer: &BudgetPacer,
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
         stop: &StopPolicy,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         let own_dir = match self.shared {
             Some(_) => None,
             None => Some(store_dir_for(target.dest)?),
@@ -415,7 +399,7 @@ where
             if let Some(dir) = &own_dir {
                 remove_leftover_store(dir).await;
             }
-            return Ok(true);
+            return Ok(());
         }
         let mut sources = SourceSet::new(
             &self.provider,
@@ -434,8 +418,7 @@ where
                 .fetch_pass(own_dir.as_deref(), target, &mut sources, &run)
                 .await?
             {
-                Pass::Exported => return Ok(true),
-                Pass::Kept => return Ok(false),
+                Pass::Exported => return Ok(()),
                 Pass::Drifted if own_dir.is_none() => {
                     return Err(anyhow::Error::new(StaleStoreEntry));
                 }
@@ -465,42 +448,31 @@ where
                 .shared
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("a download with no store"))?;
-            return Ok(if self.fetch_target(dir, target, sources, run).await? {
-                checked_export(target).await
-            } else {
-                Pass::Kept
-            });
+            self.fetch_target(dir, target, sources, run).await?;
+            return Ok(checked_export(target).await);
         };
         let dir = BlobDir::open(store_dir).await?;
-        let exported = match self.fetch_target(&dir, target, sources, run).await {
-            Ok(exported) => exported,
-            Err(e) => {
-                if let Err(shutdown) = dir.shutdown().await {
-                    tracing::warn!(error = %shutdown, "store shutdown after a failed fetch");
-                }
-                return Err(e);
+        if let Err(e) = self.fetch_target(&dir, target, sources, run).await {
+            if let Err(shutdown) = dir.shutdown().await {
+                tracing::warn!(error = %shutdown, "store shutdown after a failed fetch");
             }
-        };
-        if !exported {
-            dir.shutdown().await?;
-            return Ok(Pass::Kept);
+            return Err(e);
         }
         dir.remove().await?;
         Ok(checked_export(target).await)
     }
 
-    /// Fill one target's ranges into its store in `dir` and export it once
-    /// every byte is present. Returns whether it exported the blob.
+    /// Fill one target's blob into its store in `dir` and export it once
+    /// every byte is present.
     async fn fetch_target(
         &self,
         dir: &BlobDir,
         target: &DownloadTarget<'_>,
         sources: &mut SourceSet<'_, P>,
         run: &Run<'_>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         // The whole blob is one tail: it runs to the proven size.
         let whole = [(0, 0)];
-        let ranges = target.ranges.unwrap_or(&whole);
         let store = dir
             .blob(
                 target.hash,
@@ -538,19 +510,14 @@ where
                     store: &store,
                     hash: target.hash,
                     total_bytes: target.total_bytes,
-                    ranges,
+                    ranges: &whole,
                 },
                 sources,
                 &env,
             )
             .await?;
-            // Explicit ranges can leave bytes to another writer, and the store
-            // then keeps them for that writer.
-            if target.ranges.is_some() && !store.is_complete().await? {
-                return Ok(false);
-            }
             match store.finalize().await {
-                Ok(()) => return Ok(true),
+                Ok(()) => return Ok(()),
                 Err(RangedStoreError::Incomplete) if passes_left > 0 => {
                     tracing::warn!(
                         hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
@@ -576,8 +543,6 @@ struct Run<'a> {
 enum Pass {
     /// The blob is at `dest`, hashed.
     Exported,
-    /// Explicit ranges left bytes missing: the store keeps what landed.
-    Kept,
     /// The exported file failed its hash and was removed, with the store.
     Drifted,
 }
