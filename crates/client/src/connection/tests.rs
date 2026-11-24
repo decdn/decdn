@@ -515,7 +515,9 @@ async fn closing_peer(closes: usize) -> (Endpoint, EndpointAddr) {
             accepted += 1;
             let close = accepted <= closes;
             tokio::spawn(async move {
-                if close && conn.accept_bi().await.is_ok() {
+                // The stream lives across the close: a dropped send half
+                // sends a FIN, and the leg reads that end before the close.
+                if close && let Ok(_stream) = conn.accept_bi().await {
                     conn.close(0u32.into(), b"idle");
                 }
                 conn.closed().await;
