@@ -175,9 +175,9 @@ impl DhtHandler {
         }
     }
 
-    /// Construct with a pre-built routing table. Used by tests and by the
-    /// bootstrap path that wants to seed the table before the handler
-    /// goes live.
+    /// Construct with a pre-built routing table, for a test that seeds the
+    /// table before the handler goes live.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     #[allow(clippy::too_many_arguments)] // wiring struct; each arg is distinct runtime state.
     pub const fn with_routing(

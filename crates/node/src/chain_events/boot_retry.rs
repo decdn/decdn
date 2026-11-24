@@ -96,6 +96,7 @@ impl BootRetry {
     }
 
     /// A deadline that allows no retry: every `run` makes one attempt.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn single_attempt(metrics: Arc<Metrics>) -> Self {
         Self::new(Duration::ZERO, metrics)

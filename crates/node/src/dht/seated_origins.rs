@@ -67,6 +67,7 @@ impl SeatedOriginSet {
     }
 
     /// Build a set from `(namespace, operator)` seats.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn from_seats(seats: impl IntoIterator<Item = (U256, Address)>) -> Self {
         let set = Self::new();

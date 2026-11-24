@@ -786,7 +786,8 @@ impl FillSession {
         self.served_paid.get()
     }
 
-    /// The live observer count (pull owner + attached serve legs).
+    /// The live observer count (pull owner + attached serve legs). A test hook.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn observer_count(&self) -> usize {
         self.observers.load(Ordering::Acquire)

@@ -167,7 +167,8 @@ impl Attestations {
         Self::with(verifier, held, dir, origin)
     }
 
-    /// A memory-only store, for tests and for a node without a data dir.
+    /// A memory-only store, for tests.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn in_memory(verifier: AttestationVerifier, origin: Option<SelfOrigin>) -> Self {
         Self::with(verifier, HashMap::new(), None, origin)

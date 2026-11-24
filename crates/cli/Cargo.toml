@@ -201,9 +201,10 @@ decdn-client = { workspace = true, features = ["test-util"] }
 iroh-io = { workspace = true }
 # Integration tests in `tests/admin_rpc.rs` exercise the loopback admin
 # RPC end-to-end against a real `AdminState` spawned from the daemon
-# crate, so the daemon's surface is a dev-dependency here.
+# crate, so the daemon's surface is a dev-dependency here. `test-support`
+# brings in `ConfigStakerSet`, the in-memory staker set the tests wire.
 # None of this leaks into the `decdn` binary's release dep tree.
-decdn-node = { workspace = true }
+decdn-node = { workspace = true, features = ["test-support"] }
 # The admin-RPC tests stand up their own jsonrpsee server too; the `decdn`
 # binary links only the client half (#2454).
 jsonrpsee = { workspace = true, features = ["server"] }
