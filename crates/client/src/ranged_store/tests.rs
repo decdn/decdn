@@ -91,19 +91,7 @@ fn write_plaintext(store: &ClientRangedStore, data: &[u8]) {
 async fn total_bytes_reports_the_bound() {
     let store = store_with_present(3 * GROUP, ChunkRanges::empty());
     assert_eq!(store.total_bytes(), 3 * GROUP);
-    store.set_bound(5 * GROUP);
-    assert_eq!(store.total_bytes(), 5 * GROUP);
     assert_eq!(store.proven(), None);
-}
-
-/// A proven size is final: moving the bound after a proof does nothing.
-#[tokio::test]
-async fn set_bound_is_a_no_op_once_a_size_is_proven() {
-    let store = store_with_present(3 * GROUP, ChunkRanges::empty());
-    store.state.lock().expect("lock").prove(2 * GROUP);
-    store.set_bound(9 * GROUP);
-    assert_eq!(store.bound(), 2 * GROUP);
-    assert_eq!(store.proven(), Some(2 * GROUP));
 }
 
 #[tokio::test]

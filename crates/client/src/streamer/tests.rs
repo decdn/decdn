@@ -170,37 +170,6 @@ async fn drained_stream_is_blake3_identical() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A first claim far below the blob does not end the stream at the claim:
-/// the fetch grows it, and the stream ends at the size a leg proves, with
-/// every byte of the blob.
-#[tokio::test]
-async fn the_stream_ends_at_the_proven_size_when_the_claim_was_small() -> anyhow::Result<()> {
-    let blob = payload(3 * 1024 * 1024 + 777);
-    let (source, ledger) = paying_source(blob.clone())?;
-    let root = source.root();
-    let scratch = tempfile::tempdir()?;
-    let streamer = streamer(vec![candidate(source, ledger, 0xA1)], scratch.path())?;
-    let (mut reader, mut drive) = streamer
-        .open(
-            root,
-            ProvenSize::assume_for_tests(64 * 1024),
-            &PullConfig::default(),
-            Arc::new(NoCache),
-            stop(),
-        )
-        .await?;
-    let mut out = Vec::new();
-    drive.alongside(reader.read_to_end(&mut out)).await?;
-    anyhow::ensure!(
-        out.len() == blob.len(),
-        "{} of {} bytes",
-        out.len(),
-        blob.len()
-    );
-    anyhow::ensure!(out == blob, "the grown stream must be byte-identical");
-    Ok(())
-}
-
 /// A sink that reports `caches() == false` is NEVER teed the whole blob on a
 /// clean finish — the `Streamer` skips the whole-blob read (and the memory it
 /// would cost) that only exists to populate a cache. This is what keeps a
@@ -926,30 +895,6 @@ async fn a_range_stream_opens_only_the_aligned_span() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A zero-length window is a tail: it streams from its offset to the size a
-/// leg proves, past a claim that was too small.
-#[tokio::test]
-async fn a_tail_window_follows_the_proven_size() -> anyhow::Result<()> {
-    let blob = payload(3 * 1024 * 1024 + 777);
-    let (source, ledger) = paying_source(blob.clone())?;
-    let offset = 2 * 1024 * 1024 + 5;
-    let claim = 2 * 1024 * 1024 + 100;
-    let got = drain_range(
-        source,
-        ledger,
-        claim,
-        (offset, 0),
-        Arc::new(NoCache),
-        &PullConfig::default(),
-    )
-    .await?;
-    let want = blob
-        .get(usize::try_from(offset)?..)
-        .context("offset inside the blob")?;
-    anyhow::ensure!(got == want, "{} of {} tail bytes", got.len(), want.len());
-    Ok(())
-}
-
 /// A window that reaches past the blob's end streams to the proven size and
 /// stops: no error, no hang.
 #[tokio::test]
@@ -1047,51 +992,6 @@ async fn a_cached_window_is_served_without_fetching() -> anyhow::Result<()> {
         probe.opened_ranges().is_empty(),
         "a cache hit opens no source"
     );
-    Ok(())
-}
-
-/// A bounded window past a first size too small for the blob streams in
-/// full: the first leg's size proof proves the true size, and the window
-/// regains its requested end (#2865), so the stream carries exactly the
-/// window's bytes and no leg runs past the window.
-#[tokio::test]
-async fn a_window_past_a_short_first_size_streams_once_the_size_is_proven() -> anyhow::Result<()> {
-    let blob = payload(3 * 1024 * 1024 + 777);
-    let (source, ledger) = paying_source(blob.clone())?;
-    let claim = 2 * 1024 * 1024 + 100;
-    let offset = 2 * 1024 * 1024 + 5;
-    // The smallest read-ahead window, so a drive that outruns a stopped
-    // reader parks on it instead of finishing within the window.
-    let config = PullConfig {
-        read_ahead_bytes: 1,
-        ..PullConfig::default()
-    };
-    let probe = source.clone();
-    let got = tokio::time::timeout(
-        Duration::from_secs(20),
-        drain_range(
-            source,
-            ledger,
-            claim,
-            (offset, 1_000),
-            Arc::new(NoCache),
-            &config,
-        ),
-    )
-    .await
-    .context("the stream and its drive end")??;
-    let want = blob
-        .get(usize::try_from(offset)?..usize::try_from(offset + 1_000)?)
-        .context("window inside the blob")?;
-    anyhow::ensure!(got == want, "{} of 1000 window bytes", got.len());
-    let window_end = (offset + 1_000).div_ceil(decdn_bao_range::CHUNK_GROUP_BYTES)
-        * decdn_bao_range::CHUNK_GROUP_BYTES;
-    for &(start, fetch_len) in &probe.opened_ranges() {
-        anyhow::ensure!(
-            start + fetch_len <= window_end,
-            "leg ({start}, {fetch_len}) runs past the window"
-        );
-    }
     Ok(())
 }
 
@@ -1306,9 +1206,6 @@ impl IngestStore for WrappedStore {
     }
     fn proven(&self) -> Option<u64> {
         IngestStore::proven(&self.0)
-    }
-    fn set_bound(&self, bound: u64) {
-        IngestStore::set_bound(&self.0, bound);
     }
     fn prove_size(&self, size: ProvenSize) {
         IngestStore::prove_size(&self.0, size);

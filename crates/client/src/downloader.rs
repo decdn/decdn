@@ -378,8 +378,7 @@ where
             tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
-            // The whole blob is one tail: it runs to the end the store's bound
-            // names, which a leg's proven size sets.
+            // The whole blob is one tail: it runs to the proven size.
             let whole = [(0, 0)];
             let ranges = target.ranges.unwrap_or(&whole);
             // Off the runtime: opening a finalized blob hashes its final file.
