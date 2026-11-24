@@ -519,14 +519,11 @@ pub(crate) fn contiguous_frontier(
 }
 
 /// The chunks of `[start, start + len)` the store misses, clipped to its
-/// bound, and that bound. A range at or past the bound misses nothing. A leg
-/// can prove a smaller size between the bound read and the query, so a query
-/// the store refuses as out of bounds reads the smaller bound again and clips
-/// to it. A proven size is final, so the retry ends.
+/// bound, and that bound. A range at or past the bound misses nothing.
 ///
 /// # Errors
 ///
-/// Any other store error, marked [`crate::LocalPullFault`]: a store that cannot
+/// The store's error, marked [`crate::LocalPullFault`]: a store that cannot
 /// answer is this process's fault, never a source's (#2213).
 pub(crate) async fn missing_below_bound<St>(
     store: &St,
@@ -536,21 +533,16 @@ pub(crate) async fn missing_below_bound<St>(
 where
     St: RangedStore + ?Sized,
 {
-    loop {
-        let bound = store.total_bytes();
-        let end = start.saturating_add(len).min(bound);
-        if start >= end {
-            return Ok((ChunkRanges::empty(), bound));
-        }
-        match store.missing_ranges(start, end - start).await {
-            Ok(missing) => return Ok((missing, bound)),
-            Err(decdn_bao_range::RangedStoreError::Alignment(_)) if store.total_bytes() < bound => {
-                // A leg proved a smaller size after the bound read: read it
-                // again on the next pass.
-            }
-            Err(e) => return Err(anyhow::Error::new(e).context(crate::LocalPullFault)),
-        }
+    let bound = store.total_bytes();
+    let end = start.saturating_add(len).min(bound);
+    if start >= end {
+        return Ok((ChunkRanges::empty(), bound));
     }
+    store
+        .missing_ranges(start, end - start)
+        .await
+        .map(|missing| (missing, bound))
+        .map_err(|e| anyhow::Error::new(e).context(crate::LocalPullFault))
 }
 
 /// Satisfy request `R = [offset, offset + len)` of blob `hash` by filling only its

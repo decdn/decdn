@@ -154,14 +154,6 @@ pub trait IngestStore: RangedStore {
         Some(self.total_bytes())
     }
 
-    /// Move the planner's bound ([`total_bytes`](RangedStore::total_bytes))
-    /// to `bound`. A pull clamps a first size to the cap's reach this way
-    /// while no size is proven. A store keyed by a fixed size keeps it, so
-    /// the default does nothing.
-    fn set_bound(&self, bound: u64) {
-        let _ = bound;
-    }
-
     /// Record `size` as the blob's proven size: a node's size proof verified
     /// it against the root before the leg that carried it opened. The
     /// planner's bound becomes it at once. A store keyed by a fixed size knows

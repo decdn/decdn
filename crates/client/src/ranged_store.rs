@@ -468,15 +468,6 @@ impl ClientRangedStore {
         &self.present_grew
     }
 
-    /// Move the planner's bound to `bound`. A proven size is final: once one
-    /// is proven, the bound stays at it and this does nothing.
-    pub fn set_bound(&self, bound: u64) {
-        let mut state = self.lock_state();
-        if state.proven.is_none() {
-            state.bound = bound;
-        }
-    }
-
     /// Record `size` as proven: a node's size proof verified it against the
     /// root (ADR 005 § Bounded byte ranges), so the bound becomes it before
     /// any leg holds the final chunk. Only the true size proves, so an entry
@@ -958,10 +949,6 @@ impl crate::source::IngestStore for ClientRangedStore {
 
     fn proven(&self) -> Option<u64> {
         Self::proven(self)
-    }
-
-    fn set_bound(&self, bound: u64) {
-        Self::set_bound(self, bound);
     }
 
     fn prove_size(&self, size: crate::ProvenSize) {

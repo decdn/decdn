@@ -104,12 +104,8 @@ fn the_store_dir_sits_beside_the_destination() {
 async fn total_bytes_reports_the_bound_until_a_size_is_proven() {
     let store = fresh_store([1; 32], 10_000);
     assert_eq!(store.total_bytes(), 10_000);
-    store.set_bound(20_000);
-    assert_eq!(store.total_bytes(), 20_000);
     store.prove_size(ProvenSize::assume_for_tests(15_000));
     assert_eq!(store.total_bytes(), 15_000);
-    store.set_bound(30_000);
-    assert_eq!(store.total_bytes(), 15_000, "a proven size is final");
 }
 
 #[tokio::test]
@@ -484,25 +480,5 @@ async fn finalize_exports_to_a_relative_destination() -> anyhow::Result<()> {
         .await?;
     store.finalize().await?;
     assert_eq!(std::fs::read(&dest)?, plaintext);
-    Ok(())
-}
-
-/// Every byte of the bound present is not enough: `finalize` needs a
-/// proven size.
-#[tokio::test]
-async fn finalize_requires_a_proven_size() -> anyhow::Result<()> {
-    let total = 2 * GROUP;
-    let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
-    let store = fresh_store(root, total);
-    // The head, then a bound moved down to it: every byte of the bound is
-    // present, but no final chunk proved a size.
-    let head = decdn_bao_range::align_range(0, GROUP, total)?;
-    store
-        .admit(head.clone(), bao_for(root, &plaintext, outboard, &head))
-        .await?;
-    store.set_bound(GROUP);
-    assert_eq!(store.proven(), None);
-    assert!(!store.is_complete().await?);
-    assert_matches!(store.finalize().await, Err(RangedStoreError::Incomplete));
     Ok(())
 }

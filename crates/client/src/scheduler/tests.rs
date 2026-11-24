@@ -966,20 +966,18 @@ fn park_keeps_every_pending_entry() -> anyhow::Result<()> {
 }
 
 /// A work-state with three lanes over one discovery block: lane 0 holds
-/// the whole block on unit 1, lanes 1 and 2 hold nothing.
+/// the whole block, lanes 1 and 2 hold nothing.
 fn one_victim_work(total: u64, coverage: &Coverage) -> super::Work {
     use std::collections::VecDeque;
 
-    use super::{CancelHandle, Unit, Work};
+    use super::{Unit, Work};
 
     Work {
         pending: VecDeque::new(),
         in_flight: vec![Some((0, total)), None, None],
-        cancel: (0..3).map(|_| Arc::new(CancelHandle::new())).collect(),
         live: (0..3).map(|_| Arc::new(Unit::new())).collect(),
         rates: vec![None; 3],
         alive: vec![true, true, true],
-        units: vec![1, 0, 0],
         coverage: vec![coverage.clone(), coverage.clone(), coverage.clone()],
         measured: vec![true; 3],
         lane_of: (0..3).collect(),
@@ -993,22 +991,16 @@ fn one_victim_work(total: u64, coverage: &Coverage) -> super::Work {
 }
 
 /// A steal trims the victim and lowers the victim's end to the split, under
-/// one lock, and never cancels it: the victim keeps its open stream and
-/// stops there. A second steal lowers the end again. Only
-/// `cancel_victim` cancels, and only the unit it names.
+/// one lock: the victim keeps its open stream and stops there. A second
+/// steal lowers the end again.
 #[tokio::test]
-async fn a_steal_lowers_the_victims_end_and_does_not_cancel_it() -> anyhow::Result<()> {
+async fn a_steal_lowers_the_victims_end() -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
 
     let total = DISCOVERY_BLOCK_BYTES;
     let coverage = cov(1, &[0]);
     // Nothing is present: every byte in flight is missing.
     let all = [(0, total)];
-    let flag = |w: &super::Work, slot: usize| {
-        w.cancel
-            .get(slot)
-            .is_some_and(|h| h.flag.load(Ordering::Acquire))
-    };
     let end = |w: &super::Work, slot: usize| {
         w.live
             .get(slot)
@@ -1032,7 +1024,6 @@ async fn a_steal_lowers_the_victims_end_and_does_not_cancel_it() -> anyhow::Resu
     let split = first.range.fetch_start();
     assert_eq!(work.in_flight.first().copied().flatten(), Some((0, split)));
     assert_eq!(end(&work, 0), split, "the victim must stop at the split");
-    assert!(!flag(&work, 0), "a steal must not cancel the victim");
     assert_eq!(
         first.unit.stop_at.load(Ordering::Acquire),
         u64::MAX,
@@ -1040,7 +1031,7 @@ async fn a_steal_lowers_the_victims_end_and_does_not_cancel_it() -> anyhow::Resu
     );
 
     // A second freed lane steals from one of the two: that victim's end
-    // drops to the new split, still without a cancel.
+    // drops to the new split.
     let second = work
         .pick(2, total, &coverage, true, &all)?
         .ok_or_else(|| anyhow::anyhow!("worker 2 must steal again"))?;
@@ -1048,30 +1039,6 @@ async fn a_steal_lowers_the_victims_end_and_does_not_cancel_it() -> anyhow::Resu
     let victim = victim_of(&work, split)
         .ok_or_else(|| anyhow::anyhow!("the second steal trims a victim"))?;
     assert_eq!(end(&work, victim), split);
-    assert!(
-        !flag(&work, victim),
-        "a second steal must not cancel either"
-    );
-
-    // A cancel names a unit: a victim on a new unit keeps it, and an idle
-    // victim has nothing to cancel.
-    let mut work = one_victim_work(total, &coverage);
-    work.clear(0)?;
-    work.pending
-        .push_back(decdn_bao_range::align_range(0, 1, total)?);
-    work.pick(0, total, &coverage, true, &all)?
-        .ok_or_else(|| anyhow::anyhow!("the victim must pick its new unit"))?;
-    work.cancel_victim(0, 1);
-    assert!(
-        !flag(&work, 0),
-        "a victim on a new unit must not be cancelled"
-    );
-    work.cancel_victim(0, 2);
-    assert!(flag(&work, 0), "a cancel of the unit in flight fires");
-    let mut work = one_victim_work(total, &coverage);
-    work.clear(0)?;
-    work.cancel_victim(0, 1);
-    assert!(!flag(&work, 0), "an idle victim must not be cancelled");
     Ok(())
 }
 
@@ -5217,37 +5184,6 @@ async fn only_the_listed_ranges_are_fetched() -> anyhow::Result<()> {
 
 const MIB: u64 = 1024 * 1024;
 
-/// Acquire the whole blob into `store` from `provider`, recording every
-/// `(position, total)` the progress callback reports.
-async fn acquire_recording<S: BlobSource>(
-    store: &ClientRangedStore,
-    provider: &StaticSources<S>,
-    root: [u8; 32],
-    lanes: usize,
-) -> (anyhow::Result<()>, Vec<(u64, u64)>) {
-    let samples: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
-    let cb_samples = Arc::clone(&samples);
-    let on_progress: Box<crate::ProgressCallback> = Box::new(move |position, total| {
-        if let Ok(mut s) = cb_samples.lock() {
-            s.push((position, total));
-        }
-    });
-    let result = run_acquire_with(
-        store,
-        provider,
-        root,
-        &BudgetPacer::new(),
-        &no_funding(),
-        Knobs {
-            on_progress: Some(&on_progress),
-            ..Knobs::lanes(lanes)
-        },
-    )
-    .await;
-    let samples = samples.lock().map(|s| s.clone()).unwrap_or_default();
-    (result, samples)
-}
-
 /// Honest lanes over `data`, one per provider byte in `providers`.
 fn honest_lanes(
     data: &[u8],
@@ -5262,129 +5198,6 @@ fn honest_lanes(
         sources.push(src);
     }
     Ok((sources, StaticSources::new(candidates)?))
-}
-
-/// A first size far below the blob (a declared size) is replaced by the size
-/// the first leg's proof proves: the bound moves straight to the true size,
-/// with no growth round, and the fetch completes byte-identical.
-#[tokio::test(start_paused = true)]
-async fn a_too_small_first_size_is_replaced_by_the_proven_size() -> anyhow::Result<()> {
-    let (c0, truth) = (MIB, 70 * MIB);
-    let data = blob(truth as usize);
-    let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
-    let root = sources
-        .first()
-        .map(ScriptedSource::root)
-        .unwrap_or_default();
-    let (store, dir) = fresh_store(root, c0);
-    let (result, samples) = acquire_recording(&store, &provider, root, 2).await;
-    result?;
-    assert_eq!(store.proven(), Some(truth));
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-    let grown: std::collections::BTreeSet<u64> = samples
-        .iter()
-        .map(|&(_, total)| total)
-        .filter(|&total| total != c0 && total != truth)
-        .collect();
-    assert!(grown.is_empty(), "no growth round: {grown:?}");
-    Ok(())
-}
-
-/// A first claim past the blob shrinks once a leg verifies the true final
-/// chunk: the fetch completes and the bound ends at the proven size.
-#[tokio::test(start_paused = true)]
-async fn a_too_big_claim_shrinks_when_a_leg_proves_the_end() -> anyhow::Result<()> {
-    let (c0, truth) = (200 * MIB, 70 * MIB);
-    let data = blob(truth as usize);
-    let (sources, provider) = honest_lanes(&data, &[0xA1, 0xB2])?;
-    let root = sources
-        .first()
-        .map(ScriptedSource::root)
-        .unwrap_or_default();
-    let (store, dir) = fresh_store(root, c0);
-    let (result, _) = acquire_recording(&store, &provider, root, 2).await;
-    result?;
-    assert_eq!(store.proven(), Some(truth));
-    assert_eq!(store.bound(), truth, "the bound ends at the proven size");
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-    Ok(())
-}
-
-/// A proven size clips the work: nothing at or past it stays pending, a
-/// range across it is cut there, and a lane whose range starts past it is
-/// cancelled.
-#[test]
-fn a_proven_size_clips_pending_and_in_flight_work() -> anyhow::Result<()> {
-    use std::collections::VecDeque;
-    use std::sync::atomic::Ordering;
-
-    use decdn_bao_range::align_range;
-
-    let old = 200 * MIB;
-    let proven = 70 * MIB;
-    let pending = VecDeque::from(vec![
-        align_range(0, 10 * MIB, old)?,
-        align_range(60 * MIB, 20 * MIB, old)?,
-        align_range(100 * MIB, 20 * MIB, old)?,
-    ]);
-    let mut work = super::Work::new(pending, [0; 32], false);
-    let past = work.add_lane(None, old);
-    let across = work.add_lane(None, old);
-    if let Some(slot) = work.in_flight.get_mut(past) {
-        *slot = Some((90 * MIB, 10 * MIB));
-    }
-    if let Some(slot) = work.in_flight.get_mut(across) {
-        *slot = Some((65 * MIB, 10 * MIB));
-    }
-    work.clip(proven)?;
-    let pending: Vec<(u64, u64)> = work
-        .pending
-        .iter()
-        .map(|seg| (seg.fetch_start(), seg.fetch_end()))
-        .collect();
-    assert_eq!(pending, vec![(0, 10 * MIB), (60 * MIB, proven)]);
-    assert!(pending.iter().all(|&(_, end)| end <= proven));
-    assert_eq!(
-        work.in_flight.get(across).copied().flatten(),
-        Some((65 * MIB, 5 * MIB))
-    );
-    let cancelled = |i: usize| {
-        work.cancel
-            .get(i)
-            .is_some_and(|h| h.flag.load(Ordering::Acquire))
-    };
-    assert!(cancelled(past), "a lane past the proven size stops");
-    assert!(!cancelled(across), "a lane across it finishes at it");
-    Ok(())
-}
-
-/// A source that signs a size one byte short is never believed: its size
-/// is only the first claim, the honest sources prove the true one, and the
-/// fetch completes.
-#[tokio::test(start_paused = true)]
-async fn a_lying_small_first_claim_never_fails_the_fetch() -> anyhow::Result<()> {
-    let truth = 3 * MIB + 12_345;
-    let data = blob(truth as usize);
-    let mut candidates = Vec::new();
-    let mut root = [0; 32];
-    for (p, signs) in [(0xA1, truth - 1), (0xB2, truth), (0xC3, truth)] {
-        let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-        let src = ScriptedSource::new(data.clone())?
-            .signing_size(signs)
-            .paying(Arc::clone(&ledger));
-        root = src.root();
-        candidates.push(candidate(src, ledger, p, None));
-    }
-    let provider = StaticSources::new(candidates)?;
-    let (store, dir) = fresh_store(root, truth - 1);
-    let (result, _) = acquire_recording(&store, &provider, root, 3).await;
-    result?;
-    assert_eq!(store.proven(), Some(truth));
-    store.finalize().await?;
-    assert_eq!(std::fs::read(dir.path().join("b"))?, data);
-    Ok(())
 }
 
 /// Coverage is a preference (#2225): two partial holders whose coverage
@@ -7140,13 +6953,10 @@ async fn a_busy_lane_runs_as_many_extra_streams_as_granted() -> anyhow::Result<(
 }
 
 /// A store that fails `missing_ranges` once `fail` is set: a local disk or
-/// store fault in the middle of a unit. A nonzero `shrink_to` moves the
-/// bound down to it at the next `missing_ranges`, before the query runs: a
-/// leg that proves a smaller size after the caller read the bound.
+/// store fault in the middle of a unit.
 struct FailingMissing {
     inner: ClientRangedStore,
     fail: std::sync::atomic::AtomicBool,
-    shrink_to: std::sync::atomic::AtomicU64,
 }
 
 impl RangedStore for FailingMissing {
@@ -7169,10 +6979,6 @@ impl RangedStore for FailingMissing {
                     "injected store read fault",
                 )))
             });
-        }
-        let shrink = self.shrink_to.swap(0, std::sync::atomic::Ordering::SeqCst);
-        if shrink > 0 {
-            self.inner.set_bound(shrink);
         }
         self.inner.missing_ranges(byte_offset, byte_len)
     }
@@ -7227,10 +7033,6 @@ impl crate::source::IngestStore for FailingMissing {
     fn proven(&self) -> Option<u64> {
         self.inner.proven()
     }
-
-    fn set_bound(&self, bound: u64) {
-        self.inner.set_bound(bound);
-    }
 }
 
 /// A store that cannot read its own record while the watchdog checks a
@@ -7248,7 +7050,6 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
     let store = FailingMissing {
         inner,
         fail: std::sync::atomic::AtomicBool::new(false),
-        shrink_to: std::sync::atomic::AtomicU64::new(0),
     };
     let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
     let health: Arc<PeerHealth> = Arc::default();
@@ -7301,55 +7102,6 @@ async fn a_store_read_error_in_the_watchdog_is_our_fault() -> anyhow::Result<()>
         Health::Healthy { streak: 0 },
         "the source is not cooled for our fault"
     );
-    Ok(())
-}
-
-/// An acquire records its proven size before it plans, and a leg's proof of
-/// the true size replaces a wrong one: the store ends at the true size.
-#[tokio::test]
-async fn the_store_ends_at_the_size_a_leg_proves() -> anyhow::Result<()> {
-    let data = blob(3 * MIB as usize);
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let src = ScriptedSource::new(data)?.paying(Arc::clone(&ledger));
-    let root = src.root();
-    let (store, _dir) = fresh_store(root, 8 * MIB);
-    let provider = StaticSources::new(vec![candidate(src, ledger, 0xA1, None)])?;
-    run_acquire(
-        &store,
-        &provider,
-        root,
-        8 * MIB,
-        &BudgetPacer::new(),
-        &no_funding(),
-        1,
-        None,
-    )
-    .await?;
-    assert_eq!(store.proven(), Some(3 * MIB));
-    assert_eq!(store.bound(), 3 * MIB);
-    Ok(())
-}
-
-/// A leg proves a smaller size between a caller's bound read and its
-/// missing-ranges query. The query clips to the smaller bound: a range past
-/// it misses nothing, and a range across it misses only the bytes below it.
-/// Neither is a store fault.
-#[tokio::test]
-async fn a_bound_that_shrinks_under_a_missing_query_clips_it() -> anyhow::Result<()> {
-    let (inner, _dir) = fresh_store([7; 32], 8 * MIB);
-    let store = FailingMissing {
-        inner,
-        fail: std::sync::atomic::AtomicBool::new(false),
-        shrink_to: std::sync::atomic::AtomicU64::new(2 * MIB),
-    };
-    let past = super::store_missing(&store, 4 * MIB, 2 * MIB).await?;
-    assert!(past.is_empty(), "a range past the new bound misses nothing");
-
-    store
-        .shrink_to
-        .store(MIB, std::sync::atomic::Ordering::SeqCst);
-    let across = super::store_missing(&store, 0, 4 * MIB).await?;
-    assert_eq!(ranges_content_len(&across, store.total_bytes()), MIB);
     Ok(())
 }
 

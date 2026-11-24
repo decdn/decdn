@@ -464,8 +464,7 @@ where
         sources: &mut SourceSet<'_, P>,
         run: &Run<'_>,
     ) -> anyhow::Result<bool> {
-        // The whole blob is one tail: it runs to the end the store's bound
-        // names, which a leg's proven size sets.
+        // The whole blob is one tail: it runs to the proven size.
         let whole = [(0, 0)];
         let ranges = target.ranges.unwrap_or(&whole);
         let store = dir

@@ -81,9 +81,9 @@
 //!
 //! # Stopping a lane: closing the double-pay
 //!
-//! A worker's `fill_gap` runs under a [`tokio::select!`] against a per-lane
-//! `CancelHandle` and a progress-relative watchdog, so it can be interrupted
-//! mid-fetch. Because [`crate::ClientRangedStore::ingest_stream`] durably
+//! A worker's `fill_gap` runs under a [`tokio::select!`] against a
+//! progress-relative watchdog and the lane's yield and retire signals, so it
+//! can be interrupted mid-fetch. Because [`crate::ClientRangedStore::ingest_stream`] durably
 //! checkpoints verified groups every `INGEST_CHECKPOINT_BYTES` as it streams,
 //! dropping the `fill_gap` future keeps every checkpointed prefix in the store:
 //! [`RangedStore::missing_ranges`](decdn_bao_range::RangedStore::missing_ranges)
@@ -105,8 +105,9 @@
 //!   apart from the frames past the split the victim's stream already carried
 //!   when it stopped, and the victim opens no new stream for the part it
 //!   keeps.
-//! - **Proven size.** A proven size that leaves a lane's whole range past
-//!   the end of the blob cancels that lane's unit (`Work::cancel_victim`).
+//! - **Yield.** Under consumption pacing, a lane parked on the consumer
+//!   while an earlier range waits gives its range back ([`yield_to_front`]):
+//!   it re-queues the remainder and picks the earlier range.
 //! - **Stall / fault.** A lane with no verified progress for the lane watchdog
 //!   ([`LANE_WATCHDOG`]), or whose `fill_gap` returns an `Err`, re-queues the
 //!   UN-fetched remainder of its range to `pending` and ends. The loop
@@ -218,9 +219,8 @@ const EXTRA_REFUSALS_LOGGED: u32 = 3;
 const WAITING_RELOG: Duration = Duration::from_secs(30);
 
 /// The chunks of `[start, start+len)` the store misses, clipped to its
-/// current bound ([`crate::driver::missing_below_bound`]): a range at or past
-/// the bound misses nothing, and a bound that shrinks under the query clips
-/// it. A store error is this process's fault ([`crate::LocalPullFault`]),
+/// bound ([`crate::driver::missing_below_bound`]): a range at or past the
+/// bound misses nothing. A store error is this process's fault ([`crate::LocalPullFault`]),
 /// never a source's.
 ///
 /// # Errors
@@ -661,41 +661,6 @@ struct PlannedSteal {
     kind: StealKind,
 }
 
-/// Per-lane interrupt: an edge-triggered wakeup ([`Notify`]) plus a `flag`
-/// that says the wakeup means "cancel", not a stale permit. The canceller sets
-/// `flag` and wakes the victim under the `Work` lock; the victim clears it on
-/// its next `Work::pick`, also under the lock, so the two never race.
-struct CancelHandle {
-    /// `true` once [`Work::cancel_victim`] cancels this lane's unit; the
-    /// victim must stop.
-    flag: AtomicBool,
-    /// Wakes the victim's `cancelled` future so it re-reads `flag` promptly.
-    notify: Notify,
-}
-
-impl CancelHandle {
-    fn new() -> Self {
-        Self {
-            flag: AtomicBool::new(false),
-            notify: Notify::new(),
-        }
-    }
-}
-
-/// Resolve once this handle is genuinely cancelled. A [`Notify`] permit can be
-/// stored by a stale `notify_one` from a prior unit, so a wakeup alone is not
-/// proof: re-read `flag` and keep waiting until it is set. This also closes the
-/// lost-wakeup: `notify_one` stores a permit even if it fires before the await,
-/// so a cancel signalled before the victim parks here is still observed.
-async fn cancelled(handle: &CancelHandle) {
-    loop {
-        handle.notify.notified().await;
-        if handle.flag.load(Ordering::Acquire) {
-            return;
-        }
-    }
-}
-
 /// One planned run staged for seeding into `pending`, with the piece count it
 /// will split into. `max_pieces` bounds the split to what is useful for THIS run
 /// (the number of lanes that hold it whole), while the seeding loop's global
@@ -796,9 +761,9 @@ where
 enum UnitOutcome {
     /// `fill_gap` filled the range: free the lane and pick again.
     Completed,
-    /// A proven size left the range past the end of the blob, or a
-    /// consumption-paced lane gave its range back for an earlier one:
-    /// re-queue the remainder and stay live (pick again).
+    /// A consumption-paced lane gave its range back for an earlier one, or a
+    /// credential swap retired the lane: re-queue the remainder and stay live
+    /// (pick again).
     Cancelled,
     /// The lane stalled or `fill_gap` failed: re-queue the remainder and end
     /// the lane. `Some(e)` carries the `fill_gap` error; `None` is a watchdog
@@ -862,10 +827,6 @@ struct Work {
     pending: VecDeque<AlignedRange>,
     /// Per-lane current range, `None` when the lane holds nothing.
     in_flight: Vec<Option<(u64, u64)>>,
-    /// Per-lane interrupt handles. [`Work::cancel_victim`] signals
-    /// `cancel[victim]` when a proven size leaves its range past the end; the
-    /// victim clears it on its next `pick`.
-    cancel: Vec<Arc<CancelHandle>>,
     /// Per-slot live state of the unit in flight. A steal reads the victim's
     /// rate and frontier off it, and lowers its end to the split under the
     /// same lock as its trim: the victim stops its open stream there
@@ -874,10 +835,6 @@ struct Work {
     /// Per-slot rate over the worker's last unit that verified a byte, in
     /// bytes per second: the stealer's side of a steal's split.
     rates: Vec<Option<u64>>,
-    /// Per-lane count of units started. Every [`Work::pick`] by worker `i`
-    /// bumps `units[i]`, so a number names one unit, and
-    /// [`Work::cancel_victim`] cancels only the unit it names.
-    units: Vec<u64>,
     /// `alive[i]` is `true` while lane `i`'s worker runs. [`Work::park`]
     /// clears it when the worker ends; [`Work::revive`] sets it when the loop
     /// starts the lane again.
@@ -886,8 +843,8 @@ struct Work {
     /// ranges it steals from ([`Work::pick`]).
     coverage: Vec<Coverage>,
     /// `measured[i]` is `true` when lane `i`'s coverage is a answered bitmap.
-    /// A lane without one holds the whole blob, so its coverage follows the
-    /// bound when a proven size moves it ([`Work::grow_coverage`]).
+    /// A lane without one holds the whole blob, so a later answer
+    /// ([`Work::set_coverage`]) leaves its coverage whole.
     measured: Vec<bool>,
     /// `lane_of[i]` is the lane slot worker slot `i` fetches for: `i` itself
     /// for a lane's own worker, the lane's slot for an extra worker
@@ -924,10 +881,8 @@ impl Work {
             coverage_reach: u64::MAX,
             pending,
             in_flight: Vec::new(),
-            cancel: Vec::new(),
             live: Vec::new(),
             rates: Vec::new(),
-            units: Vec::new(),
             alive: Vec::new(),
             coverage: Vec::new(),
             measured: Vec::new(),
@@ -997,9 +952,7 @@ impl Work {
     fn add_lane(&mut self, coverage: Option<Coverage>, total_bytes: u64) -> usize {
         let slot = self.in_flight.len();
         self.in_flight.push(None);
-        self.cancel.push(Arc::new(CancelHandle::new()));
         self.push_unit_state();
-        self.units.push(0);
         self.alive.push(true);
         self.measured.push(coverage.is_some());
         let coverage = coverage.unwrap_or_else(|| self.whole_coverage(total_bytes));
@@ -1033,9 +986,6 @@ impl Work {
             if let Some(held) = self.in_flight.get_mut(slot) {
                 *held = None;
             }
-            if let Some(handle) = self.cancel.get_mut(slot) {
-                *handle = Arc::new(CancelHandle::new());
-            }
             if let Some(rate) = self.rates.get_mut(slot) {
                 *rate = None;
             }
@@ -1055,9 +1005,7 @@ impl Work {
         }
         let slot = self.in_flight.len();
         self.in_flight.push(None);
-        self.cancel.push(Arc::new(CancelHandle::new()));
         self.push_unit_state();
-        self.units.push(0);
         self.alive.push(true);
         self.measured
             .push(self.measured.get(lane).copied().unwrap_or(true));
@@ -1148,57 +1096,6 @@ impl Work {
             wanted.push((seg.clone(), candidates));
         }
         wanted
-    }
-
-    /// Size every lane without a answered bitmap to the whole blob of
-    /// `total_bytes`, up to the requested reach.
-    fn grow_coverage(&mut self, total_bytes: u64) {
-        let whole = self.whole_coverage(total_bytes);
-        for (coverage, &measured) in self.coverage.iter_mut().zip(&self.measured) {
-            if !measured {
-                *coverage = whole.clone();
-            }
-        }
-    }
-
-    /// Clip every range to a proven size of `total_bytes`: drop the pending
-    /// ranges at or past it and cut the rest there. A lane whose range starts
-    /// at or past it is cancelled, so it stops fetching a range the blob does
-    /// not have; a lane whose range crosses it is trimmed, and its own drive
-    /// ends at the proven size.
-    ///
-    /// # Errors
-    ///
-    /// A segmentation alignment error.
-    fn clip(&mut self, total_bytes: u64) -> anyhow::Result<()> {
-        let mut kept = VecDeque::with_capacity(self.pending.len());
-        for seg in self.pending.drain(..) {
-            let start = seg.fetch_start();
-            if start >= total_bytes {
-                continue;
-            }
-            if seg.fetch_end() > total_bytes {
-                kept.push_back(align_range(start, total_bytes - start, total_bytes)?);
-            } else {
-                kept.push_back(seg);
-            }
-        }
-        self.pending = kept;
-        for i in 0..self.in_flight.len() {
-            let Some(Some((start, len))) = self.in_flight.get(i).copied() else {
-                continue;
-            };
-            if start >= total_bytes {
-                if let Some(unit) = self.units.get(i).copied() {
-                    self.cancel_victim(i, unit);
-                }
-            } else if start.saturating_add(len) > total_bytes
-                && let Some(Some(slot)) = self.in_flight.get_mut(i)
-            {
-                slot.1 = total_bytes - start;
-            }
-        }
-        Ok(())
     }
 
     /// Mark lane `i`'s worker ended. Every `pending` entry stays: a cooling
@@ -1413,17 +1310,6 @@ impl Work {
         steal: bool,
         missing: &[(u64, u64)],
     ) -> anyhow::Result<Option<Picked>> {
-        // This worker is starting a fresh unit: clear any cancel signal left from
-        // a prior unit, under the lock, so a stale `notify_one` permit cannot
-        // spuriously cancel the new unit (see `cancelled`).
-        match self.cancel.get(i) {
-            Some(handle) => handle.flag.store(false, Ordering::Release),
-            None => anyhow::bail!("worker index {i} out of range for cancel handles"),
-        }
-        match self.units.get_mut(i) {
-            Some(unit) => *unit = unit.wrapping_add(1),
-            None => anyhow::bail!("worker index {i} out of range for unit counters"),
-        }
         // A fresh live state for the unit, so a steal can only lower the end
         // of the unit it trims.
         let unit = Arc::new(Unit::new());
@@ -1770,28 +1656,6 @@ impl Work {
                 .insert(pos.saturating_add(k), align_range(s, l, total_bytes)?);
         }
         Ok(Some(take))
-    }
-
-    /// Cancel worker `victim`'s unit `unit`: its `fill_gap` is dropped, and it
-    /// re-queues the missing bytes of its range and picks again. A proven size
-    /// that leaves the unit's whole range past the end of the blob cancels it
-    /// this way ([`Work::clip`]). The signal fires only while the victim still
-    /// runs `unit`. A victim that has since finished, faulted, or re-queued
-    /// holds no slot or runs a later unit, and cancelling that unit would be
-    /// wrong. Set the flag then wake it, both under the caller's `Work` lock,
-    /// serialized against the victim's own `pick` reset. `notify_one` stores a
-    /// permit if the victim is not parked yet, so the signal is never lost.
-    fn cancel_victim(&self, victim: usize, unit: u64) {
-        let same_unit = self.units.get(victim) == Some(&unit)
-            && self.in_flight.get(victim).is_some_and(Option::is_some);
-        if !same_unit {
-            tracing::debug!(victim, unit, "the unit to cancel has ended; cancel skipped");
-            return;
-        }
-        if let Some(handle) = self.cancel.get(victim) {
-            handle.flag.store(true, Ordering::Release);
-            handle.notify.notify_one();
-        }
     }
 
     /// Whether a pending segment worker `i` can serve starts before the range
@@ -2175,14 +2039,13 @@ where
         progress_wake,
         ..
     } = *engine;
-    // This lane's coverage and cancel handle, cloned once so `cancelled` can
-    // await the handle OUTSIDE the `Work` lock while `Work::cancel_victim`
-    // signals it under the lock.
-    let (my_coverage, handle) = {
+    // This lane's coverage, cloned once so the worker reads it outside the
+    // `Work` lock.
+    let my_coverage = {
         let w = work.lock().await;
-        match (w.coverage.get(i).cloned(), w.cancel.get(i).map(Arc::clone)) {
-            (Some(c), Some(h)) => (c, h),
-            _ => anyhow::bail!("worker index {i} out of range for lane slots"),
+        match w.coverage.get(i).cloned() {
+            Some(c) => c,
+            None => anyhow::bail!("worker index {i} out of range for lane slots"),
         }
     };
     let mut delivered = false;
@@ -2425,7 +2288,6 @@ where
                         // The loop classifies the fault once the lane ends.
                         Err(e) => UnitOutcome::Faulted(Some(e)),
                     },
-                    () = cancelled(&handle) => UnitOutcome::Cancelled,
                     // Parked on the consumer with an earlier range waiting: give
                     // this range back (it re-queues like a cancel) and take that
                     // one. Only under consumption pacing.
@@ -2749,54 +2611,28 @@ impl std::fmt::Debug for ConsumptionPacing<'_> {
     }
 }
 
-/// The byte ranges one [`acquire`] fills, fitted to the store's bound as it
-/// moves (ADR 039 § Dynamic segmentation and tail-stealing).
+/// The byte ranges one [`acquire`] fills, fitted to the blob's proven size
+/// (ADR 039 § Dynamic segmentation and tail-stealing).
 struct Want {
-    /// The `(offset, len)` ranges the caller asked for; a zero length is a
-    /// tail that runs to the end of the blob.
-    requested: Vec<(u64, u64)>,
-    /// The `(offset, len)` ranges still to fill: `requested` clipped to
-    /// `bound`, each tail running to it.
+    /// The `(offset, len)` ranges to fill, each clipped to the proven size.
     ranges: Vec<(u64, u64)>,
-    /// The bound the ranges were last fitted to.
-    bound: u64,
 }
 
 impl Want {
-    /// `ranges` fitted to a first bound of `bound`. Only a zero-length range
-    /// is a tail (#2865): a range with a length keeps its requested end, and
-    /// is clipped to the bound.
+    /// `ranges` fitted to a proven size of `bound`. Only a zero-length range
+    /// is a tail that runs to `bound` (#2865): a range with a length keeps
+    /// its requested end, clipped to `bound`. A range that starts at or past
+    /// `bound` is dropped.
     fn new(ranges: &[(u64, u64)], bound: u64) -> Self {
-        let requested = ranges.to_vec();
-        Self {
-            ranges: Self::clipped(&requested, bound),
-            requested,
-            bound,
-        }
-    }
-
-    /// `requested` clipped to `bound`, each tail running to it.
-    fn clipped(requested: &[(u64, u64)], bound: u64) -> Vec<(u64, u64)> {
-        requested
+        let ranges = ranges
             .iter()
             .filter(|&&(start, _)| start < bound)
             .map(|&(start, len)| {
                 let room = bound - start;
                 (start, if len == 0 { room } else { len.min(room) })
             })
-            .collect()
-    }
-
-    /// Fit the ranges to a new `bound`: every requested range is clipped to
-    /// it again, so an exact range regains its requested end as the bound
-    /// grows. Returns whether the bound moved.
-    fn fit(&mut self, bound: u64) -> bool {
-        if bound == self.bound {
-            return false;
-        }
-        self.ranges = Self::clipped(&self.requested, bound);
-        self.bound = bound;
-        true
+            .collect();
+        Self { ranges }
     }
 
     /// The furthest byte the fitted ranges reach: the end of the last range.
@@ -3362,17 +3198,17 @@ where
     // `c0` is proven: the store records it, and a resumed record that names
     // another size gives way to it.
     store.prove_size(c0);
-    let first_bound = store.total_bytes();
-    let mut want = Want::new(ranges, first_bound);
+    let bound = store.total_bytes();
+    let want = Want::new(ranges, bound);
     let missing = missing_chunks(store, &want.ranges).await?;
     let mut pending = VecDeque::new();
-    for (start, len) in contiguous_byte_ranges(&missing, first_bound) {
-        pending.push_back(align_range(start, len, first_bound)?);
+    for (start, len) in contiguous_byte_ranges(&missing, bound) {
+        pending.push_back(align_range(start, len, bound)?);
     }
     // Seeded with the bytes already present, so a resumed fetch's bar starts
     // where the last run left off; each lane folds in its own leg deltas.
-    let base_present = ranges_content_len(&store.present_ranges().await?, first_bound);
-    let needs = base_present.saturating_add(ranges_content_len(&missing, first_bound));
+    let base_present = ranges_content_len(&store.present_ranges().await?, bound);
+    let needs = base_present.saturating_add(ranges_content_len(&missing, bound));
     // A proven size is verified, so ranges that need more than the cap under
     // it can never complete: end before any leg opens.
     if cap > 0 && store.proven().is_some() && needs > cap {
@@ -3480,13 +3316,8 @@ where
     let progress_agg = AtomicU64::new(base_present);
     // Surface the resume base on the bar before any lane opens a leg.
     if let Some(cb) = env.on_progress {
-        cb(base_present, first_bound);
+        cb(base_present, bound);
     }
-    // The bound the loop last fitted its work to. A leg that proves a size
-    // moves the store's bound; the progress report sees that first and wakes
-    // the loop to clip the work.
-    let bound_seen = AtomicU64::new(first_bound);
-    let bound_moved = Notify::new();
     // The highest position reported so far: each rise is newly verified bytes
     // for the recovery gate's progress rule.
     let verified_seen = AtomicU64::new(base_present);
@@ -3498,9 +3329,6 @@ where
             env.recovery.record_verified(position - before);
         }
         env.stop.clock.tick();
-        if store.total_bytes() != bound_seen.load(Ordering::Acquire) {
-            bound_moved.notify_one();
-        }
         if let Some(cb) = env.on_progress {
             cb(position, total);
         }
@@ -3559,27 +3387,6 @@ where
     let mut batch_late: Option<anyhow::Error> = None;
     let result: anyhow::Result<()> = async {
         loop {
-            let bound = store.total_bytes();
-            if want.fit(bound) {
-                // A leg proved the size. Ranges that need more than the cap
-                // under it can never complete: end before the work grows.
-                if cap > 0 && store.proven().is_some() {
-                    let held = ranges_content_len(&store.present_ranges().await?, bound);
-                    let missing = missing_chunks(store, &want.ranges).await?;
-                    let needs = held.saturating_add(ranges_content_len(&missing, bound));
-                    if needs > cap {
-                        return Err(anyhow::Error::new(crate::BlobTooLarge {
-                            reached: needs,
-                            ceiling: cap,
-                        }));
-                    }
-                }
-                bound_seen.store(bound, Ordering::Release);
-                let mut w = work.lock().await;
-                w.set_coverage_reach(want.reach());
-                w.grow_coverage(bound);
-                w.clip(bound)?;
-            }
             if running.is_empty()
                 && ready.is_empty()
                 && extras_running == 0
@@ -4141,8 +3948,6 @@ where
                 Ok(()) = deposit_rx.changed() => {}
                 // A swapped credential: the loop top rebuilds the lanes.
                 () = swap_after(env.credentials, generation_seen) => {}
-                // A leg proved a size: the loop top clips the work to it.
-                () = bound_moved.notified() => {}
                 flushed = poll_opt(&mut record), if record.is_some() => {
                     record = None;
                     flushed?;
