@@ -596,6 +596,14 @@ fn expand_env_per_field_error_context() -> anyhow::Result<()> {
                 discovery: None,
             });
         }),
+        ("network.external_addrs", |c, v| {
+            c.network = Some(types::NetworkConfig {
+                bind_port: None,
+                relay_urls: None,
+                external_addrs: Some(vec![v.to_string()]),
+                discovery: None,
+            });
+        }),
         ("blockchain.rpc_url", |c, v| {
             c.blockchain = Some(types::BlockchainConfig {
                 origin_assignment_address: None,

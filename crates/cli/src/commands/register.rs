@@ -90,9 +90,9 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
 ///
 /// 1. `explicit`, when the operator passed any. The file is not read.
 /// 2. Each `network.external_addrs` address, on its own port, when that list
-///    holds any address. An empty list counts as unset. The command can run on another host than the node, so
-///    the configured addresses are the only default; the host's own
-///    addresses are not added.
+///    holds any address. An empty list counts as unset. The configured
+///    addresses replace the host's own, as in the daemon's reachability check
+///    (see [`decdn_common::net::public_quic_addrs`]).
 /// 3. One `/ip{4,6}/<ip>/udp/<bind_port>/quic-v1` per public address on the
 ///    host's default route. A host behind NAT gets none, since its route
 ///    source is not dialable; its operator sets `network.external_addrs` or

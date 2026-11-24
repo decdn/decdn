@@ -1285,8 +1285,8 @@ async fn build_endpoint_binds_with_portless_relay_url() {
 async fn build_endpoint_advertises_configured_external_addrs() {
     // iroh adds each configured address to the endpoint's own address set
     // during bind, so it is present right after `bind()` returns. A static
-    // peer map keeps the build off the n0 publisher, so nothing reaches the
-    // network.
+    // peer map keeps the build off the n0 pkarr publisher, so the test
+    // publishes no address record; the relay leg keeps the n0 default.
     let sk = SecretKey::generate();
     let transport = quic_transport_config().unwrap();
     let external: Vec<SocketAddr> = vec![

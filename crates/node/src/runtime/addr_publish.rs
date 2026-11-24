@@ -5,11 +5,11 @@
 //! publisher uses [`node_publish_filter`] instead: the relay URL plus every
 //! globally routable IP address the endpoint knows for itself, so a peer that
 //! dials by bare `NodeId` resolves a direct path. The endpoint's addresses
-//! include each configured `network.external_addrs` address (iroh tags it
-//! `DirectAddrType::Config`), which is public by resolution, so the filter
-//! keeps it. Private, loopback,
-//! link-local, and shared (CGNAT) addresses stay out of the record: no remote
-//! dialer can reach them, and they describe the operator's internal network.
+//! include each configured `network.external_addrs` address. Config
+//! resolution admits only public IPs there, so the filter keeps each one.
+//! Private, loopback, link-local, and shared (CGNAT) addresses stay out of the
+//! record: no remote dialer can reach them, and they describe the operator's
+//! internal network.
 
 use std::borrow::Cow;
 

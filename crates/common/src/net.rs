@@ -117,10 +117,18 @@ pub fn quic_multiaddr(ip: IpAddr, port: u16) -> String {
 /// an IP without a port), for port 0, and for an IP that [`is_publishable`]
 /// refuses. The message names the value or the IP.
 pub fn parse_external_addr(raw: &str) -> anyhow::Result<SocketAddr> {
-    let addr: SocketAddr = raw.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "invalid socket address {raw:?}: expected IP:port; a hostname is not accepted"
-        )
+    let trimmed = raw.trim();
+    let addr: SocketAddr = trimmed.parse().map_err(|_| {
+        if trimmed.parse::<IpAddr>().is_ok() {
+            anyhow::anyhow!(
+                "invalid socket address {raw:?}: missing port; write IP:port, with IPv6 as \
+                 [addr]:port"
+            )
+        } else {
+            anyhow::anyhow!(
+                "invalid socket address {raw:?}: expected IP:port; a hostname is not accepted"
+            )
+        }
     })?;
     anyhow::ensure!(
         addr.port() != 0,

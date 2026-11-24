@@ -48,3 +48,16 @@ fn unregistered_external_addr_names_its_own_port() {
         }
     );
 }
+
+#[test]
+fn report_marks_a_configured_external_addr_public() {
+    // The configured address replaces the host's own, so the gauge reads 1
+    // on any host, behind NAT included.
+    let metrics = Metrics::new();
+    report(&metrics, 4433, &[sock("1.1.1.1:30443")], &[]);
+    let text = metrics.encode().unwrap();
+    assert!(
+        text.lines().any(|l| l == "decdn_node_public_address 1"),
+        "{text}"
+    );
+}

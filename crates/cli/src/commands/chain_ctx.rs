@@ -47,9 +47,9 @@ impl FileConfig {
     /// [`decdn_common::config::configured_external_addrs`]): public `IP:port`
     /// addresses in configured order, each kept once. Empty when unset.
     ///
-    /// The CLI reads the file raw, so an entry that holds `${VAR}` fails here
-    /// although the daemon expands it. The operator passes `--multiaddr`
-    /// instead.
+    /// `decdn setup` and `decdn node register` read the file raw, so an entry
+    /// that holds `${VAR}` fails here although the daemon expands it. The
+    /// operator passes `--multiaddr` instead.
     ///
     /// # Errors
     ///

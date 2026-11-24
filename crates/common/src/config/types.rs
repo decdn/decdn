@@ -105,14 +105,16 @@ pub struct NetworkConfig {
     pub relay_urls: Option<Vec<String>>,
     /// Public addresses where remote peers reach this node, for a node behind
     /// a port forward or a load balancer. Each entry is `IP:port`, with an
-    /// IPv6 address in brackets (`"[2606:4700::1111]:4433"`). A hostname is
-    /// refused, and the IP must be public. The port is the one peers dial,
+    /// IPv6 address in brackets (`"[2606:4700::1111]:4433"`). A hostname or
+    /// port 0 is refused, and the IP must be public. The port is the one peers dial,
     /// which can differ from [`Self::bind_port`]. The node publishes each
     /// address in its address record and counts it as a public address in its
     /// reachability check, in place of the host's own addresses. When the list
     /// holds any address, `decdn setup` and `decdn node register` register
     /// these addresses if no `--multiaddr` is given; an empty list counts as
-    /// unset. A change takes effect on restart.
+    /// unset. The daemon expands `${VAR}` in an entry; `decdn setup` and
+    /// `decdn node register` read the file raw and refuse such an entry. A
+    /// change takes effect on restart.
     pub external_addrs: Option<Vec<String>>,
     /// Operator-configurable address discovery (#818 scope 1). Absent => the
     /// node uses the n0-hosted pkarr/DNS discovery (`presets::N0`, unchanged).

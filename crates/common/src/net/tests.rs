@@ -71,6 +71,14 @@ fn parse_external_addr_refuses_hostnames_bare_ips_and_port_zero() {
         let err = parse_external_addr(raw).unwrap_err().to_string();
         assert!(err.contains(&format!("{raw:?}")), "{raw}: {err}");
     }
+    for raw in ["8.8.8.8", "2606:4700::1111"] {
+        let err = parse_external_addr(raw).unwrap_err().to_string();
+        assert!(err.contains("missing port"), "{raw}: {err}");
+    }
+    let err = parse_external_addr("node.example:4433")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("a hostname is not accepted"), "{err}");
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Ports group: probe bindability of the QUIC (UDP) and metrics/admin (TCP)
-//! ports, and report whether the host has a public address. A port already in
+//! ports, and report whether the host has a public address or a configured
+//! `network.external_addrs` address. A port already in
 //! use while this node's daemon is running is expected, not a fault.
 
 use std::io::ErrorKind;
@@ -70,8 +71,8 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 /// Discovery). `public` holds the QUIC addresses a remote peer can dial, each
 /// with its own port: each configured `network.external_addrs` address when
 /// there are any, else the host's route-public IPs on `bind_port`, as the
-/// daemon counts them.
-/// Both outcomes pass: a host behind NAT is a supported setup whose inbound
+/// daemon counts them. `bind_port` feeds only the behind-NAT remediation
+/// text. Both outcomes pass: a host behind NAT is a supported setup whose inbound
 /// runs through the relay and hole-punching.
 pub(crate) fn classify_reachability(public: &[SocketAddr], bind_port: u16) -> Finding {
     if public.is_empty() {

@@ -46,11 +46,12 @@ pub fn configured_bind_port(file_bind_port: Option<u16>) -> u16 {
         .unwrap_or(DEFAULT_BIND_PORT)
 }
 
-/// The configured external addresses as a command without `RunArgs` resolves
-/// them from `raw` (the config file's `network.external_addrs`): each entry
-/// parsed by [`crate::net::parse_external_addr`], in order, each address kept
-/// once. The same rule [`resolve_config`] applies. The caller reads the file
-/// raw, so an entry that holds `${VAR}` is refused with its own error.
+/// The configured external addresses from `raw`, the config file's
+/// `network.external_addrs` read without `${VAR}` expansion, for a command
+/// that does not run [`resolve_config`]. Each entry follows the same rule as
+/// in [`resolve_config`] ([`crate::net::parse_external_addr`]), in order, each
+/// address kept once. Unlike [`resolve_config`], it refuses an entry that
+/// holds `${VAR}` and stops at the first bad entry.
 ///
 /// # Errors
 ///
@@ -71,6 +72,7 @@ pub fn configured_external_addrs(raw: &[String]) -> anyhow::Result<Vec<std::net:
     }
     Ok(out)
 }
+
 /// Default maximum cache size in megabytes (100 GB) — sized for the large-file
 /// (AI model) wedge, where a node holds many multi-GB shards.
 const DEFAULT_CACHE_SIZE_MB: u64 = 102_400;
@@ -793,8 +795,8 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
     Ok(upper)
 }
 
-/// Resolve network fields, recording any malformed `relay_urls` or
-/// `external_addrs` entry into `bag` (#818).
+/// Resolve network fields, recording any malformed `relay_urls` (#818) or
+/// `external_addrs` entry into `bag`.
 ///
 /// Each `external_addrs` entry must pass [`crate::net::parse_external_addr`]:
 /// a public `IP:port`. A bad entry is recorded under

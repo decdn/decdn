@@ -765,7 +765,8 @@ identity rotation, host clock skew breaking TLS.
    a load balancer, set the public `IP:port` peers dial in
    `network.external_addrs` and restart the node (the key is not
    hot-reloaded): the node then publishes that address in its pkarr record
-   and counts it as public at bring-up.
+   and counts it as public at bring-up. Register it in the registry record
+   with `decdn node update-multiaddrs --multiaddr <addr>`.
 2. If a peer's iroh key was rotated, neighbours referring to its prior
    `NodeId` will not reconnect until they re-discover the new identity via
    gossip. The node config carries no static bootstrap-peer list
