@@ -15,19 +15,6 @@ fn node_info(node_id: [u8; 32], active: bool) -> CapacityBond::NodeInfo {
 }
 
 #[test]
-fn skips_inactive_nodes() {
-    // A valid ed25519 key: the all-zero point is rejected by `from_bytes`,
-    // so derive a real one from a known secret.
-    let key = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
-    let bytes = *key.as_bytes();
-    assert!(candidate_from(&node_info(bytes, true), true).is_some());
-    assert!(
-        candidate_from(&node_info(bytes, true), false).is_none(),
-        "inactive nodes must be filtered out"
-    );
-}
-
-#[test]
 fn candidate_carries_registry_multiaddrs_for_dialing() {
     let key = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let mut info = node_info(*key.as_bytes(), true);

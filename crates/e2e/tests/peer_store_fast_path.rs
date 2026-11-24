@@ -5,7 +5,7 @@
 //! `CapacityBond` registry read or a round of discovery opens.
 //!
 //! Why the whole binary rather than a unit test: `store_fast_path`'s own unit
-//! tests (`crates/cli/src/commands/fetch.rs`) already prove the ranking and
+//! tests (`crates/client/src/targets/tests.rs`) already prove the ranking and
 //! `min_fresh_candidates` floor in isolation, and `PeerStore`'s unit tests
 //! (`crates/client/src/peer_store.rs`) prove the on-disk record shape.
 //! What neither can reach is that a REAL `decdn get` subprocess — driven by
@@ -61,8 +61,8 @@
 //! documented limitation, not a faked test.** `decdn get`'s CLI surface has
 //! no way to break the `CapacityBond` registry read in isolation:
 //! `--capacity-bond-address` is also the ADR 005 client-binding EIP-712
-//! domain's `verifyingContract` (`crates/cli/src/commands/fetch.rs`'s
-//! `attach_client_binding`: `capacity_bond_domain(chain.chain_id,
+//! domain's `verifyingContract` (`crates/client/src/funding.rs`'s
+//! `attach_client_binding`:`capacity_bond_domain(chain.chain_id,
 //! capacity_bond)`), computed identically on the node side from ITS OWN
 //! (unchanged, correct) config — so pointing the flag anywhere else makes
 //! every subsequent delivery request's binding fail `verify_binding` and the
@@ -70,11 +70,9 @@
 //! `resolve_bootstrap` correctly fell back to `Bootstrap::Cached` first
 //! (confirmed empirically: the fallback warning prints, then delivery fails
 //! against every cached candidate with `stream reset by peer: error 3`).
-//! The pool RPC (`--pool-rpc-url`) cannot be broken instead: `fetch()`
-//! unconditionally calls `contract.usdc().call().await` right after target
-//! resolution (`crates/cli/src/commands/fetch.rs::fetch`), before any
-//! pool-reuse check, so an unreachable payment RPC aborts the whole command
-//! even when the buyer's existing pool has ample deposit. Pausing the
+//! The pool RPC (`--pool-rpc-url`) cannot be broken instead: the fetch's pool
+//! funding step (`crates/client/src/funding.rs`) reads the payment chain before
+//! any delivery, so an unreachable payment RPC aborts the whole command. Pausing the
 //! fixture's own anvil hits the same wall, because one anvil serves both
 //! chains. Covering the fallback needs a governance RPC (`--governance-rpc-url`)
 //! that fails while the payment RPC answers, or a fixture seam that fails
@@ -86,7 +84,7 @@
 //!
 //! ```bash
 //! cargo build -p decdn-cli -p decdn-node
-//! cargo nextest run -p decdn-e2e --features anvil-e2e peer_store_probeless
+//! cargo nextest run -p decdn-e2e --features anvil-e2e peer_store_fast_path
 //! ```
 
 #![cfg(feature = "anvil-e2e")]
@@ -133,7 +131,7 @@ const SERVED: &str = "decdn_bytes_served_total";
 const UNCLAIMED: &str = "decdn_serve_stream_unclaimed_total";
 
 #[tokio::test(flavor = "multi_thread")]
-async fn peer_store_probeless_second_fetch_and_cross_process_persistence() -> anyhow::Result<()> {
+async fn peer_store_fast_path_second_fetch_and_cross_process_persistence() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run()))
         .await
         .context("peer store e2e exceeded the overall timeout")??;

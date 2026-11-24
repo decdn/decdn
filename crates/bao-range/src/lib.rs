@@ -14,7 +14,6 @@
 //! | Snap a `[offset, +len)` request to whole chunk groups | [`align_range`], [`align_range_clamped`], [`AlignedRange`] |
 //! | Encode a verified range from raw bytes and an untrusted outboard | [`encode_verified_range`] |
 //! | Know how many wire bytes a range costs, proof included | [`bao_encoded_size`], [`AlignedRange::wire_len`] |
-//! | Encode a whole blob as a stream, without buffering it | [`streaming`] |
 //! | Implement a range-aware blob backend | [`RangedStore`] |
 //! | Let a paid pull fill that backend, or read it back as it fills | [`IngestStore`], [`StreamStore`] ([`ingest`]) |
 //! | Write or find a blob's outboard in a filesystem origin | [`encode_outboard`], [`OBAO4_SUFFIX`], [`shard_prefix`] |
@@ -48,7 +47,6 @@ pub mod ingest;
 pub mod origin_seed;
 pub mod ranged_store;
 pub mod size_proof;
-pub mod streaming;
 pub use ingest::{
     BaoRangeReader, HashMismatch, IngestEnd, IngestFuture, IngestStore, SourceFuture, StashedFault,
     StreamStore,

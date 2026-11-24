@@ -10,10 +10,9 @@
 //! an observer and streams the same filling cache — each downstream client over
 //! its OWN send stream, metering its OWN egress against its OWN lane.
 //!
-//! This closes the gap `coalesce_two_clients` calls out in its header: that proof
-//! coalesces on the OWN-ORIGIN path only (the server eats its own fs-origin egress
-//! once, no upstream payment), because the harness could not express a node paying
-//! an upstream. Two pieces of net-new harness make it expressible here:
+//! `coalesce_two_clients` proves the OWN-ORIGIN path (the server eats its own
+//! fs-origin egress once, no upstream payment). Two pieces of harness make the
+//! paid upstream expressible here:
 //!   * `ChainFixture::fund_node_as_buyer` — mints the server operator the USDC a
 //!     buyer pool escrows (the daemon self-approves the `PaymentPool` at
 //!     buyer bootstrap, so minting is the fixture's whole job).

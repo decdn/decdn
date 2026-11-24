@@ -305,7 +305,6 @@ const LANE_SNAPSHOT: Keys<LaneSnapshot> = {
   pool_id: true,
   counterparty: true,
   voucher_signer: true,
-  last_nonce: true,
   outstanding_micro_usdc: true,
   unredeemed_micro_usdc: true,
   deposit_micro_usdc: true,

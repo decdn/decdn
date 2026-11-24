@@ -1250,15 +1250,12 @@ fn build_lane_snapshots(
                 // the counterparty, and the lane signer as the voucher signer.
                 // The owner comes from the pool, not the lane: a lane signer
                 // is often a derived lane key or a delegate, never a stand-in
-                // for the owner. There is no per-voucher nonce —
-                // cumulative amount is the sole ordering key — so `last_nonce`
-                // reports 0, and the pool-level deposit is not carried per lane
-                // so `deposit_micro_usdc` reports 0.
+                // for the owner. The pool-level deposit is not carried per
+                // lane, so `deposit_micro_usdc` reports 0.
                 pool: pool.clone(),
                 pool_id: state.pool_id.to_string(),
                 counterparty: owners.get(&state.pool_id).map(ToString::to_string),
                 voucher_signer: state.signer.to_string(),
-                last_nonce: 0,
                 outstanding_micro_usdc: u64::try_from(outstanding).unwrap_or(u64::MAX),
                 // What a landed redemption has not paid yet (#2598): the claim
                 // minus the paid watermark the redeemer recorded.

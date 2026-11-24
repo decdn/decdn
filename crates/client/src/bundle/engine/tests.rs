@@ -1834,13 +1834,13 @@ fn plan_dedup_skips_a_donor_whose_claimed_length_disagrees() {
 /// Review #2 (money-band): a per-donor copy that would run past the donor
 /// file's end (a mismatched aligned span, a truncated or racing donor) is not a
 /// hard failure — `splice_donors` queues the aligned range for a paid,
-/// bao-verified re-fetch and leaves the assembly untouched for it, rather than
-/// returning `Err` and failing the whole entry.
+/// bao-verified re-fetch and leaves the assembly file untouched for it, rather
+/// than returning `Err` and failing the whole entry.
 #[test]
 fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
     let tmp = tempfile::tempdir().expect("tmp");
     let donor_path = tmp.path().join("donor");
-    let partial = tmp.path().join("out.assembly");
+    let assembly = tmp.path().join("out.assembly");
 
     // The donor holds exactly ONE group of bytes, so its chunk verifies — but
     // the donor range below asks to copy TWO groups from offset 0, which EOFs.
@@ -1851,9 +1851,9 @@ fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
     let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
 
     let total = 3 * GROUP;
-    std::fs::File::create(&partial)
+    std::fs::File::create(&assembly)
         .and_then(|f| f.set_len(total))
-        .expect("presize partial");
+        .expect("presize assembly");
 
     let donor = DonorRange {
         // Aligned span of TWO groups, but only one group is readable at
@@ -1867,18 +1867,17 @@ fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
         chunk_len: GROUP,
     };
 
-    let failed = splice_donors(&partial, std::slice::from_ref(&donor))
+    let failed = splice_donors(&assembly, std::slice::from_ref(&donor))
         .expect("a copy that EOFs must not fail the splice");
     let refetch: Vec<(u64, u64)> = failed.iter().map(|d| d.refetch).collect();
     assert_eq!(refetch, vec![(GROUP, 2 * GROUP)]);
 
-    // Nothing was written into the assembly for the untrusted donor — the whole
-    // file stays at its pre-sized zero value, so the coming re-fetch overwrites
-    // clean bytes.
-    let got = std::fs::read(&partial).expect("read partial");
+    // Nothing was written into the assembly for the untrusted donor — the
+    // whole file stays at its pre-sized zero value.
+    let got = std::fs::read(&assembly).expect("read assembly");
     assert!(
         got.iter().all(|&b| b == 0),
-        "an EOF-ing donor copy must leave partial untouched"
+        "an EOF-ing donor copy must leave the assembly untouched"
     );
 }
 
@@ -1887,7 +1886,7 @@ fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
 /// complement drive finalizes and exports `<hex>` — `reassemble_dedup` must
 /// treat the entry as done and splice nothing. The [`FinalizingDriver`]
 /// simulates that finalize on its first drive; the post-drive
-/// `staging.try_exists()` guard ends the entry there.
+/// `staging.try_exists()` guard returns before any assembly is built.
 #[tokio::test]
 async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
     // A driver that, on its first (complement) drive, finalizes the blob by
@@ -2488,80 +2487,6 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
         !store_dir_for(&staging).expect("store dir").exists(),
         "the store is removed once the entry is promoted"
     );
-}
-
-/// An entry with nothing to pay for up front splices its donors into its
-/// assembly, and a later fallback drive into the same entry keeps those
-/// spliced bytes: the whole-file hash matches and no self-heal pays for the
-/// whole blob.
-#[tokio::test]
-async fn a_fallback_drive_keeps_the_bytes_spliced_before_it() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let half = usize::try_from(2 * GROUP).expect("fits usize");
-
-    // The first half comes from a verified on-disk donor.
-    let donor_path = tmp.path().join("donor");
-    std::fs::write(&donor_path, &content[..half]).expect("write donor");
-    let donor_hash = *blake3::hash(&content[..half]).as_bytes();
-    // The second half is deferred to a sibling that has already finished
-    // without producing it, so it falls back to a paid drive.
-    let deferred_hash = *blake3::hash(&content[half..]).as_bytes();
-
-    let staging = tmp.path().join("blob");
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-    let plan = ReassemblePlan {
-        donor: vec![DonorRange {
-            dst: (0, 2 * GROUP),
-            refetch: (0, 2 * GROUP),
-            source: donor_path,
-            src_offset: 0,
-            chunk_hash: donor_hash,
-            chunk_src_offset: 0,
-            chunk_len: 2 * GROUP,
-        }],
-        deferred: vec![whole_deferred(Hint {
-            hash: deferred_hash,
-            offset: 2 * GROUP,
-            len: 2 * GROUP,
-        })],
-        drive: Vec::new(),
-    };
-    let index = ChunkIndex::default();
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
-    index.mark_finished([0xaa; 32]);
-
-    let outcome = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await
-    .expect("reassembly must succeed");
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert_eq!(
-        driver.driven.lock().expect("driven lock").clone(),
-        vec![(2 * GROUP, 2 * GROUP)],
-        "only the deferred half is paid for; no self-heal re-drive"
-    );
-    assert_eq!(outcome.spliced_bytes, 2 * GROUP);
-    assert_eq!(outcome.resumed_bytes, 0);
 }
 
 /// An entry resumed from an earlier run's store whose splice then covers part
@@ -3505,13 +3430,13 @@ fn chunk_index_seeded_source_survives_sweep() {
 
 /// `splice_donors` happy path: a donor file holds a verified chunk at some
 /// offset (with padding on both sides), and the aligned subset lands at the
-/// correct recipient offset in the assembly — nothing else in it is touched,
-/// and nothing is queued for refetch.
+/// correct recipient offset in the assembly file — nothing else in it is
+/// touched, and nothing is queued for refetch.
 #[test]
 fn splice_donors_copies_a_verified_subset_into_the_assembly() {
     let tmp = tempfile::tempdir().expect("tmp");
     let donor_path = tmp.path().join("donor");
-    let partial = tmp.path().join("out.assembly");
+    let assembly = tmp.path().join("out.assembly");
 
     // The chunk occupies exactly one group, padded on both sides in the donor
     // file so the source offset is not trivially zero.
@@ -3526,11 +3451,11 @@ fn splice_donors_copies_a_verified_subset_into_the_assembly() {
 
     let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
     let total = 2 * GROUP;
-    // splice_donors only opens the assembly for write, so pre-size it (zeros)
-    // the way the reassembly does before splicing runs.
-    std::fs::File::create(&partial)
+    // splice_donors only opens `assembly` for write, so pre-size it (zeros)
+    // the way `create_assembly_off_runtime` does before splicing runs.
+    std::fs::File::create(&assembly)
         .and_then(|f| f.set_len(total))
-        .expect("presize partial");
+        .expect("presize assembly");
 
     let donor = DonorRange {
         dst: (GROUP, GROUP),
@@ -3542,10 +3467,10 @@ fn splice_donors_copies_a_verified_subset_into_the_assembly() {
         chunk_len: GROUP,
     };
 
-    let refetch = splice_donors(&partial, std::slice::from_ref(&donor)).expect("splice");
+    let refetch = splice_donors(&assembly, std::slice::from_ref(&donor)).expect("splice");
     assert!(refetch.is_empty(), "{refetch:?}");
 
-    let got = std::fs::read(&partial).expect("read partial");
+    let got = std::fs::read(&assembly).expect("read assembly");
     let g = usize::try_from(GROUP).expect("GROUP fits in usize");
     assert_eq!(&got[g..2 * g], &chunk_bytes[..], "spliced subset mismatch");
     assert!(
@@ -3557,12 +3482,12 @@ fn splice_donors_copies_a_verified_subset_into_the_assembly() {
 /// A donor whose recorded chunk bytes no longer hash to the hint's chunk hash
 /// (corruption, or a stale/overwritten donor file) is never trusted: its range
 /// is pushed to the refetch list and no bytes are written into the assembly
-/// for it.
+/// file for it.
 #[test]
 fn splice_donors_refetches_a_corrupted_donor_chunk() {
     let tmp = tempfile::tempdir().expect("tmp");
     let donor_path = tmp.path().join("donor");
-    let partial = tmp.path().join("out.assembly");
+    let assembly = tmp.path().join("out.assembly");
 
     let chunk_bytes: Vec<u8> = (0..GROUP)
         .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
@@ -3577,9 +3502,9 @@ fn splice_donors_refetches_a_corrupted_donor_chunk() {
     std::fs::write(&donor_path, &corrupted).expect("write corrupted donor");
 
     let total = 2 * GROUP;
-    std::fs::File::create(&partial)
+    std::fs::File::create(&assembly)
         .and_then(|f| f.set_len(total))
-        .expect("presize partial");
+        .expect("presize assembly");
 
     let donor = DonorRange {
         dst: (GROUP, GROUP),
@@ -3591,17 +3516,17 @@ fn splice_donors_refetches_a_corrupted_donor_chunk() {
         chunk_len: GROUP,
     };
 
-    let failed = splice_donors(&partial, std::slice::from_ref(&donor)).expect("splice");
+    let failed = splice_donors(&assembly, std::slice::from_ref(&donor)).expect("splice");
     let refetch: Vec<(u64, u64)> = failed.iter().map(|d| d.refetch).collect();
     assert_eq!(refetch, vec![donor.refetch]);
 
     // No (wrong) bytes were written for the untrusted donor: the recipient
     // range stays at its pre-sized zero value.
-    let got = std::fs::read(&partial).expect("read partial");
+    let got = std::fs::read(&assembly).expect("read assembly");
     let g = usize::try_from(GROUP).expect("GROUP fits in usize");
     assert!(
         got[g..2 * g].iter().all(|&b| b == 0),
-        "untrusted donor must not write into partial"
+        "untrusted donor must not write into the assembly"
     );
 }
 

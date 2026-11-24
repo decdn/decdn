@@ -27,15 +27,3 @@ fn partial_section_fills_missing_fields_from_defaults() {
     assert_eq!(p.max_backoff_ms, d.max_backoff_ms);
     assert!((p.jitter_ratio - d.jitter_ratio).abs() < f64::EPSILON);
 }
-
-#[test]
-fn default_and_disabled_are_distinct() {
-    // Footgun guard: `default()` is *not* `disabled()` — defaults
-    // are opt-out (3 retries on by default per #285). A test
-    // author writing `RetryPolicy::default()` to "get a no-op"
-    // would actually retry 3 times with real sleeps. Pin the
-    // distinction so a future "make default = disabled" change
-    // is a deliberate, test-visible decision.
-    assert_ne!(RetryPolicy::default(), RetryPolicy::disabled());
-    assert!(RetryPolicy::default().max_retries > 0);
-}

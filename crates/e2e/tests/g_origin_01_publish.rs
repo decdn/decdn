@@ -1,20 +1,13 @@
-//! G-ORIGIN-01 — namespace creation + transfer, driven through the `decdn
-//! publish` CLI (issue #1038).
+//! G-ORIGIN-01 — namespace creation, driven through the `decdn publish` CLI
+//! (issue #1038), against a real anvil deployment of `PublisherRegistry`.
 //!
-//! Two journeys against a real anvil deployment of `PublisherRegistry`:
-//!
-//! - **`namespace_create_mints_owned_ids`:** a publisher with a real encrypted
-//!   keystore runs `decdn publish namespace create` as a subprocess, and the
-//!   on-chain `ownerOf(id)` is asserted to be the signer. A second create mints
-//!   a distinct id, also owned by the signer, and the reserved namespace 0 is
-//!   confirmed unowned. There is no per-hash on-chain claim (ADR 002 §
-//!   Hash-to-namespace association) — content is bound to a namespace off-chain
-//!   at fetch time.
-//! - **`namespace_transfer_respects_timelock`:** the 2-step ownership transfer
-//!   cannot be finalized before `namespaceTransferTimelock` (7 days by default)
-//!   has elapsed, and does transfer ownership once the chain clock is warped
-//!   past `pendingTransfer.readyAt`. There is no `publish namespace transfer`
-//!   CLI subcommand, so this leg drives the contract bindings directly.
+//! A publisher with a real encrypted keystore runs `decdn publish namespace
+//! create` as a subprocess, and the on-chain `ownerOf(id)` is asserted to be
+//! the signer. A second create mints a distinct id, also owned by the signer,
+//! and the reserved namespace 0 is confirmed unowned. There is no per-hash
+//! on-chain claim (ADR 002 § Hash-to-namespace association) — content is bound
+//! to a namespace off-chain at fetch time. The namespace ownership-transfer
+//! timelock is covered by the forge suite (`PublisherRegistry.t.sol`).
 //!
 //! Deliberately out of scope: proving content becomes servable *as an origin*.
 //! That needs an `OriginAssignment` publisher vetting, a seated origin, and a
@@ -41,14 +34,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
-use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
-use decdn_e2e::assert::expect_revert;
 use decdn_e2e::bindings::PublisherRegistry;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::decdn_command;
-use decdn_e2e::time;
 use decdn_incentive::eth_identity;
 
 /// Standard journey tier (see [`decdn_e2e::timeout`] for the tier rule).
@@ -59,27 +48,11 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 /// `DECDN_KEYSTORE_PASSWORD` so no prompt is ever reached.
 const KEYSTORE_PASSWORD: &str = "e2e-publisher-password";
 
-/// ADR 002 default `namespaceTransferTimelock`.
-const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
-
-/// How far short of `readyAt` the pre-timelock leg warps. Anvil derives block
-/// timestamps from wall-clock, so this has to absorb the wall time a few RPC
-/// round-trips take on a loaded CI runner — minutes of slack, not seconds.
-const WARP_MARGIN: u64 = 600;
-
 #[tokio::test(flavor = "multi_thread")]
 async fn namespace_create_mints_owned_ids() -> anyhow::Result<()> {
     tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_publish()))
         .await
         .context("publish e2e exceeded the overall timeout")??;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn namespace_transfer_respects_timelock() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_transfer()))
-        .await
-        .context("namespace transfer e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -121,169 +94,6 @@ async fn run_publish() -> anyhow::Result<()> {
     anyhow::ensure!(
         registry.ownerOf(U256::ZERO).call().await? == Address::ZERO,
         "namespace 0 is reserved and must be unowned"
-    );
-
-    Ok(())
-}
-
-// The transfer journey is one strictly ordered on-chain script: mint a
-// namespace, assert it starts owned by its creator, queue a transfer, assert the
-// 7-day default timelock and the exact `readyAt`, cancel it and prove it is
-// un-queued, re-queue, warp to just short of `readyAt` and assert the
-// pre-timelock and wrong-caller rejections there, warp past `readyAt`, finalize,
-// then re-check ownership and the cleared pending slot. Every step consumes
-// state the previous step wrote on a live chain — including both warps, since
-// the pre-timelock rejection is only meaningful once the clock has moved — so
-// the sequence, not any nesting, is what makes it long.
-#[allow(
-    clippy::cognitive_complexity,
-    clippy::too_many_lines,
-    reason = "sequential on-chain journey: each step depends on the previous step's chain state, \
-              so decomposing it would thread a state bundle through helpers without reducing the \
-              journey's length or making it easier to follow"
-)]
-async fn run_transfer() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .try_init();
-
-    let chain = ChainFixture::launch().await?;
-    let owner = PrivateKeySigner::random();
-    let recipient = PrivateKeySigner::random();
-    let stranger = PrivateKeySigner::random();
-    chain.fund_eth(recipient.address(), 10).await?;
-    chain.fund_eth(stranger.address(), 10).await?;
-
-    // `create_namespace` funds the owner and mints the id.
-    let ns = chain.create_namespace(&owner).await?;
-    let registry_addr = chain.addrs().publisher_registry;
-    let read = PublisherRegistry::new(registry_addr, chain.admin());
-    anyhow::ensure!(
-        read.ownerOf(ns).call().await? == owner.address(),
-        "namespace must start owned by its creator"
-    );
-
-    // The timelock is the ADR 002 default: 7 days.
-    let timelock = read.namespaceTransferTimelock().call().await?;
-    anyhow::ensure!(
-        timelock == SEVEN_DAYS,
-        "expected the 7-day default transfer timelock, got {timelock}s"
-    );
-
-    // Owner queues the transfer.
-    let owner_provider = chain.provider_for(&owner);
-    let receipt = PublisherRegistry::new(registry_addr, &owner_provider)
-        .initiateNamespaceTransfer(ns, recipient.address())
-        .send()
-        .await
-        .context("initiateNamespaceTransfer send")?
-        .get_receipt()
-        .await
-        .context("initiateNamespaceTransfer receipt")?;
-    anyhow::ensure!(receipt.status(), "initiateNamespaceTransfer reverted");
-
-    let pending = read.pendingTransfer(ns).call().await?;
-    anyhow::ensure!(
-        pending.newOwner == recipient.address(),
-        "pendingTransfer must name the recipient"
-    );
-    // `readyAt` is exactly `timelock` past the block that ran the initiate — the
-    // receipt names that block, so this is an equality, not a slack window. A
-    // one-sided `>= now + timelock` would also pass for `now + 700 days`.
-    let init_block = receipt
-        .block_number
-        .context("initiateNamespaceTransfer receipt carried no block number")?;
-    let init_ts = block_timestamp(chain.admin(), init_block).await?;
-    anyhow::ensure!(
-        pending.readyAt == init_ts + timelock,
-        "readyAt ({}) must be exactly {timelock}s past the initiating block ({init_ts})",
-        pending.readyAt
-    );
-
-    // --- Cancel is the owner's escape hatch, and it really un-queues. -------
-    let owner_registry = PublisherRegistry::new(registry_addr, &owner_provider);
-    let cancel = owner_registry
-        .cancelNamespaceTransfer(ns)
-        .send()
-        .await
-        .context("cancelNamespaceTransfer send")?
-        .get_receipt()
-        .await
-        .context("cancelNamespaceTransfer receipt")?;
-    anyhow::ensure!(cancel.status(), "cancelNamespaceTransfer reverted");
-    anyhow::ensure!(
-        read.pendingTransfer(ns).call().await?.newOwner == Address::ZERO,
-        "cancel must clear the pending transfer"
-    );
-    let recipient_registry = PublisherRegistry::new(registry_addr, chain.provider_for(&recipient));
-    expect_revert::<_, PublisherRegistry::NoPendingTransfer>(
-        recipient_registry
-            .finalizeNamespaceTransfer(ns)
-            .call()
-            .await,
-        "finalizing a cancelled transfer",
-    )?;
-
-    // Re-queue it so the timelock legs below have something to finalize.
-    let receipt = owner_registry
-        .initiateNamespaceTransfer(ns, recipient.address())
-        .send()
-        .await
-        .context("re-initiateNamespaceTransfer send")?
-        .get_receipt()
-        .await
-        .context("re-initiateNamespaceTransfer receipt")?;
-    anyhow::ensure!(receipt.status(), "re-initiateNamespaceTransfer reverted");
-    let pending = read.pendingTransfer(ns).call().await?;
-
-    // --- Before the timelock elapses: finalization is rejected. -------------
-    // Warp to comfortably short of `readyAt` rather than shaving a second off
-    // it: anvil derives block timestamps from wall-clock, so a loaded runner
-    // can overshoot a tight margin and turn a real gate into a spurious pass.
-    // The margin is then asserted, so an overshoot fails as an overshoot.
-    time::increase_time(chain.admin(), timelock - WARP_MARGIN).await?;
-    let head = chain.head_timestamp().await?;
-    anyhow::ensure!(
-        head < pending.readyAt,
-        "warp overshot readyAt ({}) — head is {head}; widen WARP_MARGIN",
-        pending.readyAt
-    );
-    expect_revert::<_, PublisherRegistry::TransferNotReady>(
-        recipient_registry
-            .finalizeNamespaceTransfer(ns)
-            .call()
-            .await,
-        "finalizing before readyAt",
-    )?;
-
-    // --- Only the pending owner may finalize, ever. -------------------------
-    expect_revert::<_, PublisherRegistry::NotPendingOwner>(
-        PublisherRegistry::new(registry_addr, chain.provider_for(&stranger))
-            .finalizeNamespaceTransfer(ns)
-            .call()
-            .await,
-        "a third party finalizing someone else's transfer",
-    )?;
-
-    // --- After the timelock elapses: the recipient can finalize. ------------
-    time::advance_to(chain.admin(), pending.readyAt).await?;
-    let finalize = recipient_registry
-        .finalizeNamespaceTransfer(ns)
-        .send()
-        .await
-        .context("finalizeNamespaceTransfer send")?
-        .get_receipt()
-        .await
-        .context("finalizeNamespaceTransfer receipt")?;
-    anyhow::ensure!(finalize.status(), "finalizeNamespaceTransfer reverted");
-    anyhow::ensure!(
-        read.ownerOf(ns).call().await? == recipient.address(),
-        "ownership must move to the recipient once the timelock has elapsed"
-    );
-    let cleared = read.pendingTransfer(ns).call().await?;
-    anyhow::ensure!(
-        cleared.newOwner == Address::ZERO,
-        "the pending transfer must be cleared on finalization"
     );
 
     Ok(())
@@ -375,15 +185,4 @@ impl Publisher {
             )
         })
     }
-}
-
-/// The timestamp of block `number`.
-async fn block_timestamp<P: Provider>(provider: &P, number: u64) -> anyhow::Result<u64> {
-    Ok(provider
-        .get_block(alloy::eips::BlockId::number(number))
-        .await
-        .context("get block by number")?
-        .with_context(|| format!("block {number} not found"))?
-        .header
-        .timestamp)
 }

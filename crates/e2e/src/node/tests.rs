@@ -101,67 +101,28 @@ fn sample_rendered_config() -> String {
     })
 }
 
-/// `set_rate_per_mb`'s parse → mutate → serialize step (`rewrite_rate_per_mb`)
-/// must round-trip: the new rate lands and every other section survives. The
-/// `[cache]` block is the one at risk — it holds a scalar
+/// The `set_*` restart helpers' parse → mutate → serialize step
+/// (`rewrite_int`) must round-trip: the new value lands and every other
+/// section survives. The `[cache]` block is the one at risk — it holds a scalar
 /// (`node_to_node_pull_through_enabled`) after a sub-table (`[cache.origin]`),
 /// the `ValueAfterTable` shape a `toml` serializer bug would mangle (#1378).
 #[test]
-fn set_rate_per_mb_round_trips_through_toml() {
-    let rewritten = rewrite_rate_per_mb(&sample_rendered_config(), 4242)
-        .expect("rewrite_rate_per_mb must succeed");
-    let doc: toml::Value = toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
-
-    assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(4242));
-    // Everything around the mutation is intact — notably the `[cache]`
-    // scalar-after-subtable that trips the serializer hazard.
-    assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
-    assert_eq!(
-        doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
-        Some(true)
-    );
-    assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
-}
-
-/// `set_buyer_working_deposit`'s parse → mutate → serialize step
-/// (`rewrite_buyer_working_deposit`) must round-trip: the new deposit lands
-/// under `[blockchain]` and every other section — notably the `[cache]`
-/// scalar-after-subtable that trips the serializer hazard — survives.
-#[test]
-fn set_buyer_working_deposit_round_trips_through_toml() {
-    let rewritten = rewrite_buyer_working_deposit(&sample_rendered_config(), 4_000_000)
-        .expect("rewrite_buyer_working_deposit must succeed");
+fn rewrite_int_round_trips_through_toml() {
+    let rewritten = rewrite_int(
+        &sample_rendered_config(),
+        "blockchain",
+        "buyer_working_deposit_micro_usdc",
+        4_000_000,
+    )
+    .expect("rewrite_int must succeed");
     let doc: toml::Value = toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
 
     assert_eq!(
         doc["blockchain"]["buyer_working_deposit_micro_usdc"].as_integer(),
         Some(4_000_000)
     );
-    // Everything around the mutation is intact.
-    assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
-    assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
-    assert_eq!(
-        doc["cache"]["node_to_node_pull_through_enabled"].as_bool(),
-        Some(true)
-    );
-    assert_eq!(doc["payment"]["rate_per_mb"].as_integer(), Some(10));
-}
-
-/// `set_pool_min_remaining_deposit`'s parse → mutate → serialize step
-/// (`rewrite_pool_min_remaining_deposit`) must round-trip: the `[blockchain]`
-/// knob lands and every other section — notably the `[cache]`
-/// scalar-after-subtable that trips the serializer hazard — survives.
-#[test]
-fn set_pool_min_remaining_deposit_round_trips_through_toml() {
-    let rewritten = rewrite_pool_min_remaining_deposit(&sample_rendered_config(), 500)
-        .expect("rewrite_pool_min_remaining_deposit must succeed");
-    let doc: toml::Value = toml::from_str(&rewritten).expect("rewritten config must be valid TOML");
-
-    assert_eq!(
-        doc["blockchain"]["pool_min_remaining_deposit_micro_usdc"].as_integer(),
-        Some(500)
-    );
-    // Everything around the mutation is intact.
+    // Everything around the mutation is intact — notably the `[cache]`
+    // scalar-after-subtable that trips the serializer hazard.
     assert_eq!(doc["blockchain"]["chain_id"].as_integer(), Some(31_337));
     assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
     assert_eq!(

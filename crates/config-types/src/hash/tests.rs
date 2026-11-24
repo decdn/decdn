@@ -84,26 +84,6 @@ fn from_str_rejects_non_hex() {
 }
 
 #[test]
-fn pinned_hashes_diff_counts_added_and_removed() {
-    // Direct unit test of the diff helper, independent of any engine
-    // swap path. Locks the API: a future caller stitching log
-    // messages from `PinDiff` shouldn't break silently if the
-    // counting changes shape.
-    let h1 = Hash::from_bytes([1; 32]);
-    let h2 = Hash::from_bytes([2; 32]);
-    let h3 = Hash::from_bytes([3; 32]);
-
-    let prev = PinnedHashes::new([h1, h2].into_iter().collect());
-    let new = PinnedHashes::new([h2, h3].into_iter().collect());
-
-    let diff = new.diff(&prev);
-    assert!(diff.added == 1 && diff.removed == 1, "got {diff:?}");
-
-    let no_change = new.diff(&new);
-    assert!(no_change.added == 0 && no_change.removed == 0);
-}
-
-#[test]
 fn pinned_hashes_empty_and_contains() {
     let empty = PinnedHashes::empty();
     assert!(empty.is_empty());

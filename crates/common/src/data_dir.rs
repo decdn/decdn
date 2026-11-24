@@ -19,7 +19,8 @@ pub const NODE_BUYER_DB_FILE: &str = "buyer.redb";
 /// The daemon's seller-side per-lane voucher store.
 pub const NODE_LANES_DB_FILE: &str = "lanes.redb";
 
-/// The daemon's pending-settle store (seller and buyer sets).
+/// The daemon's settlement store: the settlement ledger and the sent
+/// `redeemMany` hashes.
 pub const NODE_SETTLE_DB_FILE: &str = "settle.redb";
 
 /// The standalone client's buyer-only pool store (`decdn get`, `decdn pool`).

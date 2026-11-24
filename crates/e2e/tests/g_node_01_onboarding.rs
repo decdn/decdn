@@ -10,8 +10,8 @@
 //!
 //! # What this covers that nothing else does
 //!
-//! `cli_setup_partial` already drives `decdn setup`, but only into a revert;
-//! `smoke` already proves an *already-bonded* node delivers. Neither runs the
+//! `cli_setup_partial` drives `decdn setup`, but only into a revert, and every
+//! delivery journey starts from an *already-bonded* node. Neither runs the
 //! command to a clean finish, and neither starts from nothing. This does both,
 //! on **one process**: a daemon that is bare when it boots is selling by the
 //! end of the test, with no restart in between.
@@ -41,9 +41,8 @@
 //! #1030 lists "under-bonded `bond()` reverts" as a negative. `bond()` has no
 //! floor at all — `CapacityBond.bond` guards only `ZeroAmount`, so bonding one
 //! wei below `minBond` **succeeds**. The floor is enforced downstream, at
-//! `registerNode`. [`register_below_min_bond_reverts`] tests the guard that
-//! actually exists rather than the one the issue names; asserting on `bond()`
-//! would have been asserting on nothing.
+//! `registerNode`, and the forge suite pins its `BondBelowMinimum` revert
+//! (`CapacityBond.t.sol`).
 //!
 //! Gated behind the `anvil-e2e` feature. Requires `anvil` + `forge` on `PATH`
 //! and BOTH binaries built:
@@ -436,64 +435,6 @@ async fn run_journey() -> anyhow::Result<()> {
         "on-chain served-bytes {served} must land in [{content_bytes}, {wire_bytes}]"
     );
 
-    Ok(())
-}
-
-/// #1030's first negative, stated correctly.
-///
-/// The issue says "under-bonded `bond()` reverts". It does not:
-/// `CapacityBond.bond` guards only `ZeroAmount`, so a bond one wei below
-/// `minBond` is accepted and the TOKEN really moves. The floor lives in
-/// `_checkRegistrationPreconditions`, which is why an operator can strand
-/// capital in the contract and still not be registered — the failure mode this
-/// pins.
-///
-/// `BondBelowMinimum` has no coverage anywhere else in the repo: the Solidity
-/// suite covers only its sibling `BondBelowCurve`.
-#[tokio::test(flavor = "multi_thread")]
-async fn register_below_min_bond_reverts() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_under_bonded()))
-        .await
-        .context("G-NODE-01 under-bond negative exceeded the overall timeout")??;
-    Ok(())
-}
-
-async fn run_under_bonded() -> anyhow::Result<()> {
-    let chain = ChainFixture::launch().await?;
-    let operator = PrivateKeySigner::random();
-    let node_secret = iroh::SecretKey::generate();
-
-    let min_bond = chain.min_bond().await?;
-    let short = min_bond - U256::from(1u64);
-
-    // `bond()` accepts it. Asserting this is half the point: the operator's
-    // TOKEN is now in the contract, and they are still not registered.
-    chain.fund_and_bond(&operator, short).await?;
-    assert_eq!(
-        chain.active_bond(operator.address()).await?,
-        short,
-        "bond() has no floor — the under-bonded stake really is held"
-    );
-
-    let err = chain
-        .register_node_raw(
-            &operator,
-            &node_secret,
-            "US",
-            "/ip4/127.0.0.1/udp/1/quic-v1",
-        )
-        .await
-        .err()
-        .context("registerNode must reject a bond below minBond")?;
-    e2e_assert::expect_revert_anyhow::<CapacityBond::BondBelowMinimum>(
-        &err,
-        "registerNode below minBond",
-    )?;
-
-    assert!(
-        !chain.is_registered(operator.address()).await?,
-        "the failed registration must leave no node record"
-    );
     Ok(())
 }
 

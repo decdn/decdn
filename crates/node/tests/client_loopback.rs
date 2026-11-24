@@ -321,7 +321,7 @@ fn unbound_context(client_signer: Arc<PrivateKeySigner>, deposit: U256) -> PoolC
 
 /// Full happy path: a 1.5 MiB blob crosses one voucher-interval boundary plus a
 /// closing voucher (two vouchers), the requester hash-verifies the bytes, and
-/// the persisted lane state advances to nonce 2 / full byte count.
+/// the persisted lane state advances to the full byte count.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_delivery_roundtrip_advances_lane_state() -> anyhow::Result<()> {
     let spans = support::capture_spans();
@@ -2842,132 +2842,6 @@ async fn concurrent_same_lane_streams_aggregate_across_the_chunk_boundary() -> a
     Ok(())
 }
 
-/// A finished stream leaves the pool's floor headroom free: after the first
-/// same-lane stream settles, a later same-lane open against the same one-floor
-/// pool headroom is admitted again. The pre-serve solvency gate prices one
-/// chunk per request against `remaining − M`, so a settled stream must not
-/// keep that headroom spoken for.
-#[tokio::test(flavor = "multi_thread")]
-async fn finished_stream_releases_its_floor_reservation() -> anyhow::Result<()> {
-    // Each blob stays inside ONE chunk of wire, so the test settles each
-    // delivery with a single closing voucher.
-    let payload_a = vec![0x71u8; 512 * 1024];
-    let payload_b = vec![0x82u8; 256 * 1024];
-    let (cache, hash_a, hash_b, _cache_tmp) = cache_with_two_blobs(&payload_a, &payload_b).await?;
-
-    let signer = Arc::new(PrivateKeySigner::random());
-    let store = Arc::new(MemoryPoolStateStore::new());
-    store.record(&LaneState::hydrate(
-        pool_id(),
-        signer.address(),
-        operator_addr(),
-        U256::from(10_000_000u64),
-        u64::MAX,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    ))?;
-    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-
-    // One floor of pool headroom and no more: the pre-serve solvency gate
-    // prices one chunk per request, so a floor costs
-    // `min_payment(CHUNK_BYTES, rate)`. Derived rather than hard-coded so it
-    // tracks the payment quantum.
-    let remaining = min_payment(CHUNK_BYTES, RATE_PER_MB) + U256::from(2u64);
-    let (target, _server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let ext = binding_ext(&signer, client_node_id)?;
-
-    // Admit, deliver, and fully settle the first stream, so the second open
-    // below runs against a pool with nothing left in flight.
-    let wire_a = support::bao_wire_len_whole(payload_a.len() as u64);
-    let first =
-        stall_delivery_at_closing_voucher(&conn, *hash_a.as_bytes(), wire_a, Some(&ext)).await?;
-    let (_first_completed_at, totals) = first
-        .pay_and_finish(&signer, VoucherTotals::default())
-        .await?;
-
-    // A later same-lane open now succeeds on the same budget — the settled
-    // stream left the floor headroom free. `stall_delivery_at_closing_voucher`
-    // itself asserts `resp.body.ok`, so headroom still held by the settled
-    // stream fails this call with a refusal error.
-    // The shared lane's cumulative watermark carries forward (as in
-    // `concurrent_same_lane_streams_aggregate_across_the_chunk_boundary`
-    // above): the second voucher's `bytes_delivered` must cover both streams.
-    let wire_b = support::bao_wire_len_whole(payload_b.len() as u64);
-    let second =
-        stall_delivery_at_closing_voucher(&conn, *hash_b.as_bytes(), wire_b, Some(&ext)).await?;
-    let _ = second.pay_and_finish(&signer, totals).await?;
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// A single same-lane stream on a one-floor budget is admitted and settles: one
-/// stream reserves one floor, which the pool ceiling covers.
-#[tokio::test(flavor = "multi_thread")]
-async fn single_same_lane_stream_admitted_unchanged() -> anyhow::Result<()> {
-    // Inside one chunk of wire, so the whole delivery settles with a single
-    // closing voucher.
-    let payload = vec![0x93u8; 512 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-
-    let signer = Arc::new(PrivateKeySigner::random());
-    let store = Arc::new(MemoryPoolStateStore::new());
-    store.record(&LaneState::hydrate(
-        pool_id(),
-        signer.address(),
-        operator_addr(),
-        U256::from(10_000_000u64),
-        u64::MAX,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    ))?;
-    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-
-    // One floor of pool headroom and no more: the pre-serve solvency gate
-    // prices one chunk per request, so a floor costs
-    // `min_payment(CHUNK_BYTES, rate)`. Derived rather than hard-coded so it
-    // tracks the payment quantum.
-    let remaining = min_payment(CHUNK_BYTES, RATE_PER_MB) + U256::from(2u64);
-    let (target, _server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, remaining).await?;
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let ext = binding_ext(&signer, client_node_id)?;
-
-    let wire = support::bao_wire_len_whole(payload.len() as u64);
-    let only = stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire, Some(&ext)).await?;
-    let (_completed_at, totals) = only
-        .pay_and_finish(&signer, VoucherTotals::default())
-        .await?;
-    anyhow::ensure!(
-        totals.wire_bytes == wire,
-        "settled wire bytes: {} (expected the whole blob's {wire})",
-        totals.wire_bytes
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// A SKIP-AHEAD voucher — one whose cumulative `bytes_delivered` assumes
 /// another same-lane stream's bytes are already settled, sent before that
 /// stream is paid — is accepted. The voucher's cumulative bytes come from the
@@ -3148,9 +3022,9 @@ async fn lower_voucher_after_higher_sibling_is_already_satisfied() -> anyhow::Re
 /// Regression for #1054: a 0-byte blob delivers end-to-end over `cdn/client/v1`.
 /// The serve emits no `ChunkData` and no voucher (0 wire bytes), the requester
 /// proves the empty stream against the empty root `Hash::new(&[])` and returns
-/// empty bytes, and the lane does NOT advance (nonce 0, 0 bytes delivered).
-/// Before the fix, `align_range(0, 0, 0)` rejected the whole-empty serve/receive
-/// with `RangeOutOfBounds`.
+/// empty bytes, and the lane does NOT advance (0 bytes delivered).
+/// `align_range(0, 0, 0)` accepts the whole-empty range on both the serve and
+/// the receive side.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_delivers_empty_blob() -> anyhow::Result<()> {
     empty_blob_delivery(0).await
@@ -3249,25 +3123,24 @@ async fn empty_blob_delivery(max_blob_size_bytes: u64) -> anyhow::Result<()> {
 /// it must NOT reset to `None`.
 ///
 /// Induced deterministically by capability-cap exhaustion (no mock server): a
-/// blob one chunk plus a remainder needs two vouchers — a cumulative amount
-/// for the interval, then a larger cumulative amount for the close — but the
-/// signer's cap only clears the first. The node acks voucher 1 and rejects
-/// voucher 2 as over-cap (`SpendingCapExhausted`), so the fetch errors after one
-/// acked voucher.
-/// `progress.advanced()` must then report voucher 1 (nonce 1), proving the
-/// copy-back in `stream_fetch_tracked` runs on the error path.
+/// blob of several chunks needs a run of vouchers, each a larger cumulative
+/// amount than the last, but the signer's cap only clears the first. The node
+/// acks voucher 1 and rejects voucher 2 as over-cap (`SpendingCapExhausted`), so
+/// the fetch errors after one acked voucher.
+/// `progress.advanced()` must then report voucher 1's cumulative watermark,
+/// proving the copy-back in `stream_fetch_tracked` runs on the error path.
 ///
 /// The deposit is load-bearing in both directions: it must clear the #1516
 /// pre-serve gate's ceiling (one credit window at `RATE_PER_MB`) so the first
 /// attempt is actually served, and fall short of voucher 2 so the mid-stream
-/// ceiling is what stops it. An acked nonce of 1 is only reachable through
-/// that exact sequence, so it pins the mid-stream backstop as surely as
-/// asserting on the reject reason did.
+/// ceiling is what stops it. A watermark of exactly one cleared voucher is only
+/// reachable through that exact sequence, so it pins the mid-stream backstop as
+/// surely as asserting on the reject reason did.
 ///
 /// The *terminal* error is the voucher rejection itself, and no resume retry is
 /// attempted at all. The rejection does carry an authenticated `WatermarkBundle`,
-/// but that bundle merely echoes the watermark this client already holds (nonce 1
-/// — the node attaches one to every watermark-gated rejection once any voucher has
+/// but that bundle merely echoes the watermark this client already holds (voucher
+/// 1's — the node attaches one to every watermark-gated rejection once any voucher has
 /// been accepted, including a genuinely exhausted one). `PoolLedger::reseed`
 /// refuses a non-advancing cumulative, so `fetch_inner` surfaces the real cause
 /// instead of spending a resume attempt re-sending a voucher the node has already
@@ -3925,7 +3798,7 @@ async fn client_reused_lane_resumes() -> anyhow::Result<()> {
     .await?;
     anyhow::ensure!(got2.as_ref() == payload.as_slice());
 
-    // The lane advanced again: nonce 2, cumulative bytes = both streams.
+    // The lane advanced again: cumulative bytes = both streams.
     let after2 = store.load_all()?;
     let s2 = after2
         .first()
@@ -5429,58 +5302,6 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
     Ok(())
 }
 
-/// The admission gate prices one chunk, not the whole blob: a pool whose
-/// remaining exactly covers one chunk clears the gate for an 8 MiB blob, because
-/// the node sends only what the lane has paid for.
-#[tokio::test(flavor = "multi_thread")]
-async fn client_deposit_gate_prices_one_chunk() -> anyhow::Result<()> {
-    let payload = vec![0x77u8; 8 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-
-    let signer = Arc::new(PrivateKeySigner::random());
-    let store = Arc::new(MemoryPoolStateStore::new());
-    store.record(&LaneState::hydrate(
-        pool_id(),
-        signer.address(),
-        operator_addr(),
-        U256::from(HARNESS_CHUNK_COST),
-        u64::MAX,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    ))?;
-
-    // Pool remaining exactly covers one chunk, not the whole blob.
-    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-    let (target, _server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_pool(cache, store_dyn, U256::from(HARNESS_CHUNK_COST)).await?;
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let ext = binding_ext(&signer, client_node_id)?;
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
-        (ClientMessage::StreamResponse(resp), _resp_ext) => anyhow::ensure!(
-            resp.body.ok,
-            "a deposit covering one chunk must clear the gate for a larger blob"
-        ),
-        other => anyhow::bail!("expected a pre-serve StreamResponse acceptance, got {other:?}"),
-    }
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// The #1516 gate reserves remaining HEADROOM, not the gross deposit. Both
 /// deposit authorities — `LaneState::stage_voucher` off-chain and
 /// `PaymentPool._redeemVoucher` on-chain — compare the *cumulative*
@@ -5621,7 +5442,7 @@ async fn client_resumed_range_is_priced_on_the_tail_not_the_whole_blob() -> anyh
 /// The gate's boundary: `headroom == ceiling` must PASS, because the check is
 /// `<` and a pool funded to exactly the window's cost can pay for it.
 ///
-/// Left uncovered by the four refusal/serve tests — each sits strictly on one
+/// Left uncovered by the refusal/serve tests above — each sits strictly on one
 /// side of the boundary, so flipping `<` to `<=` passes all of them while
 /// refusing every exactly-funded pool with a lossy `NotFound` the CLI renders
 /// as a missing blob. A `decdn get --working-deposit-micro-usdc` funded to the
@@ -8000,15 +7821,15 @@ async fn buyer_refuses_an_oversized_small_blob_without_paying() -> anyhow::Resul
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     // The server has no size ceiling — it honestly serves all 64 KiB; the
-    // ceiling under test is the buyer's received-byte cap.
+    // ceiling under test is the buyer's `max_blob_size_bytes`.
     let (target, server_eth, server_ep, server_task) =
         spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, signer, deposit);
     let mut progress = VoucherProgress::default();
-    // Buyer cap of one 16 KiB group < the 64 KiB that actually arrive → the
-    // received bytes trip the cap.
+    // Buyer cap of one 16 KiB group < the 64 KiB size the open proves → the
+    // buyer refuses at the open.
     let err = stream_fetch_tracked(
         &client_ep,
         target,
@@ -8026,7 +7847,7 @@ async fn buyer_refuses_an_oversized_small_blob_without_paying() -> anyhow::Resul
     )
     .await
     .err()
-    .ok_or_else(|| anyhow::anyhow!("received bytes over the ceiling must abort the fetch"))?;
+    .ok_or_else(|| anyhow::anyhow!("a proven size over the ceiling must abort the fetch"))?;
     anyhow::ensure!(
         err.to_string().contains("BlobTooLarge"),
         "error should surface the buyer-side BlobTooLarge ceiling: {err}"
@@ -8042,57 +7863,8 @@ async fn buyer_refuses_an_oversized_small_blob_without_paying() -> anyhow::Resul
     Ok(())
 }
 
-/// Buyer-side cap, multi-interval blob (#1895): a blob genuinely larger than the
-/// ceiling — the "honest giant" — is refused at the open from its proven size,
-/// before the buyer pays for any of it.
-#[tokio::test(flavor = "multi_thread")]
-async fn buyer_refuses_an_over_ceiling_blob_without_paying() -> anyhow::Result<()> {
-    let payload = vec![0x5Bu8; 4 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, signer, deposit) = seeded_store()?;
-    // The server has no size ceiling — it honestly serves the whole 4 MiB blob;
-    // the ceiling under test is the buyer's received-byte cap.
-    let (target, server_eth, server_ep, server_task) =
-        spawn_handler_server(cache, store, RATE_PER_MB, 16).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let ctx = pool_context(&client_ep, signer, deposit);
-    let mut progress = VoucherProgress::default();
-    // Ceiling ~2.4 MiB, under the 4 MiB blob.
-    let ceiling: u64 = 2_500_000;
-    let err = stream_fetch_tracked(
-        &client_ep,
-        target,
-        &ctx,
-        &stream_domain(),
-        server_eth.address(),
-        *hash.as_bytes(),
-        decdn_protocol::client::NO_NAMESPACE,
-        0,
-        now_us(),
-        PullDeadlines::whole_transfer(Duration::from_secs(10)),
-        ceiling,
-        0,
-        &mut progress,
-    )
-    .await
-    .err()
-    .ok_or_else(|| anyhow::anyhow!("an oversized blob must be refused"))?;
-    anyhow::ensure!(
-        err.to_string().contains("BlobTooLarge"),
-        "the received-byte cap must surface BlobTooLarge: {err}"
-    );
-    anyhow::ensure!(
-        progress.advanced().is_none(),
-        "an over-ceiling blob is refused before the first voucher: {:?}",
-        progress.advanced()
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// Buyer-side RATE gate (#1375): the rate analogue of `buyer_rejects_oversized_total_bytes`.
+/// Buyer-side RATE gate (#1375): the rate analogue of
+/// `buyer_refuses_an_oversized_small_blob_without_paying`.
 /// The server quotes `RATE_PER_MB` in a valid, signed `ok == true` `StreamResponse`, but the
 /// buyer's ceiling is below it. The buyer must refuse BEFORE paying a single voucher, with a
 /// typed `RateAboveCeiling` that names the quote and the ceiling.
@@ -9456,68 +9228,6 @@ async fn a_stale_stream_on_a_warm_connection_is_typed_and_refused_alone() -> any
     Ok(())
 }
 
-/// Binding authorization gate: a correctly-signed binding for an address that
-/// signs for no lane on the requested pool is refused at admission as an
-/// unknown lane (wire `NotFound`), before any `ChunkData`. This is the leech
-/// closure for bound clients.
-#[tokio::test(flavor = "multi_thread")]
-async fn client_binding_for_other_owner_is_not_found() -> anyhow::Result<()> {
-    let payload = b"valid binding, wrong pool owner".to_vec();
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    // The pool is owned by `seeded_store`'s signer; the binding attests a
-    // different address (`intruder`), so it must not authorize this pool.
-    let (store, _owner, _deposit) = seeded_store()?;
-    let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-
-    let intruder = PrivateKeySigner::random();
-    let intruder_addr: [u8; 20] = intruder.address().into();
-    let ext = StreamRequestExt {
-        binding: Some(ClientBinding {
-            ethereum_address: intruder_addr,
-            binding_signature: sign_binding_for(&intruder, client_node_id)?,
-        }),
-        pull_through: true,
-        ..Default::default()
-    };
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    let refusal =
-        raw_request_refused_at_first_proof(&client_ep, target, &req, Some(&ext), &intruder).await?;
-    anyhow::ensure!(
-        refusal == StreamError::NotFound,
-        "expected NotFound for an unauthorized binding, got {refusal:?}"
-    );
-
-    // Pool model: a valid binding for an address with no lane on this pool
-    // resolves to no lane, so the refusal is the unknown-lane arm — the
-    // owner-mismatch gate is subsumed into lane resolution (a wrong signer simply
-    // owns no lane). Wire-indistinguishable from a cache miss (all `NotFound`), so
-    // only the reason counter proves which arm ran (#876).
-    support::assert_inbound_failures_attributed(&metrics, 1).await?;
-    anyhow::ensure!(
-        metric_line_present(
-            &metrics.encode()?,
-            "decdn_serve_stream_rejected_unknown_lane_total 1"
-        ),
-        "a bound-but-laneless request must bump the unknown-lane counter"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// Capability intake end to end (#2631): a bound request, through dispatch with
 /// a pool view wired, carries a capability signed by a key other than the pool
 /// owner. Intake drops it at admission, so the request names no lane: the
@@ -9667,95 +9377,6 @@ fn binding_ext(
     })
 }
 
-/// The binding gate is a *signer* question: a connection bound as the lane's
-/// pinned `voucher_signer` is authorized, even though that address never funded
-/// the pool. Its vouchers are the ones the lane will accept, so it is the
-/// only identity that can pay for this delivery.
-#[tokio::test(flavor = "multi_thread")]
-async fn binding_matching_the_delegate_signer_is_authorized() -> anyhow::Result<()> {
-    let payload = b"delegate-signed lane is served".to_vec();
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, _funder, delegate) = delegate_signer_store()?;
-    let (target, _server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-
-    let ext = binding_ext(&delegate, client_node_id)?;
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    match raw_request(&client_ep, target, &req, Some(&ext)).await? {
-        (ClientMessage::StreamResponse(resp), resp_ext) => {
-            anyhow::ensure!(
-                resp.body.ok,
-                "the pinned voucher signer must be authorized, got {:?}",
-                resp_ext.error()
-            );
-        }
-        other => anyhow::bail!("expected a StreamResponse, got {other:?}"),
-    }
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// The mirror of the above: a connection bound as the *funder* behind a delegated
-/// lane is refused at admission as an unknown lane (wire `NotFound`). The funder holds
-/// no voucher authority on this lane, so its vouchers would fail
-/// `WrongSigner` mid-stream after free bytes had already shipped.
-#[tokio::test(flavor = "multi_thread")]
-async fn binding_matching_only_the_funder_is_refused() -> anyhow::Result<()> {
-    let payload = b"the funder cannot spend a delegated lane".to_vec();
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, funder, _delegate) = delegate_signer_store()?;
-    let (target, _server_eth, server_ep, server_task, metrics) =
-        spawn_handler_server_with_metrics(cache, store, RATE_PER_MB, 16).await?;
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-
-    let ext = binding_ext(&funder, client_node_id)?;
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    let refusal =
-        raw_request_refused_at_first_proof(&client_ep, target, &req, Some(&ext), &funder).await?;
-    anyhow::ensure!(
-        refusal == StreamError::NotFound,
-        "expected NotFound for the funder binding, got {refusal:?}"
-    );
-    // Pool model: the funder holds no lane on this delegated pool (the lane is
-    // keyed by the delegate signer), so its binding resolves to no lane and the
-    // refusal is the unknown-lane arm.
-    support::assert_inbound_failures_attributed(&metrics, 1).await?;
-    anyhow::ensure!(
-        metric_line_present(
-            &metrics.encode()?,
-            "decdn_serve_stream_rejected_unknown_lane_total 1"
-        ),
-        "the funder binding must bump the unknown-lane counter"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// COMPLIANCE REGRESSION GUARD (ADR 011 §On Blacklist Event). The takedown gate
 /// keys on the pool's FUNDER, never on the lane's voucher signer. A blacklisted
 /// funder that delegates signing to a clean throwaway key must still be refused
@@ -9803,67 +9424,6 @@ async fn blacklisted_funder_is_refused_even_behind_a_clean_delegate() -> anyhow:
             "decdn_serve_stream_rejected_origin_denied_total 1"
         ),
         "the compliance gauge must count the delegated-lane refusal"
-    );
-
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
-/// The full delegated round trip: a lane whose `voucher_signer` is NOT the
-/// funder is served end to end on delegate-signed vouchers, and the persisted
-/// state keeps the two addresses apart.
-///
-/// Every other delegated-lane test stops at the open-time gate's verdict.
-/// This one crosses the whole seam — request admitted, delegate-signed vouchers
-/// accepted at each interval, bytes assembled and hash-verified — so a
-/// regression that accepted the open but rejected the delegate's vouchers
-/// mid-stream cannot hide.
-#[tokio::test(flavor = "multi_thread")]
-async fn delegate_signed_vouchers_carry_a_delivery_to_completion() -> anyhow::Result<()> {
-    // 1.5 MiB crosses one voucher-interval boundary plus a closing voucher, so
-    // at least two delegate-signed vouchers are verified.
-    let payload = vec![0xC3u8; 1_572_864];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let (store, _funder, delegate) = delegate_signer_store()?;
-    let (target, server_eth, server_ep, server_task, _metrics) =
-        spawn_handler_server_with_metrics(cache, Arc::clone(&store), RATE_PER_MB, 16).await?;
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    // The requester signs with the DELEGATE — the funder's key never appears.
-    let ctx = pool_context(&client_ep, Arc::clone(&delegate), U256::from(10_000_000u64));
-    let got = stream_fetch(
-        &client_ep,
-        target,
-        &ctx,
-        &stream_domain(),
-        server_eth.address(),
-        *hash.as_bytes(),
-        0,
-        now_us(),
-        Duration::from_secs(30),
-    )
-    .await?;
-    anyhow::ensure!(
-        got.as_ref() == payload.as_slice(),
-        "delegate-signed delivery returned {} bytes, expected {}",
-        got.len(),
-        payload.len()
-    );
-
-    let states = store.load_all()?;
-    let state = states
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("the lane must still be persisted"))?;
-    // ADR 038: the metered quantity is bao wire bytes, not payload bytes.
-    let wire = support::bao_wire_len_whole(payload.len() as u64);
-    anyhow::ensure!(
-        state.last_bytes_delivered() == U256::from(wire),
-        "the persisted byte count must cover the whole blob: {} (expected {wire})",
-        state.last_bytes_delivered()
-    );
-    anyhow::ensure!(
-        state.signer == delegate.address() && state.provider == operator_addr(),
-        "the delegate is the lane signer across a completed delivery"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
@@ -9980,10 +9540,11 @@ async fn cache_with_two_blobs(
 }
 
 /// Concurrent pulls on ONE lane coordinate through a shared [`PoolLedger`]:
-/// two simultaneous fetches of two distinct blobs issue vouchers in strict nonce
-/// order (the ledger serializes the sign→send→ack→commit cycle), so BOTH succeed
-/// and the lane advances monotonically. Without that coordination, two streams
-/// would both sign voucher nonce 1 and the node would accept only one.
+/// two simultaneous fetches of two distinct blobs issue vouchers in strict
+/// cumulative order (the ledger serializes compute → sign → send), so BOTH
+/// succeed and the lane advances monotonically. Without that coordination, two
+/// streams would both sign cumulatives from the same base and the node would
+/// refuse the lower one as a regression.
 #[tokio::test(flavor = "multi_thread")]
 async fn client_concurrent_same_lane_both_succeed() -> anyhow::Result<()> {
     let payload_a = vec![0x5Au8; 4096];
@@ -10030,8 +9591,8 @@ async fn client_concurrent_same_lane_both_succeed() -> anyhow::Result<()> {
             0,
         ),
     );
-    // BOTH succeed: the shared ledger serialized voucher issuance, so neither
-    // collided on a nonce. Each pull returns its own verified blob.
+    // BOTH succeed: the shared ledger serialized voucher issuance, so no voucher
+    // regressed the lane's cumulative. Each pull returns its own verified blob.
     let bytes_a = ra.map_err(|e| anyhow::anyhow!("pull A failed: {e:?}"))?;
     let bytes_b = rb.map_err(|e| anyhow::anyhow!("pull B failed: {e:?}"))?;
     anyhow::ensure!(bytes_a.as_ref() == payload_a.as_slice(), "blob A mismatch");
@@ -10540,85 +10101,6 @@ async fn pull_through_gate_authorizes_only_lane_signer() -> anyhow::Result<()> {
         hits.load(std::sync::atomic::Ordering::SeqCst)
     );
     shutdown([], [&c3]).await?;
-
-    shutdown([server_task], [&server_ep]).await?;
-    Ok(())
-}
-
-/// The pull-through gate is the same *signer* question as the binding gate: on
-/// a lane with a delegated voucher signer, only the delegate can make this
-/// node front upstream USDC. The funder — which cannot produce an acceptable
-/// voucher — must not.
-#[tokio::test(flavor = "multi_thread")]
-async fn pull_through_authorizes_the_delegate_not_the_funder() -> anyhow::Result<()> {
-    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cache_tmp = tempfile::tempdir()?;
-    let cache = CacheEngine::open(
-        cache_tmp.path(),
-        vec![Arc::new(CountingOrigin {
-            hits: Arc::clone(&hits),
-        }) as Arc<dyn decdn_cache::Origin>],
-        16,
-    )
-    .await?;
-
-    let (store, funder, delegate) = delegate_signer_store()?;
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_full_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store,
-        RATE_PER_MB,
-        &loopback_domains(),
-        16,
-        |deps| deps.pull_through = Some(std::time::Duration::from_secs(10)),
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let req = StreamRequest {
-        hash: [0xEDu8; 32], // never cached — a miss that would trigger the pull
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-
-    // 1) Bound as the FUNDER: it holds no voucher authority here, so it must not
-    //    make this node spend upstream.
-    let funder_sk = fresh_key();
-    let funder_node_id = B256::from(*funder_sk.public().as_bytes());
-    let (c1, _) = local_endpoint(funder_sk, vec![]).await?;
-    let ext_funder = binding_ext(&funder, funder_node_id)?;
-    let _ = raw_request(&c1, target.clone(), &req, Some(&ext_funder)).await?;
-    anyhow::ensure!(
-        hits.load(std::sync::atomic::Ordering::SeqCst) == 0,
-        "the funder behind a delegated lane must NOT trigger a paid pull"
-    );
-    shutdown([], [&c1]).await?;
-
-    // 2) Bound as the pinned DELEGATE signer: authorized → the pull is attempted.
-    let delegate_sk = fresh_key();
-    let delegate_node_id = B256::from(*delegate_sk.public().as_bytes());
-    let (c2, _) = local_endpoint(delegate_sk, vec![]).await?;
-    let ext_delegate = binding_ext(&delegate, delegate_node_id)?;
-    let _ = raw_request(&c2, target.clone(), &req, Some(&ext_delegate)).await?;
-    anyhow::ensure!(
-        hits.load(std::sync::atomic::Ordering::SeqCst) == 1,
-        "the pinned voucher signer MUST trigger the pull exactly once, got {}",
-        hits.load(std::sync::atomic::Ordering::SeqCst)
-    );
-    shutdown([], [&c2]).await?;
 
     shutdown([server_task], [&server_ep]).await?;
     Ok(())
@@ -11266,40 +10748,10 @@ async fn spawn_pull_through_server(
 /// (#1759): an origin-only node. Reactive fs-origin pull-through
 /// (`ClientHandlerDeps.pull_through`) is wired the same as
 /// [`spawn_pull_through_server`] so a hash the backend genuinely holds can
-/// still be served; the only difference is the origin-only gate.
-async fn spawn_origin_only_server(
-    cache: CacheEngine,
-    store: Arc<dyn PoolStateStore>,
-) -> anyhow::Result<(EndpointAddr, Address, Endpoint, tokio::task::JoinHandle<()>)> {
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    let handler = build_handler_limited_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store,
-        RATE_PER_MB,
-        16,
-        |deps| {
-            deps.pull_through = Some(Duration::from_secs(20));
-            deps.relay_foreign_namespaces = false;
-        },
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-    Ok((target, server_eth.address(), server_ep, server_task))
-}
-
-/// Same as [`spawn_origin_only_server`] but also returns the server's
-/// [`Metrics`], so a test can tell a policy decline (`ForeignNamespaceDeclined`)
-/// apart from a backend fault (`InternalError`) by the operator's own counters,
-/// not just by the wire error (#1766).
+/// still be served; the only difference is the origin-only gate. It also
+/// returns the server's [`Metrics`], so a test can tell a policy decline
+/// (`ForeignNamespaceDeclined`) apart from a backend fault (`InternalError`) by
+/// the operator's own counters, not just by the wire error (#1766).
 async fn spawn_origin_only_server_with_metrics(
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
@@ -11475,6 +10927,40 @@ async fn cache_with_foreign_blob_imported(
     Ok((cache, hash, cache_metrics, cache_dir))
 }
 
+/// Assert an origin-only node refused a fetch as a policy decline: the client
+/// sees `Declined`, and the operator counts exactly one foreign decline and no
+/// internal error.
+fn assert_foreign_declined<T>(res: anyhow::Result<T>, metrics: &Metrics) -> anyhow::Result<()> {
+    match res {
+        Ok(_) => anyhow::bail!("origin-only node must decline a foreign hash"),
+        Err(e) => anyhow::ensure!(
+            e.to_string().contains("Declined"),
+            "a foreign hash must surface as Declined, got: {e}"
+        ),
+    }
+    let encoded = metrics.encode()?;
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_foreign_declined_total 1"
+        ),
+        "expected one foreign decline; counters were:\n{}",
+        encoded
+            .lines()
+            .filter(|l| l.starts_with("decdn_serve_stream_rejected"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    anyhow::ensure!(
+        metric_line_present(
+            &encoded,
+            "decdn_serve_stream_rejected_internal_error_total 0"
+        ),
+        "a foreign decline must not be counted as an internal error"
+    );
+    Ok(())
+}
+
 /// #1759: an origin-only node declines a hash its own backend does not hold,
 /// even for a request carrying a valid client binding — the gate is
 /// backend-authoritative, not a binding/authorization check.
@@ -11487,8 +10973,8 @@ async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
     let foreign_hash = decdn_cache::Hash::from([0x9Au8; 32]);
 
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
-        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+    let (target, server_eth_addr, server_ep, server_task, metrics) =
+        spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
@@ -11505,7 +10991,7 @@ async fn origin_only_node_declines_a_foreign_hash() -> anyhow::Result<()> {
         Duration::from_secs(20),
     )
     .await;
-    anyhow::ensure!(res.is_err(), "origin-only node must decline a foreign hash");
+    assert_foreign_declined(res, &metrics)?;
 
     // Declined BEFORE any origin egress / discovery.
     anyhow::ensure!(
@@ -11525,8 +11011,8 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
-        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+    let (target, server_eth_addr, server_ep, server_task, _metrics) =
+        spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
@@ -11562,8 +11048,8 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
     let (cache, foreign_hash, cache_metrics, _cache_tmp) =
         cache_with_foreign_blob_imported(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task) =
-        spawn_origin_only_server(cache, Arc::clone(&store)).await?;
+    let (target, server_eth_addr, server_ep, server_task, _metrics) =
+        spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
 
     // Baseline AFTER setup, so the assertion below isolates origin reads caused
     // by THIS request.
@@ -11614,11 +11100,10 @@ async fn bound_client_fetch_triggers_reactive_origin_pull_through() -> anyhow::R
         spawn_pull_through_server(cache, Arc::clone(&store)).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    // Sign the binding over the CLIENT's own node id with the pool-owning key,
-    // under the handler's binding domain — exactly what `pull_authorized` checks.
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    // `pool_context` signs the binding over the CLIENT's own node id with the
+    // pool-owning key, under the handler's binding domain — exactly what
+    // `pull_authorized` checks.
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -11713,9 +11198,7 @@ async fn own_namespace_miss_ignores_serve_economics_gate() -> anyhow::Result<()>
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -11818,9 +11301,7 @@ async fn a_completed_serve_credits_the_source_through_the_background_aggregator(
     let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -11923,9 +11404,7 @@ async fn own_origin_serves_with_node_to_node_off() -> anyhow::Result<()> {
         spawn_fault_server(cache, Arc::clone(&store), FaultTiers::None).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -11966,9 +11445,7 @@ async fn own_origin_preferred_over_peer_window_path() -> anyhow::Result<()> {
         spawn_fault_server(cache, Arc::clone(&store), FaultTiers::Window).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     let got = stream_fetch(
         &client_ep,
@@ -12025,9 +11502,7 @@ async fn own_origin_absence_is_clean_cache_miss() -> anyhow::Result<()> {
         spawn_fault_server(cache, Arc::clone(&store), FaultTiers::None).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     match stream_fetch(
         &client_ep,
@@ -12220,9 +11695,7 @@ async fn lane_registered_mid_request_refuses_on_no_lane(
     );
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
     let stream_dom = stream_domain();
     let fetch = || {
         stream_fetch(
@@ -12572,9 +12045,7 @@ async fn own_origin_fault_is_internal_error_not_signed_not_found() -> anyhow::Re
         spawn_fault_server(cache, Arc::clone(&store), FaultTiers::None).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     match stream_fetch(
         &client_ep,
@@ -12636,9 +12107,7 @@ async fn own_origin_fault_survives_fallthrough_to_the_window_tier() -> anyhow::R
         spawn_fault_server(cache, Arc::clone(&store), FaultTiers::Window).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     match stream_fetch(
         &client_ep,
@@ -12715,9 +12184,7 @@ async fn buffered_pull_through_hard_fault_is_internal_error() -> anyhow::Result<
         spawn_fault_server(cache, Arc::clone(&store), FaultTiers::Buffered).await?;
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let own_node_id = B256::from(*client_ep.id().as_bytes());
-    let binding = sign_client_binding(&signer, own_node_id, &binding_domain())?;
-    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit).with_client_binding(binding);
+    let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
     match stream_fetch(
         &client_ep,
@@ -13830,116 +13297,13 @@ async fn a_chunk_settled_by_the_last_proof_of_its_budget_is_paid() -> anyhow::Re
     Ok(())
 }
 
-/// The per-connection stream cap sheds an over-cap stream with a bare QUIC reset
-/// carrying [`decdn_protocol::APP_ERR_RATE_LIMITED`] and signs no
-/// `StreamResponse` (ADR 005 §Concurrent stream limits): signing a response per
-/// shed request would let a request flood amplify into one ECDSA signature each,
-/// so the cap adds no work to the reject path. One stream holds the sole permit
-/// (parked at its closing voucher); a second stream on the same connection is
-/// reset without a response.
-#[tokio::test(flavor = "multi_thread")]
-async fn over_cap_stream_is_reset_without_signing_a_response() -> anyhow::Result<()> {
-    // 64 KiB: fits one credit-window floor, so the first stream parks at a single
-    // closing voucher while holding the sole stream permit.
-    let payload = vec![0x4Bu8; 64 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let wire_bytes = support::bao_wire_len_whole(payload.len() as u64);
-
-    let signer = Arc::new(PrivateKeySigner::random());
-    let store = Arc::new(MemoryPoolStateStore::new());
-    store.record(&fresh_lane(signer.address(), U256::from(10_000_000u64)))?;
-    let store_dyn: Arc<dyn PoolStateStore> = store.clone();
-
-    let server_sk = fresh_key();
-    let server_id = server_sk.public();
-    let server_eth = operator_signer();
-    let metrics = Arc::new(Metrics::new());
-    let limiter = permissive_limiter(&metrics);
-    // Per-connection cap of exactly one concurrent stream.
-    let handler = build_handler_limited_configured(
-        server_id,
-        &server_eth,
-        &metrics,
-        limiter,
-        cache,
-        store_dyn,
-        RATE_PER_MB,
-        1,
-        |_deps| {},
-    )?;
-    let (server_ep, server_addr) = local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-    let server_task = spawn_server(server_ep.clone(), handler);
-    let target = EndpointAddr::new(server_id).with_ip_addr(server_addr);
-
-    let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let client_node_id = B256::from(*client_ep.id().as_bytes());
-    let ext = binding_ext(&signer, client_node_id)?;
-
-    // Stream 1 takes the sole permit and parks at its closing voucher, holding it
-    // for as long as the test declines to pay.
-    let _held =
-        stall_delivery_at_closing_voucher(&conn, *hash.as_bytes(), wire_bytes, Some(&ext)).await?;
-
-    // Stream 2 on the SAME connection finds no permit: the handler resets it with
-    // RATE_LIMITED and never signs a response.
-    let (mut send2, mut recv2) = conn
-        .open_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("open_bi (second stream): {e}"))?;
-    let req = StreamRequest {
-        hash: *hash.as_bytes(),
-        namespace_id: decdn_protocol::client::NO_NAMESPACE,
-        payment_pool: decdn_protocol::PoolAccount::eip155(CHAIN_ID, [0x34; 20]),
-        pool_id: pool_id().into(),
-        byte_offset: 0,
-        byte_len: 0,
-        timestamp_us: now_us(),
-    };
-    // One write: the node sheds the stream before it reads anything, so a
-    // prefix written on its own lets the shed land before the payload. The shed
-    // can still beat this write, and a STOP_SENDING that carries RATE_LIMITED
-    // is the signal under test, so the write accepts it.
-    let payload2 = encode_stream_request(&req, Some(&ext))?;
-    let mut frame2 = support::frame_len_prefix(u32::try_from(payload2.len())?);
-    frame2.extend_from_slice(&payload2);
-    match send2.write_all(&frame2).await {
-        Ok(()) => {}
-        Err(WriteError::Stopped(code))
-            if code == VarInt::from_u32(decdn_protocol::APP_ERR_RATE_LIMITED) => {}
-        Err(e) => anyhow::bail!("write second request: {e}"),
-    }
-    assert_stream_reset(&mut recv2, decdn_protocol::APP_ERR_RATE_LIMITED).await?;
-    support::assert_inbound_failures_attributed(&metrics, 1).await?;
-    anyhow::ensure!(
-        counter(
-            &metrics,
-            "decdn_serve_stream_rejected_stream_cap_full_total"
-        )? == 1,
-        "an over-cap stream must be counted"
-    );
-
-    // Closing the connection ends the parked stream before its first proof:
-    // an unclaimed open.
-    conn.close(0u32.into(), b"done");
-    support::assert_inbound_failures_attributed(&metrics, 2).await?;
-    anyhow::ensure!(
-        counter(&metrics, "decdn_serve_stream_unclaimed_total")? == 1,
-        "the parked stream ends unclaimed"
-    );
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
-}
-
 /// An over-cap stream is refused before its request is read (ADR 005
 /// §Concurrent stream limits). One stream holds the sole permit; a second stream
 /// announces a request frame and never sends its body. The handler resets the
 /// second stream with `RATE_LIMITED` at once. It does not buffer the announced
 /// frame or wait out the request-read timeout for it, so over-cap streams cannot
-/// each pin a frame of memory.
+/// each pin a frame of memory, and it signs no `StreamResponse`, so a request
+/// flood cannot amplify into one signature each.
 #[tokio::test(flavor = "multi_thread")]
 async fn over_cap_stream_is_reset_before_its_request_is_read() -> anyhow::Result<()> {
     let payload = vec![0x4Cu8; 64 * 1024];

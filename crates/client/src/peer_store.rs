@@ -75,12 +75,6 @@ pub struct PeerRecord {
     /// stale cached address loses the iroh path race but never fails a dial that
     /// live infrastructure would have served, since on the outage path there is
     /// no discovery to fall back to anyway.
-    ///
-    /// `#[serde(default)]` so a record written before this field existed still
-    /// loads — with empty addresses — instead of failing to deserialize and
-    /// taking its latency and identity stats down with it. The field then
-    /// repopulates on the next registry read.
-    #[serde(default)]
     pub multiaddrs: Bytes,
     /// Seconds since the Unix epoch when identity was last confirmed against the registry.
     pub identity_seen_at_secs: u64,

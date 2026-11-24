@@ -31,34 +31,6 @@ impl Bytes {
     pub const fn get(self) -> u64 {
         self.0
     }
-
-    /// Whether this is zero bytes. A domain-named alternative to `.get() == 0`
-    /// for the "`0` disables the cap" sentinel checks on the seed-leech budget,
-    /// `const` so it stays usable in the validated `const fn` constructors.
-    #[must_use]
-    pub const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-
-    /// Add two byte quantities, saturating at `u64::MAX`. Typed on both sides so
-    /// a byte count can only be added to another byte count, never to a value
-    /// carrying a different unit.
-    #[must_use]
-    pub const fn saturating_add(self, rhs: Bytes) -> Bytes {
-        Bytes(self.0.saturating_add(rhs.0))
-    }
-
-    /// Subtract `rhs` from this quantity, saturating at `0`.
-    #[must_use]
-    pub const fn saturating_sub(self, rhs: Bytes) -> Bytes {
-        Bytes(self.0.saturating_sub(rhs.0))
-    }
-}
-
-impl std::fmt::Display for Bytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
-    }
 }
 
 #[cfg(test)]

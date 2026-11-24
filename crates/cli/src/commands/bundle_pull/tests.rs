@@ -69,18 +69,6 @@ fn sample() -> Vec<ManifestEntry> {
 }
 
 #[test]
-fn entry_retries_flag_is_gone() {
-    use clap::Parser as _;
-    let uri = format!("decdn:{}/", "ab".repeat(32));
-    let base = ["decdn", "get", uri.as_str(), "-o", "out"];
-    assert!(decdn_common::cli::Cli::try_parse_from(base).is_ok());
-    let parsed = decdn_common::cli::Cli::try_parse_from(
-        base.iter().copied().chain(["--entry-retries", "2"]),
-    );
-    assert!(parsed.is_err());
-}
-
-#[test]
 fn parse_selection_drops_commented_and_deleted_lines() {
     let entries = vec![
         sel_entry("a.bin", 1),

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::signers::local::PrivateKeySigner;
-use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH, preimage_at, root_from_seed};
+use decdn_incentive::chain::{CHUNK_BYTES, MAX_CHAIN_LENGTH, root_from_seed};
 use decdn_incentive::stream_sig::StreamSigData;
 use decdn_incentive::{
     LaneKey, Voucher, capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
@@ -913,22 +913,15 @@ fn a_lane_is_settled_once_a_redemption_reaches_its_claim() {
 }
 
 #[test]
-fn a_reveal_verifies_against_the_chain_root() {
-    let seed = B256::repeat_byte(0x77);
-    let root = root_from_seed(seed);
+fn a_claim_at_a_reveal_index_adds_one_chunk_per_reveal() {
     let voucher = ReceiptVoucher {
         amount: 10,
         bytes_delivered: 0,
-        chain_root: root,
+        chain_root: root_from_seed(B256::repeat_byte(0x77)),
         chunk_price: RATE,
         signature: Bytes::new(),
     };
     let index = 4;
-    assert!(verify_forward(
-        preimage_at(seed, index),
-        index,
-        voucher.chain_root
-    ));
     assert_eq!(
         voucher.claim(index),
         Some(ReceiptAmount {

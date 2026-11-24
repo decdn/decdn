@@ -25,11 +25,8 @@ use decdn_client::{
     stream_fetch_tracked,
 };
 use decdn_incentive::payment_pool::PaymentPool;
-use decdn_incentive::{BuyerPoolState, Deployment, SignedCapability, capacity_bond_domain};
-use decdn_protocol::client::{StreamError, WireCapability};
-use decdn_protocol::{
-    ALPN_CLIENT, PoolAccount, StreamRequest, StreamRequestExt, encode_stream_request,
-};
+use decdn_incentive::{BuyerPoolState, Deployment, capacity_bond_domain};
+use decdn_protocol::client::StreamError;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 
@@ -48,29 +45,12 @@ pub const DEPOSIT_MICRO_USDC: u64 = 10_000_000;
 /// time. The daemon's own clock helper, so the fixture and the gate it must
 /// satisfy cannot drift apart.
 use decdn_node::handlers::timestamp_skew::now_us as timestamp_now_us;
-/// How long [`ClientFixture::capture_delivery_wire`] waits *between* frames
-/// before deciding the node has finished speaking. The tap never pays, so the
-/// node's closing-voucher pause is the terminator on a successful delivery.
-///
-/// Load-bearing coupling: this must stay below the node's `VOUCHER_READ_TIMEOUT`
-/// (10s with no transport progress, `crates/node/src/handlers/client/mod.rs`).
-/// The tap has read every frame, so the connection shows no progress, and past
-/// that timeout the node gives up on the voucher and resets the stream before
-/// the tap decides it has gone idle.
-const WIRE_TAP_IDLE: Duration = Duration::from_secs(5);
-/// How long the tap waits for the *first* frame. Far larger than
-/// [`WIRE_TAP_IDLE`] because the first frame is gated on the node's
-/// own-origin fill (its `{H}.sizeproof` read, admission and the first range
-/// window), not on an idle pause — a tapped blob is deliberately absent from
-/// the store.
-const WIRE_TAP_FIRST_FRAME: Duration = Duration::from_secs(30);
 /// How long [`ClientFixture::discovery_open`] waits for the dial, and again
 /// for the answer.
 const DISCOVERY_OPEN: Duration = Duration::from_secs(10);
 
 /// One open payment pool, reusable across several single-shot fetches
-/// ([`ClientFixture::fetch_once`]) and the raw wire tap
-/// ([`ClientFixture::capture_delivery_wire`]). The session pins ONE delivering
+/// ([`ClientFixture::fetch_once`]). The session pins ONE delivering
 /// provider (the fixture's node), so its `(signer, provider)` voucher lane is
 /// the one it advances.
 ///
@@ -98,21 +78,6 @@ impl PoolSession {
     #[must_use]
     pub const fn pool_id(&self) -> B256 {
         self.ctx.pool_id
-    }
-
-    /// The `PaymentPool` contract that holds this session's pool: the
-    /// contract its voucher domain binds.
-    fn payment_pool(&self) -> anyhow::Result<PoolAccount> {
-        let domain = &self.ctx.voucher_domain;
-        let chain_id = domain
-            .chain_id
-            .context("session voucher domain names no chain id")?;
-        let chain_id =
-            u64::try_from(chain_id).context("session voucher domain chain id exceeds u64")?;
-        let contract = domain
-            .verifying_contract
-            .context("session voucher domain names no verifying contract")?;
-        Ok(PoolAccount::eip155(chain_id, contract.into()))
     }
 
     /// Fold whatever the node acked into the lane's cumulative voucher
@@ -455,114 +420,6 @@ impl ClientFixture {
         Ok(result?.as_ref().to_vec())
     }
 
-    /// Drive a raw `cdn/client/v1` delivery for `hash` on `session` and return
-    /// every framed message the node sent, verbatim.
-    ///
-    /// This is the wire tap G-NODE-08 needs: no client-side interpretation — the
-    /// frame payloads a delivering node put on the QUIC stream, so a journey can
-    /// assert an opaque backend's location is not among them. (Payloads, not raw
-    /// stream bytes: `read_frame` consumes the varint length prefix.)
-    ///
-    /// Deliberately never pays, which bounds what it can see. The node streams
-    /// `StreamResponse` + every `ChunkData` up to the chunk and then
-    /// blocks on payment, so for a sub-interval blob this captures **every
-    /// message the node emits before it blocks** — but never `StreamEnd`,
-    /// which is emitted only after a voucher arrives. The capture
-    /// ends when the node falls silent for a few seconds (that payment pause) or
-    /// the stream closes cleanly.
-    ///
-    /// Side effect: tapping a blob the node does not hold drives a real reactive
-    /// backend fill, leaving the blob **warmed in the node's store**. Run this
-    /// after any assertion that depends on the blob being absent, and treat it as
-    /// the last operation on `session` — the node is left blocked awaiting a
-    /// voucher that never comes.
-    pub async fn capture_delivery_wire(
-        &self,
-        session: &PoolSession,
-        hash: Hash,
-        namespace_id: alloy::primitives::U256,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
-        let conn = self
-            .endpoint
-            .connect(session.target.clone(), ALPN_CLIENT)
-            .await
-            .map_err(|e| anyhow::anyhow!("connect for wire tap: {e}"))?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow::anyhow!("open_bi for wire tap: {e}"))?;
-        let req = StreamRequest {
-            hash: *hash.as_bytes(),
-            // The backend-fill gate keys on the request namespace, so the tap must
-            // carry the ratified namespace the blob is published under — otherwise
-            // the authorized-origin gate refuses and the tap captures a refusal
-            // instead of a delivery. The origin backend itself remains hash-keyed
-            // and opaque (it never sees the namespace).
-            namespace_id: namespace_id.to_be_bytes(),
-            payment_pool: session.payment_pool()?,
-            pool_id: session.ctx.pool_id.into(),
-            byte_offset: 0,
-            byte_len: 0,
-            timestamp_us: timestamp_now_us(),
-        };
-        // `pull_authorized` gates every backend-fill tier on the client binding,
-        // and the capability lets the node register the lane; without them the tap
-        // would only ever capture a refusal.
-        let ext = session.request_ext();
-        let payload =
-            encode_stream_request(&req, Some(&ext)).context("encode wire-tap StreamRequest")?;
-        decdn_protocol::write_frame(&mut send, &payload)
-            .await
-            .context("write wire-tap StreamRequest")?;
-
-        // Reads until the stream closes cleanly (a refusal, then `finish`) or the
-        // node goes idle waiting for the voucher we never send: either way it has
-        // said everything it is going to say.
-        //
-        // A genuine transport/framing fault is NOT a terminator — folding it into
-        // the idle case would silently return a truncated capture, and every
-        // "the backend is absent from these frames" assertion downstream would be
-        // that much weaker without saying so.
-        let mut frames: Vec<Vec<u8>> = Vec::new();
-        loop {
-            let budget = if frames.is_empty() {
-                WIRE_TAP_FIRST_FRAME
-            } else {
-                WIRE_TAP_IDLE
-            };
-            match tokio::time::timeout(
-                budget,
-                decdn_protocol::read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME),
-            )
-            .await
-            {
-                Ok(Ok(frame)) => frames.push(frame),
-                // Idle: the expected terminator on a successful delivery.
-                Err(_) => break,
-                // Clean end of stream.
-                Ok(Err(decdn_protocol::FrameError::Io(e)))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Ok(Err(e)) => {
-                    let captured: usize = frames.iter().map(Vec::len).sum();
-                    conn.close(0u32.into(), b"wire tap failed");
-                    return Err(anyhow::anyhow!(
-                        "wire tap read failed after {} frames ({captured} bytes): {e}",
-                        frames.len()
-                    ));
-                }
-            }
-        }
-        conn.close(0u32.into(), b"wire tap complete");
-        anyhow::ensure!(
-            !frames.is_empty(),
-            "node sent nothing on the delivery stream within {WIRE_TAP_FIRST_FRAME:?}"
-        );
-        Ok(frames)
-    }
-
     /// Open and fund a payment pool for `node`, self-issue the owner capability
     /// delegating spend to the buyer's own key, and pin the delivering provider
     /// (the node's operator) plus the ADR 005 client binding, returning the
@@ -779,30 +636,6 @@ impl ClientFixture {
                 )?)
                 .with_capability(capability),
         )
-    }
-}
-
-impl PoolSession {
-    /// The trailing [`StreamRequestExt`] this session's manual-wire helpers send:
-    /// the client identity binding plus the owner capability, so the node's
-    /// serve/fill gates authorize the request and can register the lane. Mirrors
-    /// what `decdn-client` attaches to a `StreamRequest`.
-    fn request_ext(&self) -> StreamRequestExt {
-        StreamRequestExt {
-            binding: self.ctx.client_binding.clone(),
-            capability: self.ctx.capability.as_ref().map(signed_to_wire_capability),
-            pull_through: true,
-        }
-    }
-}
-
-/// Lower a [`SignedCapability`] into its wire form for a manual `StreamRequestExt`
-/// (`decdn-client` does the same internally when it opens a pull).
-fn signed_to_wire_capability(signed: &SignedCapability) -> WireCapability {
-    WireCapability {
-        spending_cap: signed.capability.spending_cap,
-        expiry: signed.capability.expiry,
-        owner_signature: signed.signature.as_bytes().to_vec(),
     }
 }
 

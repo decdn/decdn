@@ -1,6 +1,6 @@
 //! On-chain assertion helpers: typed reads of the state journeys check
-//! (pool records, per-lane watermarks, capability authorizations, operator bond
-//! activity) and typed revert matching. Daemon-side assertions go through the
+//! (pool records, per-lane watermarks, capability authorizations) and typed
+//! revert matching. Daemon-side assertions go through the
 //! admin RPC client on [`crate::node::NodeFixture`]; delivered-bytes assertions
 //! come from [`crate::client::FetchOutcome`].
 
@@ -9,24 +9,13 @@ use alloy::providers::Provider;
 use alloy::sol_types::SolError;
 use anyhow::Context;
 
-use crate::bindings::{CapacityBond, PaymentPool};
+use crate::bindings::PaymentPool;
 
-/// Assert an alloy contract call reverted with exactly `E`, matching on the
-/// 4-byte selector. Distinguishes the guard under test from a transport fault
-/// (no revert data at all) and from a *different* revert — both of which an
-/// `is_err()` check would happily accept.
-pub fn expect_revert<T, E: SolError>(
-    result: Result<T, alloy::contract::Error>,
-    what: &str,
-) -> anyhow::Result<()> {
-    match result {
-        Ok(_) => anyhow::bail!("{what} must revert with {}, but succeeded", E::SIGNATURE),
-        Err(err) => assert_revert_data::<E>(err.as_revert_data(), what, &err),
-    }
-}
-
-/// [`expect_revert`] for a call whose typed error has already been wrapped in an
-/// `anyhow` chain — the shape every `ChainFixture` write helper returns.
+/// Assert a call reverted with exactly `E`, matching on the 4-byte selector.
+/// Distinguishes the guard under test from a transport fault (no revert data
+/// at all) and from a *different* revert — both of which an `is_err()` check
+/// would happily accept. Takes the typed error wrapped in an `anyhow` chain —
+/// the shape every `ChainFixture` write helper returns.
 ///
 /// `anyhow`'s `.context()` preserves the source, so the typed
 /// `alloy::contract::Error` is still reachable by downcast and its revert data
@@ -109,19 +98,6 @@ pub async fn read_watermark<P: Provider>(
         .call()
         .await
         .context("getWatermark")
-}
-
-/// Whether `operator` is on-chain `isActive` (bonded + registered).
-pub async fn operator_active<P: Provider>(
-    provider: &P,
-    capacity_bond: Address,
-    operator: Address,
-) -> anyhow::Result<bool> {
-    CapacityBond::new(capacity_bond, provider)
-        .isActive(operator)
-        .call()
-        .await
-        .context("isActive")
 }
 
 /// `poolId = keccak256(abi.encodePacked(owner, ownerPoolNonce))`, matching

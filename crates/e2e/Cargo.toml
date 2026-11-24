@@ -10,9 +10,9 @@ publish = false
 # This crate is test-infrastructure only: it ships reusable fixtures (chain /
 # node / client / time-control / assertions) that compose a real anvil
 # deployment, subprocess daemon(s), and the paid client path. The fixtures live
-# in the library; the test targets are feature-gated journeys built on them —
-# the smoke test that proves the fixtures compose, and the G-NODE-04 blacklist
-# compliance journeys (#1031). See `crates/node/tests/anvil_settlement_e2e.rs`
+# in the library; the test targets are feature-gated journeys built on them,
+# such as G-NODE-01 onboarding and the G-NODE-04 blacklist compliance journeys
+# (#1031). See `crates/node/tests/anvil_settlement_e2e.rs`
 # for the monolith this generalizes.
 [lib]
 doctest = false

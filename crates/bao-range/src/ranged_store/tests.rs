@@ -1,22 +1,4 @@
 use super::*;
-use std::assert_matches;
-
-#[test]
-fn error_from_range_verify() {
-    // Any RangeVerifyError becomes RangedStoreError::Alignment via `?`.
-    fn coerce(e: crate::RangeVerifyError) -> RangedStoreError {
-        e.into()
-    }
-    // The trait is dyn-compatible: this type-checks only if object-safe.
-    fn _assert_dyn(_: &dyn RangedStore) {}
-    // Construct a representative RangeVerifyError to exercise the From.
-    let err = coerce(crate::RangeVerifyError::RangeOutOfBounds {
-        offset: 0,
-        len: 0,
-        blob_size: 0,
-    });
-    assert_matches!(err, RangedStoreError::Alignment(_));
-}
 
 /// A wrapping variant names only itself and hands its cause to `source()`,
 /// so a chain walk prints each cause once.

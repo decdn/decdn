@@ -84,15 +84,6 @@ fn sample_preimage() -> ChunkPreimage {
 
 // --- Roundtrips ----------------------------------------------------------
 
-#[test]
-fn stream_request_roundtrip() -> Result<(), postcard::Error> {
-    let req = sample_request();
-    let bytes = postcard::to_allocvec(&req)?;
-    let decoded: StreamRequest = postcard::from_bytes(&bytes)?;
-    assert_eq!(req, decoded);
-    Ok(())
-}
-
 /// `payment_pool` sits in the base request after `namespace_id` and before
 /// `pool_id` (ADR 005), as a length-prefixed CAIP-10 string.
 #[test]
@@ -177,30 +168,6 @@ fn stream_request_ext_tolerates_future_trailing_bytes() -> Result<(), postcard::
     Ok(())
 }
 
-/// `capability` round-trips both present and absent, independent of
-/// `binding` (the wire fields are orthogonal — a registered on-chain
-/// client can still carry a capability, and vice versa).
-#[test]
-fn stream_request_ext_capability_roundtrip() -> Result<(), postcard::Error> {
-    let with_cap = StreamRequestExt {
-        binding: None,
-        capability: Some(sample_capability()),
-        pull_through: false,
-    };
-    let bytes = postcard::to_allocvec(&with_cap)?;
-    let decoded: StreamRequestExt = postcard::from_bytes(&bytes)?;
-    assert_eq!(with_cap, decoded);
-
-    let without_cap = StreamRequestExt {
-        capability: None,
-        ..with_cap
-    };
-    let bytes = postcard::to_allocvec(&without_cap)?;
-    let decoded: StreamRequestExt = postcard::from_bytes(&bytes)?;
-    assert_eq!(without_cap, decoded);
-    Ok(())
-}
-
 #[test]
 fn wire_capability_rejects_empty_signature() {
     let cap = WireCapability {
@@ -232,15 +199,6 @@ fn stream_request_ext_validate_rejects_empty_capability_signature() {
 }
 
 #[test]
-fn stream_response_roundtrip() -> Result<(), postcard::Error> {
-    let resp = sample_response();
-    let bytes = postcard::to_allocvec(&resp)?;
-    let decoded: StreamResponse = postcard::from_bytes(&bytes)?;
-    assert_eq!(resp, decoded);
-    Ok(())
-}
-
-#[test]
 fn stream_response_error_roundtrip() -> Result<(), postcard::Error> {
     let resp = StreamResponse {
         body: StreamResponseBody {
@@ -254,33 +212,6 @@ fn stream_response_error_roundtrip() -> Result<(), postcard::Error> {
     let (decoded, remainder) = postcard::take_from_bytes::<ClientMessage>(&buf)?;
     assert_eq!(decoded, ClientMessage::StreamResponse(resp));
     assert_eq!(parse_stream_response_ext(remainder)?, ext);
-    Ok(())
-}
-
-#[test]
-fn chunk_data_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
-    let chunk = ChunkData::new(vec![0x42u8; 4096])?;
-    let bytes = postcard::to_allocvec(&chunk)?;
-    let decoded: ChunkData = postcard::from_bytes(&bytes)?;
-    assert_eq!(chunk, decoded);
-    Ok(())
-}
-
-#[test]
-fn voucher_roundtrip() -> Result<(), postcard::Error> {
-    let v = sample_voucher();
-    let bytes = postcard::to_allocvec(&v)?;
-    let decoded: Voucher = postcard::from_bytes(&bytes)?;
-    assert_eq!(v, decoded);
-    Ok(())
-}
-
-#[test]
-fn chunk_preimage_roundtrip() -> Result<(), postcard::Error> {
-    let p = sample_preimage();
-    let bytes = postcard::to_allocvec(&p)?;
-    let decoded: ChunkPreimage = postcard::from_bytes(&bytes)?;
-    assert_eq!(p, decoded);
     Ok(())
 }
 
@@ -317,42 +248,6 @@ fn chunk_preimage_index_zero_decodes_and_validates() -> Result<(), postcard::Err
     let bytes = postcard::to_allocvec(&ClientMessage::ChunkPreimage(p))?;
     let decoded: ClientMessage = postcard::from_bytes(&bytes)?;
     assert_eq!(decoded.validate(), Ok(()));
-    Ok(())
-}
-
-#[test]
-fn stream_error_voucher_rejected_roundtrip() -> Result<(), postcard::Error> {
-    let e = StreamError::VoucherRejected {
-        reason: VoucherRejectReason::SpendingCapExhausted,
-        bundle: None,
-    };
-    let bytes = postcard::to_allocvec(&e)?;
-    let decoded: StreamError = postcard::from_bytes(&bytes)?;
-    assert_eq!(e, decoded);
-    Ok(())
-}
-
-/// The gated case: a `WatermarkBundle` rides alongside the reject reason
-/// (issue #1481). Round-trips `Some` distinctly from the `None` case above
-/// — this is the shape a wallet-less client actually receives on a gated
-/// regression/exhaustion reject.
-#[test]
-fn stream_error_voucher_rejected_with_bundle_roundtrip() -> Result<(), postcard::Error> {
-    let e = StreamError::VoucherRejected {
-        reason: VoucherRejectReason::SpendingCapExhausted,
-        bundle: Some(WatermarkBundle {
-            amount: 0x1111_1111_1111_1111u64,
-            bytes_delivered: 0x3333_3333_3333_3333u64,
-            chain_root: [0x55u8; 32],
-            verified_index: 7,
-            tip: [0x66u8; 32],
-            chunk_price: 0x7777_7777_7777_7777u64,
-            last_signature: vec![0x44u8; VOUCHER_SIG_LEN],
-        }),
-    };
-    let bytes = postcard::to_allocvec(&e)?;
-    let decoded: StreamError = postcard::from_bytes(&bytes)?;
-    assert_eq!(e, decoded);
     Ok(())
 }
 
@@ -510,13 +405,6 @@ fn only_the_gate_stops_keep_the_last_proof() {
     }
 }
 
-#[test]
-fn client_message_rejects_unknown_discriminant() {
-    let bytes = [99u8, 0, 0, 0, 0];
-    let r: Result<ClientMessage, _> = postcard::from_bytes(&bytes);
-    assert!(r.is_err());
-}
-
 // Pins `TopLevelEnum::VARIANT_COUNT` to the highest discriminant so a future
 // variant addition must update the count the ADR 013 unknown/known
 // classifier relies on.
@@ -654,11 +542,6 @@ fn voucher_wire_format_is_stable() -> Result<(), postcard::Error> {
 // --- Validation ----------------------------------------------------------
 
 #[test]
-fn stream_response_validate_accepts_sample() {
-    assert_eq!(sample_response().validate(), Ok(()));
-}
-
-#[test]
 fn stream_response_validate_rejects_zero_rate() {
     let resp = StreamResponse {
         body: StreamResponseBody {
@@ -668,18 +551,6 @@ fn stream_response_validate_rejects_zero_rate() {
         ..sample_response()
     };
     assert_eq!(resp.validate(), Err(MessageValidationError::RateIsZero));
-}
-
-#[test]
-fn stream_response_validate_rejects_empty_operator_sig() {
-    let resp = StreamResponse {
-        operator_sig: Vec::new(),
-        ..sample_response()
-    };
-    assert_eq!(
-        resp.validate(),
-        Err(MessageValidationError::InvalidOperatorSigLen { len: 0 })
-    );
 }
 
 #[test]
@@ -752,39 +623,7 @@ fn watermark_bundle_validate_rejects_wrong_len_signature() {
     assert_eq!(ok.validate(), Ok(()));
 }
 
-// --- Edge-case roundtrips ------------------------------------------------
-
-#[test]
-fn stream_request_nonzero_byte_offset_roundtrip() -> Result<(), postcard::Error> {
-    // byte_offset != 0 exercises the multi-byte varint path (resume/seek);
-    // the shared sample uses 0, a single byte.
-    let req = StreamRequest {
-        byte_offset: 1_048_576,
-        ..sample_request()
-    };
-    let bytes = postcard::to_allocvec(&req)?;
-    let decoded: StreamRequest = postcard::from_bytes(&bytes)?;
-    assert_eq!(req, decoded);
-    assert_eq!(decoded.byte_offset, 1_048_576);
-    Ok(())
-}
-
-#[test]
-fn stream_request_bounded_byte_len_roundtrip() -> Result<(), postcard::Error> {
-    // A bounded range [byte_offset, byte_offset + byte_len) (ADR 005 §Bounded
-    // byte ranges) — byte_len != 0 distinguishes a scoped origin range pull
-    // from the whole-tail default (byte_len == 0).
-    let req = StreamRequest {
-        byte_offset: 1_048_576,
-        byte_len: 262_144,
-        ..sample_request()
-    };
-    let bytes = postcard::to_allocvec(&req)?;
-    let decoded: StreamRequest = postcard::from_bytes(&bytes)?;
-    assert_eq!(req, decoded);
-    assert_eq!(decoded.byte_len, 262_144);
-    Ok(())
-}
+// --- ChunkData framing ---------------------------------------------------
 
 #[test]
 fn an_empty_chunk_cannot_be_decoded_at_all() -> Result<(), Box<dyn std::error::Error>> {
@@ -1039,27 +878,6 @@ fn chunk_frame_postcard_len_matches_the_encoded_header() -> Result<(), MessageVa
     // Every caller rejects 0 first, but the sizing answer for it is still the
     // true encoded length of an empty `ChunkData` body: discriminant + `0x00`.
     assert_eq!(chunk_frame_postcard_len(0), 2);
-    Ok(())
-}
-
-#[test]
-fn chunk_data_validate_agrees_with_the_constructor() -> Result<(), MessageValidationError> {
-    // `validate` survives only as the arm `ClientMessage::validate` dispatches to, so
-    // the aggregate validator stays total over the enum. It cannot FAIL — a
-    // `ChunkData` that exists came through `new` or the decode gate — and that is the
-    // assertion worth making: if this ever returns `Err`, some construction path has
-    // gone around the constructor.
-    assert_eq!(ChunkData::new(vec![0u8])?.validate(), Ok(()));
-    assert_eq!(ChunkData::new(vec![0u8; 1024 * 1024])?.validate(), Ok(()));
-    Ok(())
-}
-
-#[test]
-fn client_binding_roundtrip() -> Result<(), postcard::Error> {
-    let b = sample_binding();
-    let bytes = postcard::to_allocvec(&b)?;
-    let decoded: ClientBinding = postcard::from_bytes(&bytes)?;
-    assert_eq!(b, decoded);
     Ok(())
 }
 

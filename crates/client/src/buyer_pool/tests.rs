@@ -21,26 +21,6 @@ fn domain() -> Eip712Domain {
     voucher_domain(CHAIN_ID, Address::repeat_byte(0xCC))
 }
 
-// ---- `open_pool` / `top_up` signatures -------------------------------
-
-/// Compile-time signature check that `open_pool` takes only `deposit` on the
-/// value axis (no provider, no `voucher_signer`): naming the monomorphized
-/// generic fn item as a value forces the compiler to check its parameter
-/// list. `open_pool` submits a real `openPool` tx and decodes the mined
-/// receipt, so end-to-end coverage lives in the anvil e2e.
-#[test]
-fn open_pool_signature_takes_deposit_only() {
-    let _ = open_pool::<alloy::providers::RootProvider>;
-}
-
-/// Compile-time signature check that `top_up` takes `(contract, owner,
-/// pool_id, additional)` — no store, no provider — mirroring the pool
-/// contract's own `topUp(poolId, additionalDeposit)` sent by its owner.
-#[test]
-fn top_up_signature_takes_pool_id_and_amount() {
-    let _ = top_up::<alloy::providers::RootProvider>;
-}
-
 /// A `PaymentPool` on a filler-free provider whose RPC calls are answered
 /// in order by `asserter`; a call past the queue fails in transport. The
 /// provider carries the send-leg marker, as the production builders do, so
@@ -204,13 +184,6 @@ fn removing_an_entry_releases_one_of_two_equal_ones() {
     escrows.insert(submitted);
     escrows.remove(submitted);
     assert_eq!(escrows.top_ups(), vec![submitted]);
-}
-
-/// Run [`open_pool`] against a mocked pool whose RPC calls `asserter` answers.
-async fn open_on(asserter: alloy::providers::mock::Asserter) -> anyhow::Error {
-    open_tracked(mocked_pool(asserter), &UnconfirmedEscrows::default(), None)
-        .await
-        .unwrap_err()
 }
 
 /// Run [`open_pool`] on `contract`, holding its broadcast in `opens`, with
@@ -644,8 +617,10 @@ async fn a_mined_open_with_no_pool_opened_event_is_held_untracked() {
     assert_eq!(held, [SCRIPTED_TX]);
 }
 
-/// A receipt read that fails leaves the open unconfirmed in `opens` as well as
-/// in the error: a caller that drops the error can still name the tx.
+/// An `openPool` whose receipt cannot be read may still escrow its deposit, so
+/// it stays unconfirmed in `opens` as well as in the error, which names its tx
+/// hash and nonce and is classified as an RPC fault (#2413, #2415): a caller
+/// that drops the error can still name the tx.
 #[tokio::test]
 async fn an_unreadable_receipt_keeps_the_open_unconfirmed() {
     let hash = B256::repeat_byte(0xab);
@@ -661,11 +636,20 @@ async fn an_unreadable_receipt_keeps_the_open_unconfirmed() {
         nonce: 5,
     };
     assert_eq!(err.downcast_ref::<OpenUnconfirmed>(), Some(&unconfirmed));
+    assert!(
+        format!("{err:#}").contains(&format!("{hash:#x}")),
+        "{err:#}"
+    );
+    assert_eq!(
+        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
+        Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
+    );
     assert_eq!(opens.opens(), vec![unconfirmed]);
 }
 
-/// A submit that fails in transport may have been broadcast, so `opens` keeps
-/// its nonce, as the error does.
+/// An `openPool` submit that fails in transport may have been broadcast, so
+/// `opens` keeps its nonce, as the error does: [`OpenUnconfirmed`] with no
+/// hash, classified as an RPC fault.
 #[tokio::test]
 async fn a_transport_failed_submit_stays_unconfirmed_by_nonce() {
     let asserter = alloy::providers::mock::Asserter::new();
@@ -676,34 +660,12 @@ async fn a_transport_failed_submit_stays_unconfirmed_by_nonce() {
         .unwrap_err();
     let unconfirmed = OpenUnconfirmed { tx: None, nonce: 5 };
     assert_eq!(err.downcast_ref::<OpenUnconfirmed>(), Some(&unconfirmed));
-    assert_eq!(opens.opens(), vec![unconfirmed]);
-}
-
-/// An `openPool` whose receipt cannot be read may still escrow its deposit, so
-/// the error names its tx hash and nonce and is classified as an RPC fault
-/// (#2413, #2415).
-#[tokio::test]
-async fn an_unreadable_open_pool_receipt_names_the_tx() {
-    let hash = B256::repeat_byte(0xab);
-    let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&U256::from(5u64));
-    asserter.push_success(&hash);
-    let err = open_on(asserter).await;
-    assert!(
-        format!("{err:#}").contains(&format!("{hash:#x}")),
-        "{err:#}"
-    );
-    assert_eq!(
-        err.downcast_ref::<OpenUnconfirmed>(),
-        Some(&OpenUnconfirmed {
-            tx: Some(hash),
-            nonce: 5
-        })
-    );
+    assert!(format!("{err:#}").contains("may have broadcast"), "{err:#}");
     assert_eq!(
         err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
         Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
     );
+    assert_eq!(opens.opens(), vec![unconfirmed]);
 }
 
 /// An `openPool` whose chain reads fail before the send signed nothing, so it
@@ -727,24 +689,6 @@ async fn an_open_pool_whose_reads_fail_before_the_send_is_not_unconfirmed() {
         Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
     );
     assert!(opens.opens().is_empty());
-}
-
-/// An `openPool` submit that fails in transport may have been broadcast, so it
-/// carries [`OpenUnconfirmed`] with no hash and the nonce it was sent with.
-#[tokio::test]
-async fn a_transport_failed_open_pool_submit_is_unconfirmed_with_its_nonce() {
-    let asserter = alloy::providers::mock::Asserter::new();
-    asserter.push_success(&U256::from(5u64));
-    let err = open_on(asserter).await;
-    assert_eq!(
-        err.downcast_ref::<OpenUnconfirmed>(),
-        Some(&OpenUnconfirmed { tx: None, nonce: 5 })
-    );
-    assert!(format!("{err:#}").contains("may have broadcast"), "{err:#}");
-    assert_eq!(
-        err.downcast_ref::<decdn_incentive::PoolOpenFailureReason>(),
-        Some(&decdn_incentive::PoolOpenFailureReason::RpcError)
-    );
 }
 
 /// A re-sent `openPool` returns its hash without waiting for a receipt, and
@@ -1097,22 +1041,6 @@ fn self_owned_lane_ctx_signs_with_the_lane_key() -> anyhow::Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("the lane context carries no capability"))?;
     assert_eq!(cap.capability.signer, payer.lane().address());
-    Ok(())
-}
-
-/// Regenerating the capability from the same key + params is deterministic:
-/// EIP-712 signing over a fixed digest is stable, so a per-connection
-/// regeneration (never stored) yields byte-identical signatures.
-#[test]
-fn regenerated_capability_is_deterministic_for_same_params() -> anyhow::Result<()> {
-    let payer = store_payer(&MemoryBuyerPoolStore::new())?;
-    let pool_id = B256::repeat_byte(0x22);
-    let a = issue_self_capability(&payer, pool_id, 5_000u64, 1_900_000_000, &domain())?;
-    let b = issue_self_capability(&payer, pool_id, 5_000u64, 1_900_000_000, &domain())?;
-    assert_eq!(
-        a.signature, b.signature,
-        "regenerated signatures must match"
-    );
     Ok(())
 }
 

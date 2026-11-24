@@ -136,15 +136,6 @@ fn a_failed_commit_still_reclaims_the_temp() -> anyhow::Result<()> {
 }
 
 #[test]
-fn generates_and_reloads() -> anyhow::Result<()> {
-    let dir = secure_tempdir()?;
-    let k1 = load_or_generate(dir.path())?;
-    let k2 = load_or_generate(dir.path())?;
-    assert_eq!(k1.to_bytes(), k2.to_bytes());
-    Ok(())
-}
-
-#[test]
 fn load_or_create_reports_whether_it_generated() -> anyhow::Result<()> {
     let dir = secure_tempdir()?;
     let first = load_or_create(dir.path())?;

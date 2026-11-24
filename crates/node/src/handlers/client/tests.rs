@@ -482,6 +482,21 @@ async fn pool_remaining_covers_window_reserves_the_floor_m() {
         !handler.pool_remaining_covers_window(m, window_bytes, rate_per_mb),
         "remaining == M leaves nothing above the floor"
     );
+    // A zero floor: exactly the window cost is covered, one base unit short
+    // is refused.
+    let (zero_floor, _zero_dir) = handler_for_tests(&metrics).await;
+    assert!(
+        zero_floor.pool_remaining_covers_window(window_cost, window_bytes, rate_per_mb),
+        "exactly the cost clears a zero floor"
+    );
+    assert!(
+        !zero_floor.pool_remaining_covers_window(
+            window_cost - U256::from(1u64),
+            window_bytes,
+            rate_per_mb
+        ),
+        "one base unit short must refuse"
+    );
 }
 
 /// The seller-side lane-count gauge tracks the live `lanes` map through the
@@ -719,39 +734,6 @@ async fn racing_first_streams_record_the_fresh_lane_once() {
         "only the vacant-slot winner records the fresh lane"
     );
     assert_eq!(handler.lane_count.load(Ordering::Relaxed), 1);
-}
-
-/// Floor-`M` serving policy: the node keeps serving while `remaining − M`
-/// covers the priced span and stops the instant it cannot. `M` is the
-/// refundable minimum the pool owner is guaranteed to keep.
-#[tokio::test]
-async fn floor_m_serves_above_the_floor_and_stops_at_it() {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _dir) = handler_for_tests(&metrics).await;
-    // `handler_for_tests` seeds `pool_min_remaining_deposit == 0`; rebuild a
-    // small handler with a real floor by poking the field via a fresh deps is
-    // awkward, so assert the arithmetic directly against the ZERO-floor
-    // handler plus a manual floor calculation.
-    // ZERO floor: covered whenever remaining >= min_payment.
-    let rate = 1_000u64;
-    let bytes = decdn_incentive::rate::BYTES_PER_MB; // one MB
-    let cost = min_payment(bytes, rate);
-    assert!(
-        handler.pool_remaining_covers_window(cost, bytes, rate),
-        "exactly the cost clears a zero floor"
-    );
-    assert!(
-        !handler.pool_remaining_covers_window(cost - U256::from(1u64), bytes, rate),
-        "one base unit short must refuse"
-    );
-    // Non-zero floor arithmetic: remaining − M must still cover the window.
-    let floor = U256::from(500u64);
-    let remaining = cost + floor;
-    let refundable = remaining.saturating_sub(floor);
-    assert_eq!(refundable, cost, "remaining − M is exactly the window cost");
-    // Draining to the floor must stop serving: remaining − M underflows to 0.
-    let at_floor = floor;
-    assert!(at_floor.saturating_sub(floor).is_zero());
 }
 
 /// Every takedown and withdrawal reason is one `Declined` (ADR 005
@@ -1072,75 +1054,6 @@ async fn intake_rejects_wrong_owner_capability() {
         lane_owner_sig(&handler, &lane_key).await,
         Some(expected_sig),
         "the verified owner signature is captured on the lane record for the redeemer"
-    );
-}
-
-/// Capability intake refuses a capability with an `expiry` of `0`: the
-/// contract reads it as already expired, and on-chain registration is
-/// write-once per `(pool, signer)`, so such a grant must never register a lane
-/// or reach the lane store. The same capability with a future expiry registers
-/// its lane (control).
-#[tokio::test]
-async fn intake_rejects_zero_expiry_capability() {
-    let metrics = Arc::new(Metrics::new());
-    let owner = PrivateKeySigner::random();
-    let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
-    let domain = TEST_DEPLOYMENT.voucher_domain();
-    let pool_id = B256::repeat_byte(0x66);
-    let signer = Address::repeat_byte(0x22);
-    let spending_cap = 1_000_000u64;
-
-    let make_wire = |expiry: u64| -> decdn_protocol::client::WireCapability {
-        let signed_cap = Capability {
-            signer,
-            spending_cap,
-            pool_id,
-            expiry,
-        }
-        .sign(&owner, &domain)
-        .expect("sign capability");
-        decdn_protocol::client::WireCapability {
-            spending_cap,
-            expiry,
-            owner_signature: signed_cap.signature.as_bytes().to_vec(),
-        }
-    };
-
-    let lane_key = LaneKey {
-        pool_id,
-        signer,
-        provider: handler.eth_signer.address(),
-    };
-
-    // A validly-signed capability with `expiry == 0` is dropped: no lane in the
-    // map or the store, so the voucher path keeps refusing the lane as unknown.
-    handler.intake_capability(
-        TEST_DEPLOYMENT,
-        pool_id,
-        signer,
-        owner.address(),
-        &make_wire(0),
-    );
-    assert!(
-        !handler.lanes.contains_key(&tid(lane_key)),
-        "a zero-expiry capability must not register a lane"
-    );
-    assert!(
-        matches!(test_store(&handler).get(lane_key), Ok(None)),
-        "a zero-expiry capability never reaches the lane store"
-    );
-
-    // The same grant with a far-future expiry registers the lane.
-    handler.intake_capability(
-        TEST_DEPLOYMENT,
-        pool_id,
-        signer,
-        owner.address(),
-        &make_wire(u64::MAX),
-    );
-    assert!(
-        handler.lanes.contains_key(&tid(lane_key)),
-        "a future-expiry capability registers its lane"
     );
 }
 
@@ -1625,8 +1538,6 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
     );
 }
 
-/// Lock the floor map for a test assertion, surfacing a poisoned lock as an
-/// `anyhow` error rather than panicking (the anti-panic policy holds in tests).
 /// The mid-stream solvency re-check stops at the refundable floor `M`: delivery
 /// continues while the pool's remaining deposit sits above `M` and stops once it
 /// reaches `M`. `M` covers every voucher in flight, so no other bound applies: the

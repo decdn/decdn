@@ -31,7 +31,6 @@ fn json_output_keys_and_types() {
     );
     assert_eq!(obj["hash"].as_str().map(str::len), Some(64));
     assert_eq!(obj["ok"].as_bool(), Some(true));
-    assert!(obj.get("has_blob").is_none());
     assert_eq!(obj["rate_per_mb"].as_u64(), Some(10));
     assert_eq!(obj["total_bytes"].as_u64(), Some(4096));
     assert_eq!(obj["coverage_blocks"].as_u64(), Some(1));
