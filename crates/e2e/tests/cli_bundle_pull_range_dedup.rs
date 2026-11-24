@@ -297,10 +297,10 @@ async fn run() -> anyhow::Result<()> {
 /// BLAKE3-exact.
 ///
 /// This exercises the finalize-aware guard on that self-heal path: the
-/// whole-file re-drive completes the blob (`drive` renames `<hex>.partial` to
-/// `<hex>`), so the guard must recognize completion and skip calling
-/// `hash_partial` on the now-absent `.partial` file, rather than surfacing an
-/// `Err(open: No such file)` that would fail the entry spuriously. With the
+/// whole-file re-drive completes the blob (`drive` exports `<hex>` and
+/// removes the store), so the guard must recognize completion and skip
+/// assembling from a store that no longer exists, rather than surfacing an
+/// error that would fail the entry spuriously. With the
 /// guard the pull succeeds; a regression here makes `decdn get` exit
 /// non-zero and `run_bundle_pull_until_ready` never succeed (the test times
 /// out).
@@ -430,8 +430,8 @@ async fn run_self_heal() -> anyhow::Result<()> {
     // The measured run: a fresh output dir (so `a.bin` is re-pulled and
     // re-registers `hash_donor`, arming `b.bin`'s self-heal) and EXACTLY ONE
     // `decdn get` invocation. The pool is already open, so the only way this
-    // exits non-zero is the self-heal bug — a `.partial` `drive` already renamed
-    // to `staging` after the whole-file re-drive. Without the finalize-aware
+    // exits non-zero is the self-heal bug — assembling from a store `drive`
+    // already exported to `staging` after the whole-file re-drive. Without the finalize-aware
     // guard the entry fails here; the retry loop is deliberately not used.
     let out_dir = client_dir.path().join("out");
     let out_args = bundle_get_argv(
@@ -1938,7 +1938,7 @@ async fn run_bundle_pull_json_until_ready(
         anyhow::ensure!(
             !stderr.contains("does not match its whole-file hash")
                 && !stderr.contains("No such file")
-                && !stderr.contains(".partial"),
+                && !stderr.contains(".assembly"),
             "decdn get --json failed with a non-transient reconstruction fault; \
              stderr:\n{stderr}"
         );
@@ -2082,11 +2082,11 @@ async fn run_bundle_pull_until_ready(
         // absorb a real bug (and silently re-pay for it), the exact hazard
         // Finding Critical-4 flags. Only the serve-path pool-resolution race is
         // retryable; any `failed:` line naming a whole-file-hash mismatch or a
-        // missing `.partial` fails the test immediately.
+        // missing assembly fails the test immediately.
         anyhow::ensure!(
             !stderr.contains("does not match its whole-file hash")
                 && !stderr.contains("No such file")
-                && !stderr.contains(".partial"),
+                && !stderr.contains(".assembly"),
             "decdn get failed with a non-transient reconstruction fault; \
              stderr:\n{stderr}"
         );

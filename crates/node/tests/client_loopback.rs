@@ -615,7 +615,13 @@ async fn peer_source_legs_share_one_connection_across_a_refusal() -> anyhow::Res
         let dir = store_dir.path().to_path_buf();
         async move {
             let total = u64::try_from(len)?;
-            let store = ClientRangedStore::create(&dir, name, *hash.as_bytes(), total)?;
+            let store = ClientRangedStore::on_disk(
+                &dir.join(format!("{name}.decdn")),
+                *hash.as_bytes(),
+                total,
+            )
+            .await?
+            .exporting_to(dir.join(name));
             drive(
                 &store,
                 source,
@@ -738,16 +744,19 @@ async fn drive_scattered_as_a_restarted_payer() -> anyhow::Result<()> {
     // Four sibling fetches of the blob, one store each, on the one lane: the
     // shape of concurrent bundle entries that share a provider.
     let store_dir = tempfile::tempdir()?;
-    let stores = (0..4)
-        .map(|i| {
-            ClientRangedStore::create(
-                store_dir.path(),
-                &format!("blob{i}"),
+    let mut stores = Vec::new();
+    for i in 0..4 {
+        let name = format!("blob{i}");
+        stores.push(
+            ClientRangedStore::on_disk(
+                &store_dir.path().join(format!("{name}.decdn")),
                 *hash.as_bytes(),
                 total,
             )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+            .await?
+            .exporting_to(store_dir.path().join(name)),
+        );
+    }
 
     let spent_ledger = Arc::clone(&ledger);
     let spent = move || spent_ledger.committed().amount;
@@ -15086,7 +15095,13 @@ async fn drive_against_stop_send_server(
     let ledger = Arc::new(ctx.new_ledger());
     let ctx = Arc::new(std::sync::Mutex::new(ctx));
     let store_dir = tempfile::tempdir()?;
-    let store = ClientRangedStore::create(store_dir.path(), "blob", *hash.as_bytes(), total_bytes)?;
+    let store = ClientRangedStore::on_disk(
+        &store_dir.path().join("blob.decdn"),
+        *hash.as_bytes(),
+        total_bytes,
+    )
+    .await?
+    .exporting_to(store_dir.path().join("blob"));
     let stream_dom = stream_domain();
     let source = PeerSource::new(
         &client_ep,

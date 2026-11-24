@@ -103,8 +103,7 @@ async fn the_predicted_leg_is_the_first_runs_first_leg() {
         (DISCOVERY_BLOCK_BYTES + 7, 2 * MIB, 0, vec![head, tail]),
     ];
     for (offset, len, ceiling, coverages) in cases {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ClientRangedStore::create(dir.path(), "b", [7; 32], total).unwrap();
+        let store = ClientRangedStore::in_memory([7; 32], total);
         let prime = PrimeLeg::new(offset, len);
         let gap = store.missing_ranges(offset, len).await.unwrap();
         let sources: Vec<SourceCoverage> = coverages

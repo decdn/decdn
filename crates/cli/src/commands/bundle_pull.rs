@@ -721,8 +721,8 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// includes the bao proof overhead (a clean pull pays a little more than
 /// `downloaded`). Content delivered twice, or paid for and then dropped after
 /// a lane fault, counts each time it is paid. An entry that fails or is
-/// interrupted counts here but not in `downloaded`; a later run resumes its
-/// `.partial` and reports it as `resumed_bytes`.
+/// interrupted counts here but not in `downloaded`; a later run resumes from
+/// its store and reports it as `resumed_bytes`.
 ///
 /// `wire_bytes` is the `ChunkData` wire bytes this run's lanes read, verified
 /// or not, bao proof overhead included. Payment follows verification, so it
@@ -732,8 +732,8 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// unpaid. The figure is net against `paid_bytes`: a voucher armed before the
 /// pull can confirm during it, so `paid_bytes` can come out above it.
 ///
-/// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
-/// interrupted run fetched and paid for, which this run resumed rather than
+/// `resumed_bytes` is the content bytes that an earlier, interrupted run
+/// fetched into an entry's store and paid for, which this run resumed rather than
 /// fetched again. It is never part of `downloaded`. A byte that this run also
 /// spliced from disk counts only in `spliced_bytes`.
 ///
@@ -779,8 +779,8 @@ struct PullReport {
     reconstructed: u64,
     spliced_bytes: u64,
     hints_ignored: u64,
-    /// Content bytes of `.partial` prefixes that earlier runs fetched and this
-    /// run resumed; never part of `downloaded`.
+    /// Content bytes that earlier runs fetched into entry stores and this run
+    /// resumed; never part of `downloaded`.
     resumed_bytes: u64,
     /// Count of distinct blobs materialized from an on-disk whole-file donor;
     /// extra destinations of the same blob are counted in `linked`.
@@ -1285,7 +1285,7 @@ impl PullObserver {
     }
 
     /// End a run that has nothing to fetch, for `reason`: say so, warn of
-    /// the `.partial` files earlier runs left under `out`, and record the
+    /// the partial downloads earlier runs left under `out`, and record the
     /// `excluded` entries, so the run's record shows how many it dropped.
     /// Under `--json`, the run says so with its [`PullReport`], the same
     /// object every real run prints: no entry fetched, the `excluded` count,
@@ -1768,9 +1768,9 @@ fn counts_line(rep: &PullReport) -> String {
 }
 
 /// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files —
-/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges`, `<hex>.assembly` — whose hash is not in
-/// `keep`, and total the disk space they take ([`allocated_bytes`]). Other
-/// names (a record's temporary file) are not counted. A missing or unreadable
+/// `<hex>` and `<hex>.assembly` — whose hash is not in `keep`, and total the
+/// disk space they take ([`allocated_bytes`]). Other names (the run's
+/// download store among them) are not counted. A missing or unreadable
 /// directory holds nothing.
 fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
     let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
@@ -1783,11 +1783,7 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let stem = name
-            .strip_suffix(".partial.ranges")
-            .or_else(|| name.strip_suffix(".partial"))
-            .or_else(|| name.strip_suffix(".assembly"))
-            .unwrap_or(name);
+        let stem = name.strip_suffix(".assembly").unwrap_or(name);
         let Ok(hash) = blake3::Hash::from_hex(stem) else {
             continue;
         };

@@ -3,6 +3,7 @@ use super::super::{
 };
 use super::*;
 use crate::ProvenSize;
+use crate::ranged_store::store_dir_for;
 use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
 use std::assert_matches;
@@ -1883,15 +1884,14 @@ fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
 
 /// Review #1 (money-band): when a range drive COMPLETES the store — a resumed
 /// run whose store already held the donor-overlap ranges, so the very first
-/// complement drive finalizes and renames `<hex>.partial` -> `<hex>` —
-/// `reassemble_dedup` must treat the entry as done and splice nothing. The
-/// [`FinalizingDriver`] simulates that finalize on its first drive; the
-/// post-drive `staging.try_exists()` guard returns before any assembly is
-/// built.
+/// complement drive finalizes and exports `<hex>` — `reassemble_dedup` must
+/// treat the entry as done and splice nothing. The [`FinalizingDriver`]
+/// simulates that finalize on its first drive; the post-drive
+/// `staging.try_exists()` guard returns before any assembly is built.
 #[tokio::test]
 async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
     // A driver that, on its first (complement) drive, finalizes the blob by
-    // creating the plain `<hex>` staging file and leaving no `.partial`.
+    // creating the plain `<hex>` staging file.
     struct FinalizingDriver {
         hash: [u8; 32],
         staging: PathBuf,
@@ -1903,6 +1903,11 @@ async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
         }
         fn staging(&self) -> &Path {
             &self.staging
+        }
+        fn store(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+            Box::pin(async { None })
         }
         fn drive<'a>(
             &'a self,
@@ -2265,17 +2270,54 @@ fn planned_downloads_match_the_run_total() {
     );
 }
 
-/// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` opens
-/// the entry's ranged store the way the real drive does (`open_or_create`) and
-/// admits each requested range's bao-verified bytes into it, so the store's
-/// record names them present. It never finalizes `<hex>` itself, so
-/// `reassemble_dedup` exercises its splice + whole-file verify + promote path.
-/// Records every driven range.
+/// The store a test entry at `staging` fetches into: `store` beside it.
+fn test_store_path(staging: &Path) -> PathBuf {
+    staging.with_file_name("store")
+}
+
+/// Seed the store beside `staging` with the verified prefix
+/// `[0, prefix_len)` of `content`, as an earlier interrupted run would leave
+/// it, and return the spans the store then holds of it.
+async fn seed_prefix(staging: &Path, content: &[u8], prefix_len: u64) -> Vec<(u64, u64)> {
+    let hash = *blake3::hash(content).as_bytes();
+    let total = u64::try_from(content.len()).expect("content len fits u64");
+    let dir = BlobDir::open(&test_store_path(staging))
+        .await
+        .expect("open store");
+    dir.blob(hash, total, None)
+        .await
+        .expect("open entry")
+        .admit_prefix(content, prefix_len)
+        .await
+        .expect("seed the store");
+    let spans = resumed_spans(Some(&dir), hash).await;
+    dir.shutdown().await.expect("shut down store");
+    spans
+}
+
+/// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive`
+/// admits each requested range's bao-verified bytes into the store beside
+/// `staging` ([`test_store_path`]), so the store holds them present. It
+/// never finalizes `<hex>` itself, so `reassemble_dedup` exercises its
+/// splice + whole-file verify + promote path. Records every driven range.
 struct RecordingDriver {
     hash: [u8; 32],
     staging: PathBuf,
     content: Vec<u8>,
     driven: std::sync::Mutex<Vec<(u64, u64)>>,
+    store: tokio::sync::OnceCell<BlobDir>,
+}
+impl RecordingDriver {
+    /// The store the drives fill, opened on first use.
+    async fn opened(&self) -> &BlobDir {
+        self.store
+            .get_or_init(|| async {
+                BlobDir::open(&test_store_path(&self.staging))
+                    .await
+                    .expect("open store")
+            })
+            .await
+    }
 }
 impl RangeDriver for RecordingDriver {
     fn hash(&self) -> [u8; 32] {
@@ -2284,6 +2326,9 @@ impl RangeDriver for RecordingDriver {
     fn staging(&self) -> &Path {
         &self.staging
     }
+    fn store(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+        Box::pin(async move { Some(self.opened().await.clone()) })
+    }
     fn drive<'a>(
         &'a self,
         ranges: &'a [(u64, u64)],
@@ -2291,9 +2336,12 @@ impl RangeDriver for RecordingDriver {
         Box::pin(async move {
             use decdn_bao_range::RangedStore as _;
             let total = u64::try_from(self.content.len()).expect("content len fits u64");
-            let (dir, stem) = ranged_store_location(&self.staging).expect("location");
-            let store = ClientRangedStore::open_or_create(&dir, &stem, self.hash, total)
-                .expect("open ranged store");
+            let store = self
+                .opened()
+                .await
+                .blob(self.hash, total, None)
+                .await
+                .expect("open entry");
             let outboard = bao_tree::io::outboard::PreOrderMemOutboard::create(
                 &self.content,
                 decdn_bao_range::IROH_BLOCK_SIZE,
@@ -2319,6 +2367,7 @@ impl RangeDriver for RecordingDriver {
 }
 
 /// A [`RangeDriver`] whose every drive fails, as an interrupted run's would.
+/// It opens no store.
 struct FailingDriver {
     hash: [u8; 32],
     staging: PathBuf,
@@ -2330,6 +2379,9 @@ impl RangeDriver for FailingDriver {
     fn staging(&self) -> &Path {
         &self.staging
     }
+    fn store(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+        Box::pin(async { None })
+    }
     fn drive<'a>(
         &'a self,
         _ranges: &'a [(u64, u64)],
@@ -2340,7 +2392,7 @@ impl RangeDriver for FailingDriver {
 
 /// Spliced donor bytes never enter the entry's ranged store: the store holds
 /// only bao-verified bytes, so an interrupted entry leaves no donor byte in
-/// its `.partial` for a later run to resume from.
+/// it for a later run to resume from.
 #[tokio::test]
 async fn spliced_bytes_never_enter_the_store() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -2397,10 +2449,9 @@ async fn spliced_bytes_never_enter_the_store() {
     .await;
     assert!(res.is_err(), "the fallback drive fails: {res:?}");
     assert!(!staging.exists(), "nothing is promoted");
-    let partial = std::fs::read(partial_path(&staging)).unwrap_or_default();
     assert!(
-        partial.iter().all(|&b| b == 0),
-        "the store's `.partial` holds no spliced byte"
+        !test_store_path(&staging).exists(),
+        "no splice opened a store"
     );
 }
 
@@ -2423,9 +2474,7 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
 
     // An earlier run fetched `[0, GROUP)` into the store.
     let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, whole);
+    let resumed = seed_prefix(&staging, &content, GROUP).await;
     assert_eq!(resumed, vec![(0, GROUP)]);
 
     // The donor's chunk verifies against its own hint, but its first group
@@ -2443,6 +2492,7 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: vec![DonorRange {
@@ -2482,15 +2532,11 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
         !assembly_path(&staging).exists(),
         "the assembly file is promoted"
     );
-    assert!(
-        !partial_path(&staging).exists(),
-        "the store's `.partial` is removed once the entry is promoted"
-    );
 }
 
-/// An entry resumed from an earlier run's `.partial` whose splice then
-/// covers part of that prefix: the overlap counts once, as spliced, and only
-/// the bytes neither resumed nor spliced count as paid (#2236).
+/// An entry resumed from an earlier run's store whose splice then covers part
+/// of that prefix: the overlap counts once, as spliced, and only the bytes
+/// neither resumed nor spliced count as paid (#2236).
 #[tokio::test]
 async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -2503,9 +2549,7 @@ async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
 
     // An earlier, interrupted run fetched `[0, 3*GROUP)` into the store.
     let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, 3 * GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, whole);
+    let resumed = seed_prefix(&staging, &content, 3 * GROUP).await;
     assert_eq!(resumed, vec![(0, 3 * GROUP)]);
 
     // This run splices `[0, 2*GROUP)` from a donor and pays for the deferred
@@ -2519,6 +2563,7 @@ async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: vec![DonorRange {
@@ -2583,11 +2628,10 @@ fn a_self_heal_outcome_counts_the_whole_resumed_prefix() {
     assert_eq!(EntryBytes::dedup(4 * GROUP, outcome).paid, GROUP);
 }
 
-/// The whole-blob path reads what an earlier run fetched from the resume
-/// record and pays only for the rest (#2236). A fresh entry and an
-/// unreadable record resume nothing.
-#[test]
-fn resumed_spans_read_the_record_an_earlier_run_left() {
+/// The whole-blob path reads what an earlier run fetched from the run's
+/// store and pays only for the rest (#2236). No store resumes nothing.
+#[tokio::test]
+async fn resumed_spans_read_the_store_an_earlier_run_left() {
     let tmp = tempfile::tempdir().expect("tmp");
     let content: Vec<u8> = (0..3 * GROUP + 99)
         .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
@@ -2597,13 +2641,11 @@ fn resumed_spans_read_the_record_an_earlier_run_left() {
     let staging = tmp.path().join("blob");
 
     assert!(
-        resumed_spans(&staging, hash).is_empty(),
-        "no record, no spans"
+        resumed_spans(None, hash).await.is_empty(),
+        "no store, no spans"
     );
 
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, hash);
+    let resumed = seed_prefix(&staging, &content, GROUP).await;
     assert_eq!(resumed, vec![(0, GROUP)]);
     assert_eq!(
         EntryBytes::whole_blob(len, span_bytes(&resumed)),
@@ -2616,12 +2658,6 @@ fn resumed_spans_read_the_record_an_earlier_run_left() {
     // A resumed count never exceeds the blob.
     assert_eq!(EntryBytes::whole_blob(10, 20).paid, 0);
     assert_eq!(EntryBytes::whole_blob(10, 20).resumed, 10);
-
-    std::fs::write(tmp.path().join("blob.partial.ranges"), b"not json").expect("corrupt");
-    assert!(
-        resumed_spans(&staging, hash).is_empty(),
-        "an unreadable record resumes nothing"
-    );
 }
 
 /// Two donor chunks of a blob, `[0, cut)` and `[cut, 4*GROUP)`, each written
@@ -2795,6 +2831,7 @@ async fn reassemble_dedup_splices_a_boundary_group_from_two_donors() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -2838,6 +2875,7 @@ async fn reassemble_dedup_refetches_the_outward_group_span_of_a_failed_donor() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -2894,6 +2932,7 @@ async fn reconcile_deferred_falls_back_to_the_outward_group_span() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -2950,6 +2989,7 @@ async fn spliced_bytes_exclude_a_first_splice_refetch_under_a_tail_splice() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -3041,6 +3081,7 @@ async fn reconcile_deferred_splices_a_late_registered_donor() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: Vec::new(),
@@ -3121,6 +3162,7 @@ async fn reconcile_deferred_pays_when_the_assigned_fetcher_never_produces_it() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: Vec::new(),
@@ -3182,6 +3224,9 @@ impl RangeDriver for SlotDriver<'_, '_> {
     fn staging(&self) -> &Path {
         self.inner.staging()
     }
+    fn store(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+        self.inner.store()
+    }
     fn drive<'a>(
         &'a self,
         ranges: &'a [(u64, u64)],
@@ -3231,6 +3276,7 @@ async fn a_donor_waiter_gives_its_slot_to_a_queued_entry_and_retakes_it_to_drive
             staging: staging.clone(),
             content: content.clone(),
             driven: std::sync::Mutex::new(Vec::new()),
+            store: tokio::sync::OnceCell::new(),
         },
         slot: &slot,
         held_on_drive: std::sync::Mutex::new(Vec::new()),
@@ -3315,6 +3361,7 @@ async fn a_waiter_whose_donor_arrives_holds_its_slot_again_for_the_splice() {
             staging: staging.clone(),
             content: content.clone(),
             driven: std::sync::Mutex::new(Vec::new()),
+            store: tokio::sync::OnceCell::new(),
         },
         slot: &slot,
         held_on_drive: std::sync::Mutex::new(Vec::new()),
@@ -3923,7 +3970,7 @@ fn group_transfer_downloads_only_the_paid_bytes_of_a_spliced_blob() {
     assert_eq!(t.reconstructed, 100);
 }
 
-/// A blob resumed from an earlier run's `.partial` downloads only what this
+/// A blob resumed from an earlier run's store downloads only what this
 /// run fetched; the resumed prefix is tallied apart and counted once per
 /// blob, however many paths it lands at (#2236).
 #[test]
@@ -5278,20 +5325,21 @@ fn root(blob: &[u8]) -> [u8; 32] {
     *blake3::hash(blob).as_bytes()
 }
 
-/// `len` bytes at `offset` of the entry's `.partial` beside `dest`: a
-/// range entry that fetched only some ranges stays unpromoted.
-fn read_range(dest: &Path, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
-    use std::io::{Read as _, Seek as _};
-    let mut f = std::fs::File::open(partial_path(dest))?;
-    f.seek(std::io::SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; usize::try_from(len)?];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+/// `len` bytes at `offset` of `blob`'s entry in the store beside `dest`: a
+/// range entry that fetched only some ranges stays in its store.
+async fn read_range(dest: &Path, blob: &[u8], offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+    let dir = BlobDir::open(&store_dir_for(dest)?).await?;
+    let store = dir
+        .blob(root(blob), u64::try_from(blob.len())?, None)
+        .await?;
+    let bytes = store.read(offset, len).await;
+    dir.shutdown().await?;
+    Ok(bytes?.to_vec())
 }
 
 /// A range-dedup entry fetches only the ranges no donor supplies, through
 /// the acquire loop. Its one blipping holder cools while the other holder
-/// carries the range, and the entry stays a `.partial` for the splice.
+/// carries the range, and the entry stays in its store for the splice.
 #[tokio::test(start_paused = true)]
 async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
     let blob = test_blob(6 * 1024 * 1024);
@@ -5325,7 +5373,7 @@ async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
         "holder 0xA1 reset a stream mid-range"
     );
     assert_eq!(
-        read_range(&dest, 1024 * 1024, 2 * 1024 * 1024)?,
+        read_range(&dest, &blob, 1024 * 1024, 2 * 1024 * 1024).await?,
         blob[1024 * 1024..3 * 1024 * 1024]
     );
     assert!(
@@ -5503,6 +5551,7 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
         false,
         &plan,
         &disk,
+        None,
     )
     .await;
     assert_eq!(
@@ -5520,6 +5569,7 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
         true,
         &plan,
         &DiskState::default(),
+        None,
     )
     .await;
     assert_eq!(all.len(), 3, "an overwriting pull fetches every group");
@@ -5540,7 +5590,7 @@ async fn planned_work_leaves_out_colliding_entries() {
     for overwrite in [false, true] {
         let disk =
             resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), overwrite).await;
-        let work = planned_work(&entries, &landing, overwrite, &plan, &disk).await;
+        let work = planned_work(&entries, &landing, overwrite, &plan, &disk, None).await;
         assert_eq!(
             work.keys().collect::<Vec<_>>(),
             vec![&[3; 32]],
