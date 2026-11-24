@@ -60,8 +60,8 @@ pub trait PoolStateStore: Send + Sync {
     /// Callers MUST pass a `LaneState` whose `last_*` tuple is a non-strict
     /// monotonic successor of any previously-recorded state for the same
     /// [`LaneKey`]. The trait does not re-validate this —
-    /// [`LaneState::apply_voucher`] is the canonical caller and enforces
-    /// monotonicity upstream.
+    /// [`LaneState::advance_presigned`] and
+    /// [`LaneState::advance_preimage_verified`] enforce monotonicity upstream.
     ///
     /// # Errors
     ///

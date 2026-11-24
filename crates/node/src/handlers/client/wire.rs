@@ -703,11 +703,7 @@ impl std::error::Error for PeerFault {}
 /// `error!`. A client's payment fault is neither a node bug nor a disconnect, and
 /// under a misbehaving client it is noisy, so it carries its own marker and lands
 /// at `debug!`. Attach it with [`anyhow::Error::context`] and recover it with
-/// `anyhow::Error::is`.
-///
-/// It marks only the client-attributable stops. The defensive node-invariant
-/// bail beside them — a `RetrySignal` from a path that touches no store — stays
-/// unmarked, because that one IS a node bug.
+/// `anyhow::Error::is`. It marks only the client-attributable stops.
 #[derive(Debug)]
 pub(super) struct ClientPaymentFault;
 

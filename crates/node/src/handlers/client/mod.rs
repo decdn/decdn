@@ -43,8 +43,8 @@ use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, CacheError, Hash};
 use decdn_incentive::rate::{DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
 use decdn_incentive::store::{PoolStateStore, StoreError};
 use decdn_incentive::{
-    Capability, Deployment, LaneKey, LaneState, RetrySignal, SignedCapability, SignedVoucher,
-    StreamSigData, verify_binding, voucher_reject_reason, wire_voucher_to_signed,
+    Capability, Deployment, LaneKey, LaneState, SignedCapability, SignedVoucher, StreamSigData,
+    verify_binding, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_protocol::client::{
     ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,

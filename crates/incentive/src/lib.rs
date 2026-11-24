@@ -114,8 +114,7 @@ pub use chain::{
     root_from_seed, verify_forward,
 };
 pub use client_bridge::{
-    RetrySignal, WireVoucherError, signed_to_wire_voucher, voucher_reject_reason,
-    wire_voucher_to_signed,
+    WireVoucherError, signed_to_wire_voucher, voucher_reject_reason, wire_voucher_to_signed,
 };
 pub use deployment::Deployment;
 pub use erc20::Erc20;

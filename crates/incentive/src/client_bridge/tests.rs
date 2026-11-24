@@ -1,5 +1,4 @@
 use super::*;
-use crate::store::StoreError;
 use crate::voucher::voucher_domain;
 use alloy::primitives::address;
 use alloy::signers::local::PrivateKeySigner;
@@ -124,33 +123,18 @@ fn amount_above_u64_max_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Every `PoolError` variant maps to a fixed reject reason — except the
-/// transient `Store`, which signals retry. Exhaustive by construction; if a
-/// new `PoolError` variant lands, `voucher_reject_reason` fails to compile
-/// and this test is the reminder to extend the wire enum.
+/// Every `PoolError` variant maps to a fixed reject reason. Exhaustive by
+/// construction; if a new `PoolError` variant lands, `voucher_reject_reason`
+/// fails to compile and this test is the reminder to extend the wire enum.
 #[test]
 fn voucher_reject_reason_is_exhaustive() {
     let cases = [
-        (
-            PoolError::WrongPool {
-                expected: B256::ZERO,
-                got: B256::ZERO,
-            },
-            Ok(VoucherRejectReason::WrongPool),
-        ),
-        (
-            PoolError::WrongProvider {
-                expected: PROVIDER,
-                got: PROVIDER,
-            },
-            Ok(VoucherRejectReason::WrongProvider),
-        ),
         (
             PoolError::AmountRegression {
                 last: U256::ZERO,
                 got: U256::ZERO,
             },
-            Ok(VoucherRejectReason::AmountRegression),
+            VoucherRejectReason::AmountRegression,
         ),
         (
             PoolError::UnderFold {
@@ -158,39 +142,31 @@ fn voucher_reject_reason_is_exhaustive() {
                 owed: U256::ZERO,
                 got: U256::ZERO,
             },
-            Ok(VoucherRejectReason::UnderFold),
+            VoucherRejectReason::UnderFold,
         ),
         (
             PoolError::BytesRegression {
                 last: U256::ZERO,
                 got: U256::ZERO,
             },
-            Ok(VoucherRejectReason::BytesRegression),
+            VoucherRejectReason::BytesRegression,
         ),
         (
             PoolError::CapExceeded {
                 cap: U256::ZERO,
                 got: U256::ZERO,
             },
-            Ok(VoucherRejectReason::SpendingCapExhausted),
+            VoucherRejectReason::SpendingCapExhausted,
         ),
         (
-            PoolError::Signature(VoucherError::InvalidSignature),
-            Ok(VoucherRejectReason::BadSignature),
-        ),
-        (
-            PoolError::Signature(VoucherError::WrongSigner {
-                expected: PROVIDER,
-                recovered: PROVIDER,
-            }),
-            Ok(VoucherRejectReason::WrongSigner),
+            PoolError::BadPreimage {
+                index: 1,
+                verified: 0,
+            },
+            VoucherRejectReason::BadPreimage,
         ),
     ];
     for (err, expected) in cases {
         assert_eq!(voucher_reject_reason(&err), expected, "{err:?}");
     }
-
-    // Store is transient — signals retry, not a wire rejection.
-    let store_err = PoolError::Store(StoreError::Io(std::io::Error::other("x")));
-    assert_eq!(voucher_reject_reason(&store_err), Err(RetrySignal));
 }
