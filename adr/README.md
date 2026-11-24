@@ -11,7 +11,7 @@ This directory is the protocol's canonical specification. Each numbered file is 
 - **Stake to participate, verify every byte.** Nodes must stake TOKEN before joining the mesh. A client protects itself against node misbehavior: it verifies the bytes and signs the price into each voucher. Honest nodes follow the on-chain content blacklist, and governance can eject an operator that does not.
 - **Origin storage is opaque.** Origin-backed nodes hold canonical content in S3/R2/B2/NFS/local-disk backends, but no external origin URL is ever exposed. Bypassing the payment layer requires bypassing the network entirely.
 - **Operator return is differentiated by capacity commitment, not raw stake.** The `CapacityBond` lock-to-capacity curve `bond = k × Mbps^α` requires operators to bond TOKEN proportional to declared bandwidth, with super-linear pressure against concentration. No fee discounts, no passive yield to non-operators.
-- **Before mainnet, the protocol has one design.** ADRs read as the canonical specification, not as an iteration log. Rejected alternatives are kept out of the ADR bodies entirely — archived in [`adr/_history/`](_history/alternatives-pre-launch.md), which is part of neither built PDF (see *Decision-record context* below).
+- **Before mainnet, the protocol has one design.** ADRs read as the canonical specification, not as an iteration log. ADR bodies carry no rejected alternatives; git history holds earlier designs (see *Decision-record context* below).
 
 ## Reading order
 
@@ -20,7 +20,7 @@ For first-time readers, follow this thematic order rather than the numeric one. 
 1. **Foundations** — language stack, network topology, content addressing, wire protocol.
 2. **Discovery** — DHT-based content lookup, regional proxy warming, multi-source fetch.
 3. **Payments** — the shared payment pool, vouchers, client architecture, smart-wallet support.
-4. **Tokenomics & incentives** — work-token tokenomics, liquidity strategy, deferred follow-ups.
+4. **Tokenomics & incentives** — work-token tokenomics, deferred follow-ups.
 5. **Verification & enforcement** — reputation, content takedown, region self-attestation.
 6. **Governance & contracts** — Governor + Timelock model, contract interaction map.
 7. **Operations** — node onboarding.
@@ -45,9 +45,7 @@ Appendices are listed in [`architecture.md` § Appendices — Reference Patterns
 
 ## Decision-record context
 
-ADRs are **decision records** — but the *rendered* spec carries only the canonical design. The pre-launch alternatives that were weighed and rejected (and the rationale) are collected in [`adr/_history/alternatives-pre-launch.md`](_history/alternatives-pre-launch.md), kept out of every ADR body and out of both built PDFs, so future contributors can see what was on the table without the spec reading as a debate transcript.
-
-> **Note:** the rejected-alternatives relocation is complete — ADR bodies carry no `## Alternatives Considered` section and no breadcrumb link; the `_history/` archive is reached directly.
+ADRs are **decision records**, and each one carries only the canonical design. ADR bodies have no `## Alternatives Considered` section, so the spec never reads as a debate transcript. A retired ADR is deleted, and its number is not reused. Git history keeps every earlier design and the rationale for each change.
 
 ## Contributing
 
@@ -84,7 +82,7 @@ A second purely-presentational filter, [`_build/table-autofit.lua`](_build/table
 
 The numeric build above is the canonical per-ADR reference. For a top-to-bottom read, build the same set in the thematic chapter order from [`architecture.md` § Reading Order](architecture.md#reading-order) — Foundations → Discovery → Payments → Tokenomics → Verification → Governance → Operations → Supporting → Appendices. Output goes to `adrs-book.pdf` so both PDFs can coexist.
 
-This build also strips *Deferred & Open* (and its legacy aliases *Open Questions* / *Future Work*) and *Alternatives Considered* / *Considered Alternatives* / *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. The architecture overview's *Reading Order* section is dropped from the book too — the book's part dividers and generated table of contents *are* the reading order, so the prose chapter list would be redundant there; it stays in the source and the numeric `adrs.pdf`. *Cross-ADR Impact* is **not** stripped — it carries substantive cross-cutting design content, not scaffolding. *Deferred & Open* is retained verbatim in the source `.md` files and the numeric `adrs.pdf` build — only the reading-order book strips it. Rejected alternatives are in no ADR; they live solely in [`adr/_history/`](_history/alternatives-pre-launch.md), which neither PDF includes. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) states what is omitted.
+This build also strips *Deferred & Open* (and its legacy aliases *Open Questions* / *Future Work*) and *Alternatives Considered* / *Considered Alternatives* / *"Why not …"* sections at render time via [`_build/strip-meta-sections.lua`](_build/strip-meta-sections.lua), so the document reads as a single canonical design rather than a debate transcript. The architecture overview's *Reading Order* section is dropped from the book too — the book's part dividers and generated table of contents *are* the reading order, so the prose chapter list would be redundant there; it stays in the source and the numeric `adrs.pdf`. *Cross-ADR Impact* is **not** stripped — it carries substantive cross-cutting design content, not scaffolding. *Deferred & Open* is retained verbatim in the source `.md` files and the numeric `adrs.pdf` build — only the reading-order book strips it. A short notice on the first page ([`_build/preface.md`](_build/preface.md)) states what is omitted.
 
 `make book` produces this. The thematic file order (with the `_build/part-*.md` dividers) and the `--lua-filter` wiring live in the `BOOK_SRCS` variable and the `adrs-book.pdf` recipe of [`adr/Makefile`](Makefile).
 
@@ -100,6 +98,6 @@ Recurring non-`Context`/`Decision`/`Consequences` sections use one canonical nam
 | **Deferred & Open** | Deferred work, open questions, forward-looking items | No — stripped | *Open Questions*, *Future Work*, *Future work and non-goals* (split: non-goals → Non-Goals) |
 | **Non-Goals** | Substantive scope exclusions | Yes — substantive | (was sometimes merged into *Future work and non-goals*) |
 | **References** | Bibliography / external links | Yes | (already consistent) |
-| **Alternatives Considered** | Rejected-alternative record | No — not in ADRs | Removed from ADR bodies; archived only in `_history/` (in neither PDF) |
+| **Alternatives Considered** | Rejected-alternative record | No — not in ADRs | Not used; git history holds rejected designs |
 
 The numeric `adrs.pdf` build keeps every section regardless of name; only the reading-order `adrs-book.pdf` applies the strip.

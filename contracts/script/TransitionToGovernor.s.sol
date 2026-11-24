@@ -33,8 +33,7 @@ interface IGovernorTimelock {
 ///         roles and revokes the multisig's, in that order.
 ///
 /// @dev    This script BROADCASTS NOTHING. It prints `TimelockController.scheduleBatch`
-///         and `executeBatch` calldata for the multisig to submit, exactly as
-///         `ActivateBuyback` does for buyback activation. Every leg targets the
+///         and `executeBatch` calldata for the multisig to submit. Every leg targets the
 ///         Timelock itself, which self-administers `PROPOSER_ROLE`/`CANCELLER_ROLE`
 ///         (their role-admin is `DEFAULT_ADMIN_ROLE`, held by the Timelock), so the
 ///         transition is an ordinary Timelock proposal — no bespoke contract, and no
@@ -150,8 +149,7 @@ contract TransitionToGovernor is Script {
     ///         the *actual* batch this script prints. A test that rebuilt the legs by
     ///         hand would be a second source of truth: reorder or retarget a leg here
     ///         and the hand-written twin still passes, leaving the one artifact a
-    ///         human signs unverified. That is precisely the duplication
-    ///         `BuybackVenueLib` removed elsewhere in this change.
+    ///         human signs unverified.
     function transitionBatch(TimelockController timelock, address governor, address multisig)
         public
         view

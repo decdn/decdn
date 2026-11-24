@@ -106,9 +106,7 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
 
         // The launch split is hard-coded in the script, not env-driven.
         assertEq(cfg.feeRouterRebateBps, LAUNCH_REBATE_BPS, "rebate");
-        assertEq(cfg.feeRouterBuybackBps, 0, "buyback dormant");
         assertEq(cfg.feeRouterDeliveryFloor, LAUNCH_DELIVERY_FLOOR, "deliveryFloor");
-        assertEq(cfg.buybackBurner, address(0), "buybackBurner unwired");
         assertEq(address(cfg.cctpMessageTransmitter), TEST_TRANSMITTER, "transmitter");
         assertEq(cfg.cctpTokenMessenger, TEST_MESSENGER, "messenger");
     }
@@ -190,7 +188,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertFalse(vm.keyExistsJson(json, ".contracts.PaymentPool"), "no pool on the governance chain");
         assertEq(json.readAddress(".contracts.OriginAssignment"), address(0x0B), "OriginAssignment");
         assertEq(json.readAddress(".contracts.ManualVettingPolicy"), address(0x0C), "ManualVettingPolicy");
-        assertEq(json.readAddress(".contracts.BuybackBurner"), address(0), "BuybackBurner unwired");
         // The verifier is script-deployed (#669), so it lives under `contracts`.
         assertEq(json.readAddress(".contracts.Ed25519Verifier"), TEST_ED25519, "ed25519");
 
@@ -206,7 +203,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readUint(".config.minBond"), DEFAULT_MIN_BOND, "minBond");
 
         assertEq(json.readUint(".config.feeRouterRebateBps"), LAUNCH_REBATE_BPS, "rebate");
-        assertEq(json.readUint(".config.feeRouterBuybackBps"), 0, "buyback");
         assertEq(json.readUint(".config.feeRouterDeliveryFloor"), LAUNCH_DELIVERY_FLOOR, "deliveryFloor");
 
         _cleanupManifest(CHAIN_ID_WRITE);

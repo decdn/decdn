@@ -137,7 +137,12 @@ Every reason here traces to a real PR/issue/ADR. Quotes are from the commit/PR/A
 - **Safety / insurance reserve** (ADR 033, retired). A 5% FeeRouter bucket, a standing USDC insurance pool
   with a payout queue and a TOKEN→USDC keeper swap, for incorrect-slash / downtime / "bad-data" incidents.
   → escrow-on-slash refund; "no pool needed." Recourse for undemonstrated harm belongs in DAO governance,
-  not a standing contract. Freed 5% folded into buyback-burn.
+  not a standing contract.
+- **Buyback-and-burn and protocol-owned liquidity** (#2926, ADR 018, retired). A three-contract burner
+  stack, a Uniswap V3 venue, TWAP / slippage / per-epoch-cap guards, a keeper role, a genesis pool seed,
+  and a fork-test CI job, all to swap a share of each sweep into TOKEN and burn it. The burn served no
+  protocol function. Deleted; `FeeRouter` splits each sweep into a rebate and a treasury remainder, and
+  the weight credit is priced on the treasury leg.
 - **Blacklist-entry appeals / fast-track** (#1432). A second appeal state machine on top of blacklisting —
   six entry points, `StandingPath`, Sybil-porous per-filer knobs, `entry.suspended` end to end. Deleted;
   `ContentBlacklist` bytecode 24,576 → 11,193 bytes. Core enforcement untouched.

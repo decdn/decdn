@@ -118,7 +118,7 @@ contract OriginAssignment is AccessControl, ReentrancyGuard {
     error VettingPolicyNotAContract(address policy);
 
     // -----------------------------------------------------------------
-    // Constructor (ADR 016 § Deployment Order, step 11)
+    // Constructor (ADR 016 § Deployment Order, step 10)
     // -----------------------------------------------------------------
 
     /// @param capacityBond_       Operator activity source.

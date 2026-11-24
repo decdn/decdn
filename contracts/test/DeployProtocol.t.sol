@@ -81,9 +81,7 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
             feeRouterEpochLength: 7 days,
             feeRouterWindowEpochs: 13,
             feeRouterRebateBps: 7500,
-            feeRouterBuybackBps: 0,
             feeRouterDeliveryFloor: 1,
-            buybackBurner: address(0),
             cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
             cctpTokenMessenger: address(cctp)
         });
@@ -267,18 +265,15 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         assertTrue(d.timelock.hasRole(d.timelock.EXECUTOR_ROLE(), address(0)), "open executor");
     }
 
-    // FeeRouter launch state — buyback bucket dormant pending a concrete
-    // BuybackBurner subclass (see BaseProtocolDeploy header).
+    // FeeRouter launch state.
 
-    function test_feeRouter_launchSplitDormantBuyback() public view {
+    function test_feeRouter_launchSplit() public view {
         assertEq(d.router.rebateBps(), cfg.feeRouterRebateBps, "rebate share at launch");
-        assertEq(d.router.buybackBps(), 0, "buyback share is 0 at launch (dormant)");
         assertEq(d.router.deliveryFloor(), cfg.feeRouterDeliveryFloor, "delivery floor at launch");
-        assertEq(d.router.buybackBurner(), address(0), "buybackBurner unwired at launch");
     }
 
     function test_feeRouter_treasuryIsTimelock() public view {
-        // ADR 016 § Deployment Order step 7: the treasury bucket is
+        // ADR 016 § Deployment Order step 6: the treasury bucket is
         // Timelock-custodied. The script deploys the Timelock first precisely so
         // its address can seed FeeRouter's treasury, not an external EOA.
         assertEq(d.router.treasury(), address(d.timelock), "router.treasury == timelock");
