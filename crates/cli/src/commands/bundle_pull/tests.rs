@@ -69,18 +69,6 @@ fn sample() -> Vec<ManifestEntry> {
 }
 
 #[test]
-fn entry_retries_flag_is_gone() {
-    use clap::Parser as _;
-    let uri = format!("decdn:{}/", "ab".repeat(32));
-    let base = ["decdn", "get", uri.as_str(), "-o", "out"];
-    assert!(decdn_common::cli::Cli::try_parse_from(base).is_ok());
-    let parsed = decdn_common::cli::Cli::try_parse_from(
-        base.iter().copied().chain(["--entry-retries", "2"]),
-    );
-    assert!(parsed.is_err());
-}
-
-#[test]
 fn parse_selection_drops_commented_and_deleted_lines() {
     let entries = vec![
         sel_entry("a.bin", 1),
@@ -503,6 +491,7 @@ fn leftover_partials_counts_only_unselected_blobs() {
     // An orphan partial and its record, and a finalized orphan blob.
     write(format!("{}.partial", hex(3)), 1000);
     write(format!("{}.partial.ranges", hex(3)), 10);
+    write(format!("{}.assembly", hex(3)), 700);
     write(hex(4), 200);
     // A record's temporary file and a stray name.
     write(".tmpAbC123".into(), 50);
@@ -513,6 +502,7 @@ fn leftover_partials_counts_only_unselected_blobs() {
         |name: String| allocated_bytes(&std::fs::metadata(dir.join(name)).expect("metadata"));
     let expected = on_disk(format!("{}.partial", hex(3)))
         + on_disk(format!("{}.partial.ranges", hex(3)))
+        + on_disk(format!("{}.assembly", hex(3)))
         + on_disk(hex(4));
     let leftovers = leftover_partials(tmp.path(), &keep);
     assert_eq!(

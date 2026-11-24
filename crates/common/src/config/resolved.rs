@@ -183,19 +183,6 @@ pub struct ResolvedBlockchain {
     pub pool_min_remaining_deposit_micro_usdc: u64,
 }
 
-impl ResolvedBlockchain {
-    /// The first configured pool of the first payment chain, with its chain.
-    /// `None` only on a value resolution would not produce (no payment chain,
-    /// or a chain with no pool).
-    #[must_use]
-    pub fn first_payment_pool(
-        &self,
-    ) -> Option<(&ResolvedPaymentChain, alloy::primitives::Address)> {
-        let chain = self.payment_chains.first()?;
-        Some((chain, *chain.payment_pools.first()?))
-    }
-}
-
 /// One resolved `[[blockchain.payment_chains]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPaymentChain {

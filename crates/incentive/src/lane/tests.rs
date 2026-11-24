@@ -6,7 +6,7 @@ use alloy::signers::local::PrivateKeySigner;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
-fn registered_until_defaults_zero_and_survives_stage_voucher_clone() {
+fn hydrate_seeds_registered_until_zero() {
     let st = LaneState::hydrate(
         B256::ZERO,
         Address::ZERO,
@@ -19,11 +19,6 @@ fn registered_until_defaults_zero_and_survives_stage_voucher_clone() {
         LaneChain::NONE,
     );
     assert_eq!(st.registered_until, 0, "hydrate seeds unknown");
-    let mut with_reg = st.clone();
-    with_reg.registered_until = 1_800_000_000;
-    // stage_voucher clones self; the clone must carry registered_until forward.
-    let cloned = with_reg.clone();
-    assert_eq!(cloned.registered_until, 1_800_000_000);
 }
 
 fn lane_with_terms(cap: u64, expiry: u64) -> LaneState {

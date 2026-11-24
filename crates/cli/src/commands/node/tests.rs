@@ -574,7 +574,6 @@ fn port_from_config_file_ignores_unrelated_field_errors() -> anyhow::Result<()> 
 fn mk_lane(
     pool_id: &str,
     counterparty: &str,
-    last_nonce: u64,
     outstanding: u64,
     deposit: u64,
     secs_since: Option<u64>,
@@ -587,7 +586,6 @@ fn mk_lane(
         // Self-signing default; the delegated and unknown-owner renderings
         // get their own dedicated tests rather than an eighth parameter.
         voucher_signer: counterparty.to_string(),
-        last_nonce,
         outstanding_micro_usdc: outstanding,
         // Half the claim is still unredeemed in every fixture; the lanes
         // table renders both columns.
@@ -640,7 +638,6 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
             mk_lane(
                 &format!("0x{}", "a".repeat(64)),
                 &counterparty,
-                7,
                 2_500_000,
                 10_000_000,
                 Some(90),
@@ -649,7 +646,6 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
             mk_lane(
                 &format!("0x{}", "c".repeat(64)),
                 &format!("0x{}", "d".repeat(40)),
-                0,
                 0,
                 5_000_000,
                 None,
@@ -716,7 +712,6 @@ fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
         &format!("0x{}", "a".repeat(64)),
         &funder,
         1,
-        1,
         2,
         Some(1),
         false,
@@ -755,15 +750,7 @@ fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
 #[test]
 fn write_lanes_table_renders_an_unknown_counterparty() -> anyhow::Result<()> {
     let signer = format!("0x{}", "2".repeat(40));
-    let mut lane = mk_lane(
-        &format!("0x{}", "a".repeat(64)),
-        &signer,
-        0,
-        1,
-        0,
-        None,
-        false,
-    );
+    let mut lane = mk_lane(&format!("0x{}", "a".repeat(64)), &signer, 1, 0, None, false);
     lane.counterparty = None;
 
     let mut buf = Vec::<u8>::new();
@@ -798,7 +785,6 @@ fn lanes_json_renders_an_unknown_counterparty_as_null() -> anyhow::Result<()> {
     let mut lane = mk_lane(
         &format!("0x{}", "a".repeat(64)),
         &format!("0x{}", "2".repeat(40)),
-        0,
         1,
         0,
         None,
@@ -858,7 +844,6 @@ fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
         lanes: vec![mk_lane(
             &format!("0x{}", "a".repeat(64)),
             &counterparty,
-            7,
             2_500_000,
             10_000_000,
             Some(42),
@@ -884,7 +869,6 @@ fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
     assert_eq!(back.lanes.len(), 1);
     let bc = back.lanes.first().expect("one lane");
     assert_eq!(bc.counterparty.as_deref(), Some(counterparty.as_str()));
-    assert_eq!(bc.last_nonce, 7);
     assert_eq!(bc.outstanding_micro_usdc, 2_500_000);
     assert_eq!(bc.deposit_micro_usdc, 10_000_000);
     assert_eq!(bc.seconds_since_last_voucher, Some(42));
@@ -898,7 +882,6 @@ fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
     assert_eq!(chans.len(), 1);
     let c0 = &chans[0];
     assert_eq!(c0["counterparty"].as_str(), Some(counterparty.as_str()));
-    assert_eq!(c0["last_nonce"], 7);
     assert_eq!(c0["outstanding_micro_usdc"], 2_500_000);
     assert_eq!(c0["deposit_micro_usdc"], 10_000_000);
     assert_eq!(c0["seconds_since_last_voucher"], 42);

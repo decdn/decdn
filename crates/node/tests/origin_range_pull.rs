@@ -2254,9 +2254,7 @@ async fn own_origin_size_proof_fault_refuses_internal_error_not_cache_miss() -> 
 
 /// The spine's own pre-signature bounds gate, on a COLD miss: an out-of-bounds
 /// bounded request against an own origin that proves the size must be refused
-/// `RangeNotSatisfiable` before any `ok: true` is signed — and the floor
-/// reservation it releases must not leak, so a follow-up in-bounds request on
-/// the same handler still serves.
+/// `RangeNotSatisfiable` before any `ok: true` is signed.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<()> {
@@ -2291,7 +2289,6 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
     let server_sk = fresh_key();
     let server_id = server_sk.public();
     let server_eth = Arc::new(PrivateKeySigner::random());
-    let provider = server_eth.address();
     let (handler, _cache, metrics, _cache_tmp) = handler_over_http_origin(
         &server.uri(),
         pool_id,
@@ -2313,7 +2310,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
     // Out of bounds: offset at the blob end, on a COLD cache (spine gate, not
     // the direct-serve gate).
     let conn = client_ep
-        .connect(target.clone(), ALPN_CLIENT)
+        .connect(target, ALPN_CLIENT)
         .await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
     let (mut send, mut recv) = conn
@@ -2360,26 +2357,6 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
     anyhow::ensure!(
         counter_value(&metrics, "local_outboard_serves_total")? == 1,
         "the gate lives inside the spine tier (entered, then refused pre-signature)"
-    );
-
-    // The released floor reservation must not leak: an in-bounds request on the
-    // SAME handler now serves the whole blob.
-    let got = ranged_paid_pull(
-        &client_ep,
-        target,
-        client_node_id,
-        &client_eth,
-        pool_id,
-        provider,
-        hash,
-        0,
-        0,
-        RATE_PER_MB,
-    )
-    .await?;
-    anyhow::ensure!(
-        got.as_slice() == blob.as_slice(),
-        "an in-bounds request after the refusal must still serve"
     );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;

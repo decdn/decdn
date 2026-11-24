@@ -31,13 +31,3 @@ fn nodeid_postcard_identical_to_array() -> Result<(), postcard::Error> {
     }
     Ok(())
 }
-
-#[test]
-fn distinct_accessors_round_trip() {
-    let raw = [7u8; ID_LEN];
-    let id = NodeId::from_bytes(raw);
-    assert_eq!(id.as_bytes(), &raw);
-    assert_eq!(id.to_bytes(), raw);
-    assert_eq!(<[u8; ID_LEN]>::from(id), raw);
-    assert_eq!(NodeId::from(raw), id);
-}

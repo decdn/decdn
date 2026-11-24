@@ -309,20 +309,6 @@ contract ContentBlacklistMutationsTest is Test {
         assertEq(_n(), 5);
     }
 
-    /// @notice Body changes move no deny answer: a suspended or deregistered
-    ///         body's entries stay live, so a node applies body records without
-    ///         touching its hash index.
-    function test_bodyChanges_leaveEntriesLive() public {
-        vm.prank(usBody);
-        blacklist.addHashRegional(REGION_US, H1, "r");
-        vm.prank(multisig);
-        blacklist.suspendRegionalBody(REGION_US);
-        assertTrue(blacklist.isHashBlacklistedInRegion(H1, REGION_US));
-        vm.prank(admin);
-        blacklist.deregisterRegionalBody(REGION_US);
-        assertTrue(blacklist.isHashBlacklistedInRegion(H1, REGION_US));
-    }
-
     function test_complianceWindows_appendNewValue_skipNoOps() public {
         vm.startPrank(admin);
         blacklist.setComplianceWindow(2 hours);

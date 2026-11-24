@@ -480,33 +480,6 @@ async fn seeded_fs_origin(
     Ok((hash, dir, origin))
 }
 
-#[tokio::test]
-async fn an_origin_stored_proof_proves_the_size() -> anyhow::Result<()> {
-    let data = blob();
-    let size = u64::try_from(data.len())?;
-    let (hash, _dir, origin) = seeded_fs_origin(&data, true).await?;
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), vec![origin], 64).await?;
-    let proof = engine.size_proof(hash, size).await;
-    anyhow::ensure!(proof.is_some(), "the stored proof proves the size");
-    anyhow::ensure!(engine.kept_size_proof(hash).map(|(s, _)| s) == Some(size));
-    Ok(())
-}
-
-/// An origin object with no `{H}.sizeproof` proves no size, so the node
-/// states none for a blob it does not hold.
-#[tokio::test]
-async fn an_origin_without_a_stored_proof_proves_nothing() -> anyhow::Result<()> {
-    let data = blob();
-    let size = u64::try_from(data.len())?;
-    let (hash, _dir, origin) = seeded_fs_origin(&data, false).await?;
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), vec![origin], 64).await?;
-    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
-    anyhow::ensure!(engine.size_proof(hash, size).await.is_none());
-    Ok(())
-}
-
 /// The names of the size proof tags the store keeps for `hash`, each with
 /// the hash its tag points at.
 async fn proof_tags(engine: &CacheEngine, hash: Hash) -> anyhow::Result<Vec<Hash>> {
@@ -580,8 +553,10 @@ async fn a_wrong_size_gets_no_proof() -> anyhow::Result<()> {
             "size {wrong} is not the size of the blob"
         );
     }
-    // With the true proof kept, a wrong size still gets none.
+    // The fs origin's stored proof proves the true size and is kept; with
+    // it kept, a wrong size still gets none.
     anyhow::ensure!(engine.size_proof(hash, size).await.is_some());
+    anyhow::ensure!(engine.kept_size_proof(hash).map(|(s, _)| s) == Some(size));
     anyhow::ensure!(engine.size_proof(hash, size + 1).await.is_none());
     Ok(())
 }

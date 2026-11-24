@@ -282,7 +282,6 @@ fn node_up() -> NodeSection {
                 pool_id: POOL.to_owned(),
                 counterparty: Some("0xAbaBabaBABaBAbAbABABaBABAbabABAbAbaBabab".to_owned()),
                 voucher_signer: "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd".to_owned(),
-                last_nonce: 812,
                 outstanding_micro_usdc: 3_200,
                 unredeemed_micro_usdc: 41_000,
                 deposit_micro_usdc: 5_000_000,

@@ -1409,8 +1409,8 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
 
     // #852: the buyer persisted the lane's voucher watermark after the pull.
     // Under ADR 038 the pull meters WIRE bytes (the bao stream: content +
-    // interleaved proof), so the closing watermark carries nonce 2, the
-    // bao-encoded size, and the cumulative amount rounded up per the rate.
+    // interleaved proof), so the closing watermark carries the bao-encoded
+    // size and the cumulative amount rounded up per the rate.
     let expected_wire =
         decdn_cache::range_pull::bao_encoded_size(total_bytes, &bao_tree::ChunkRanges::all());
     let expected_amount = U256::from(expected_wire)
@@ -1456,10 +1456,8 @@ async fn node_origin_pull_fills_and_records_reputation() -> Result<()> {
 /// through the streaming pull (no whole-blob RAM buffer). #1682.
 ///
 /// Twin of [`node_origin_pull_fills_and_records_reputation`], but driven through
-/// `CacheEngine::populate` rather than a bare `Origin::fetch` call, and over a
-/// blob several chunk groups past the old 4 MiB buffered threshold — the point
-/// of the port is only exercised once the pull spans more than one gap-driven
-/// range.
+/// `CacheEngine::populate` rather than a bare `Origin::fetch` call, and over an
+/// 8 MiB blob, so the pull spans more than one gap-driven range.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::expect_used, clippy::too_many_lines)] // test setup; failures should panic loudly
 async fn large_blob_populates_via_streaming_pull() -> Result<()> {
@@ -2951,13 +2949,13 @@ async fn node_origin_corruption_is_classified_and_scored() -> Result<()> {
 }
 
 /// #857 over the real orchestration: an upstream serves the *correct* bytes but
-/// rejects the buyer's closing voucher (a stale nonce / our payment fault). The
-/// pull must fail to a clean `NotFound`, and — crucially — the provider must NOT
-/// be tarred: a voucher rejection is OUR payment-side fault, so no observation is
-/// emitted, the local score stays neutral, and only the
+/// rejects the buyer's closing voucher (an `AmountRegression`: our payment
+/// fault). The pull must fail to a clean `NotFound`, and — crucially — the
+/// provider must NOT be tarred: a voucher rejection is OUR payment-side fault, so
+/// no observation is emitted, the local score stays neutral, and only the
 /// buyer-side `node_pull_voucher_rejected` counter moves (no unreachable, no
-/// corruption). Before the fix, this self-inflicted failure mapped to
-/// `Outcome::Unreachable` and unfairly defamed the honest provider's local reputation.
+/// corruption). Mapping this self-inflicted failure to `Outcome::Unreachable`
+/// would unfairly defame the honest provider's local reputation.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn node_origin_voucher_rejection_does_not_tar_upstream() -> Result<()> {
@@ -10767,7 +10765,8 @@ async fn two_concurrent_pulls_to_one_provider_share_the_lane_ledger() -> Result<
     let total_bytes = u64::try_from(PAYLOAD_LEN).unwrap_or(u64::MAX);
 
     // --- Node A: holds both blobs, serves the REAL client handler (so vouchers are
-    //     validated for real — a colliding nonce is genuinely rejected, not simulated).
+    //     validated for real — a regressing cumulative is genuinely rejected, not
+    //     simulated).
     let (cache_a, _tmp_a) = cache_with_blobs(&[payload.as_slice(), payload2.as_slice()]).await?;
     let a_sk = fresh_key();
     let a_id = a_sk.public();

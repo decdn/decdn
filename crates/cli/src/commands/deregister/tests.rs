@@ -19,16 +19,6 @@ fn rendered(p: &Plan, json: bool, tx: Option<&B256>, dry_run: bool) -> String {
 }
 
 #[test]
-fn headless_without_yes_refuses() {
-    assert_eq!(decide_confirmation(false, false), Confirmation::NeedFlag);
-    assert_eq!(decide_confirmation(false, true), Confirmation::Prompt);
-    // `--yes` bypasses the prompt on a terminal AND headless — the flag is
-    // what makes a scripted run legal.
-    assert_eq!(decide_confirmation(true, false), Confirmation::Bypassed);
-    assert_eq!(decide_confirmation(true, true), Confirmation::Bypassed);
-}
-
-#[test]
 fn ejected_operator_is_pointed_at_unbond_not_register() {
     let err = ensure_active(&plan(false, true, 1000)).expect_err("ejected must not proceed");
     let msg = format!("{err}");

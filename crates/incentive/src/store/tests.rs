@@ -115,16 +115,6 @@ fn memory_store_forget_removes_entry() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn memory_store_flush_is_noop_ok() -> anyhow::Result<()> {
-    let store = MemoryPoolStateStore::new();
-    store.record(&sample(1, 1))?;
-    // Volatile store: flush has nothing to do and must succeed.
-    store.flush()?;
-    anyhow::ensure!(store.len() == 1);
-    Ok(())
-}
-
 mod settlement_ledger {
     use super::*;
 

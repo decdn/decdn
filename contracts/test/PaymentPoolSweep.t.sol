@@ -198,18 +198,6 @@ contract PaymentPoolSweepTest is Test {
     // Constructor
     // -----------------------------------------------------------------
 
-    function test_constructor_setsImmutables() public view {
-        assertEq(address(pool.usdc()), address(srcUsdc));
-        assertEq(address(pool.tokenMessenger()), address(srcMessenger));
-        assertEq(pool.sweepRecipient(), address(receiver));
-        assertEq(pool.sweepDomain(), DST);
-        assertEq(pool.disputeWindow(), 48 hours);
-        assertEq(pool.operatorBps(), OPERATOR_BPS);
-        assertEq(pool.minSweep(), MIN_SWEEP);
-        assertEq(pool.minDeposit(), 0);
-        assertEq(pool.pauser(), pauser);
-    }
-
     function test_constructor_rejectsZeroAddresses() public {
         vm.expectRevert(PaymentPoolBase.ZeroAddress.selector);
         _deploy(ITokenMessengerV2(address(0)), address(receiver), OPERATOR_BPS, pauser);

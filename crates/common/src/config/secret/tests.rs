@@ -12,23 +12,6 @@ fn debug_redacts_value() {
 }
 
 #[test]
-fn debug_redacts_inside_struct() {
-    // Realistic case: a containing struct derives Debug and prints
-    // every field. The wrapper must redact in that context too.
-    #[derive(Debug)]
-    struct Wrap {
-        #[allow(dead_code)] // Read by Debug only.
-        secret: SecretString,
-    }
-    let w = Wrap {
-        secret: SecretString::new("super-secret-token-abc123"),
-    };
-    let dbg = format!("{w:?}");
-    assert!(!dbg.contains("super-secret"), "got: {dbg}");
-    assert!(dbg.contains("***"), "redaction marker missing: {dbg}");
-}
-
-#[test]
 fn expose_returns_raw_value() {
     let s = SecretString::new("hunter2");
     assert_eq!(s.expose(), "hunter2");

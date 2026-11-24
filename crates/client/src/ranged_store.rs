@@ -120,7 +120,7 @@ pub struct ClientRangedStore {
     ranges_path: PathBuf,
     /// Size bound, proven size and verified chunk ranges, trusted from the
     /// record (loaded once at construction, updated in memory by
-    /// `admit`/`ingest_stream`/`set_bound`, persisted by
+    /// `admit`/`ingest_stream`/`prove_size`, persisted by
     /// `admit`/`finalize`/`flush_present_record`).
     state: Arc<Mutex<StoreState>>,
     /// Woken each time an ingest checkpoint extends `present`
@@ -523,16 +523,6 @@ impl ClientRangedStore {
     #[must_use]
     pub(crate) fn present_grew(&self) -> &tokio::sync::Notify {
         &self.present_grew
-    }
-
-    /// Move the planner's bound to `bound`. The record picks it up at its next
-    /// flush. A proven size is final: once a leg has proved one, the bound
-    /// stays at it and this does nothing.
-    pub fn set_bound(&self, bound: u64) {
-        let mut state = self.lock_state();
-        if state.proven.is_none() {
-            state.bound = bound;
-        }
     }
 
     /// Record `size` as proven: a node's size proof verified it against the
@@ -1632,10 +1622,6 @@ impl crate::source::IngestStore for ClientRangedStore {
 
     fn proven(&self) -> Option<u64> {
         Self::proven(self)
-    }
-
-    fn set_bound(&self, bound: u64) {
-        Self::set_bound(self, bound);
     }
 
     fn prove_size(&self, size: crate::ProvenSize) {

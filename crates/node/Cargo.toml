@@ -163,7 +163,7 @@ proptest = { workspace = true }
 # integration tests can deliver real signals from inside the test process
 # without violating the workspace `unsafe_code = "forbid"` lint that would
 # otherwise force us to use `libc::raise` directly.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.32", default-features = false, features = ["signal"] }
 wiremock = { workspace = true }
 # `tests/origin_range_pull.rs` builds the `{H}.obao4` pre-order outboard a
 # range-pull origin must publish, so the e2e test can verify the cold ranged

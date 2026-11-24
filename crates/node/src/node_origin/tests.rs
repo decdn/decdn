@@ -469,51 +469,11 @@ fn a_pool_exhaustion_is_a_retryable_topup_not_a_dead_lane() {
     );
 }
 
-/// The #1145-review refinement: exonerating a refusal is not the same as believing
-/// it. How long we suppress a (peer, hash) must match how much the refusal actually
-/// proves — and for the codes below it proves rather little.
-#[test]
-fn only_a_durable_refusal_earns_the_full_suppression_ttl() {
-    // A peer that declines the blob will say the same thing in a minute. Worth
-    // the full TTL.
-    assert_eq!(
-        classify_refusal(&StreamError::Declined),
-        RefusalVerdict::DurableMiss,
-        "Declined is a lasting fact about this (peer, hash)"
-    );
-    // `NotFound` is the one that matters. `wire_error` collapses `UnknownLane`
-    // (the window where the upstream's chain watcher has not yet seen the pool
-    // WE just opened) onto it, so pool existence cannot be probed. At the full
-    // TTL that blackholes a healthy peer for five minutes over a condition that
-    // has already passed. `Unfunded` is our own upstream funding short at the
-    // peer, likewise transient and no fault of the peer.
-    for error in [StreamError::NotFound, StreamError::Unfunded] {
-        assert_eq!(
-            classify_refusal(&error),
-            RefusalVerdict::Transient,
-            "{error:?} is not durable evidence about this (peer, hash)"
-        );
-    }
-    // And the brief suppression has to actually be brief — a `REFUSAL_SUPPRESSION_TTL`
-    // raised to the cache's own TTL would silently restore the bug.
-    assert!(
-        REFUSAL_SUPPRESSION_TTL < Duration::from_mins(5),
-        "the transient TTL must stay well under the negative cache's own"
-    );
-}
-
-/// A refusal that is OUR fault must leave the peer entirely untouched — not scored,
-/// and not suppressed either. It still holds the blob; the problem is our voucher.
-#[test]
-fn our_own_payment_fault_neither_scores_nor_suppresses_the_peer() {
-    assert_eq!(
-        classify_refusal(&StreamError::VoucherRejected {
-            reason: VoucherRejectReason::BadSignature,
-            bundle: None,
-        }),
-        RefusalVerdict::OurFault
-    );
-}
+// A transient refusal (`NotFound`, `Unfunded`) proves little about the peer, so
+// its suppression stays brief: a `REFUSAL_SUPPRESSION_TTL` raised to the
+// negative cache's own five-minute TTL would blackhole a healthy peer over a
+// condition that has already passed.
+const _: () = assert!(REFUSAL_SUPPRESSION_TTL.as_nanos() < Duration::from_mins(5).as_nanos());
 
 /// A fault in THIS node must never be scored against the peer we happened to be
 /// talking to when it surfaced.

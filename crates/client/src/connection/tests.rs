@@ -431,23 +431,6 @@ async fn map_with_dial_runtime_survives_caller_runtime_drop() {
         .expect("the endpoint must close: the driver lives on the dial runtime");
 }
 
-/// Concurrent gets on a map built with options share one dial.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_gets_share_one_dial() {
-    let (_peer, peer_addr, accepted) = holding_peer().await;
-    let (ep, _) = loopback_endpoint(Vec::new()).await;
-    let connections =
-        super::Connections::with_options(ep.clone(), ALPN_CLIENT, Some(Handle::current()));
-
-    let (a, b) = tokio::join!(connections.get(&peer_addr), connections.get(&peer_addr));
-    assert!(std::sync::Arc::ptr_eq(
-        &a.expect("first get"),
-        &b.expect("second get")
-    ));
-    assert_eq!(connections.dials(), 1);
-    assert_accepted(&accepted, 1).await;
-}
-
 /// The control: the same dial on the dropped runtime itself takes the
 /// connection's driver down with it, and the endpoint's close never
 /// finishes. Without it, the test above would pass for a setup that never
@@ -532,7 +515,9 @@ async fn closing_peer(closes: usize) -> (Endpoint, EndpointAddr) {
             accepted += 1;
             let close = accepted <= closes;
             tokio::spawn(async move {
-                if close && conn.accept_bi().await.is_ok() {
+                // The stream lives across the close: a dropped send half
+                // sends a FIN, and the leg reads that end before the close.
+                if close && let Ok(_stream) = conn.accept_bi().await {
                     conn.close(0u32.into(), b"idle");
                 }
                 conn.closed().await;

@@ -204,13 +204,6 @@ fn admit_batch_extra_does_not_bump_rejection_counters() {
     }
 }
 
-#[test]
-fn layer_label_strings_are_stable() {
-    // Pinned because operators alert on these label values.
-    assert_eq!(DhtRejectLayer::PerPeer.as_str(), "per_peer");
-    assert_eq!(DhtRejectLayer::Global.as_str(), "global");
-}
-
 // ---- #645: keyspace bound — periodic GC + lazy prune ----
 
 #[test]

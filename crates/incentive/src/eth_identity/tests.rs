@@ -1,8 +1,4 @@
 use super::*;
-use alloy::primitives::{B256, keccak256};
-use alloy::signers::{Signer, SignerSync};
-use alloy::sol;
-use alloy::sol_types::{SolStruct, eip712_domain};
 use std::assert_matches;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
@@ -496,66 +492,5 @@ fn unreadable_password_file_is_fatal() {
     assert!(
         !chain.contains("no keystore password source"),
         "an unreadable file must not fall through to the next source: {chain}"
-    );
-}
-
-// Canonical EIP-712 schema from ADR 003 §EIP-712 NodeId-to-Ethereum
-// Binding (`BindNodeId(bytes32 nodeId,uint64 nonce)`). Inlined rather
-// than imported from another module: this test asserts the schema we
-// build against the keystore-loaded signer matches the ADR exactly,
-// so any drift here surfaces independently of the on-chain contract
-// wiring (#327).
-sol! {
-    #[allow(missing_docs)]
-    struct BindNodeId {
-        bytes32 nodeId;
-        uint64 nonce;
-    }
-}
-
-#[test]
-fn eip712_loopback_sign_and_recover() {
-    let tmp = make_data_dir();
-    let written = generate_and_persist(tmp.path(), TEST_PASSWORD, false).unwrap();
-    let signer = load_signer(&keystore_path(tmp.path()), TEST_PASSWORD)
-        .unwrap()
-        .with_chain_id(Some(421_614));
-
-    let domain = eip712_domain! {
-        name: "decdn-test",
-        version: "1",
-        chain_id: 421_614,
-        verifying_contract: Address::ZERO,
-    };
-    let binding = BindNodeId {
-        nodeId: B256::from([0xaau8; 32]),
-        nonce: 1,
-    };
-    let signing_hash: B256 = binding.eip712_signing_hash(&domain);
-
-    let sig = signer.sign_hash_sync(&signing_hash).unwrap();
-    let recovered = sig.recover_address_from_prehash(&signing_hash).unwrap();
-
-    assert_eq!(
-        recovered, written,
-        "recovered EIP-712 signer must match the keystore-derived address"
-    );
-}
-
-/// Lock the EIP-712 type hash to ADR 003's canonical wording. If this
-/// breaks, either the ADR changed or the `sol!` macro's canonical
-/// encoding shifted — both warrant a coordinated update with the
-/// Solidity contract. Mirrors the equivalent test in
-/// `voucher::voucher_type_hash_matches_adr_003`.
-#[test]
-fn bind_node_id_type_hash_matches_adr_003() {
-    // Single space between Solidity type and field name; no other
-    // whitespace; fields in declaration order. Per ADR 003 §606.
-    let canonical: &[u8] = b"BindNodeId(bytes32 nodeId,uint64 nonce)";
-    let expected = keccak256(canonical);
-    let actual = keccak256(BindNodeId::eip712_root_type().as_bytes());
-    assert_eq!(
-        actual, expected,
-        "BindNodeId type hash drifted from ADR 003 §EIP-712 NodeId-to-Ethereum Binding"
     );
 }

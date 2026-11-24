@@ -30,9 +30,6 @@ contract CapacityBondTest is Test {
     address internal operator = address(0xB0B);
 
     uint256 internal constant MIN_BOND = 50_000e18;
-    // Governance `minBond` ceiling, mirroring `CapacityBond.MIN_BOND_CEILING`
-    // (internal), used by the non-retroactive-minBond tests.
-    uint256 internal constant MIN_BOND_CEILING_TEST = 1_000_000e18;
     // ADR 019 § Terms Acceptance — genesis operator-terms hash the fixture
     // registers against (stand-in for `keccak256(TERMS.md)`).
     bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
@@ -431,13 +428,6 @@ contract CapacityBondTest is Test {
         vm.prank(admin);
         vm.expectRevert(CapacityBond.ZeroAddress.selector);
         bond.unEjectNode(address(0));
-    }
-
-    function test_declaredMbps_storesValue() public {
-        _bondForMbps(1000);
-        vm.prank(operator);
-        bond.declareMbps(1000);
-        assertEq(bond.declaredMbps(operator), 1000);
     }
 
     // ADR 026 § Capacity-bond curve — declared-capacity band on `declareMbps`.
@@ -966,35 +956,8 @@ contract CapacityBondTest is Test {
 
     /// @notice A re-registration into a new region snapshots the old region in
     ///         `regionPrev`, so the old region's blacklist entries keep applying
-    ///         through the stability window (ADR 030). Re-registering into the
-    ///         same region keeps the snapshot. The change waits out the
-    ///         `updateRegion` cooldown, as every region change does.
-    function test_reRegisterIntoNewRegion_recordsRegionPrev() public {
-        uint256 opPk = 0x8EE9;
-        bytes32 nodeId = bytes32(uint256(0x8EE9));
-        address opAddr = _onboardAtTier(opPk, 1000, nodeId);
-
-        vm.warp(block.timestamp + bond.regionStabilityWindow());
-        vm.prank(opAddr);
-        bond.deregisterNode();
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
-        vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
-
-        (string memory region, string memory prev,,) = bond.regionScopeData(opAddr);
-        assertEq(region, "eu-west");
-        assertEq(prev, "us-east", "the old region is snapshotted");
-
-        vm.prank(opAddr);
-        bond.deregisterNode();
-        sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
-        vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
-        (, prev,,) = bond.regionScopeData(opAddr);
-        assertEq(prev, "us-east", "an unchanged region keeps the snapshot");
-    }
-
-    /// @notice #2837: two deregister/re-register hops inside one stability
+    ///         through the stability window (ADR 030). #2837: two
+    ///         deregister/re-register hops inside one stability
     ///         window cannot flip the region twice. A → B waits out the window;
     ///         B → C inside the next window reverts `RegionCooldownActive`, so
     ///         `regionPrev` still holds A and A's regional entries still reach
@@ -1555,6 +1518,7 @@ contract CapacityBondTest is Test {
 
         // Still active though active bond (50k) sits below the new minBond.
         assertTrue(bond.isActive(opAddr));
+        assertFalse(bond.ejected(opAddr), "a minBond raise alone never ejects");
         assertEq(bond.activeBond(opAddr), MIN_BOND);
         assertEq(bond.bondFloorAtActivation(opAddr), MIN_BOND); // floor unchanged
     }
@@ -1694,16 +1658,6 @@ contract CapacityBondTest is Test {
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowMinimum.selector, MIN_BOND, 100_000e18));
         bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
-    }
-
-    /// @notice A `minBond` raise alone never ejects or de-activates an
-    ///         operator active under the grandfathered `bondFloorAtActivation`.
-    function test_minBond_raiseNeverEjects() public {
-        address opAddr = _bondAndRegister(0xF10023, MIN_BOND); // floor 50k
-        vm.prank(admin);
-        bond.setMinBond(MIN_BOND_CEILING_TEST); // 1M — a 20× raise
-        assertTrue(bond.isActive(opAddr)); // raise alone: still active
-        assertFalse(bond.ejected(opAddr)); // raise alone: not ejected
     }
 
     /// @notice A grandfathered operator's own partial unbond below its

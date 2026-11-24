@@ -89,10 +89,9 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         });
     }
 
-    // Role-matrix assertions (ADR 016 § Access Control Matrix). Mirror of
-    // GovernanceLifecycleTest.test_canary_governanceRoleHandoff so the deploy
-    // script and the governance lifecycle suite stay in lockstep — if the
-    // base contract drifts, both tests fail in the same way.
+    // Role-matrix assertions (ADR 016 § Access Control Matrix). The governance
+    // lifecycle suite deploys through the same `BaseProtocolDeploy`, so these
+    // pin the role hand-off it relies on too.
 
     function test_roleMatrix_timelockHoldsGovernanceOnEveryTarget() public view {
         address tl = address(d.timelock);
@@ -224,6 +223,8 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
     // fails here independently of the heavier E2E flow.
     function test_crossContractWiring_newContractPeerRoles() public view {
         assertEq(address(d.sweepReceiver.feeRouter()), address(d.router), "sweepReceiver deposits into router");
+        assertEq(address(d.sweepReceiver.usdc()), address(cfg.usdc), "sweepReceiver usdc binding");
+        assertEq(address(d.router.capacityBond()), address(d.bond), "router capacityBond binding");
         assertEq(
             address(d.sweepReceiver.messageTransmitter()),
             address(cfg.cctpMessageTransmitter),

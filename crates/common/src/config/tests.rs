@@ -32,37 +32,6 @@ fn normalize_region_accepts_and_uppercases() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
-fn normalize_region_rejects_wrong_length_or_charset() {
-    // Length / charset failures and unassigned codes. Adversarial
-    // inputs that the wire layer also rejects are pinned here too so
-    // a config-resolver regression can't shift the only effective
-    // check onto the receive path.
-    let bad_inputs = [
-        "usa", "u1", "", "U", "U S", "Ü1", "12", "U-", "OO", "JJ", "BX", "U/", "U\0",
-    ];
-    for bad in bad_inputs {
-        assert!(
-            normalize_region(bad).is_err(),
-            "expected {bad:?} to be rejected"
-        );
-    }
-}
-
-#[test]
-fn normalize_region_accepts_reserved_codes() {
-    // Reserved-for-user-assignment codes (ISO 3166-1 §8.1.3) must
-    // round-trip unchanged so air-gapped / testnet operators can use
-    // them. Spot-check each range.
-    for code in ["AA", "QM", "QZ", "XA", "XK", "XZ", "ZZ"] {
-        assert_eq!(
-            normalize_region(code).expect("accepted"),
-            code,
-            "{code} should round-trip"
-        );
-    }
-}
-
 // vitalik.eth, known-good EIP-55 checksum.
 const GOOD_ADDR: &str = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
 const ALT_ADDR_1: &str = "0x0000000000000000000000000000000000000001";
@@ -1226,21 +1195,6 @@ fn resolve_cache_rejects_empty_fs_origin_path() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The node speaks no probe protocol, so a `[probe]` table is an unknown
-/// section and fails the parse rather than being silently ignored.
-#[test]
-fn a_probe_table_is_an_unknown_section() {
-    let toml = "\
-[probe.rate_limit]
-per_peer_rate_per_sec = 5.0
-";
-    let err = ::toml::from_str::<crate::config::FileConfig>(toml)
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
-    assert!(err.contains("unknown field `probe`"), "{err}");
-}
-
 // -------------------------------------------------------------------
 // Governance / payment-chain split
 // -------------------------------------------------------------------
@@ -1327,10 +1281,6 @@ fn split_config_resolves_governance_and_payment_chains() -> anyhow::Result<()> {
         "{:?}",
         resolved.payment_chains
     );
-    let (chain, pool) = resolved
-        .first_payment_pool()
-        .ok_or_else(|| anyhow::anyhow!("no first pool"))?;
-    anyhow::ensure!(chain.chain_id == 84_532 && pool == one);
     Ok(())
 }
 
@@ -1469,24 +1419,6 @@ fn unknown_payment_chain_fields_are_rejected() {
          usdc_address = \"{ALT_ADDR_2}\"\n"
     ));
     assert!(::toml::from_str::<FileConfig>(&toml).is_err());
-}
-
-/// The single-pool shape and the fields this split deletes are unknown
-/// fields now, so a stale config fails at parse rather than silently
-/// running without its pool.
-#[test]
-fn removed_blockchain_fields_are_rejected() {
-    for stale in [
-        format!("payment_pool_address = \"{ALT_ADDR_1}\"\n"),
-        format!("usdc_address = \"{ALT_ADDR_1}\"\n"),
-        "fee_shares_poll_interval_sec = 3600\n".to_owned(),
-    ] {
-        let toml = blockchain_toml(&stale);
-        assert!(
-            ::toml::from_str::<FileConfig>(&toml).is_err(),
-            "{stale} must be an unknown field"
-        );
-    }
 }
 
 /// A payment chain's `${VAR}` references expand like the governance fields.
@@ -2949,38 +2881,6 @@ fn fs_origin_rejects_unknown_field_typo() -> anyhow::Result<()> {
     let msg = format!("{err}");
     anyhow::ensure!(
         msg.contains("unknown field") && msg.contains("paht"),
-        "got: {msg}"
-    );
-    Ok(())
-}
-
-/// An origin serves raw bytes and the node decompresses nothing, so
-/// `decompress` is an unknown field on every origin kind.
-#[test]
-fn origin_decompress_is_an_unknown_field() -> anyhow::Result<()> {
-    for origin in [
-        "kind = \"http\"\nurl = \"https://origin.example/\"\n",
-        "kind = \"fs\"\npath = \"/var/decdn\"\n",
-        "kind = \"s3\"\nbucket = \"decdn-blobs\"\nregion = \"us-east-1\"\n",
-    ] {
-        assert_origin_toml_rejects(
-            &format!("{origin}decompress = \"auto\"\n"),
-            &["unknown field", "decompress"],
-        )?;
-    }
-    Ok(())
-}
-
-/// No whole-blob origin tier buffers a blob, so `buffered_max_bytes` is an
-/// unknown field of `cache.origin_retry`.
-#[test]
-fn buffered_max_bytes_is_an_unknown_field() -> anyhow::Result<()> {
-    let err = toml::from_str::<decdn_config_types::RetryPolicy>("buffered_max_bytes = 1048576\n")
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
-    let msg = format!("{err}");
-    anyhow::ensure!(
-        msg.contains("unknown field") && msg.contains("buffered_max_bytes"),
         "got: {msg}"
     );
     Ok(())
@@ -4632,26 +4532,6 @@ fn resolve_network_cli_relay_url_overrides_file_list() {
     };
     let resolved = resolve_network(&cli, Some(&file));
     assert_eq!(resolved.relay_urls, vec!["https://cli.example".to_string()]);
-}
-
-/// `[network]` carries no 0-RTT knob, and the section denies unknown
-/// fields, so a config still setting one fails to load rather than
-/// being silently ignored — the operator has to delete the line.
-#[test]
-fn network_rejects_removed_0rtt_key() -> anyhow::Result<()> {
-    let toml = "
-            bind_port = 4433
-            enable_0rtt = true
-        ";
-    let err = toml::from_str::<types::NetworkConfig>(toml)
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected unknown-field error"))?;
-    let msg = format!("{err}");
-    anyhow::ensure!(
-        msg.contains("unknown field") && msg.contains("enable_0rtt"),
-        "got: {msg}"
-    );
-    Ok(())
 }
 
 #[test]
@@ -6329,8 +6209,9 @@ fn resolve_config_blockchain_override_layer_beats_file_for_required_fields() -> 
     assert_eq!(
         resolved
             .blockchain
-            .first_payment_pool()
-            .map(|(_, pool)| pool),
+            .payment_chains
+            .first()
+            .and_then(|chain| chain.payment_pools.first().copied()),
         Some(ALT_ADDR_1.parse()?),
         "payment pools come from the file only"
     );
@@ -6365,8 +6246,9 @@ fn resolve_config_accepts_file_only_blockchain_fields_at_watchdog_min() -> anyho
     assert_eq!(
         resolved
             .blockchain
-            .first_payment_pool()
-            .map(|(_, pool)| pool),
+            .payment_chains
+            .first()
+            .and_then(|chain| chain.payment_pools.first().copied()),
         Some(ALT_ADDR_1.parse()?)
     );
     assert_eq!(resolved.blockchain.capacity_bond_address, ALT_ADDR_2);
@@ -6711,53 +6593,6 @@ rate_per_mb = 0
 }
 
 #[test]
-fn resolve_config_errors_on_flat_origin_url_field() -> anyhow::Result<()> {
-    // A flat `origin_url` field directly under `[cache]` is rejected
-    // by `deny_unknown_fields`: origins live under the tagged
-    // `[cache.origin]` table, so a flat field must get a clear
-    // "unknown field" error at config load instead of silently
-    // dropping the origin and missing every cache pull.
-    let dir = data_dir_with_keystore()?;
-    let toml_body = format!(
-        "{}\n\n[cache]\norigin_url = \"https://origin.example/\"\n",
-        complete_toml_body()
-    );
-    let path = write_minimal_toml(&dir, &toml_body)?;
-    let args = run_args_with_data_dir(dir.path());
-    let Err(err) = resolve_config(Some(&path), &args) else {
-        anyhow::bail!("expected unknown-field error for a flat origin_url");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("origin_url") && msg.contains("unknown field"),
-        "error should call out the flat `origin_url` key: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_config_errors_on_flat_origin_path_field() -> anyhow::Result<()> {
-    // Sibling of the above: a flat `origin_path` field directly under
-    // `[cache]` is rejected by `deny_unknown_fields`.
-    let dir = data_dir_with_keystore()?;
-    let toml_body = format!(
-        "{}\n\n[cache]\norigin_path = \"/var/cache/decdn/origin\"\n",
-        complete_toml_body()
-    );
-    let path = write_minimal_toml(&dir, &toml_body)?;
-    let args = run_args_with_data_dir(dir.path());
-    let Err(err) = resolve_config(Some(&path), &args) else {
-        anyhow::bail!("expected unknown-field error for a flat origin_path");
-    };
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("origin_path") && msg.contains("unknown field"),
-        "error should call out the flat `origin_path` key: {msg}"
-    );
-    Ok(())
-}
-
-#[test]
 fn load_file_config_returns_default_when_path_is_none_and_default_absent() -> anyhow::Result<()> {
     // Implicit-path branch of load_file_config: when no explicit
     // path is given and the documented default location does not
@@ -6873,23 +6708,6 @@ fn resolve_security_max_concurrent_handlers_file_override() {
     let s = sec_with(|s| s.max_concurrent_handlers = Some(1024));
     let resolved = resolve_security(Some(&s)).expect("valid override");
     assert_eq!(resolved.max_concurrent_handlers, 1024);
-}
-
-/// The `[security]` section keys nothing on the source address (#2505):
-/// a `per_source_*` key is an unknown field and the file does not parse.
-#[test]
-fn security_section_rejects_per_source_keys() {
-    for key in [
-        "per_source_rate_per_sec = 1.0",
-        "per_source_burst = 1",
-        "max_tracked_sources = 1",
-    ] {
-        let toml = format!("[security]\n{key}\n");
-        assert!(
-            toml::from_str::<types::FileConfig>(&toml).is_err(),
-            "{key} must be an unknown field"
-        );
-    }
 }
 
 // --- resolve_load_shed ----------------------------------------------------

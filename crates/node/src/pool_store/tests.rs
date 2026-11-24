@@ -352,35 +352,24 @@ fn pre_existing_file_chmod_failure_preserves_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The buyer pending-settle store of `store`'s deployment over its files.
-fn buyer_pending(store: &Arc<PersistentPoolStateStore>) -> BuyerPendingSettleStoreHandle {
-    BuyerPendingSettleStoreHandle::new(Arc::clone(store.files()), store.deployment())
-}
-
-/// Fill every seller-side family a deployment change must clear — a lane,
-/// a seller and a buyer pending settle, a sent `redeemMany` hash — and flush.
+/// Fill every seller-side family a deployment change must clear — a lane and
+/// a sent `redeemMany` hash — and flush.
 fn seed_seller_state(dir: &Path, deployment: Deployment) -> anyhow::Result<LaneState> {
     let store = Arc::new(PersistentPoolStateStore::open(dir, deployment)?);
     let lane = sample(0x31);
     store.record(&lane)?;
     store.flush()?;
-    let pending = PendingSettle {
-        pool_id: lane.pool_id,
-        settle_after: 1_700_000_000,
-    };
-    store.record_pending(&pending)?;
-    buyer_pending(&store).record_pending(&pending)?;
     store.record_sent_redeem(deployment, SENT_TX)?;
     Ok(lane)
 }
 
-/// Whether every seller-side family `seed_seller_state` fills is empty.
-fn seller_state_is_empty(store: &Arc<PersistentPoolStateStore>) -> anyhow::Result<bool> {
-    let buyer = buyer_pending(store);
-    Ok(store.load_all()?.is_empty()
-        && store.load_pending()?.is_empty()
-        && buyer.load_pending()?.is_empty()
-        && store.sent_redeems(store.deployment())?.is_empty())
+/// Whether every seller-side family `seed_seller_state` fills is empty for
+/// `deployment`.
+fn seller_state_is_empty(
+    store: &Arc<PersistentPoolStateStore>,
+    deployment: Deployment,
+) -> anyhow::Result<bool> {
+    Ok(store.load_all()?.is_empty() && store.sent_redeems(deployment)?.is_empty())
 }
 
 /// A `redeemMany` hash `seed_seller_state` records.
@@ -394,11 +383,6 @@ fn reopen_on_the_same_deployment_keeps_seller_state() -> anyhow::Result<()> {
 
     let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
     anyhow::ensure!(store.load_all()? == vec![lane], "lane kept");
-    anyhow::ensure!(store.load_pending()?.len() == 1, "seller pending kept");
-    anyhow::ensure!(
-        buyer_pending(&store).load_pending()?.len() == 1,
-        "buyer pending kept"
-    );
     anyhow::ensure!(
         store.sent_redeems(DEPLOYMENT)? == vec![SENT_TX],
         "sent hash kept"
@@ -428,7 +412,7 @@ fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Re
 
         let store = Arc::new(PersistentPoolStateStore::open(dir.path(), other)?);
         anyhow::ensure!(
-            seller_state_is_empty(&store)?,
+            seller_state_is_empty(&store, other)?,
             "{other:?} must not see the first deployment's rows"
         );
         // The same lane identity, other values, on the other deployment.
@@ -445,27 +429,11 @@ fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Re
         );
         store.record(&second)?;
         store.flush()?;
-        store.record_pending(&PendingSettle {
-            pool_id: first.pool_id,
-            settle_after: 1,
-        })?;
         store.record_sent_redeem(other, B256::repeat_byte(1))?;
         drop(store);
 
         let store = Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
         anyhow::ensure!(store.load_all()? == vec![first.clone()], "first lane kept");
-        anyhow::ensure!(
-            store.load_pending()?
-                == vec![PendingSettle {
-                    pool_id: first.pool_id,
-                    settle_after: 1_700_000_000,
-                }],
-            "first pending settle kept"
-        );
-        anyhow::ensure!(
-            buyer_pending(&store).load_pending()?.len() == 1,
-            "first buyer pending kept"
-        );
         anyhow::ensure!(
             store.sent_redeems(DEPLOYMENT)? == vec![SENT_TX],
             "first sent hash kept"
@@ -480,7 +448,7 @@ fn another_deployment_keeps_its_own_seller_rows_beside_the_first() -> anyhow::Re
 }
 
 /// Two live seller views over one file set — one per pool the node accepts —
-/// keep apart the same lane identity and pending settle, through
+/// keep apart the same lane identity, through
 /// a flush and a reopen. A second live view of one deployment is refused, and
 /// dropping a view frees its deployment.
 #[test]
@@ -514,13 +482,8 @@ fn live_views_of_two_deployments_share_the_files_and_stay_apart() -> anyhow::Res
         b.record(&lane_b)?;
         a.flush()?;
         b.flush()?;
-        b.record_pending(&PendingSettle {
-            pool_id: lane_b.pool_id,
-            settle_after: 7,
-        })?;
         anyhow::ensure!(a.load_all()? == vec![lane_a.clone()]);
         anyhow::ensure!(b.load_all()? == vec![lane_b.clone()]);
-        anyhow::ensure!(a.load_pending()?.is_empty(), "b's pending stays b's");
         drop(a);
         // The deployment is free again once its view drops.
         let again = files.seller_view(DEPLOYMENT)?;
@@ -531,7 +494,6 @@ fn live_views_of_two_deployments_share_the_files_and_stay_apart() -> anyhow::Res
     let b = files.seller_view(other)?;
     anyhow::ensure!(a.load_all()? == vec![lane_a], "a's lane after reopen");
     anyhow::ensure!(b.load_all()? == vec![lane_b], "b's lane after reopen");
-    anyhow::ensure!(b.load_pending()?.len() == 1 && a.load_pending()?.is_empty());
     Ok(())
 }
 
@@ -811,75 +773,6 @@ fn sent_redeem_round_trip_and_persist() -> anyhow::Result<()> {
     store.forget_sent_redeem(DEPLOYMENT, a)?;
     store.forget_sent_redeem(DEPLOYMENT, a)?;
     anyhow::ensure!(store.sent_redeems(DEPLOYMENT)? == vec![b]);
-    Ok(())
-}
-
-/// Pending-settle entries round-trip, re-stamp on a re-close, survive a
-/// reopen, and forget cleanly (#327). Keyed by `pool_id`.
-#[test]
-fn pending_settle_round_trip_and_persist() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    let a = PendingSettle {
-        pool_id: sample(1).pool_id,
-        settle_after: 1_700_000_000,
-    };
-    let b = PendingSettle {
-        pool_id: sample(2).pool_id,
-        settle_after: 1_700_000_500,
-    };
-    {
-        let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-        store.record_pending(&a)?;
-        store.record_pending(&b)?;
-        store.record_pending(&PendingSettle {
-            settle_after: 1_700_009_999,
-            ..a
-        })?;
-    }
-    let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-    let mut all = store.load_pending()?;
-    all.sort_by_key(|p| p.pool_id);
-    anyhow::ensure!(all.len() == 2, "overwrite must not add a row");
-    let first = all.first().ok_or_else(|| anyhow::anyhow!("missing [0]"))?;
-    anyhow::ensure!(first.settle_after == 1_700_009_999, "deadline re-stamped");
-    // forget clears it.
-    store.forget_pending(a.pool_id)?;
-    store.forget_pending(b.pool_id)?;
-    anyhow::ensure!(store.load_pending()?.is_empty());
-    Ok(())
-}
-
-/// Seller and buyer pending-settle sets are isolated: a pool recorded in one
-/// never appears in the other (#988).
-#[test]
-fn buyer_and_seller_pending_settle_sets_are_isolated() -> anyhow::Result<()> {
-    let dir = data_dir()?;
-    let store = std::sync::Arc::new(PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?);
-    let buyer = BuyerPendingSettleStoreHandle::new(
-        std::sync::Arc::clone(store.files()),
-        store.deployment(),
-    );
-    let seller_pool = b256!("aa00000000000000000000000000000000000000000000000000000000000000");
-    let buyer_pool = b256!("bb00000000000000000000000000000000000000000000000000000000000000");
-    PendingSettleStore::record_pending(
-        store.as_ref(),
-        &PendingSettle {
-            pool_id: seller_pool,
-            settle_after: 1_000,
-        },
-    )?;
-    buyer.record_pending(&PendingSettle {
-        pool_id: buyer_pool,
-        settle_after: 2_000,
-    })?;
-    let seller_set = PendingSettleStore::load_pending(store.as_ref())?;
-    let buyer_set = buyer.load_pending()?;
-    anyhow::ensure!(
-        seller_set.len() == 1 && seller_set.first().map(|p| p.pool_id) == Some(seller_pool)
-    );
-    anyhow::ensure!(
-        buyer_set.len() == 1 && buyer_set.first().map(|p| p.pool_id) == Some(buyer_pool)
-    );
     Ok(())
 }
 

@@ -152,6 +152,8 @@ fn config_fills_unset_flags_and_chain_id_defaults() {
     let r = resolve_chain(&args(), &file).unwrap();
     assert_eq!(r.rpc_url, "http://config:8545");
     assert_eq!(r.chain_id, DEFAULT_CHAIN_ID);
+    // An explicit data dir is used as given, not scoped under a client subdir.
+    assert_eq!(r.data_dir, PathBuf::from("/tmp/d"));
     assert_eq!(
         r.keystore,
         eth_identity::keystore_path(&PathBuf::from("/tmp/d"))
@@ -179,20 +181,6 @@ fn keystore_password_file_flows_through_and_defaults_to_none() {
     assert_eq!(
         resolve_chain(&a, &file).unwrap().keystore_password_file,
         Some(PathBuf::from("/abs/pw.txt"))
-    );
-}
-
-#[test]
-fn explicit_data_dir_not_client_scoped() {
-    let file = config(
-        "[blockchain]\nrpc_url = \"http://config:8545\"\n\
-         payment_chains = [{ rpc_url = \"http://config:8545\", payment_pools = [\"0x3333333333333333333333333333333333333333\"] }]\n",
-    );
-    let r = resolve_chain(&args(), &file).unwrap();
-    assert_eq!(r.data_dir, PathBuf::from("/tmp/d"));
-    assert_eq!(
-        r.keystore,
-        eth_identity::keystore_path(&PathBuf::from("/tmp/d"))
     );
 }
 

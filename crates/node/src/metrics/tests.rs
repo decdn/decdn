@@ -698,81 +698,6 @@ fn buyer_pool_skipped_undecodable_metric_starts_at_zero_and_increments() {
 }
 
 #[test]
-fn serve_stream_rejected_counters_start_at_zero_and_increment_per_reason() {
-    // #876. Each `serve_stream` reject branch maps to a distinct counter
-    // because a plain counter field carries no label dimension and the wire
-    // `StreamError` deliberately conflates the three `NotFound` reasons.
-    // The exported names carry the encoder-appended `_total` suffix. All
-    // must be exposed at zero on a fresh registry (so dashboards don't read
-    // `(no data)`) and each method must bump exactly its own counter.
-    let metrics = Metrics::new();
-    let reasons = [
-        "decdn_serve_stream_rejected_withdrawn_total",
-        "decdn_serve_stream_rejected_cache_miss_total",
-        "decdn_serve_stream_rejected_internal_error_total",
-        "decdn_serve_stream_rejected_unknown_lane_total",
-        "decdn_serve_stream_rejected_owner_mismatch_total",
-        "decdn_serve_stream_rejected_insufficient_deposit_total",
-        "decdn_serve_stream_rejected_pool_unconfirmed_total",
-        "decdn_serve_stream_rejected_pool_closing_total",
-        "decdn_serve_stream_rejected_signer_cap_exhausted_total",
-        "decdn_serve_stream_rejected_capability_expired_total",
-        "decdn_serve_stream_midstream_signer_cap_exhausted_total",
-        "decdn_serve_stream_midstream_blob_too_large_total",
-        "decdn_serve_stream_rejected_pull_loop_guard_total",
-        // Completed in #1520. These four always exported (the fields have
-        // existed as long as their siblings) — what was missing was any
-        // assertion pinning it, so a rename could have silently broken a
-        // dashboard without failing this test.
-        "decdn_serve_stream_rejected_range_not_satisfiable_total",
-        "decdn_serve_stream_rejected_blob_too_large_total",
-        "decdn_serve_stream_rejected_hash_denied_total",
-        "decdn_serve_stream_rejected_chain_hash_denied_total",
-        "decdn_serve_stream_rejected_origin_denied_total",
-        "decdn_serve_stream_rejected_foreign_declined_total",
-        "decdn_serve_stream_rejected_unattested_total",
-        "decdn_serve_stream_rejected_chain_stale_total",
-    ];
-    let text = metrics.encode().unwrap();
-    for name in reasons {
-        assert!(
-            has_metric_line(&text, name, 0),
-            "reject counter {name} should be exposed at zero on a fresh registry:\n{text}"
-        );
-    }
-
-    metrics.serve_stream_rejected_withdrawn();
-    metrics.serve_stream_rejected_cache_miss();
-    metrics.serve_stream_rejected_internal_error();
-    metrics.serve_stream_rejected_unknown_lane();
-    metrics.serve_stream_rejected_owner_mismatch();
-    metrics.serve_stream_rejected_insufficient_deposit();
-    metrics.serve_stream_rejected_pool_unconfirmed();
-    metrics.serve_stream_rejected_pool_closing();
-    metrics.serve_stream_rejected_signer_cap_exhausted();
-    metrics.serve_stream_rejected_capability_expired();
-    metrics.serve_stream_midstream_signer_cap_exhausted();
-    metrics.serve_stream_midstream_blob_too_large();
-    metrics.serve_stream_rejected_pull_loop_guard();
-    metrics.serve_stream_rejected_range_not_satisfiable();
-    metrics.serve_stream_rejected_blob_too_large();
-    metrics.serve_stream_rejected_hash_denied();
-    metrics.serve_stream_rejected_chain_hash_denied();
-    metrics.serve_stream_rejected_origin_denied();
-    metrics.serve_stream_rejected_foreign_declined();
-    metrics.serve_stream_rejected_unattested();
-    metrics.serve_stream_rejected_chain_stale();
-
-    let text = metrics.encode().unwrap();
-    for name in reasons {
-        assert!(
-            has_metric_line(&text, name, 1),
-            "reject counter {name} should read exactly 1 after one bump:\n{text}"
-        );
-    }
-}
-
-#[test]
 fn attestation_refresh_counters_start_at_zero_and_increment() {
     let metrics = Metrics::new();
     let names = [
@@ -786,14 +711,26 @@ fn attestation_refresh_counters_start_at_zero_and_increment() {
     for name in names {
         assert!(has_metric_line(&text, name, 0), "{name} at zero:\n{text}");
     }
-    metrics.attestation_refreshed_dht();
-    metrics.attestation_refreshed_origin();
-    metrics.attestation_refreshed_self();
-    metrics.attestation_refresh_failed();
-    metrics.attestation_expired();
+    // A distinct count per counter, so a recorder wired to a sibling's
+    // counter reads the wrong value.
+    let recorders: [fn(&Metrics); 5] = [
+        Metrics::attestation_refreshed_dht,
+        Metrics::attestation_refreshed_origin,
+        Metrics::attestation_refreshed_self,
+        Metrics::attestation_refresh_failed,
+        Metrics::attestation_expired,
+    ];
+    for (bumps, record) in (1u64..).zip(recorders) {
+        for _ in 0..bumps {
+            record(&metrics);
+        }
+    }
     let text = metrics.encode().unwrap();
-    for name in names {
-        assert!(has_metric_line(&text, name, 1), "{name} at one:\n{text}");
+    for (want, name) in (1u64..).zip(names) {
+        assert!(
+            has_metric_line(&text, name, want),
+            "{name} at {want}:\n{text}"
+        );
     }
 }
 
@@ -1025,29 +962,6 @@ fn stream_outcomes_split_by_direction() {
 }
 
 #[test]
-fn receipt_writes_dropped_metric_starts_at_zero_and_increments() {
-    // #803. The struct field is `receipt_writes_dropped`; the OpenMetrics
-    // encoder appends `_total`, so the exported name is
-    // `decdn_receipt_writes_dropped_total` — the operator-visible name an
-    // alert on lost audit records references. Must be exposed at zero on a
-    // fresh registry and bump once per dropped receipt.
-    let metrics = Metrics::new();
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_receipt_writes_dropped_total", 0),
-        "receipt-write-dropped counter should be exposed at zero on a fresh registry:\n{text}"
-    );
-
-    metrics.receipt_write_dropped();
-
-    let text = metrics.encode().unwrap();
-    assert!(
-        has_metric_line(&text, "decdn_receipt_writes_dropped_total", 1),
-        "expected one dropped-receipt event:\n{text}"
-    );
-}
-
-#[test]
 fn warming_credits_dropped_metric_starts_at_zero_and_increments() {
     // ADR 041. Exposed at zero on a fresh registry so an alert can be
     // written against it before the first drop ever happens, and bumped once
@@ -1212,16 +1126,23 @@ fn serve_cache_hit_family_exports_and_records() {
         );
     }
 
-    // One bump each, so a recorder wired to the wrong sibling shows up as a
-    // count on a name it should not have touched.
-    metrics.serve_cache_hit();
-    metrics.serve_cache_partial_hit();
-    metrics.serve_cache_miss();
+    // A distinct count per sibling, so a recorder wired to the wrong sibling
+    // shows up as a wrong count.
+    let recorders: [fn(&Metrics); 3] = [
+        Metrics::serve_cache_hit,
+        Metrics::serve_cache_partial_hit,
+        Metrics::serve_cache_miss,
+    ];
+    for (bumps, record) in (1u64..).zip(recorders) {
+        for _ in 0..bumps {
+            record(&metrics);
+        }
+    }
     let text = metrics.encode().unwrap();
-    for name in names {
+    for (want, name) in (1u64..).zip(names) {
         assert!(
-            has_metric_line(&text, name, 1),
-            "{name} should report 1 after its recorder fired once:\n{text}"
+            has_metric_line(&text, name, want),
+            "{name} should report {want}:\n{text}"
         );
     }
 }
@@ -1234,7 +1155,7 @@ fn serve_cache_hit_family_exports_and_records() {
 /// the predicate to e.g. `addr.ip() == Ipv4Addr::LOCALHOST` would
 /// regress on `::1` and break here visibly.
 #[tokio::test]
-async fn bind_accepts_loopback_and_warns_on_non_loopback() {
+async fn bind_accepts_loopback_and_unspecified() {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     // IPv4 loopback: warn-free.

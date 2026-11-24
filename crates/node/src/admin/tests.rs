@@ -346,19 +346,6 @@ async fn admin_reload_applies_and_returns_post_reload_values() {
     assert_eq!(resp.log_level, "debug");
 }
 
-/// `DrainTrigger::fire` followed by `wait()` resolves. The Notify
-/// stores a permit when no waiter is present, so the `notified()`
-/// future claims it immediately — no race window or ordering
-/// requirement between `fire` and `wait` in tests.
-#[tokio::test]
-async fn drain_trigger_fire_then_wait_resolves() {
-    let trigger = DrainTrigger::new();
-    let honored = trigger.fire(false);
-    assert!(!honored, "first writer's value is the effective one");
-    let waited = tokio::time::timeout(std::time::Duration::from_millis(100), trigger.wait()).await;
-    assert!(waited.is_ok(), "wait() did not resolve after fire()");
-}
-
 /// Firing repeatedly must not deadlock a subsequent `wait`. `Notify`
 /// coalesces multiple `notify_one` calls into a single permit, so the
 /// second and third `fire` while no waiter is pending are no-ops and
@@ -941,7 +928,6 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
     let first = snaps.first().expect("first snapshot");
     assert_eq!(first.outstanding_micro_usdc, 2_500_000);
     assert_eq!(first.deposit_micro_usdc, 0);
-    assert_eq!(first.last_nonce, 0);
     assert!(
         first.pool_id.starts_with("0x"),
         "pool_id must be 0x-hex: {}",

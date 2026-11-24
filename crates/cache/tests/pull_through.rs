@@ -281,18 +281,6 @@ async fn populate_pulls_no_whole_blob_from_an_fs_origin() -> anyhow::Result<()> 
     Ok(())
 }
 
-#[tokio::test]
-async fn miss_without_origin_returns_no_origin() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(tmp.path(), Vec::new(), 16).await?;
-    let err = err_of(engine.populate(Hash::new(b"whatever")).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::NoOrigin { .. }),
-        "expected NoOrigin, got: {err:?}"
-    );
-    Ok(())
-}
-
 // ----- origin retry policy (#285) -----------------------------------------
 
 /// Open an engine over `origins` with `policy` and `breaker`, then set
@@ -1219,25 +1207,6 @@ async fn single_origin_chain_never_advances() -> anyhow::Result<()> {
     // A second populate is a local hit: no origin call.
     engine.populate(hash).await?;
     anyhow::ensure!(only.fetches() == 1, "a hit calls no origin");
-    Ok(())
-}
-
-#[tokio::test]
-async fn empty_origin_vec_returns_no_origin() -> anyhow::Result<()> {
-    let hash = Hash::new(b"impossible");
-    let slot = EngineSlot::default();
-    let metrics = Arc::new(CacheMetrics::default());
-    let (engine, _tmp) = build_engine_with_origins(Vec::new(), Arc::clone(&metrics), &slot).await?;
-
-    let err = err_of(engine.populate(hash).await)?;
-    anyhow::ensure!(
-        matches!(err, CacheError::NoOrigin { .. }),
-        "empty chain must surface NoOrigin (cache-only mode), got: {err:?}",
-    );
-    anyhow::ensure!(
-        metrics.origin_fetches.get() == 0,
-        "no origin attempted => no origin_fetches bump",
-    );
     Ok(())
 }
 

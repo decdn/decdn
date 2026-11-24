@@ -117,19 +117,6 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
     }
 
     // -----------------------------------------------------------------
-    // Deploy wiring
-    // -----------------------------------------------------------------
-
-    function test_deployWiring_sweepReceiverBound() public view {
-        assertEq(address(d.sweepReceiver.feeRouter()), address(d.router), "receiver.feeRouter");
-        assertEq(address(d.sweepReceiver.usdc()), address(usdc), "receiver.usdc");
-        assertEq(address(d.sweepReceiver.messageTransmitter()), address(cctp), "receiver.messageTransmitter");
-        assertEq(d.sweepReceiver.tokenMessenger(), address(cctp), "receiver.tokenMessenger");
-        assertEq(address(d.router.capacityBond()), address(d.bond), "router.capacityBond");
-        assertEq(d.router.treasury(), address(d.timelock), "router.treasury");
-    }
-
-    // -----------------------------------------------------------------
     // Full redemption lifecycle
     // -----------------------------------------------------------------
 

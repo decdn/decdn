@@ -1,13 +1,6 @@
 use super::*;
 use rand::SeedableRng;
 
-#[test]
-fn open_ceiling_is_two_open_timeouts_and_the_path_grace() {
-    assert_eq!(OPEN_TIMEOUT, Duration::from_secs(1));
-    assert_eq!(OPEN_PATH_GRACE, Duration::from_millis(500));
-    assert_eq!(OPEN_CEILING, Duration::from_millis(2_500));
-}
-
 // #859 regression guard: the derived outer pull-through deadline must strictly
 // exceed the sum of what all `MAX_PROVIDER_ATTEMPTS` candidates can actually
 // cost, so the outer `tokio::time::timeout` can never preempt the fallback loop

@@ -1247,8 +1247,9 @@ async fn losers_are_cancelled_with_their_connections_kept() -> anyhow::Result<()
 }
 
 /// A download with two holders adopts the winner's whole-blob stream as its
-/// first leg, with no second open, and resets the other: the drive narrows
-/// the pull to the winner's stripe and plans the other holder's at once.
+/// first leg, with no second open, and resets the other: the claim keeps
+/// both holders for the drive and parks the winner's lane with its primed
+/// pull.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_multi_holder_download_adopts_the_winners_stream() -> anyhow::Result<()> {
     use crate::SourceProvider as _;

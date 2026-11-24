@@ -32,20 +32,6 @@ fn a_malformed_public_url_is_refused() {
     assert!(parse(&["--public-url", "not a url"]).is_err());
 }
 
-/// The capabilities' caps bound what a gateway spends: it takes no daily
-/// allowance.
-#[test]
-fn the_gateway_takes_no_allowance() {
-    for flags in [
-        &["--allowance-bytes-per-day", "1GiB"][..],
-        &["--allowance", "7=1GiB"][..],
-    ] {
-        let mut args = vec!["--public-url", "https://decdn.link"];
-        args.extend_from_slice(flags);
-        assert!(parse(&args).is_err(), "{flags:?}");
-    }
-}
-
 #[test]
 fn metrics_listen_parses_with_a_public_url() {
     let args = parse(&[

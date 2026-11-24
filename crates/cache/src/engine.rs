@@ -1383,6 +1383,10 @@ async fn snapshot_blob_sizes(
     let mut partials = HashSet::new();
     while let Some(hash) = stream.next().await {
         let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
+        // Size-proof tags hold the empty blob, which is never a cache entry.
+        if hash == Hash::EMPTY {
+            continue;
+        }
         let status = blobs
             .status(hash)
             .await
@@ -1852,13 +1856,8 @@ impl CacheEngine {
                 .collect::<HashSet<Hash>>(),
         );
         let prev_arc = self.inner.pinned.swap(Arc::clone(&new_arc));
-        // Same set-difference arithmetic as `PinnedHashes::diff` (in
-        // `decdn-config-types`), recomputed here over the store-hash
-        // sets instead of round-tripping back to leaf hashes. The two
-        // must stay behaviorally identical — `to_store_hash` is a
-        // bijection on the 32 bytes, so cardinalities and membership are
-        // preserved; if `PinnedHashes::diff` ever reports more than
-        // counts (e.g. a sample of changed hashes), update both.
+        // Counted over the store-hash sets: `to_store_hash` is a bijection
+        // on the 32 bytes, so the counts equal those of the leaf sets.
         let added = new_arc.iter().filter(|h| !prev_arc.contains(*h)).count();
         let removed = prev_arc.iter().filter(|h| !new_arc.contains(*h)).count();
         PinDiff { added, removed }
@@ -4784,7 +4783,8 @@ impl CacheEngine {
         let mut out = Vec::new();
         while let Some(hash) = stream.next().await {
             let hash = hash.map_err(|e| CacheError::Store(anyhow::Error::from(e)))?;
-            if self.refuses(hash) {
+            // Size-proof tags hold the empty blob, which is never a cache entry.
+            if hash == Hash::EMPTY || self.refuses(hash) {
                 continue;
             }
             let status = match blobs.status(hash).await {

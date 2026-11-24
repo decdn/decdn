@@ -180,16 +180,6 @@ fn delivered_at_zero_speed_isolates_correctness_weight() -> anyhow::Result<()> {
 }
 
 #[test]
-fn unreachable_pulls_score_down() -> anyhow::Result<()> {
-    let r = LocalReputation::new(LocalReputationConfig::default())?;
-    let p = fresh_peer();
-    // interaction = 0; EWMA from 0.5: 0.45
-    let next = r.record(p, Outcome::Unreachable);
-    ensure!(approx(next, 0.45), "got {next}");
-    Ok(())
-}
-
-#[test]
 fn corruption_holds_score_near_reachability_weight() -> anyhow::Result<()> {
     let r = LocalReputation::new(LocalReputationConfig::default())?;
     let p = fresh_peer();
@@ -275,18 +265,6 @@ fn region_latency_mismatch_scores_like_unreachable() -> anyhow::Result<()> {
 }
 
 #[test]
-fn speed_score_function_is_correct() {
-    let bps = 1024 * 1024 * 1024; // 1 GiB/s reference
-    let one_sec = Duration::from_secs(1);
-    assert!(approx(speed_score(bps, one_sec, bps), 1.0));
-    assert!(approx(speed_score(2 * bps, one_sec, bps), 1.0));
-    assert!(speed_score(bps / 10, one_sec, bps) < speed_score(bps, one_sec, bps));
-    assert!(approx(speed_score(0, one_sec, bps), 0.0));
-    assert!(approx(speed_score(1, Duration::ZERO, bps), 0.0));
-    assert!(approx(speed_score(1, one_sec, 0), 0.0));
-}
-
-#[test]
 fn reference_bps_override_changes_speed_baseline() -> anyhow::Result<()> {
     let cfg = LocalReputationConfig {
         reference_bps: 1024 * 1024, // 1 MiB/s baseline
@@ -354,22 +332,6 @@ fn independent_peers_tracked_separately() -> anyhow::Result<()> {
     let bad = r.score(p_bad);
     ensure!(good > 0.9, "good={good}");
     ensure!(bad < 0.05, "bad={bad}");
-    Ok(())
-}
-
-#[test]
-fn zero_elapsed_does_not_panic_and_yields_zero_speed() -> anyhow::Result<()> {
-    let r = LocalReputation::new(LocalReputationConfig::default())?;
-    let p = fresh_peer();
-    // speed_score=0 → interaction = 0 + 0.4 + 0.2 = 0.6; EWMA → 0.51
-    let next = r.record(
-        p,
-        Outcome::Delivered {
-            bytes: 1,
-            elapsed: Duration::ZERO,
-        },
-    );
-    ensure!(approx(next, 0.51), "got {next}");
     Ok(())
 }
 

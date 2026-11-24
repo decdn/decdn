@@ -753,44 +753,6 @@ async fn release_for_eviction_reclaims_a_deny_listed_pinned_hash() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn populate_hit_records_access_time() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"hello cache hit";
-    let engine = CacheEngine::open(tmp.path(), vec![], 10).await?;
-    let hash = engine.insert_blob(payload.to_vec()).await?;
-
-    // Clear the access time so the next populate proves a cache-hit path.
-    engine.inner.access_times.clear();
-
-    // Populate again — this time it's a local hit.
-    engine.populate(hash).await?;
-
-    anyhow::ensure!(
-        engine.last_accessed(hash).is_some(),
-        "expected Some(Instant) after a cache-hit populate"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn pull_through_records_access_time() -> anyhow::Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let payload = b"hello pull-through";
-    let hash = Hash::new(payload);
-    let origin = Arc::new(AdmittingOrigin::new(&[payload]));
-    let engine = admitting_engine(tmp.path(), &origin).await?;
-
-    engine.populate(hash).await?;
-
-    anyhow::ensure!(origin.fetches() == 1, "the miss pulls through");
-    anyhow::ensure!(
-        engine.last_accessed(hash).is_some(),
-        "expected Some(Instant) after a pull-through populate"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn subscribe_inserts_emits_on_pull_through_success() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"hello dht hook";
@@ -857,6 +819,7 @@ async fn second_populate_updates_access_time() -> anyhow::Result<()> {
 
     // First access (pull-through).
     engine.populate(hash).await?;
+    anyhow::ensure!(origin.fetches() == 1, "the miss pulls through");
     let first = engine
         .last_accessed(hash)
         .ok_or_else(|| anyhow::anyhow!("expected Some after first populate"))?;
@@ -874,40 +837,6 @@ async fn second_populate_updates_access_time() -> anyhow::Result<()> {
         second > first,
         "access time should advance: first={first:?}, second={second:?}"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn observe_hit_forwards_to_frequency_estimator() -> anyhow::Result<()> {
-    use crate::policy::FrequencyEstimator;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    #[derive(Debug, Default)]
-    struct Counter(AtomicU32);
-    impl FrequencyEstimator for Counter {
-        fn observe(&self, _h: Hash) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-        fn estimate(&self, _h: Hash) -> u32 {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-
-    let tmp = tempfile::tempdir()?;
-    let payload = b"hello frequency";
-    let hash = Hash::new(payload);
-    let origin = StubOrigin;
-
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(origin) as Arc<dyn Origin>], 10).await?;
-
-    let counter = Arc::new(Counter::default());
-    engine.set_frequency_estimator(counter.clone());
-
-    let _ = engine.insert_blob(payload.to_vec()).await?;
-    engine.observe_hit(hash);
-
-    anyhow::ensure!(counter.estimate(hash) >= 1, "observe should fire on access");
     Ok(())
 }
 
@@ -1755,7 +1684,7 @@ async fn set_pinned_atomically_updates_filter() -> anyhow::Result<()> {
 // ----- Operator-evict (#279) -----
 
 /// `evict` must take a previously-cached hash off the served set. After
-/// evict, `has` reports false and `get` returns `NotFound` rather than
+/// evict, `has` reports false and `populate` returns `NotFound` rather than
 /// silently re-pulling from the origin (which would defeat the point of
 /// the takedown use case behind issue #279).
 #[tokio::test]
@@ -2409,13 +2338,13 @@ async fn inspect_unknown_hash_reports_absent() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// After a successful pull-through `get`, `inspect` reports the
-/// concrete blob size, a finite `last_accessed_us_ago`, and
-/// `served=true`. Asserts the size matches the payload exactly so
-/// a regression that returned the partial-blob size (or a wrong
-/// match arm in the `BlobStatus` decode) fails loudly.
+/// After an `insert_blob`, `inspect` reports the concrete blob size, a
+/// finite `last_accessed_us_ago`, and `served=true`. Asserts the size
+/// matches the payload exactly so a regression that returned the
+/// partial-blob size (or a wrong match arm in the `BlobStatus` decode)
+/// fails loudly.
 #[tokio::test]
-async fn inspect_after_get_reports_size_and_served() -> anyhow::Result<()> {
+async fn inspect_after_insert_reports_size_and_served() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let payload = b"inspect me";
     let hash = Hash::new(payload);
@@ -2434,7 +2363,7 @@ async fn inspect_after_get_reports_size_and_served() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         preview.last_accessed_us_ago.is_some(),
-        "expected Some(last_accessed_us_ago) after get()"
+        "expected Some(last_accessed_us_ago) after insert_blob()"
     );
     anyhow::ensure!(preview.served, "expected served=true");
     anyhow::ensure!(!preview.already_evicted, "expected already_evicted=false");
@@ -4662,47 +4591,6 @@ async fn coverage_of_partial_blob_covers_only_present_blocks() {
     assert!(!cov.covers(1), "block 1's middle group is missing");
 }
 
-// -- On a front-prefix partial, the observe() bitfield knows the full --
-// -- blob size while status() still reports it unknown (#1506). --
-
-#[tokio::test]
-async fn spike_bitfield_size_known_before_status_size_on_front_partial() {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
-    // Front-fill only: admit block 0 and NEVER admit the trailing group,
-    // so iroh-blobs never sees the blob's final chunk and `status()`
-    // never learns the size.
-    let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * crate::CHUNK_GROUP_BYTES;
-    let (root, plaintext, outboard) = synth_blob(total as usize);
-
-    let (hash, block0_ranges, block0_bao) = bao_for(
-        root,
-        &plaintext,
-        outboard,
-        0,
-        decdn_protocol::DISCOVERY_BLOCK_BYTES,
-        total,
-    );
-    engine
-        .admit_bao(hash, block0_ranges, block0_bao)
-        .await
-        .unwrap();
-
-    let status = engine.inner.store.blobs().status(hash).await.unwrap();
-    assert_matches!(
-        status,
-        iroh_blobs::api::blobs::BlobStatus::Partial { size: None },
-        "front-only partial must NOT have a status()-known size yet, got {status:?}"
-    );
-
-    let bitfield = engine.inner.store.blobs().observe(hash).await.unwrap();
-    assert_eq!(
-        bitfield.size(),
-        total,
-        "observe()'s bitfield must already know the full synthetic blob size"
-    );
-}
-
 /// A front-prefix partial (block 0 present, no tail, `status()` size
 /// still unknown) must still advertise coverage for block 0: the size
 /// used to derive discovery blocks comes from the `observe()` bitfield
@@ -5046,6 +4934,21 @@ async fn size_snapshot_counts_tail_bearing_partial_by_present_bytes_not_total() 
     Ok(())
 }
 
+/// The store lists the empty blob, which the client reports complete at size
+/// 0. It is never a cache entry, so the size walk leaves it out.
+#[tokio::test]
+async fn size_snapshot_leaves_out_the_empty_blob() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await?;
+    let hash = engine.insert_blob(b"snapshot-a".to_vec()).await?;
+    let sizes = engine.size_snapshot().await?;
+    anyhow::ensure!(
+        sizes.keys().copied().collect::<Vec<_>>() == vec![hash],
+        "expected only {hash}, got {sizes:?}"
+    );
+    Ok(())
+}
+
 /// The walk re-observes a partial only once its memoized count is a TTL
 /// old: within the TTL it reuses the count, after it it measures the new
 /// bytes. A hash that stops being partial leaves the memo.
@@ -5153,64 +5056,6 @@ fn present_byte_count_clamps_to_size() {
         present_byte_count(&ChunkRanges::from(ChunkNum(1)..), 0),
         0,
         "an unknown size contributes nothing past it"
-    );
-}
-
-/// Advertise (`coverage`) and serve (`partial_hit_size`, mirrored here via
-/// `present_ranges` + `missing_ranges` — the exact sequence it runs)
-/// must AGREE on a front-prefix partial (#1506).
-///
-/// Both size the blob from the `observe()` bitfield. `status()`'s size is
-/// not usable here: iroh-blobs leaves it `None` for a `Partial` blob until
-/// its FINAL chunk validates, so on a front-prefix partial (block 0
-/// present, no tail) a `status()`-sized serve gate declines a block that
-/// `coverage` already advertises as covered.
-#[tokio::test]
-async fn partial_hit_size_source_agrees_with_coverage_on_front_partial() {
-    let tmp = tempfile::tempdir().unwrap();
-    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
-    let total = decdn_protocol::DISCOVERY_BLOCK_BYTES + 3 * crate::CHUNK_GROUP_BYTES;
-    let (root, plaintext, outboard) = synth_blob(total as usize);
-
-    let (hash, block0_ranges, block0_bao) = bao_for(
-        root,
-        &plaintext,
-        outboard,
-        0,
-        decdn_protocol::DISCOVERY_BLOCK_BYTES,
-        total,
-    );
-    engine
-        .admit_bao(hash, block0_ranges, block0_bao)
-        .await
-        .unwrap();
-
-    let status = engine.inner.store.blobs().status(hash).await.unwrap();
-    assert_matches!(
-        status,
-        iroh_blobs::api::blobs::BlobStatus::Partial { size: None },
-        "front-only partial must NOT have a status()-known size yet, got {status:?}"
-    );
-
-    // Advertise side: coverage() says block 0 is covered.
-    let cov = engine.coverage(hash).await.unwrap();
-    assert!(cov.covers(0), "advertise: block 0 is fully present");
-
-    // Serve side: partial_hit_size's exact logic — bitfield size, then a
-    // fully-present check for a range inside block 0.
-    let present = engine.present_ranges(hash).await.unwrap();
-    let size = present.size();
-    assert_ne!(size, 0, "serve: the bitfield must know the blob's size");
-    let byte_offset = 0;
-    let byte_len = decdn_protocol::DISCOVERY_BLOCK_BYTES;
-    let missing = engine
-        .missing_ranges(hash, byte_offset, byte_len, size)
-        .await
-        .unwrap();
-    assert!(
-        missing.is_empty(),
-        "serve: block 0's byte range is fully present, so partial_hit_size must return \
-         Some(size), agreeing with advertise's coverage(0)"
     );
 }
 

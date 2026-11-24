@@ -2410,7 +2410,7 @@ fn shutdown_service<P: Provider + Clone + 'static>(
     let (redeem_tx, _redeem_rx) = mpsc::channel(1);
     PoolSettlementService {
         contract,
-        redeem_tx,
+        _redeem_tx: redeem_tx,
         store,
         paid: PaidWatermarks::default(),
         self_address,
