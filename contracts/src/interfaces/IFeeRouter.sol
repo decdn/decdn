@@ -14,8 +14,8 @@ pragma solidity 0.8.28;
 interface IFeeRouter {
     // ─── Deposit entrypoint ───────────────────────────────────────────
 
-    /// @notice Pull `amount` USDC from the caller, split it into rebate,
-    ///         buyback and treasury legs, and credit up to `servedBytes` to
+    /// @notice Pull `amount` USDC from the caller, split it into rebate and
+    ///         treasury legs, and credit up to `servedBytes` to
     ///         `operator` in the arrival epoch. Permissionless.
     function deposit(address operator, uint256 servedBytes, uint256 amount) external;
 
@@ -58,15 +58,10 @@ interface IFeeRouter {
     /// @notice Share of each deposit returned to an active operator, in bps.
     function rebateBps() external view returns (uint256);
 
-    /// @notice Share of each deposit sent to `buybackBurner`, in bps.
-    function buybackBps() external view returns (uint256);
-
-    /// @notice Destination of the buyback leg. Zero while `buybackBps` is 0.
-    function buybackBurner() external view returns (address);
-
     /// @notice Destination of the remainder (the `TimelockController`).
     function treasury() external view returns (address);
 
-    /// @notice Net USDC base units per MiB of weight credit (bounded [1, 1000]).
+    /// @notice Treasury-leg USDC base units per MiB of weight credit
+    ///         (bounded [1, 1000]).
     function deliveryFloor() external view returns (uint256);
 }

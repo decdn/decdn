@@ -561,11 +561,11 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     // `openPool` mines, the node can still answer `NotFound` for the brief window
     // before its `getPool` view resolves the new pool (there is no pool-open event
     // to wait on). A
-    // pure readiness `NotFound` delivers no byte and writes no partial, so
+    // pure readiness `NotFound` delivers no byte and writes no data, so
     // re-invoking is safe and cannot double-pay; the moment any byte lands we stop
     // retrying, so the recovery top-up branch remains the only thing that can move
     // the byte offset within the one delivering run.
-    let partial = client_dir.path().join("blob.bin.partial");
+    let partial = client_dir.path().join("blob.bin.decdn");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let output = tokio::process::Command::from(decdn_command(
@@ -580,10 +580,15 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         if output.status.success() {
             break;
         }
-        // Anything already on disk means the run began delivering; a re-invocation
-        // would resume from that flushed prefix and corrupt the cost measurement,
-        // so surface the failure rather than retry.
-        let progressed = out.exists() || std::fs::metadata(&partial).is_ok_and(|m| m.len() > 0);
+        // Any data in the store means the run began delivering; a re-invocation
+        // would resume from that prefix and corrupt the cost measurement, so
+        // surface the failure rather than retry. A run that delivered nothing
+        // leaves at most an empty store.
+        let progressed = out.exists()
+            || std::fs::read_dir(partial.join("data")).is_ok_and(|dir| {
+                dir.flatten()
+                    .any(|e| e.metadata().is_ok_and(|m| m.len() > 0))
+            });
         anyhow::ensure!(
             !progressed && tokio::time::Instant::now() < deadline,
             "decdn get failed (delivered bytes on disk = {progressed}): {}",
@@ -602,7 +607,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         !partial.exists(),
-        "the .partial scratch file must be promoted away, not left beside --output: {}",
+        "the store must be removed, not left beside --output: {}",
         partial.display()
     );
 
@@ -854,10 +859,10 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     // The one exception is the node's serve-path readiness race: right after
     // `openPool` mines, the node can answer `NotFound` for the brief window before
     // its `getPool` view resolves the new pool (there is no pool-open event to wait
-    // on). A pure readiness `NotFound` delivers no byte and writes no partial, so
+    // on). A pure readiness `NotFound` delivers no byte and writes no data, so
     // re-invoking is safe and cannot corrupt the measurement; the moment any byte
     // lands the loop stops retrying.
-    let partial = client_dir.path().join("blob.bin.partial");
+    let partial = client_dir.path().join("blob.bin.decdn");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     // The delivering run's stderr, at `CLIENT_DEBUG_LOG`: every money assertion
     // below prints it, so a load-dependent miss arrives with its leg trail.
@@ -884,7 +889,11 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         // resume from that flushed prefix and corrupt the cost measurement.
         let stderr = String::from_utf8_lossy(&output.stderr);
         let readiness_race = stderr.contains("NotFound");
-        let progressed = out.exists() || std::fs::metadata(&partial).is_ok_and(|m| m.len() > 0);
+        let progressed = out.exists()
+            || std::fs::read_dir(partial.join("data")).is_ok_and(|dir| {
+                dir.flatten()
+                    .any(|e| e.metadata().is_ok_and(|m| m.len() > 0))
+            });
         anyhow::ensure!(
             readiness_race && !progressed && tokio::time::Instant::now() < deadline,
             "decdn get failed (readiness race = {readiness_race}, delivered bytes on disk = \
@@ -894,8 +903,8 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     };
 
     // Byte-exact delivery. A paid frontier that ever ran PAST the true one shows up
-    // here: `set_len` would have zero-extended the partial over the skipped span,
-    // and the whole-file BLAKE3 check would reject the result.
+    // here: the store would hold no verified bytes over the skipped span, and
+    // the blob would never complete.
     let got = std::fs::read(&out).context("read output")?;
     anyhow::ensure!(
         got == blob,
@@ -905,7 +914,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         !partial.exists(),
-        "the .partial scratch file must be promoted away, not left beside --output: {}",
+        "the store must be removed, not left beside --output: {}",
         partial.display()
     );
 

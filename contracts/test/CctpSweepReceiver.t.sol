@@ -57,9 +57,7 @@ contract CctpSweepReceiverTest is Test {
             windowEpochs_: 13,
             deliveryFloor_: 1,
             admin: admin,
-            rebateBps_: 7500,
-            buybackBps_: 0,
-            buybackBurner_: address(0)
+            rebateBps_: 7500
         });
         receiver = new CctpSweepReceiver(dstUsdc, transmitter, address(dstMessenger), IFeeRouter(address(router)));
     }

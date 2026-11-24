@@ -6,7 +6,7 @@
 //! once, from one shared payment pool, and lands it at every path that names
 //! it. It resumes from what an earlier run left: a file already on disk is
 //! skipped, a byte-identical file elsewhere in the output directory is linked,
-//! a range a sibling entry shares is spliced from disk, and a `.partial` an
+//! a range a sibling entry shares is spliced from disk, and the store an
 //! interrupted run left is the next fetch's prefix.
 //!
 //! # A pull, end to end
@@ -62,6 +62,7 @@ use crate::{
 mod engine;
 mod landing;
 mod manifest_cache;
+mod run_store;
 mod skip_cache;
 #[cfg(test)]
 mod tests;
@@ -70,8 +71,9 @@ mod tests;
 pub use crate::lane_sources::FaultContext;
 
 /// The directory under the output root where a pull stages the blobs it
-/// fetches: `<hex>.partial` and its resume record while a blob is in flight,
-/// and `<hex>` once it is verified and before it lands at its paths.
+/// fetches: the run's download store (`store/`, one for every entry) and a
+/// dedup entry's `<hex>.assembly` while a blob is in flight, and `<hex>` once
+/// it is verified and before it lands at its paths.
 pub const STAGING_DIR: &str = ".decdn-partial";
 
 /// The largest bundle manifest a pull fetches, in bytes. A manifest fetch
@@ -899,7 +901,7 @@ pub struct BundleReport {
     /// include the bao proof overhead. Content delivered twice, or paid for and
     /// then dropped after a lane fault, counts each time it is paid. An entry
     /// that fails or is interrupted counts here but not in `downloaded`; a
-    /// later pull resumes its `.partial` and reports it as `resumed_bytes`.
+    /// later pull resumes from its store and reports it as `resumed_bytes`.
     pub paid_bytes: u64,
     /// The `ChunkData` wire bytes this pull's lanes read, verified or not,
     /// summed over every lane ([`crate::PoolLedger::wire_bytes`]). They
@@ -912,7 +914,7 @@ pub struct BundleReport {
     pub wire_bytes: u64,
     /// The bytes written to disk: every landed copy of every blob.
     pub reconstructed: u64,
-    /// The bytes of `.partial` prefixes earlier pulls fetched, which this pull
+    /// The bytes earlier pulls fetched into entry stores, which this pull
     /// resumed. Never part of `downloaded`.
     pub resumed_bytes: u64,
     /// The bytes spliced from files already on disk. Never downloaded.
@@ -1065,7 +1067,12 @@ impl BundlePuller {
         overwrite: bool,
         cancel: &CancellationToken,
     ) -> BundleOutcome {
-        Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await
+        self.ctx.run_store.pull_started();
+        let outcome = Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await;
+        if matches!(outcome.end, BundleEnd::Complete) && outcome.report.failed == 0 {
+            self.ctx.run_store.pull_settled();
+        }
+        outcome
     }
 
     /// Every pool replacement this puller's funding recovery steps made, in
@@ -1105,11 +1112,14 @@ impl BundlePuller {
         self.ctx.rate_hints()
     }
 
-    /// Wait for every queued peer-record and watermark write to land. Call it
-    /// before the process exits, after a cancelled pull too, so the next run
-    /// resumes each lane from what it paid.
+    /// Wait for every queued peer-record and watermark write to land, and close
+    /// the run's download store: it is removed once every pull settled every
+    /// entry, and kept for the next run otherwise. Call it before the process
+    /// exits, after a cancelled pull too, so the next run resumes each lane
+    /// from what it paid and each entry from what it fetched.
     pub async fn finish(self) {
         self.ctx.writes.settle().await;
+        self.ctx.run_store.close().await;
     }
 }
 
@@ -1305,6 +1315,7 @@ impl BundlePullerBuilder {
             hints: self.hints,
             evidence: self.evidence,
             rate_samples: std::sync::Mutex::default(),
+            run_store: run_store::RunStore::default(),
         };
         Ok(BundlePuller { ctx })
     }

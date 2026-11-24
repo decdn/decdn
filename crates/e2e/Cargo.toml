@@ -79,7 +79,7 @@ tracing = { workspace = true }
 # `NodeFixture::terminate` sends the daemon a real SIGTERM, the signal
 # `systemctl stop` sends, through `kill(2)`'s safe wrapper: the workspace forbids
 # `unsafe_code`, which rules out calling `libc::kill` directly.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+nix = { version = "0.32", default-features = false, features = ["signal"] }
 # `ports` binds a port reservation without listening on it, which `std` cannot.
 socket2 = { workspace = true }
 

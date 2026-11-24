@@ -5,7 +5,6 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import { BaseProtocolDeploy } from "./BaseProtocolDeploy.s.sol";
 import { IMessageTransmitterV2 } from "../src/interfaces/ICctpV2.sol";
-import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
 import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 
 /// @title DeployProtocol — production v3 contract surface deployer (issue #694)
@@ -21,20 +20,6 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 /// @dev    This is the governance-chain deploy. Each payment chain deploys its
 ///         `PaymentPool` with `DeployPaymentPool.s.sol`, pointed at the
 ///         `CctpSweepReceiver` this script deploys.
-///
-///         BuybackBurner is dormant by default: the deploy leaves
-///         `FeeRouter.buybackBurner == address(0)` and `buybackBps == 0`. Mainnet
-///         activates it later with `FeeRouter.setBuybackBurner` and
-///         `FeeRouter.setSplit` through the 48h Timelock (ADR 018 § Activation
-///         Criteria) — fully observable in advance.
-///
-///         `ACTIVATE_BUYBACK=true` opts into an OFF-by-default deploy-time genesis
-///         activation instead (a testnet / genesis convenience): the script seeds
-///         the Uniswap V3 TOKEN/USDC pool, deploys the concrete burner, and flips
-///         the FeeRouter to the steady-state split in-script —
-///         before the governance handoff, because at genesis the served-bytes voting
-///         weight that gates the governance path is zero (ADR 036). See
-///         `_readBuybackActivation`.
 ///
 /// @dev    The production `Ed25519Verifier` (issue #669) is deployed in-script
 ///         as the first broadcast step — no operator-supplied address. It wraps
@@ -58,7 +43,7 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///                                            `CapacityBond` rejects the zero sentinel
 ///
 ///         The FeeRouter treasury bucket is NOT an env var: it is the
-///         `TimelockController` this script deploys (step 7 sets it as the
+///         `TimelockController` this script deploys (step 6 sets it as the
 ///         FeeRouter treasury destination), so the 10% treasury leg is
 ///         Timelock-custodied and disbursed only by governance proposal (ADR 016
 ///         § Deployment Order step 3 / § Contracts Holding Funds). Re-pointing it
@@ -108,10 +93,10 @@ contract DeployProtocol is BaseProtocolDeploy {
     uint64 internal constant DEFAULT_FEE_ROUTER_WINDOW_EPOCHS = 13;
 
     // Launch FeeRouter split (ADR 016 § Tunable Economics example): with the
-    // reference `operatorBps` of 6000 on each payment chain, a 75% rebate and no
-    // buyback give the operator 90% and the treasury 10% of each redemption.
+    // reference `operatorBps` of 6000 on each payment chain, a 75% rebate gives
+    // the operator 90% and the treasury 10% of each redemption.
     uint256 internal constant LAUNCH_REBATE_BPS = 7500;
-    // Launch weight-credit price: one net USDC base unit per MiB (ADR 016).
+    // Launch weight-credit price: one treasury-leg USDC base unit per MiB (ADR 016).
     uint256 internal constant LAUNCH_DELIVERY_FLOOR = 1;
 
     /// @notice The deploy refuses to overwrite an existing manifest unless
@@ -146,7 +131,6 @@ contract DeployProtocol is BaseProtocolDeploy {
 
     function run() external returns (Deployment memory d) {
         DeployConfig memory cfg = _readConfig();
-        BuybackActivation memory act = _readBuybackActivation();
         if (cfg.deployer == FORGE_DEFAULT_SENDER) revert DeployerIsForgeDefaultSender(cfg.deployer);
         // Fail BEFORE spending gas: a stale manifest with no FORCE_OVERWRITE_MANIFEST
         // must abort here, not after `_runFullDeploy` has already broadcast the
@@ -161,7 +145,7 @@ contract DeployProtocol is BaseProtocolDeploy {
         // inject a mock by populating `cfg.ed25519Verifier` and calling
         // `_runFullDeploy` directly, bypassing this path).
         cfg.ed25519Verifier = new Ed25519Verifier();
-        d = _runFullDeploy(cfg, act);
+        d = _runFullDeploy(cfg);
         vm.stopBroadcast();
 
         _writeManifest(cfg, d);
@@ -218,83 +202,14 @@ contract DeployProtocol is BaseProtocolDeploy {
         if (windowEpochs > type(uint64).max) revert ParamOverflowsUint64("FEE_ROUTER_WINDOW_EPOCHS", windowEpochs);
         cfg.feeRouterWindowEpochs = uint64(windowEpochs);
         cfg.feeRouterRebateBps = LAUNCH_REBATE_BPS;
-        cfg.feeRouterBuybackBps = 0;
         cfg.feeRouterDeliveryFloor = LAUNCH_DELIVERY_FLOOR;
-        cfg.buybackBurner = address(0);
-    }
-
-    // -----------------------------------------------------------------
-    // Optional genesis buyback activation (OFF by default).
-    //
-    // Left unset (`ACTIVATE_BUYBACK` unset/false), the launch is byte-for-byte the
-    // dormant deploy: `_readBuybackActivation` returns an all-off struct and
-    // `_runFullDeploy` skips the whole path. This is a testnet / genesis
-    // convenience; mainnet activates through the ADR 018 governance-gated path.
-    //
-    //   Required when ON:
-    //     - `BUYBACK_KEEPER`             — EOA/bot granted KEEPER_ROLE
-    //     - `UNISWAP_SWAP_ROUTER`        — SwapRouter02
-    //     - `UNISWAP_POSITION_MANAGER`   — NonfungiblePositionManager
-    //   Optional (defaults from ADR 018 § Parameter Table):
-    //     - `TWAP_MIN_WINDOW_SECS`       (default 1800)
-    //     - `MAX_BUYBACK_AMOUNT`         (default 10_000e6 USDC; must be non-zero)
-    //     - `MIN_BUYBACK_AMOUNT`         (default 100e6 USDC)
-    //     - `SLIPPAGE_BPS`               (default 200; ceiling 1000 = 10%)
-    //     - `EPOCH_CAP_FRACTION_BPS`     (default 1000 = 10%)
-    //     - `UNISWAP_POOL_FEE`           (default 10000 = 1%)
-    //   Pool seed (the script creates + seeds the Uniswap V3 pool in-script; the
-    //   deployer must hold the seed TOKEN + USDC — set `INITIAL_TOKEN_HOLDER` to the
-    //   deployer or fund it). Pick a USDC amount you hold and a target price; the
-    //   paired TOKEN seed is derived so the 50/50 pool initializes at that price:
-    //     - `BUYBACK_USDC_SEED`          (default 1_000e6 = 1,000 USDC; the seeded
-    //                                      depth × `EPOCH_CAP_FRACTION_BPS` must admit
-    //                                      one `MIN_BUYBACK_AMOUNT` buyback, or the
-    //                                      deploy reverts `BuybackBandBelowEpochCap`)
-    //     - `BUYBACK_TARGET_PRICE`       (default 10_000 — the price of one TOKEN in
-    //                                      USDC base units; 6-dec USDC → $0.01/TOKEN)
-    error PoolFeeOutOfRange(uint256 fee);
-
-    function _readBuybackActivation() internal view returns (BuybackActivation memory act) {
-        act.activate = vm.envOr("ACTIVATE_BUYBACK", false);
-        if (!act.activate) return act; // all-off; every other field is ignored.
-
-        act.keeper = vm.envAddress("BUYBACK_KEEPER"); // required — enforced in _activateBuyback too
-        act.guard = GuardedBuybackBurner.GuardParams({
-            twapMinWindow_: vm.envOr("TWAP_MIN_WINDOW_SECS", uint256(1800)),
-            maxBuybackAmount_: vm.envOr("MAX_BUYBACK_AMOUNT", uint256(10_000e6)),
-            minBuybackAmount_: vm.envOr("MIN_BUYBACK_AMOUNT", uint256(100e6)),
-            slippageBps_: vm.envOr("SLIPPAGE_BPS", uint256(200)),
-            epochLiquidityCapFraction_: vm.envOr("EPOCH_CAP_FRACTION_BPS", uint256(1000))
-        });
-
-        // Pool seed: pick a USDC amount you actually hold and a target TOKEN price;
-        // the paired TOKEN seed is derived so the 50/50 pool initializes at that
-        // price (no need to hand-compute the ratio). `BUYBACK_TARGET_PRICE` is the
-        // price of one whole TOKEN in USDC base units (6-dec USDC → `$0.01/TOKEN`
-        // is `10_000`).
-        uint256 usdcSeed = vm.envOr("BUYBACK_USDC_SEED", uint256(1000e6));
-        uint256 targetPrice = vm.envOr("BUYBACK_TARGET_PRICE", uint256(10_000)); // $0.01/TOKEN
-        // Built through the derivation helper so the seed records the price it was
-        // sized for; `_assertPoolSeedDerived` re-derives to prove `tokenSeed`.
-        act.seed = _derivePoolSeed(usdcSeed, targetPrice);
-
-        act.uni.swapRouter = vm.envAddress("UNISWAP_SWAP_ROUTER");
-        act.uni.positionManager = vm.envAddress("UNISWAP_POSITION_MANAGER");
-        // Validate the fee against the supported Uniswap V3 tiers here, before
-        // `vm.startBroadcast`, so an unsupported tier aborts with no gas spent
-        // rather than reverting `UnsupportedFeeTier` mid-deploy.
-        uint256 fee = vm.envOr("UNISWAP_POOL_FEE", uint256(10_000));
-        if (fee != 100 && fee != 500 && fee != 3000 && fee != 10_000) revert PoolFeeOutOfRange(fee);
-        act.uni.poolFee = uint24(fee);
     }
 
     // -----------------------------------------------------------------
     // Manifest — `deployments/<chainId>.json`.
     //
     // Schema is intentionally flat with stable, deterministic keys so downstream
-    // tooling can read it without needing a Solidity-side type. `BuybackBurner`
-    // is `address(0)` for a dormant launch, or the wired concrete burner when
-    // genesis activation ran (see header / `_readBuybackActivation`).
+    // tooling can read it without needing a Solidity-side type.
 
     /// @dev Manifest path for the active chain. Single source of truth shared by
     ///      the early writability check (`run`) and the writer.
@@ -316,17 +231,8 @@ contract DeployProtocol is BaseProtocolDeploy {
     function _writeManifest(DeployConfig memory cfg, Deployment memory d) internal {
         _assertManifestWritable();
         string memory path = _manifestPath();
-        // BuybackBurner is `address(0)` when the launch is dormant (the default);
-        // when genesis activation ran it is the wired concrete burner, and the
-        // split is the steady-state one `_activateBuyback` set. The dormant branch
-        // reads the launch config, so the writer stays safe on stub deployments.
-        address bb = address(d.buybackBurner);
-        uint256 rebateBps = cfg.feeRouterRebateBps;
-        uint256 buybackBps = cfg.feeRouterBuybackBps;
-        if (bb != address(0)) (rebateBps, buybackBps) = (d.router.rebateBps(), d.router.buybackBps());
 
         string memory contracts = "contracts";
-        vm.serializeAddress(contracts, "BuybackBurner", bb);
         vm.serializeAddress(contracts, "CctpSweepReceiver", address(d.sweepReceiver));
         vm.serializeAddress(contracts, "CapacityBond", address(d.bond));
         vm.serializeAddress(contracts, "ContentBlacklist", address(d.blacklist));
@@ -354,10 +260,9 @@ contract DeployProtocol is BaseProtocolDeploy {
         string memory depsJson = vm.serializeAddress(deps, "usdc", address(cfg.usdc));
 
         string memory params = "config";
-        vm.serializeUint(params, "feeRouterBuybackBps", buybackBps);
         vm.serializeUint(params, "feeRouterDeliveryFloor", cfg.feeRouterDeliveryFloor);
         vm.serializeUint(params, "feeRouterEpochLength", cfg.feeRouterEpochLength);
-        vm.serializeUint(params, "feeRouterRebateBps", rebateBps);
+        vm.serializeUint(params, "feeRouterRebateBps", cfg.feeRouterRebateBps);
         vm.serializeUint(params, "feeRouterWindowEpochs", cfg.feeRouterWindowEpochs);
         vm.serializeUint(params, "minBond", cfg.minBond);
         string memory paramsJson = vm.serializeUint(params, "timelockDelay", cfg.timelockDelay);

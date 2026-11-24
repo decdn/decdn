@@ -20,11 +20,10 @@ import { ICapacityBondCredit } from "./interfaces/ICapacityBondCredit.sol";
 ///         bridge: a bridge adapter receives a sweep and deposits the USDC that
 ///         arrived (ADR 016 § Bridge adapters).
 /// @dev    Each deposit splits into a rebate to the operator (`rebateBps`, only
-///         while the operator is active), a buyback leg (`buybackBps`), and a
-///         treasury remainder, all in the same transaction. The weight credit
-///         is priced on the buyback and treasury legs (`net`), never on the
-///         rebate, and is clamped to the operator's declared capacity for the
-///         arrival epoch.
+///         while the operator is active) and a treasury remainder, in the same
+///         transaction. The weight credit is priced on the treasury leg, never
+///         on the rebate, and is clamped to the operator's declared capacity
+///         for the arrival epoch.
 contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPausable {
     using SafeERC20 for IERC20;
     using Checkpoints for Checkpoints.Trace208;
@@ -50,8 +49,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     /// @dev Bytes per second carried by one Mbps (1e6 bits / 8).
     uint256 internal constant BYTES_PER_MBPS_SECOND = 125_000;
 
-    /// @dev Rebate ceiling. Buyback plus treasury keep at least 1% of each
-    ///      deposit, so weight credit always has a net to back it and an
+    /// @dev Rebate ceiling. The treasury keeps at least 1% of each deposit,
+    ///      so weight credit always has a treasury leg to back it and an
     ///      empty window never locks governance out (ADR 036).
     uint256 internal constant MAX_REBATE_BPS = 9900;
 
@@ -88,10 +87,6 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     /// @inheritdoc IFeeRouter
     uint256 public override rebateBps;
     /// @inheritdoc IFeeRouter
-    uint256 public override buybackBps;
-    /// @inheritdoc IFeeRouter
-    address public override buybackBurner;
-    /// @inheritdoc IFeeRouter
     address public override treasury;
     /// @inheritdoc IFeeRouter
     uint256 public override deliveryFloor;
@@ -118,12 +113,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         uint256 credit,
         uint64 indexed epoch
     );
-    /// @notice The rebate and buyback shares changed.
-    event SplitUpdated(uint256 rebateBps, uint256 buybackBps);
+    /// @notice The rebate share changed.
+    event SplitUpdated(uint256 rebateBps);
     /// @notice The weight-credit price changed.
     event DeliveryFloorUpdated(uint256 oldValue, uint256 newValue);
-    /// @notice The buyback destination changed.
-    event BuybackBurnerUpdated(address indexed oldAddr, address indexed newAddr);
     /// @notice The treasury destination changed.
     event TreasuryUpdated(address indexed oldAddr, address indexed newAddr);
     /// @notice The trailing-window length changed.
@@ -137,12 +130,8 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     error ZeroAddress();
     /// @notice A deposit moved no USDC.
     error ZeroAmount();
-    /// @notice `rebateBps + buybackBps` exceeds 10000.
-    error SplitExceedsWhole(uint256 rebateBps, uint256 buybackBps);
-    /// @notice `rebateBps` exceeds 9900, which leaves less than 1% net.
+    /// @notice `rebateBps` exceeds 9900, which leaves the treasury less than 1%.
     error RebateAboveCeiling(uint256 rebateBps);
-    /// @notice A non-zero `buybackBps` needs a non-zero `buybackBurner`.
-    error BuybackNeedsBurner();
     /// @notice `deliveryFloor` is outside [1, 1000].
     error DeliveryFloorOutOfBounds(uint256 value);
     /// @notice `windowEpochs` is outside [4, 26].
@@ -163,9 +152,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     /// @param windowEpochs_  Initial trailing-window length (bounded [4, 26]).
     /// @param deliveryFloor_ Initial weight-credit price (bounded [1, 1000]).
     /// @param admin          `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder.
-    /// @param rebateBps_     Initial rebate share.
-    /// @param buybackBps_    Initial buyback share.
-    /// @param buybackBurner_ Initial burner; zero only while `buybackBps_` is 0.
+    /// @param rebateBps_     Initial rebate share (at most 9900).
     constructor(
         IERC20 usdc_,
         ICapacityBondCredit capacityBond_,
@@ -174,10 +161,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         uint64 windowEpochs_,
         uint256 deliveryFloor_,
         address admin,
-        uint256 rebateBps_,
-        uint256 buybackBps_,
-        // slither-disable-next-line missing-zero-check
-        address buybackBurner_
+        uint256 rebateBps_
     ) {
         if (
             address(usdc_) == address(0) || address(capacityBond_) == address(0) || treasury_ == address(0)
@@ -194,8 +178,7 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         epochLength = epochLength_;
         treasury = treasury_;
         deliveryFloor = deliveryFloor_;
-        buybackBurner = buybackBurner_;
-        _setSplit(rebateBps_, buybackBps_);
+        _setSplit(rebateBps_);
         // The window is bounded to [4, 26], so the uint208 cast is exact.
         // slither-disable-next-line unused-return
         _windowEpochsHistory.push(Time.timestamp(), uint208(uint256(windowEpochs_)));
@@ -229,16 +212,14 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         bool active = capacityBond.isActive(operator);
 
         uint256 rebate = active ? (amount * rebateBps) / BPS_DENOMINATOR : 0;
-        uint256 toBuyback = (amount * buybackBps) / BPS_DENOMINATOR;
-        uint256 toTreasury = amount - rebate - toBuyback;
+        uint256 toTreasury = amount - rebate;
 
         uint256 credit = 0;
-        if (active) credit = _credit(operator, epoch, servedBytes, toBuyback + toTreasury);
+        if (active) credit = _credit(operator, epoch, servedBytes, toTreasury);
 
         // A rebate the operator cannot receive (a blocked address) joins the
         // treasury leg, so one bad operator address never strands a sweep.
         if (rebate != 0 && !_tryTransfer(operator, rebate)) toTreasury += rebate;
-        if (toBuyback != 0) usdc.safeTransfer(buybackBurner, toBuyback);
         if (toTreasury != 0) usdc.safeTransfer(treasury, toTreasury);
 
         emit Deposited(msg.sender, operator, amount, servedBytes, credit, epoch);
@@ -294,18 +275,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     // Governance
     // -----------------------------------------------------------------
 
-    /// @notice Set the rebate and buyback shares. The rebate is at most 9900
-    ///         and their sum is at most 10000; the treasury takes the remainder.
-    function setSplit(uint256 newRebateBps, uint256 newBuybackBps) external onlyRole(GOVERNANCE_ROLE) {
-        _setSplit(newRebateBps, newBuybackBps);
-    }
-
-    /// @notice Set the buyback destination. Zero only while `buybackBps` is 0.
-    function setBuybackBurner(address newAddr) external onlyRole(GOVERNANCE_ROLE) {
-        if (newAddr == address(0) && buybackBps != 0) revert BuybackNeedsBurner();
-        address old = buybackBurner;
-        buybackBurner = newAddr;
-        emit BuybackBurnerUpdated(old, newAddr);
+    /// @notice Set the rebate share (at most 9900). The treasury takes the
+    ///         remainder.
+    function setSplit(uint256 newRebateBps) external onlyRole(GOVERNANCE_ROLE) {
+        _setSplit(newRebateBps);
     }
 
     /// @notice Set the treasury destination.
@@ -353,12 +326,12 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
     // -----------------------------------------------------------------
 
     /// @dev The USDC-backed, capacity-clamped credit, written to the operator
-    ///      and network counters for `epoch`.
-    function _credit(address operator, uint64 epoch, uint256 servedBytes, uint256 net)
+    ///      and network counters for `epoch`. `backing` is the treasury leg.
+    function _credit(address operator, uint64 epoch, uint256 servedBytes, uint256 backing)
         internal
         returns (uint256 credit)
     {
-        credit = Math.min(servedBytes, Math.mulDiv(net, BYTES_PER_MIB, deliveryFloor));
+        credit = Math.min(servedBytes, Math.mulDiv(backing, BYTES_PER_MIB, deliveryFloor));
         uint256 cap = capacityBond.declaredMbps(operator) * uint256(epochLength) * BYTES_PER_MBPS_SECOND;
         uint256 used = _bytesPerEpoch[operator][epoch];
         uint256 room = cap > used ? cap - used : 0;
@@ -377,13 +350,10 @@ contract FeeRouter is IFeeRouter, AccessControl, ReentrancyGuard, SunsettingPaus
         return ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool)));
     }
 
-    function _setSplit(uint256 newRebateBps, uint256 newBuybackBps) internal {
+    function _setSplit(uint256 newRebateBps) internal {
         if (newRebateBps > MAX_REBATE_BPS) revert RebateAboveCeiling(newRebateBps);
-        if (newRebateBps + newBuybackBps > BPS_DENOMINATOR) revert SplitExceedsWhole(newRebateBps, newBuybackBps);
-        if (newBuybackBps != 0 && buybackBurner == address(0)) revert BuybackNeedsBurner();
         rebateBps = newRebateBps;
-        buybackBps = newBuybackBps;
-        emit SplitUpdated(newRebateBps, newBuybackBps);
+        emit SplitUpdated(newRebateBps);
     }
 
     function _enforceWindowBounds(uint64 value) internal pure {

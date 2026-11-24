@@ -2,7 +2,6 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
-import { Vm } from "forge-std/Vm.sol";
 import { Token } from "../src/Token.sol";
 
 contract TokenTest is Test {
@@ -45,32 +44,6 @@ contract TokenTest is Test {
         (bool ok,) = address(token).call(abi.encodeWithSignature("mint(address,uint256)", holder, 1e18));
         assertFalse(ok, "mint must not exist on Token");
         assertEq(token.totalSupply(), 1_000_000_000e18, "supply unchanged");
-    }
-
-    // -----------------------------------------------------------------
-    // Burn semantics (BuybackBurner's burn of bought-back TOKEN depends on this)
-    // -----------------------------------------------------------------
-
-    function test_burn_reducesTotalSupplyAndBalance() public {
-        uint256 burnAmount = 500e18;
-        uint256 supplyBefore = token.totalSupply();
-
-        vm.prank(holder);
-        token.burn(burnAmount);
-
-        assertEq(token.totalSupply(), supplyBefore - burnAmount);
-        assertEq(token.balanceOf(holder), supplyBefore - burnAmount);
-    }
-
-    function testFuzz_burn_reducesSupplyByExactAmount(uint256 amount) public {
-        amount = bound(amount, 0, token.balanceOf(holder));
-        uint256 supplyBefore = token.totalSupply();
-
-        vm.prank(holder);
-        token.burn(amount);
-
-        assertEq(token.totalSupply(), supplyBefore - amount, "supply delta");
-        assertEq(token.balanceOf(holder), supplyBefore - amount, "balance delta");
     }
 
     // -----------------------------------------------------------------

@@ -131,14 +131,11 @@ async fn run() -> anyhow::Result<()> {
     // manifests themselves so a new contract joins the sweep without an edit
     // here, plus the settlement USDC. Each has code but does not answer
     // `PaymentPool.operatorBps()` and `sweepDomain()`, so the preflight aborts
-    // on the identity probe without retrying it. A zero entry is a contract the deploy left
-    // undeployed (the dormant `BuybackBurner`): there is no code to probe, and
-    // config validation rejects a zero address before the preflight runs.
-    // `payment_pool_probe_selector` covers such a contract by its selectors.
+    // on the identity probe without retrying it.
     let mut siblings: Vec<(String, Address)> = chain
         .manifest_contracts()
         .iter()
-        .filter(|(_, addr)| *addr != payment_pool && !addr.is_zero())
+        .filter(|(_, addr)| *addr != payment_pool)
         .cloned()
         .collect();
     siblings.push(("USDC".to_string(), chain.usdc()));

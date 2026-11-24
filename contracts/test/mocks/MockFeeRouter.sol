@@ -42,14 +42,6 @@ contract MockFeeRouter is IFeeRouter {
         return 0;
     }
 
-    function buybackBps() external pure override returns (uint256) {
-        return 0;
-    }
-
-    function buybackBurner() external pure override returns (address) {
-        return address(0);
-    }
-
     function treasury() external pure override returns (address) {
         return address(0);
     }

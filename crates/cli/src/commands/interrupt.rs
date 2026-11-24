@@ -7,7 +7,7 @@
 //! exits at once with the same status.
 //!
 //! Stopping mid-transfer loses nothing already paid for: every fetch resumes
-//! from its on-disk `.partial` on the next run. A `decdn get` run whose
+//! from its on-disk store (`<output>.decdn`) on the next run. A `decdn get` run whose
 //! destination is relative keeps that state under the current directory, so
 //! its stop line names the directory to run the command again from
 //! ([`ResumeFrom`]). Stopping an `openPool` or a `topUp` before its record

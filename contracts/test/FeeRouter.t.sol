@@ -43,7 +43,6 @@ contract FeeRouterTest is Test {
     address internal adapter = address(0xCAFE);
     address internal operator = address(0xB0B);
     address internal treasury = address(0xD7);
-    address internal buyback = address(0xBB);
 
     uint64 internal constant EPOCH = 7 days;
     uint256 internal constant MIB = 1_048_576;
@@ -66,8 +65,8 @@ contract FeeRouterTest is Test {
         bond.set(operator, true, MBPS);
 
         // Launch split from ADR 016 § Tunable Economics example: 75% rebate,
-        // no buyback, 25% treasury. Floor 1 (the launch value).
-        router = _deployRouter(bond, EPOCH, 7500, 0, address(0), 1);
+        // 25% treasury. Floor 1 (the launch value).
+        router = _deployRouter(bond, EPOCH, 7500, 1);
 
         usdc.transfer(adapter, 1_000_000e6);
         vm.prank(adapter);
@@ -75,14 +74,10 @@ contract FeeRouterTest is Test {
         vm.warp(EPOCH + 1);
     }
 
-    function _deployRouter(
-        ICapacityBondCredit bond_,
-        uint64 epochLength_,
-        uint256 rebateBps_,
-        uint256 buybackBps_,
-        address burner_,
-        uint256 floor_
-    ) internal returns (FeeRouter) {
+    function _deployRouter(ICapacityBondCredit bond_, uint64 epochLength_, uint256 rebateBps_, uint256 floor_)
+        internal
+        returns (FeeRouter)
+    {
         return new FeeRouter({
             usdc_: usdc,
             capacityBond_: bond_,
@@ -91,9 +86,7 @@ contract FeeRouterTest is Test {
             windowEpochs_: 13,
             deliveryFloor_: floor_,
             admin: admin,
-            rebateBps_: rebateBps_,
-            buybackBps_: buybackBps_,
-            buybackBurner_: burner_
+            rebateBps_: rebateBps_
         });
     }
 
@@ -113,30 +106,25 @@ contract FeeRouterTest is Test {
     function test_constructor_revertsOnEpochLengthMismatch() public {
         MockCreditBond mismatched = new MockCreditBond(EPOCH + 1 days);
         vm.expectRevert(abi.encodeWithSelector(FeeRouter.EpochLengthMismatch.selector, EPOCH + 1 days, EPOCH));
-        _deployRouter(mismatched, EPOCH, 7500, 0, address(0), 1);
+        _deployRouter(mismatched, EPOCH, 7500, 1);
     }
 
     function test_constructor_revertsOnZeroEpochLengthEvenWhenBondAgrees() public {
         MockCreditBond zeroBond = new MockCreditBond(0);
         vm.expectRevert(FeeRouter.ZeroEpochLength.selector);
-        _deployRouter(zeroBond, 0, 7500, 0, address(0), 1);
+        _deployRouter(zeroBond, 0, 7500, 1);
     }
 
-    function test_constructor_revertsOnSplitAboveWhole() public {
-        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(7500), uint256(3000)));
-        _deployRouter(bond, EPOCH, 7500, 3000, buyback, 1);
-    }
-
-    function test_constructor_revertsOnBuybackWithoutBurner() public {
-        vm.expectRevert(FeeRouter.BuybackNeedsBurner.selector);
-        _deployRouter(bond, EPOCH, 0, 7500, address(0), 1);
+    function test_constructor_revertsOnRebateAboveCeiling() public {
+        vm.expectRevert(abi.encodeWithSelector(FeeRouter.RebateAboveCeiling.selector, uint256(9901)));
+        _deployRouter(bond, EPOCH, 9901, 1);
     }
 
     function test_constructor_revertsOnFloorOutOfBounds() public {
         vm.expectRevert(abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(0)));
-        _deployRouter(bond, EPOCH, 7500, 0, address(0), 0);
+        _deployRouter(bond, EPOCH, 7500, 0);
         vm.expectRevert(abi.encodeWithSelector(FeeRouter.DeliveryFloorOutOfBounds.selector, uint256(1001)));
-        _deployRouter(bond, EPOCH, 7500, 0, address(0), 1001);
+        _deployRouter(bond, EPOCH, 7500, 1001);
     }
 
     // -----------------------------------------------------------------
@@ -148,18 +136,6 @@ contract FeeRouterTest is Test {
         assertEq(usdc.balanceOf(operator), 750e6, "rebate");
         assertEq(usdc.balanceOf(treasury), 250e6, "treasury remainder");
         assertEq(usdc.balanceOf(address(router)), 0, "router holds nothing");
-    }
-
-    function test_deposit_buybackSplit() public {
-        vm.startPrank(admin);
-        router.setBuybackBurner(buyback);
-        router.setSplit(0, 7500);
-        vm.stopPrank();
-
-        _deposit(0, 1000e6);
-        assertEq(usdc.balanceOf(operator), 0, "no rebate");
-        assertEq(usdc.balanceOf(buyback), 750e6, "buyback");
-        assertEq(usdc.balanceOf(treasury), 250e6, "treasury");
     }
 
     function test_deposit_inactiveOperatorRebateGoesToTreasury() public {
@@ -226,26 +202,27 @@ contract FeeRouterTest is Test {
     // deposit: credit
     // -----------------------------------------------------------------
 
-    /// Net (treasury + buyback) is 25% of the deposit; at floor 1 one net
+    /// The treasury leg is 25% of the deposit; at floor 1 one treasury-leg
     /// base unit buys one MiB of credit, so `bytes` binds here.
-    function test_deposit_creditIsBytesWhenNetCoversThem() public {
+    function test_deposit_creditIsBytesWhenTreasuryLegCoversThem() public {
         _deposit(1_000_000, 1000e6);
         assertEq(router.bytesPerEpoch(operator, _epoch()), 1_000_000);
         assertEq(router.totalBytesPerEpoch(_epoch()), 1_000_000);
     }
 
-    /// Net 25 base units at floor 1 back 25 MiB, below the claimed bytes.
-    function test_deposit_creditIsCappedByNetUsdc() public {
+    /// A 25-base-unit treasury leg at floor 1 backs 25 MiB, below the claimed bytes.
+    function test_deposit_creditIsCappedByTreasuryLeg() public {
         _deposit(1000 * MIB, 100);
         assertEq(router.bytesPerEpoch(operator, _epoch()), 25 * MIB);
     }
 
-    /// The rebate does not back credit: at the rebate ceiling only the 1% net does.
-    function test_deposit_maxRebateCreditsFromTheNetFloor() public {
+    /// The rebate does not back credit: at the rebate ceiling only the 1%
+    /// treasury leg does.
+    function test_deposit_maxRebateCreditsFromTheTreasuryLeg() public {
         vm.prank(admin);
-        router.setSplit(9900, 0);
+        router.setSplit(9900);
         _deposit(1000 * MIB, 100e6);
-        // Net 1e6 at floor 1 backs 1e6 MiB, above the claimed bytes.
+        // A 1e6 treasury leg at floor 1 backs 1e6 MiB, above the claimed bytes.
         assertEq(router.bytesPerEpoch(operator, _epoch()), 1000 * MIB);
         assertEq(usdc.balanceOf(operator), 99e6);
     }
@@ -253,7 +230,7 @@ contract FeeRouterTest is Test {
     function test_deposit_floorPricesCredit() public {
         vm.prank(admin);
         router.setDeliveryFloor(1000);
-        // Net 250e6 at 1000 base units per MiB backs 250_000 MiB.
+        // A 250e6 treasury leg at 1000 base units per MiB backs 250_000 MiB.
         _deposit(type(uint64).max, 1000e6);
         assertEq(router.bytesPerEpoch(operator, _epoch()), 250_000 * MIB > CLAMP ? CLAMP : 250_000 * MIB);
     }
@@ -327,38 +304,17 @@ contract FeeRouterTest is Test {
     // Governance setters
     // -----------------------------------------------------------------
 
-    function test_setSplit_rejectsAboveWhole() public {
-        vm.prank(admin);
-        vm.expectRevert(abi.encodeWithSelector(FeeRouter.SplitExceedsWhole.selector, uint256(9900), uint256(101)));
-        router.setSplit(9900, 101);
-    }
-
-    /// A rebate above 99% would leave no net to back weight, so a quiet window
-    /// could empty the electorate for good.
-    function test_setSplit_keepsANetShare() public {
+    /// A rebate above 99% would leave no treasury leg to back weight, so a
+    /// quiet window could empty the electorate for good.
+    function test_setSplit_keepsATreasuryShare() public {
         vm.startPrank(admin);
         vm.expectRevert(abi.encodeWithSelector(FeeRouter.RebateAboveCeiling.selector, uint256(9901)));
-        router.setSplit(9901, 0);
+        router.setSplit(9901);
         vm.expectRevert(abi.encodeWithSelector(FeeRouter.RebateAboveCeiling.selector, uint256(10_000)));
-        router.setSplit(10_000, 0);
-        router.setSplit(9900, 0);
+        router.setSplit(10_000);
+        router.setSplit(9900);
         vm.stopPrank();
         assertEq(router.rebateBps(), 9900);
-    }
-
-    function test_setSplit_buybackNeedsBurner() public {
-        vm.prank(admin);
-        vm.expectRevert(FeeRouter.BuybackNeedsBurner.selector);
-        router.setSplit(0, 1);
-    }
-
-    function test_setBuybackBurner_cannotClearWhileBuybackActive() public {
-        vm.startPrank(admin);
-        router.setBuybackBurner(buyback);
-        router.setSplit(5000, 2500);
-        vm.expectRevert(FeeRouter.BuybackNeedsBurner.selector);
-        router.setBuybackBurner(address(0));
-        vm.stopPrank();
     }
 
     function test_setTreasury_rejectsZero() public {
@@ -382,9 +338,7 @@ contract FeeRouterTest is Test {
         bytes32 gov = router.GOVERNANCE_ROLE();
         vm.startPrank(operator);
         _expectMissingRole(operator, gov);
-        router.setSplit(0, 0);
-        _expectMissingRole(operator, gov);
-        router.setBuybackBurner(address(0x9999));
+        router.setSplit(0);
         _expectMissingRole(operator, gov);
         router.setTreasury(address(0x9999));
         _expectMissingRole(operator, gov);

@@ -11,46 +11,37 @@
 //! after a drop), and it is only observable end to end, as the delta in the
 //! persisted voucher watermark across two runs.
 //!
-//! **New-model on-disk state (#1621).** The gap-driven fetch resumes from a
-//! [`ClientRangedStore`]'s two files beside `--output`, NOT from a raw
-//! `.partial`: a positioned `<stem>.partial` data file and a
-//! `<stem>.partial.ranges` JSON record of its bound, proven size and present
-//! ranges. The `.ranges` record is the resume signal: a raw
-//! `.partial` with no record is truncated and re-fetched from scratch. So these
-//! journeys construct a real *checkpointed* on-disk state with
-//! [`ClientRangedStore::seed_checkpointed_prefix`] (the `test-util` fixture seam)
-//! rather than writing bytes into a bare `.partial`, which the store would ignore.
+//! **On-disk state (#2881).** The gap-driven fetch resumes from the store a
+//! download keeps beside `--output`, in `<output>.decdn`: an iroh-blobs file
+//! store holding the verified bytes, their outboard and the present ranges.
+//! These journeys build a real resumable state in it with
+//! [`ClientRangedStore::seed_download_prefix`] (the `test-util` fixture seam).
 //!
 //! Five journeys, sharing one node and one funded buyer:
 //!
-//! 1. **Clean fetch.** Output matches the blob and the `.partial` scratch file is
-//!    gone — a fetch that leaves litter beside `--output` would be a regression
-//!    users notice immediately.
-//! 2. **Resume.** Seeded with a genuine checkpointed prefix (data + record),
-//!    the fetch completes correctly AND bills strictly fewer bytes than
-//!    the clean run did: `drive` reads the recorded prefix locally and pulls only
-//!    the still-missing suffix. The inequality is the assertion that matters;
-//!    without it the test would pass on an implementation that silently
-//!    re-downloaded everything.
-//! 3. **Corrupt checkpoint.** Seeded with a valid checkpoint whose `.partial` data
-//!    is then flipped a byte, while the record still claims the group present.
-//!    `finalize`'s whole-file BLAKE3 of `[0, proven)` is the guarantee: a
-//!    corrupt group can never be silently promoted. The run pulls the missing
-//!    suffix, the hash catches the drift, and the record drops its claim to
-//!    every byte. The same run then re-pulls the blob over the `.partial` and
-//!    promotes the correct blob. Never a silently wrong output; never a wedge.
-//! 4. **Checkpoint from a different blob.** Seeded from a FOREIGN blob's bytes at
-//!    `--output`'s location. On open against the real blob's root the foreign
-//!    prefix fails the `finalize` hash, the claim is dropped, and the blob is
-//!    re-fetched. The fetch recovers to the correct blob rather than wedging or
-//!    promoting foreign bytes. Adjacent to journey 3 and driven by the same hash,
-//!    which is exactly why both are here.
-//! 5. **Complete checkpoint, exact-multiple-of-16-KiB blob.** A complete
-//!    checkpointed partial whose blob size is an exact multiple of the chunk-group
-//!    size. `drive` sees an empty `missing_ranges`, pulls NOTHING, and `finalize`
-//!    promotes the already-complete `.partial` — the fetch finishes for FREE
-//!    (#1622). Any positive billed cost means the store re-downloaded a blob
-//!    already fully on disk.
+//! 1. **Clean fetch.** Output matches the blob and the store is gone — a fetch
+//!    that leaves litter beside `--output` would be a regression users notice
+//!    immediately.
+//! 2. **Resume.** Seeded with a verified prefix, the fetch completes correctly
+//!    AND bills strictly fewer bytes than the clean run did: `drive` reads the
+//!    held prefix locally and pulls only the still-missing suffix. The
+//!    inequality is the assertion that matters; without it the test would pass
+//!    on an implementation that silently re-downloaded everything.
+//! 3. **Corrupt store data.** Seeded with a verified prefix whose data file is
+//!    then flipped a byte. The exported file's whole-file BLAKE3 is the
+//!    guarantee: a corrupt byte can never become the output. The run pulls the
+//!    missing suffix, exports, the hash catches the drift, and the file is
+//!    removed. The same run then fetches the blob again into an empty store and
+//!    exports the correct blob. Never a silently wrong output; never a wedge.
+//! 4. **A store holding a different blob.** Seeded with a FOREIGN blob's prefix
+//!    at `--output`'s location. The store keys entries by hash, so the real
+//!    blob's entry starts empty, the blob is fetched whole, and the foreign
+//!    bytes never reach the output.
+//! 5. **Complete store, exact-multiple-of-16-KiB blob.** A store that holds a
+//!    whole blob whose size is an exact multiple of the chunk-group size.
+//!    `drive` sees an empty `missing_ranges`, pulls NOTHING, and `finalize`
+//!    exports the blob — the fetch finishes for FREE (#1622). Any positive
+//!    billed cost means the store re-downloaded a blob already fully on disk.
 //!
 //! Gated behind the `anvil-e2e` feature (off by default). Requires `anvil` +
 //! `forge` on `PATH` and a prior build of the `decdn` binary:
@@ -91,7 +82,7 @@ const OVERALL_TIMEOUT: Duration = decdn_e2e::timeout::STANDARD;
 
 /// Bytes per bao chunk group — the granularity a resume offset must snap to.
 const CHUNK_GROUP: usize = 16 * 1024;
-/// Groups to pre-seed into the `.partial` for the resume journey. Enough that
+/// Groups to pre-seed into the store for the resume journey. Enough that
 /// skipping them is unambiguous in the billed-bytes comparison.
 const SEEDED_GROUPS: usize = 4;
 
@@ -118,7 +109,7 @@ fn make_blob() -> Vec<u8> {
 }
 
 /// A blob whose total size is an EXACT multiple of the chunk-group size, so a
-/// COMPLETE `.partial` snaps to `byte_offset == total_bytes` — the aligned-size
+/// COMPLETE store snaps to `byte_offset == total_bytes` — the aligned-size
 /// resume trap journey 5 guards. Distinct byte pattern from [`make_blob`] so a
 /// crossed-up hash can never pass by coincidence.
 fn make_aligned_blob() -> Vec<u8> {
@@ -133,17 +124,23 @@ fn make_aligned_blob() -> Vec<u8> {
     v
 }
 
-/// Flip the first byte of a checkpoint's `.partial` data file in place, leaving
-/// its `.ranges` record untouched, so the record still claims the (now-corrupt)
-/// group present. This is the "bit rot after a durable checkpoint" state
-/// `finalize`'s whole-file hash exists to catch.
-fn corrupt_partial_byte(partial: &std::path::Path) -> anyhow::Result<()> {
-    let mut bytes = std::fs::read(partial).context("read .partial to corrupt")?;
+/// Flip the first byte of the data file in the store `store` (a download's
+/// `<output>.decdn`), leaving the store's own record untouched, so it still
+/// holds the (now-corrupt) group present. This is the "bit rot after a
+/// verified write" state the exported file's hash exists to catch.
+fn corrupt_store_byte(store: &std::path::Path) -> anyhow::Result<()> {
+    let data = std::fs::read_dir(store.join("data"))
+        .context("list the store's data dir")?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "data"))
+        .context("the store holds no data file to corrupt")?;
+    let mut bytes = std::fs::read(&data).context("read the data file to corrupt")?;
     let first = bytes
         .first_mut()
-        .context("checkpoint .partial is empty; nothing to corrupt")?;
+        .context("the data file is empty; nothing to corrupt")?;
     *first ^= 0xff;
-    std::fs::write(partial, &bytes).context("write corrupted .partial")?;
+    std::fs::write(&data, &bytes).context("write the corrupted data file")?;
     Ok(())
 }
 
@@ -207,7 +204,7 @@ async fn run() -> anyhow::Result<()> {
         .context("mint buyer USDC")?;
 
     let out = client_dir.path().join("blob.bin");
-    let partial = client_dir.path().join("blob.bin.partial");
+    let partial = client_dir.path().join("blob.bin.decdn");
     let args = fetch_argv(
         &chain,
         &node,
@@ -217,7 +214,7 @@ async fn run() -> anyhow::Result<()> {
         &out,
     );
     let out_aligned = client_dir.path().join("aligned.bin");
-    let partial_aligned = client_dir.path().join("aligned.bin.partial");
+    let partial_aligned = client_dir.path().join("aligned.bin.decdn");
     let aligned_args = fetch_argv(
         &chain,
         &node,
@@ -244,7 +241,7 @@ async fn run() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         !partial.exists(),
-        "the .partial scratch file must be promoted away, not left beside --output: {}",
+        "the store must be removed, not left beside --output: {}",
         partial.display()
     );
     let clean_cost =
@@ -254,24 +251,19 @@ async fn run() -> anyhow::Result<()> {
         "a clean fetch must bill some bytes; the watermark did not advance"
     );
 
-    // ---- Journey 2: resume from a genuine checkpointed partial ----
+    // ---- Journey 2: resume from a verified prefix in the store ----
     //
-    // Seed a real group-aligned CHECKPOINT (positioned `.partial` + `.ranges`
-    // record) and remove the output, so the fetch has to
-    // resume from it. This stands in for "a previous run was interrupted after
-    // durably checkpointing this prefix": the on-disk state is byte-identical to
-    // what `ingest_stream`'s checkpoint leaves, and constructing it directly makes
-    // the billed-bytes comparison exact. `drive` reads the recorded prefix locally
-    // and pulls only the still-missing suffix.
+    // Seed a real group-aligned prefix into the store and remove the output,
+    // so the fetch has to resume from it. This stands in for "a previous run
+    // was interrupted after this prefix landed": the store holds what an
+    // ingest leaves, and constructing it directly makes the billed-bytes
+    // comparison exact. `drive` reads the held prefix locally and pulls only
+    // the still-missing suffix.
     std::fs::remove_file(&out).context("remove output before resume")?;
     let seeded = SEEDED_GROUPS * CHUNK_GROUP;
-    ClientRangedStore::seed_checkpointed_prefix(
-        client_dir.path(),
-        "blob.bin",
-        &blob,
-        seeded as u64,
-    )
-    .context("seed genuine checkpointed prefix")?;
+    ClientRangedStore::seed_download_prefix(&out, &blob, seeded as u64)
+        .await
+        .context("seed a verified prefix")?;
 
     let before_resume = billed_bytes(client_dir.path(), node.operator_addr())?;
     run_fetch_until_ready(client_dir.path(), &args).await?;
@@ -285,7 +277,7 @@ async fn run() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         !partial.exists(),
-        "the .partial must be promoted away after a resume too"
+        "the store must be removed after a resume too"
     );
     let resume_cost =
         billed_bytes(client_dir.path(), node.operator_addr())?.saturating_sub(before_resume);
@@ -299,27 +291,22 @@ async fn run() -> anyhow::Result<()> {
          clean billed {clean_cost} — the {seeded}-byte prefix on disk was re-fetched"
     );
 
-    // ---- Journey 3: a corrupt checkpoint is caught by the finalize hash ----
+    // ---- Journey 3: corrupt store data is caught by the export hash ----
     //
-    // Seed a valid checkpoint, then flip a byte in its `.partial` data while the
-    // `.ranges` record still claims the group present. The client
-    // trusts the record for what to SKIP, so the corrupt group is never re-pulled
-    // on its own: only `finalize`'s whole-file hash can catch it.
+    // Seed a verified prefix, then flip a byte in the store's data file while
+    // the store still holds the group present. The client trusts the store for
+    // what to SKIP, so the corrupt group is never re-pulled on its own: only
+    // the exported file's whole-file hash can catch it.
     //
-    // `drive` pulls the missing suffix, `finalize` hashes, the hash does not
-    // match, and the record drops its claim to every byte; the corruption is
-    // never promoted. The same command then fetches the blob once more and
-    // promotes the correct one: the self-heal needs no second run, and no
-    // wrong `--output` ever exists.
+    // `drive` pulls the missing suffix, the store exports, the hash does not
+    // match, and the file is removed; the corruption never stays as the
+    // output. The same command then fetches the blob once more into an empty
+    // store and exports the correct one: the self-heal needs no second run.
     std::fs::remove_file(&out).context("remove output before corrupt run")?;
-    ClientRangedStore::seed_checkpointed_prefix(
-        client_dir.path(),
-        "blob.bin",
-        &blob,
-        seeded as u64,
-    )
-    .context("seed valid checkpoint before corrupting it")?;
-    corrupt_partial_byte(&partial).context("corrupt one byte of the checkpoint's .partial data")?;
+    ClientRangedStore::seed_download_prefix(&out, &blob, seeded as u64)
+        .await
+        .context("seed a verified prefix before corrupting it")?;
+    corrupt_store_byte(&partial).context("corrupt one byte of the store's data")?;
 
     let output =
         tokio::process::Command::from(decdn_command(client_dir.path(), KEYSTORE_PASSWORD)?)
@@ -336,74 +323,61 @@ async fn run() -> anyhow::Result<()> {
     let got = std::fs::read(&out).context("read output after corruption recovery")?;
     anyhow::ensure!(
         got == blob,
-        "a fetch whose finalize hash catches a corrupt group must re-pull the blob and \
-         promote the correct blob: got {} bytes, expected {}",
+        "a fetch whose export hash catches a corrupt group must re-pull the blob and \
+         export the correct blob: got {} bytes, expected {}",
         got.len(),
         blob.len()
     );
     anyhow::ensure!(
         !partial.exists(),
-        "the recovered blob must be promoted away, not left as a .partial"
+        "the store must be removed after the recovered export"
     );
 
-    // ---- Journey 4: a checkpoint belonging to a DIFFERENT blob ----
+    // ---- Journey 4: a store holding a DIFFERENT blob ----
     //
-    // The trap journey 3 does not cover, and the two are driven by the same hash.
-    // Seed a checkpoint from a FOREIGN blob's bytes at `--output`'s location. On
-    // open against the real blob's root the record claims a prefix present, so
-    // `drive` pulls only the (real) suffix, but the foreign prefix fails
-    // `finalize`'s whole-file hash and the claim is dropped. The same run then
-    // re-pulls the blob from the node (overwriting the foreign bytes) and
-    // promotes the correct blob. The command must recover, never wedge and never
-    // promote foreign bytes.
+    // Seed a FOREIGN blob's prefix into the store at `--output`'s location. The
+    // store keys entries by hash, so the real blob's entry starts empty and
+    // the blob is fetched whole. The command must finish with the correct
+    // blob and never let the foreign bytes reach the output.
     //
     // Mundane trigger: fetch one blob to `-o out.bin`, interrupt it, then fetch a
     // different one to the same `-o`.
     std::fs::remove_file(&out).context("remove output before journey 4")?;
-    ClientRangedStore::seed_checkpointed_prefix(
-        client_dir.path(),
-        "blob.bin",
-        &aligned,
-        (SEEDED_GROUPS * CHUNK_GROUP) as u64,
-    )
-    .context("seed a foreign-blob checkpoint at blob.bin's location")?;
+    ClientRangedStore::seed_download_prefix(&out, &aligned, (SEEDED_GROUPS * CHUNK_GROUP) as u64)
+        .await
+        .context("seed a foreign blob's prefix at blob.bin's location")?;
 
     run_fetch_until_ready(client_dir.path(), &args).await?;
 
     let got = std::fs::read(&out).context("read output after a foreign checkpoint")?;
     anyhow::ensure!(
         got == blob,
-        "a checkpoint belonging to another blob must be discarded and the fetch restarted clean, \
-         not wedged or promoted with foreign bytes: got {} bytes, expected {}",
+        "a store holding another blob must not stop or poison the fetch: got {} bytes, \
+         expected {}",
         got.len(),
         blob.len()
     );
     anyhow::ensure!(
         !partial.exists(),
-        "the .partial must be promoted away after recovering from a foreign checkpoint"
+        "the store must be removed after a fetch beside a foreign blob"
     );
 
-    // ---- Journey 5: a COMPLETE checkpoint for an exact-multiple-of-16-KiB blob --
+    // ---- Journey 5: a COMPLETE store for an exact-multiple-of-16-KiB blob --
     //
-    // Seed a COMPLETE checkpoint (record claims the whole blob) whose total size is
-    // an exact multiple of the chunk-group size. The store is
-    // simply complete: `drive` computes an EMPTY `missing_ranges`, opens NOTHING,
-    // and `finalize` promotes the already-complete `.partial` in place. The
-    // aligned-size trap of an offset-derived resume — reading a
-    // complete partial as `byte_offset == total_bytes`, drawing a `NotFound`, and
-    // re-paying from zero — cannot arise: presence is record-driven, not
-    // offset-derived. A ragged final group (journeys 1-4) exercises the same free
+    // Seed a store that holds the whole blob, whose total size is an exact
+    // multiple of the chunk-group size. The store is simply complete: `drive`
+    // computes an EMPTY `missing_ranges`, opens NOTHING, and `finalize` exports
+    // the blob. The aligned-size trap of an offset-derived resume — reading a
+    // complete store as `byte_offset == total_bytes`, drawing a `NotFound`, and
+    // re-paying from zero — cannot arise: presence comes from the store, not
+    // from an offset. A ragged final group (journeys 1-4) exercises the same free
     // finish; this pins it for the exact-multiple size an offset-derived resume would re-pay.
     //
-    // A complete checkpoint with no `--output` is exactly the on-disk state a crash
-    // between the last checkpoint and the atomic promote leaves behind.
-    ClientRangedStore::seed_checkpointed_prefix(
-        client_dir.path(),
-        "aligned.bin",
-        &aligned,
-        aligned.len() as u64,
-    )
-    .context("seed complete aligned checkpoint")?;
+    // A complete store with no `--output` is exactly the on-disk state a crash
+    // between the last ingest and the export leaves behind.
+    ClientRangedStore::seed_download_prefix(&out_aligned, &aligned, aligned.len() as u64)
+        .await
+        .context("seed a complete aligned store")?;
     anyhow::ensure!(
         !out_aligned.exists(),
         "aligned output should not exist before journey 5"
@@ -415,13 +389,13 @@ async fn run() -> anyhow::Result<()> {
     let got = std::fs::read(&out_aligned).context("read aligned output")?;
     anyhow::ensure!(
         got == aligned,
-        "a complete aligned partial must be promoted as-is: got {} bytes, expected {}",
+        "a complete aligned store must be exported as-is: got {} bytes, expected {}",
         got.len(),
         aligned.len()
     );
     anyhow::ensure!(
         !partial_aligned.exists(),
-        "the complete .partial must be promoted away, not left beside --output"
+        "the complete store must be removed, not left beside --output"
     );
     let complete_cost =
         billed_bytes(client_dir.path(), node.operator_addr())?.saturating_sub(before_complete);

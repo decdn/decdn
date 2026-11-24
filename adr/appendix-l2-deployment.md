@@ -4,9 +4,7 @@
 
 ## Governance chain
 
-Ethereum L1 holds TOKEN, the bond, governance, the treasury, and the buyback. Payments are chain-neutral, so the trust root does not depend on any one payment chain.
-
-Uniswap V3 and native private relays are available on L1. The buyback path uses both ([ADR 018 § Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3)).
+Ethereum L1 holds TOKEN, the bond, governance, and the treasury. Payments are chain-neutral, so the trust root does not depend on any one payment chain.
 
 Operators pay L1 gas for these actions:
 
@@ -32,8 +30,6 @@ Each redemption on a payment chain adds the writes that accrue the protocol shar
 
 A standard CCTP transfer from an L2 reaches Ethereum in about 15 to 20 minutes. Circle encodes no expiration block in a standard-transfer message (`expirationBlock` is 0), so an attested sweep stays valid until something receives it. Circle does not re-attest a finalized message, and a standard message needs no re-attestation. `CctpSweepReceiver.receiveSweep` is permissionless, so any party can receive a pending sweep at any later time. CCTP nonce tracking makes each sweep credit once. Circle can pause message receipt. That is the same trust root as USDC itself.
 
-[ADR 026](026-tokenomics.md#adr-026-tokenomics) adds three gates. Measure each one in integration testing before mainnet.
+[ADR 026](026-tokenomics.md#adr-026-tokenomics) adds one gate. Measure it in integration testing before mainnet.
 
 1. **Per-redemption gas overhead.** The pending-accrual writes MUST keep aggregate per-redemption gas within the operator P&L bounds of [ADR 026 § Operator economics](026-tokenomics.md#operator-economics).
-2. **Keeper gas on the governance chain.** One buyback keeper call runs per epoch through `BuybackBurner` ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)). Its gas MUST stay a small fraction of the inflow that the call routes.
-3. **Private relay on L1.** The buyback swap path needs private-relay routing for its MEV defense.
