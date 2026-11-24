@@ -485,14 +485,17 @@ async fn finalize_exports_to_a_relative_destination() -> anyhow::Result<()> {
 
 /// An exported blob whose file then moves away is a lost export: the entry
 /// still reads complete, and its bytes cannot be read. One whose file stays
-/// is not.
+/// is not. The file moves while the store is shut, as between two runs of a
+/// download: a store that stays open can still read a moved file through
+/// the handle it holds from an earlier read.
 #[tokio::test]
 async fn an_export_whose_file_moves_is_a_lost_export() -> anyhow::Result<()> {
     let total = 4 * GROUP;
     let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
     let tmp = tempfile::tempdir()?;
     let dest = tmp.path().join("out.bin");
-    let dir = BlobDir::open(&tmp.path().join("store")).await?;
+    let store_dir = tmp.path().join("store");
+    let dir = BlobDir::open(&store_dir).await?;
     let store = dir.blob(root, total, Some(dest.clone())).await?;
     let whole = decdn_bao_range::align_range(0, total, total)?;
     store
@@ -500,8 +503,11 @@ async fn an_export_whose_file_moves_is_a_lost_export() -> anyhow::Result<()> {
         .await?;
     store.finalize().await?;
     assert!(!dir.blob(root, total, None).await?.is_lost_export().await);
+    drop(store);
+    dir.shutdown().await?;
 
     std::fs::rename(&dest, tmp.path().join("moved.bin"))?;
+    let dir = BlobDir::open(&store_dir).await?;
     let reopened = dir.blob(root, total, None).await?;
     assert!(
         reopened.is_complete().await?,
