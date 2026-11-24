@@ -4,7 +4,7 @@
 use std::io;
 use std::io::Write as _;
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -12,8 +12,8 @@ use alloy::primitives::Address;
 use anyhow::Context;
 use iroh::{EndpointAddr, PublicKey};
 use jsonrpsee::core::client::Error as JsonRpcClientError;
-use jsonrpsee::http_client::HttpClientBuilder;
-use serde::{Deserialize, Serialize};
+use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use serde::Serialize;
 
 use decdn_client::discovery::{self, NodeCandidate, SELECT_K, select_candidates};
 use decdn_client::endpoint as client_endpoint;
@@ -25,7 +25,7 @@ use decdn_common::admin::{
 use decdn_common::cli;
 use decdn_common::cli::ConfigPathSource;
 use decdn_common::cli::common::expand_tilde;
-use decdn_common::config::DEFAULT_ADMIN_PORT;
+use decdn_common::config::{DEFAULT_ADMIN_PORT, DEFAULT_METRICS_PORT};
 use decdn_protocol::Region;
 
 use crate::commands::bundle_pull::human_bytes;
@@ -34,23 +34,188 @@ use crate::commands::civil_time;
 
 pub(crate) mod earnings_chain;
 
-/// Partial deserializer for the TOML config — only the path
-/// `observability.admin_port` is interesting to the `node` admin
-/// subcommands. Kept private here (rather than reusing
-/// `decdn_common::config::FileConfig`) so an operator's typo in an
-/// unrelated section can't make these commands unusable. `serde(default)`
-/// and serde-toml's default
-/// "ignore unknown fields" together guarantee that any other valid
-/// TOML — including missing tables — round-trips through with no
-/// effect.
-#[derive(Debug, Default, Deserialize)]
-struct AdminPortConfig {
-    observability: Option<AdminPortObservability>,
+/// One of the daemon's loopback HTTP listeners, as the `node` subcommands find
+/// it: the subcommand's URL flag, then the env var the daemon itself reads
+/// (`common/src/cli/run.rs`), then `observability.<config_key>` in the config
+/// file, then the built-in default port.
+pub(crate) struct LoopbackPort {
+    /// The flag that names the whole URL, as error messages spell it.
+    flag: &'static str,
+    /// The env var that holds the port.
+    env: &'static str,
+    /// The key under `[observability]` that holds the port.
+    config_key: &'static str,
+    /// The server's name, as error messages spell it.
+    server: &'static str,
+    /// The port when nothing else names one.
+    default: u16,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct AdminPortObservability {
-    admin_port: Option<u16>,
+/// The admin JSON-RPC listener.
+pub(crate) const ADMIN_PORT: LoopbackPort = LoopbackPort {
+    flag: "--admin-url",
+    env: "DECDN_ADMIN_PORT",
+    config_key: "admin_port",
+    server: "admin",
+    default: DEFAULT_ADMIN_PORT,
+};
+
+/// The `/metrics` listener.
+pub(crate) const METRICS_PORT: LoopbackPort = LoopbackPort {
+    flag: "--metrics-url",
+    env: "DECDN_METRICS_PORT",
+    config_key: "metrics_port",
+    server: "metrics",
+    default: DEFAULT_METRICS_PORT,
+};
+
+impl LoopbackPort {
+    /// Resolve the listener's URL:
+    ///
+    /// 1. `flag`, verbatim.
+    /// 2. The env var. An env-only deployment (port set via env, no config
+    ///    file) would otherwise be unreachable: the CLI would dial the default
+    ///    and report "is the node running?" (#864). A malformed or `0` value
+    ///    errors rather than silently falling through.
+    /// 3. `observability.<config_key>` from the TOML config file — either the
+    ///    caller's explicit path or the default `~/.decdn/node.toml`. An
+    ///    explicit path that doesn't exist is an error; a missing default path
+    ///    falls through. A `0` port in the file is an operator opt-out and
+    ///    errors here rather than silently probing the default.
+    /// 4. The default port on `127.0.0.1`.
+    ///
+    /// The host is always `127.0.0.1`: the daemon can bind `0.0.0.0` / `::`,
+    /// which a client cannot dial. An operator who exposed the listener on
+    /// another address passes the flag.
+    pub(crate) fn resolve_url(
+        &self,
+        flag: Option<&str>,
+        config_path: Option<&Path>,
+    ) -> anyhow::Result<String> {
+        if let Some(url) = flag {
+            return Ok(url.to_string());
+        }
+        if let Some(url) = self.url_from_env(std::env::var(self.env).ok())? {
+            return Ok(url);
+        }
+        let (resolved_path, source) = match config_path {
+            Some(p) => (Some(expand_tilde(p)), ConfigPathSource::Explicit),
+            None => (
+                cli::common::default_config_path(),
+                ConfigPathSource::Default,
+            ),
+        };
+        let port = self
+            .port_from_config_file(resolved_path.as_deref(), source)?
+            .unwrap_or(self.default);
+        Ok(format!("http://127.0.0.1:{port}"))
+    }
+
+    /// Build the loopback URL from the raw env value, or `None` when the var
+    /// is unset. Pure (takes the value rather than reading the environment) so
+    /// the parse/validation logic is testable without mutating process-global
+    /// state. A non-numeric value or `0` (the daemon's "disabled" sentinel) is
+    /// an error — both indicate misconfiguration the operator should see
+    /// rather than have masked by a fall-through.
+    fn url_from_env(&self, raw: Option<String>) -> anyhow::Result<Option<String>> {
+        let Some(raw) = raw else { return Ok(None) };
+        let port: u16 = raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{} is not a valid port number: {raw:?}", self.env))?;
+        if port == 0 {
+            anyhow::bail!(
+                "{}=0 disables the {} server; pass {} or set a non-zero port",
+                self.env,
+                self.server,
+                self.flag
+            );
+        }
+        Ok(Some(format!("http://127.0.0.1:{port}")))
+    }
+
+    /// Read `observability.<config_key>` from a TOML config file. Returns:
+    /// - `Ok(None)` when `path` is `None`, or when `path` is the *default*
+    ///   path and the file doesn't exist (operator hasn't set up a config
+    ///   file yet — fall through to the built-in default).
+    /// - `Ok(Some(port))` for a positive port value.
+    /// - `Err` if the file exists but can't be parsed, if the port is not a
+    ///   `u16`, if the operator explicitly set it to `0` (which disables the
+    ///   server), or if `source` is `Explicit` and the file is
+    ///   missing/unreadable.
+    ///
+    /// The file is read as a bare TOML table rather than the full
+    /// `FileConfig`, so an operator's typo in an unrelated section can't make
+    /// these commands unusable.
+    fn port_from_config_file(
+        &self,
+        path: Option<&Path>,
+        source: ConfigPathSource,
+    ) -> anyhow::Result<Option<u16>> {
+        let Some(path) = path else { return Ok(None) };
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                return match (err.kind(), source) {
+                    // Default path not yet created: fall through to the built-in.
+                    (io::ErrorKind::NotFound, ConfigPathSource::Default) => Ok(None),
+                    // Permission problems usually point at file mode / ownership,
+                    // not a wrong path — give the operator that nudge rather than
+                    // a generic "failed to read".
+                    (io::ErrorKind::PermissionDenied, _) => Err(anyhow::anyhow!(
+                        "cannot read config file {}: permission denied; check file mode and \
+                         ownership",
+                        path.display()
+                    )),
+                    _ => Err(anyhow::anyhow!(
+                        "failed to read config file {}: {err}",
+                        path.display()
+                    )),
+                };
+            }
+        };
+        let parse_err = || format!("failed to parse config file {}", path.display());
+        let table: toml::Table = toml::from_str(&contents).with_context(parse_err)?;
+        let port = table
+            .get("observability")
+            .and_then(|o| o.get(self.config_key))
+            .map(|v| v.clone().try_into::<u16>())
+            .transpose()
+            .with_context(parse_err)?;
+        match port {
+            Some(0) => anyhow::bail!(
+                "config {} disables the {} server (observability.{} = 0); pass {} or enable \
+                 the {} port",
+                path.display(),
+                self.server,
+                self.config_key,
+                self.flag,
+                self.server
+            ),
+            other => Ok(other),
+        }
+    }
+}
+
+/// Check `--timeout-ms` and build the JSON-RPC client for the running node's
+/// admin listener. Returns the client and the URL it dials, which error
+/// messages name.
+fn admin_client(
+    admin_url: Option<&str>,
+    config_path: Option<&Path>,
+    timeout_ms: u64,
+) -> anyhow::Result<(HttpClient, String)> {
+    anyhow::ensure!(
+        timeout_ms > 0,
+        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
+         'never' rather than 'sub-millisecond deadline')"
+    );
+    let url = resolve_admin_url(admin_url, config_path)?;
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_millis(timeout_ms))
+        .build(&url)
+        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    Ok((client, url))
 }
 
 /// Dispatch a `decdn node <sub>` invocation.
@@ -97,19 +262,11 @@ pub async fn node_dispatch(
 /// print the result. Two-line plain text by default (`node_id=…` /
 /// `uptime_s=…`), or pretty JSON with `--json`.
 pub async fn health(args: &cli::HealthArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    let (client, url) = admin_client(
+        args.admin_url.as_deref(),
+        args.config.as_deref().or(global_config),
+        args.timeout_ms,
+    )?;
 
     let resp: HealthResponse = client
         .health()
@@ -171,19 +328,11 @@ const fn binding_label(status: BindingStatus) -> &'static str {
 /// preview what the evict would touch when `--dry-run` is set (issue
 /// #379).
 pub async fn evict(args: &cli::EvictArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    let (client, url) = admin_client(
+        args.admin_url.as_deref(),
+        args.config.as_deref().or(global_config),
+        args.timeout_ms,
+    )?;
 
     let resp: EvictResponse = client
         .evict(EvictRequest {
@@ -272,19 +421,11 @@ fn write_dry_run_human(w: &mut impl io::Write, hash: &str, resp: &EvictResponse)
 /// for operators who'd rather not stat the PID — and shares the same
 /// internal mutex, so concurrent SIGHUPs queue rather than race.
 pub async fn reload(args: &cli::ReloadArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    let (client, url) = admin_client(
+        args.admin_url.as_deref(),
+        args.config.as_deref().or(global_config),
+        args.timeout_ms,
+    )?;
 
     let resp: ReloadResponse = client
         .reload()
@@ -320,21 +461,13 @@ pub async fn reload(args: &cli::ReloadArgs, global_config: Option<&Path>) -> any
 /// with `drain_timeout=true in_flight_streams=N` on stderr if
 /// `--wait-timeout-secs` elapses first.
 pub async fn drain(args: &cli::DrainArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
     // `wait_timeout_secs` and `wait_poll_ms` are `NonZeroU64` — clap
     // rejects `0` at parse time, so no further runtime check needed.
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    let (client, url) = admin_client(
+        args.admin_url.as_deref(),
+        args.config.as_deref().or(global_config),
+        args.timeout_ms,
+    )?;
 
     let resp: DrainResponse = client
         .drain(DrainRequest {
@@ -539,19 +672,11 @@ fn emit_drain_complete(w: &mut impl io::Write, json: bool, admin_closed: bool) -
 /// `decdn node status`: call `admin_v1_status` on the running node and
 /// print a snapshot of its DHT participation health (issue #741).
 pub async fn status(args: &cli::StatusArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    let (client, url) = admin_client(
+        args.admin_url.as_deref(),
+        args.config.as_deref().or(global_config),
+        args.timeout_ms,
+    )?;
 
     let parsed: StatusResponse = client
         .status()
@@ -599,17 +724,11 @@ pub async fn earnings(
         earnings_chain::run(args, operator, since_unix, global_config).await?
     } else {
         refuse_pool_in_daemon_mode(&args.payment)?;
-        anyhow::ensure!(
-            args.timeout_ms > 0,
-            "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-             'never' rather than 'sub-millisecond deadline')"
-        );
-        let config_path = args.config.as_deref().or(global_config);
-        let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-        let client = HttpClientBuilder::default()
-            .request_timeout(Duration::from_millis(args.timeout_ms))
-            .build(&url)
-            .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+        let (client, url) = admin_client(
+            args.admin_url.as_deref(),
+            args.config.as_deref().or(global_config),
+            args.timeout_ms,
+        )?;
         client
             .earnings(EarningsRequest { since_unix })
             .await
@@ -871,19 +990,11 @@ fn unix_now() -> u64 {
 /// `decdn node lanes`: call `admin_v1_lanes` on the running node and
 /// print a snapshot of its open payment lanes (issue #749).
 pub async fn lanes(args: &cli::LanesArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    let (client, url) = admin_client(
+        args.admin_url.as_deref(),
+        args.config.as_deref().or(global_config),
+        args.timeout_ms,
+    )?;
 
     let parsed: LanesResponse = client
         .lanes()
@@ -1007,19 +1118,11 @@ pub(crate) fn format_usdc(micro: u64) -> String {
 /// process-exclusive lock on that file for the node's lifetime, so nothing can
 /// open it from disk while the node is up (#2078).
 pub async fn pools(args: &cli::PoolsArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.timeout_ms > 0,
-        "--timeout-ms must be > 0 (jsonrpsee treats Duration::ZERO as \
-         'never' rather than 'sub-millisecond deadline')"
-    );
-
-    let config_path = args.config.as_deref().or(global_config);
-    let url = resolve_admin_url(args.admin_url.as_deref(), config_path)?;
-
-    let client = HttpClientBuilder::default()
-        .request_timeout(Duration::from_millis(args.timeout_ms))
-        .build(&url)
-        .with_context(|| format!("failed to build admin JSON-RPC client for {url}"))?;
+    let (client, url) = admin_client(
+        args.admin_url.as_deref(),
+        args.config.as_deref().or(global_config),
+        args.timeout_ms,
+    )?;
 
     let parsed: BuyerPoolsResponse = client
         .pools()
@@ -1132,120 +1235,13 @@ fn io_error_kind_in_source_chain(
     false
 }
 
-/// Resolve the admin URL in this precedence order:
-///
-/// 1. `--admin-url` flag or the `DECDN_ADMIN_URL` env var (clap folds the
-///    env into `args.admin_url`).
-/// 2. `DECDN_ADMIN_PORT` — the same env var the daemon reads for its admin
-///    bind (`common/src/cli/run.rs`). An env-only deployment (port set via
-///    env, no config file) would otherwise be unreachable: the CLI would
-///    dial the default 9191 and report "is the node running?" (#864). A
-///    malformed or `0` value errors rather than silently falling through.
-/// 3. `observability.admin_port` from the TOML config file — either the
-///    caller's explicit path or the default `~/.decdn/node.toml`. An
-///    explicit path that doesn't exist is an error; a missing default
-///    path falls through. `admin_port = 0` in the file is an operator
-///    opt-out and errors here rather than silently probing the default.
-/// 4. Default `http://127.0.0.1:9191`.
+/// Resolve the admin URL ([`LoopbackPort::resolve_url`] over [`ADMIN_PORT`]).
+/// `flag` is `--admin-url`, which clap also fills from `DECDN_ADMIN_URL`.
 pub(crate) fn resolve_admin_url(
     flag: Option<&str>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<String> {
-    if let Some(url) = flag {
-        return Ok(url.to_string());
-    }
-    if let Some(url) = admin_url_from_env(std::env::var("DECDN_ADMIN_PORT").ok())? {
-        return Ok(url);
-    }
-    let (resolved_path, source) = match config_path {
-        Some(p) => (Some(expand_tilde(p)), ConfigPathSource::Explicit),
-        None => (
-            cli::common::default_config_path(),
-            ConfigPathSource::Default,
-        ),
-    };
-    let port =
-        port_from_config_file(resolved_path.as_deref(), source)?.unwrap_or(DEFAULT_ADMIN_PORT);
-    Ok(format!("http://127.0.0.1:{port}"))
-}
-
-/// Build the loopback admin URL from the raw `DECDN_ADMIN_PORT` env value, or
-/// `None` when the var is unset. Pure (takes the value rather than reading the
-/// environment) so the parse/validation logic is testable without mutating
-/// process-global state. A non-numeric value or `0` (the daemon's "admin
-/// disabled" sentinel) is an error — both indicate misconfiguration the
-/// operator should see rather than have masked by a fall-through to the
-/// config file or the built-in default.
-fn admin_url_from_env(raw: Option<String>) -> anyhow::Result<Option<String>> {
-    let Some(raw) = raw else { return Ok(None) };
-    let port: u16 = raw
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("DECDN_ADMIN_PORT is not a valid port number: {raw:?}"))?;
-    if port == 0 {
-        anyhow::bail!(
-            "DECDN_ADMIN_PORT=0 disables the admin server; pass --admin-url or set a non-zero port"
-        );
-    }
-    Ok(Some(format!("http://127.0.0.1:{port}")))
-}
-
-/// Read `observability.admin_port` from a TOML config file. Returns:
-/// - `Ok(None)` when `path` is `None`, or when `path` is the *default*
-///   path and the file doesn't exist (operator hasn't set up a config
-///   file yet — fall through to the built-in default).
-/// - `Ok(Some(port))` for a positive port value.
-/// - `Err` if the file exists but can't be parsed, if the operator
-///   explicitly set `admin_port = 0` (which disables the server), or if
-///   `source` is `Explicit` and the file is missing/unreadable.
-///
-/// Callers are expected to have already tilde-expanded the path;
-/// `resolve_admin_url` is the only intended caller and does so via
-/// [`expand_tilde`] / [`cli::common::default_config_path`].
-fn port_from_config_file(
-    path: Option<&Path>,
-    source: ConfigPathSource,
-) -> anyhow::Result<Option<u16>> {
-    let Some(path) = path else { return Ok(None) };
-    let path: PathBuf = path.to_path_buf();
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            // Deliberately a partial deserializer: parsing the full
-            // `FileConfig` would couple these commands to every
-            // unrelated field's well-formedness. An operator with a
-            // typo'd `[payments]` table shouldn't lose the ability to
-            // resolve the admin port. Serde's TOML mode ignores unknown
-            // fields by default, so this only fails on (a) genuinely
-            // malformed TOML or (b) a wrong type for
-            // `observability.admin_port` itself — both of which we
-            // genuinely want to surface.
-            let parsed: AdminPortConfig = toml::from_str(&contents)
-                .with_context(|| format!("failed to parse config file {}", path.display()))?;
-            match parsed.observability.and_then(|o| o.admin_port) {
-                Some(0) => anyhow::bail!(
-                    "config {} disables the admin server (observability.admin_port = 0); \
-                     pass --admin-url or enable the admin port",
-                    path.display()
-                ),
-                other => Ok(other),
-            }
-        }
-        Err(err) => match (err.kind(), source) {
-            // Default path not yet created: fall through to the built-in.
-            (io::ErrorKind::NotFound, ConfigPathSource::Default) => Ok(None),
-            // Permission problems usually point at file mode / ownership,
-            // not a wrong path — give the operator that nudge rather than
-            // a generic "failed to read".
-            (io::ErrorKind::PermissionDenied, _) => Err(anyhow::anyhow!(
-                "cannot read config file {}: permission denied; check file mode and ownership",
-                path.display()
-            )),
-            _ => Err(anyhow::anyhow!(
-                "failed to read config file {}: {err}",
-                path.display()
-            )),
-        },
-    }
+    ADMIN_PORT.resolve_url(flag, config_path)
 }
 
 /// A `PaymentPool` CAIP-10 account as `<chainId>:<address preview>`, for a

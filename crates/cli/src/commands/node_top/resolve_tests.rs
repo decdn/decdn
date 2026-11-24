@@ -63,54 +63,9 @@ fn append_metrics_path_preserves_query_and_fragment() {
     );
 }
 
-#[test]
-fn resolve_metrics_url_prefers_flag() {
-    let got = resolve_metrics_url(Some("http://custom:1234"), None).unwrap();
-    assert_eq!(got, "http://custom:1234");
-}
-
-#[test]
-fn metrics_url_from_env_unset_is_none() {
-    assert_eq!(metrics_url_from_env(None).unwrap(), None);
-}
-
-#[test]
-fn metrics_url_from_env_valid_port_builds_loopback_url() {
-    assert_eq!(
-        metrics_url_from_env(Some("9999".to_string())).unwrap(),
-        Some("http://127.0.0.1:9999".to_string())
-    );
-    assert_eq!(
-        metrics_url_from_env(Some(" 9999 ".to_string())).unwrap(),
-        Some("http://127.0.0.1:9999".to_string())
-    );
-}
-
-#[test]
-fn metrics_url_from_env_zero_and_malformed_error() {
-    assert!(metrics_url_from_env(Some("0".to_string())).is_err());
-    assert!(metrics_url_from_env(Some("notaport".to_string())).is_err());
-    assert!(metrics_url_from_env(Some("70000".to_string())).is_err());
-}
-
-#[test]
-fn port_from_config_file_returns_none_when_path_is_none() {
-    // Locks the helper-layer contract that resolve_metrics_url
-    // relies on for its `unwrap_or(DEFAULT_METRICS_PORT)`
-    // fallback. Tested at the helper rather than the resolver
-    // because resolve_metrics_url(None, None) reads
-    // `~/.decdn/node.toml` if it exists, which is non-hermetic
-    // on developer machines that have a real config file.
-    assert_eq!(
-        port_from_config_file(None, ConfigPathSource::Default).unwrap(),
-        None
-    );
-    assert_eq!(
-        port_from_config_file(None, ConfigPathSource::Explicit).unwrap(),
-        None
-    );
-}
-
+/// The shared resolver is covered against the admin port in `node/tests.rs`;
+/// these pin that `node top` reads the metrics key and names the metrics
+/// server.
 #[test]
 fn resolve_metrics_url_reads_observability_metrics_port_from_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -137,77 +92,5 @@ fn resolve_metrics_url_zero_port_errors() {
     assert!(
         err.contains("disables the metrics server"),
         "missing context: {err}"
-    );
-}
-
-#[test]
-fn port_from_config_file_missing_default_returns_none() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("absent.toml");
-    assert_eq!(
-        port_from_config_file(Some(&path), ConfigPathSource::Default).unwrap(),
-        None
-    );
-}
-
-#[test]
-fn port_from_config_file_missing_explicit_errors() {
-    // Explicit path that doesn't exist is a typo, not a
-    // not-yet-configured operator — must surface as an error
-    // (unlike the default-path branch above).
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("absent.toml");
-    let err = port_from_config_file(Some(&path), ConfigPathSource::Explicit)
-        .expect_err("expected explicit-missing error")
-        .to_string();
-    assert!(
-        err.contains("failed to read config file"),
-        "missing context: {err}"
-    );
-}
-
-#[test]
-fn port_from_config_file_errors_on_invalid_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("broken.toml");
-    std::fs::write(&path, b"not = valid = toml").unwrap();
-    let err = port_from_config_file(Some(&path), ConfigPathSource::Default)
-        .expect_err("expected parse error")
-        .to_string();
-    assert!(err.contains("parse"), "missing context: {err}");
-}
-
-#[test]
-fn port_from_config_file_ignores_unrelated_field_errors() {
-    // Locks in the partial-deserializer choice: a wrong type in
-    // some unrelated section (e.g. a malformed `[network]`
-    // field that the full FileConfig would reject) must not stop
-    // `decdn node top` from resolving the metrics port.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node.toml");
-    std::fs::write(
-        &path,
-        b"[observability]\nmetrics_port = 4242\n[network]\nbind_addr = 7\n",
-    )
-    .unwrap();
-    assert_eq!(
-        port_from_config_file(Some(&path), ConfigPathSource::Default).unwrap(),
-        Some(4242)
-    );
-}
-
-#[test]
-fn port_from_config_file_reads_metrics_port_explicit_path() {
-    // Parity with the admin-side test of the same name: locks
-    // that the Explicit-source success arm produces the parsed
-    // port. Without this, a regression that broadened the
-    // explicit-source error arm to swallow successes would
-    // still pass CI because the other tests use `Default`.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node.toml");
-    std::fs::write(&path, b"[observability]\nmetrics_port = 7777\n").unwrap();
-    assert_eq!(
-        port_from_config_file(Some(&path), ConfigPathSource::Explicit).unwrap(),
-        Some(7777)
     );
 }

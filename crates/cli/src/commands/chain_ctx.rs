@@ -22,7 +22,7 @@ use serde::Deserialize;
 /// Partial deserializer for the TOML config — only the `[blockchain]`,
 /// `[identity]`, `network.bind_port`, and `[cache]` pull-through flag and
 /// origin-table presence these commands need.
-/// Deliberately partial (like `node.rs`'s `AdminPortConfig`) so an operator's
+/// Deliberately partial (like `node.rs`'s `LoopbackPort` config read) so an operator's
 /// typo in an unrelated section can't block onboarding; serde-toml ignores
 /// unknown fields. A field read here is typed, so a wrongly typed value in it
 /// (a quoted number, a `"yes"` flag) fails the parse, as it fails the

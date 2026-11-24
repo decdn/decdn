@@ -4,16 +4,16 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use serde::Deserialize;
 
 use decdn_common::cli;
-use decdn_common::cli::ConfigPathSource;
-use decdn_common::cli::common::{default_config_path, expand_tilde};
-use decdn_common::config::DEFAULT_METRICS_PORT;
+
+#[cfg(doc)]
+use crate::commands::node::LoopbackPort;
+use crate::commands::node::{self, METRICS_PORT};
 
 /// Parse an `OpenMetrics` text body into `name -> value`.
 ///
@@ -215,17 +215,12 @@ pub(crate) fn format_rate_bytes(per_sec: f64) -> String {
 }
 
 /// Render a raw micro-USDC amount (6 decimals, the on-chain base unit) as a
-/// dollar figure, e.g. `12_345_678` → `$12.345678`. Emits all six fractional
-/// digits rather than rounding, so the operator reads back the exact base-unit
-/// value this formatter is handed. That value is itself exact only below 2^53
-/// micro-USDC (~$9e9, far past any realistic per-node total): the `/metrics`
-/// scrape parses series as `f64` in [`parse_openmetrics`], which cannot
-/// represent every larger `u64` — an upstream limit of the text exposition,
-/// not of this formatter.
-fn format_usdc(micro: u64) -> String {
-    let dollars = micro / 1_000_000;
-    let frac = micro % 1_000_000;
-    format!("${dollars}.{frac:06}")
+/// dollar figure, e.g. `12_345_678` → `$12.345678` ([`node::format_usdc`]
+/// behind a `$`). The value is exact only below 2^53 micro-USDC (~$9e9, far
+/// past any realistic per-node total): the `/metrics` scrape parses series as
+/// `f64` in [`parse_openmetrics`], which cannot represent every larger `u64`.
+fn format_dollars(micro: u64) -> String {
+    format!("${}", node::format_usdc(micro))
 }
 
 fn format_uptime(secs: u64) -> String {
@@ -325,7 +320,7 @@ pub(crate) fn write_top_table(
         w,
         "{:<35} {:>14} {:>12}",
         "unredeemed_usdc",
-        format_usdc(now.unredeemed_usdc),
+        format_dollars(now.unredeemed_usdc),
         "-",
     )?;
     writeln!(w)?;
@@ -358,102 +353,14 @@ pub(crate) fn render_json_snapshot(s: &Snapshot) -> anyhow::Result<String> {
     serde_json::to_string_pretty(&value).context("encode top snapshot as JSON")
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct MetricsPortConfig {
-    observability: Option<MetricsPortObservability>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct MetricsPortObservability {
-    metrics_port: Option<u16>,
-}
-
-/// Resolve the metrics URL. Mirrors `resolve_admin_url` in
-/// `crates/cli/src/commands/node.rs` so the operator's config-file
-/// experience for `node top` is identical to the other `node`
-/// subcommands. The host
-/// is hard-coded to `127.0.0.1` because the daemon's `metrics_bind`
-/// can be `0.0.0.0` / `::`, and a client that dials that goes
-/// nowhere; the operator overrides the host explicitly via
-/// `--metrics-url` if they exposed metrics on a non-loopback address.
-///
-/// Precedence: `--metrics-url` flag → `DECDN_METRICS_PORT` env (the same var
-/// the daemon reads, `common/src/cli/run.rs`) → `observability.metrics_port`
-/// from the config file → default 9090. The env step (#864) keeps an env-only
-/// deployment reachable instead of dialing the default and reporting the node
-/// is down.
+/// Resolve the metrics URL ([`LoopbackPort::resolve_url`] over
+/// [`METRICS_PORT`]), the same way the other `node` subcommands find the
+/// admin listener.
 pub(crate) fn resolve_metrics_url(
     flag: Option<&str>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<String> {
-    if let Some(url) = flag {
-        return Ok(url.to_string());
-    }
-    if let Some(url) = metrics_url_from_env(std::env::var("DECDN_METRICS_PORT").ok())? {
-        return Ok(url);
-    }
-    let (resolved, source) = match config_path {
-        Some(p) => (Some(expand_tilde(p)), ConfigPathSource::Explicit),
-        None => (default_config_path(), ConfigPathSource::Default),
-    };
-    let port = port_from_config_file(resolved.as_deref(), source)?.unwrap_or(DEFAULT_METRICS_PORT);
-    Ok(format!("http://127.0.0.1:{port}"))
-}
-
-/// Build the loopback metrics URL from the raw `DECDN_METRICS_PORT` env value,
-/// or `None` when unset. Pure (takes the value rather than reading the
-/// environment) so the parse/validation logic is testable without mutating
-/// process-global state. A non-numeric value or `0` is an error rather than a
-/// silent fall-through — port 0 cannot be dialed and signals misconfiguration.
-fn metrics_url_from_env(raw: Option<String>) -> anyhow::Result<Option<String>> {
-    let Some(raw) = raw else { return Ok(None) };
-    let port: u16 = raw
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("DECDN_METRICS_PORT is not a valid port number: {raw:?}"))?;
-    if port == 0 {
-        anyhow::bail!(
-            "DECDN_METRICS_PORT=0 cannot be dialed; pass --metrics-url or set a non-zero port"
-        );
-    }
-    Ok(Some(format!("http://127.0.0.1:{port}")))
-}
-
-fn port_from_config_file(
-    path: Option<&Path>,
-    source: ConfigPathSource,
-) -> anyhow::Result<Option<u16>> {
-    let Some(path) = path else { return Ok(None) };
-    let path: PathBuf = path.to_path_buf();
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            // Partial deserializer: a typo in some unrelated section
-            // (e.g. `[payments]`) shouldn't cost the operator the
-            // ability to point `node top` at the daemon. Mirrors
-            // `port_from_config_file` for `admin_port`.
-            let parsed: MetricsPortConfig = toml::from_str(&contents)
-                .with_context(|| format!("failed to parse config file {}", path.display()))?;
-            match parsed.observability.and_then(|o| o.metrics_port) {
-                Some(0) => anyhow::bail!(
-                    "config {} disables the metrics server (observability.metrics_port = 0); \
-                     pass --metrics-url or enable the metrics port",
-                    path.display(),
-                ),
-                other => Ok(other),
-            }
-        }
-        Err(err) => match (err.kind(), source) {
-            (io::ErrorKind::NotFound, ConfigPathSource::Default) => Ok(None),
-            (io::ErrorKind::PermissionDenied, _) => Err(anyhow::anyhow!(
-                "cannot read config file {}: permission denied; check file mode and ownership",
-                path.display()
-            )),
-            _ => Err(anyhow::anyhow!(
-                "failed to read config file {}: {err}",
-                path.display()
-            )),
-        },
-    }
+    METRICS_PORT.resolve_url(flag, config_path)
 }
 
 /// ANSI escape: clear screen + move cursor home. Used between live
