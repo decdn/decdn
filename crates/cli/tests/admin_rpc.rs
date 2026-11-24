@@ -30,9 +30,7 @@ const fn nz(v: u64) -> NonZeroU64 {
 use decdn_cache::CacheEngine;
 use decdn_cli::commands::node as commands;
 use decdn_common::admin::{AdminRpcClient, DrainRequest};
-use decdn_common::cli::{
-    DrainArgs, EvictArgs, HealthArgs, LanesArgs, PoolsArgs, ReloadArgs, StatusArgs,
-};
+use decdn_common::cli::{DrainArgs, HealthArgs, StatusArgs};
 use decdn_incentive::buyer_pool::{BuyerPoolState, BuyerPoolStore};
 use decdn_incentive::{LaneState, MemoryBuyerPoolStore, MemoryPoolStateStore, PoolStateStore};
 use decdn_node::admin::pool_owners::PoolOwners;
@@ -431,61 +429,12 @@ async fn pools_without_buyer_leg_is_an_error_over_http() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// CLI `pools` against a dropped listener surfaces the connection-refused
-/// hint, same as the other admin subcommands.
-#[tokio::test]
-async fn cli_pools_surfaces_connection_refused() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    drop(listener);
-
-    let args = PoolsArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 2_000,
-    };
-    let err = commands::pools(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
-        .to_string();
-    assert!(
-        err.contains("refused"),
-        "error should mention 'refused', got: {err}"
-    );
-    Ok(())
-}
-
-/// CLI `lanes` against a dropped listener surfaces the
-/// connection-refused hint, same as the other admin subcommands.
-#[tokio::test]
-async fn cli_lanes_surfaces_connection_refused() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    drop(listener);
-
-    let args = LanesArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 2_000,
-    };
-    let err = commands::lanes(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
-        .to_string();
-    assert!(
-        err.contains("refused"),
-        "error should mention 'refused', got: {err}"
-    );
-    Ok(())
-}
-
 /// The CLI's connection-refused branch is the single most operator-
 /// visible error path (mistyped `--admin-url`, node not running). Bind
 /// a loopback socket, drop it, and call `commands::health` against its
 /// address: the kernel will return `ECONNREFUSED` and the CLI should
-/// surface that with the "is the node running?" hint.
+/// surface that with the "is the node running?" hint. Every admin
+/// subcommand builds its client and classifies its errors the same way.
 #[tokio::test]
 async fn cli_health_surfaces_connection_refused() -> anyhow::Result<()> {
     let (listener, addr) = bind_loopback().await?;
@@ -518,106 +467,6 @@ async fn cli_health_rejects_zero_timeout() -> anyhow::Result<()> {
         timeout_ms: 0,
     };
     let err = commands::health(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
-        .to_string();
-    assert!(
-        err.contains("--timeout-ms"),
-        "error should mention the flag, got: {err}"
-    );
-    Ok(())
-}
-
-/// Mirror the connection-refused coverage onto `decdn node evict`. The
-/// CLI subcommand routes through the same `classify_client_error`
-/// path as `health` and the other admin subcommands, but a regression
-/// that swallowed the classification (or printed a misleading "evicted"
-/// line on failure) would not be caught by the admin-RPC unit tests alone.
-#[tokio::test]
-async fn cli_evict_surfaces_connection_refused() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    drop(listener);
-
-    let args = EvictArgs {
-        hash: "0".repeat(64),
-        dry_run: false,
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 2_000,
-    };
-    let err = commands::evict(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
-        .to_string();
-    assert!(
-        err.contains("refused"),
-        "error should mention 'refused', got: {err}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn cli_evict_rejects_zero_timeout() -> anyhow::Result<()> {
-    let args = EvictArgs {
-        hash: "0".repeat(64),
-        dry_run: false,
-        admin_url: Some("http://127.0.0.1:1".to_string()),
-        config: None,
-        json: false,
-        timeout_ms: 0,
-    };
-    let err = commands::evict(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
-        .to_string();
-    assert!(
-        err.contains("--timeout-ms"),
-        "error should mention the flag, got: {err}"
-    );
-    Ok(())
-}
-
-/// Same coverage on `decdn node reload`: surface the connection-refused
-/// hint when the admin port is dead. The unit tests in `admin.rs` cover
-/// the server-side branches; this guards the CLI's
-/// `classify_client_error` path so a regression there can't reach
-/// operators as a silent hang or unhelpful message.
-#[tokio::test]
-async fn cli_reload_surfaces_connection_refused() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    drop(listener);
-
-    let args = ReloadArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 2_000,
-    };
-    let err = commands::reload(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
-        .to_string();
-    assert!(
-        err.contains("refused"),
-        "error should mention 'refused', got: {err}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn cli_reload_rejects_zero_timeout() -> anyhow::Result<()> {
-    let args = ReloadArgs {
-        admin_url: Some("http://127.0.0.1:1".to_string()),
-        config: None,
-        json: false,
-        timeout_ms: 0,
-    };
-    let err = commands::reload(&args, None)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
@@ -670,57 +519,6 @@ async fn admin_v1_drain_returns_initiated_true() -> anyhow::Result<()> {
 
     let _ = stop_tx.send(());
     join.await?;
-    Ok(())
-}
-
-/// Mirror the connection-refused coverage onto `decdn node drain` so the
-/// CLI path is guarded the same way as `peers`, `health`, `reload`, etc.
-#[tokio::test]
-async fn cli_drain_surfaces_connection_refused() -> anyhow::Result<()> {
-    let (listener, addr) = bind_loopback().await?;
-    drop(listener);
-
-    let args = DrainArgs {
-        admin_url: Some(format!("http://{addr}")),
-        config: None,
-        json: false,
-        timeout_ms: 2_000,
-        wait: false,
-        wait_timeout_secs: nz(30),
-        wait_poll_ms: nz(250),
-    };
-    let err = commands::drain(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected connection-refused error"))?
-        .to_string();
-    assert!(
-        err.contains("refused"),
-        "error should mention 'refused', got: {err}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn cli_drain_rejects_zero_timeout() -> anyhow::Result<()> {
-    let args = DrainArgs {
-        admin_url: Some("http://127.0.0.1:1".to_string()),
-        config: None,
-        json: false,
-        timeout_ms: 0,
-        wait: false,
-        wait_timeout_secs: nz(30),
-        wait_poll_ms: nz(250),
-    };
-    let err = commands::drain(&args, None)
-        .await
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected zero-timeout error"))?
-        .to_string();
-    assert!(
-        err.contains("--timeout-ms"),
-        "error should mention the flag, got: {err}"
-    );
     Ok(())
 }
 

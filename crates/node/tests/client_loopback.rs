@@ -5303,7 +5303,7 @@ async fn client_sub_interval_blob_serves_below_one_interval_cost() -> anyhow::Re
 }
 
 /// The #1516 gate reserves remaining HEADROOM, not the gross deposit. Both
-/// deposit authorities — `LaneState::stage_voucher` off-chain and
+/// deposit authorities — `LaneState::advance_presigned` off-chain and
 /// `PaymentPool._redeemVoucher` on-chain — compare the *cumulative*
 /// voucher amount, so a long-lived lane that has already claimed most of its
 /// cap has almost nothing left to spend. Here the gross deposit (100) is ten

@@ -54,13 +54,15 @@ pub trait NodeAddressResolver: Send + Sync + std::fmt::Debug {
     fn address_of(&self, node_id: &NodeId) -> Option<Address>;
 }
 
-/// Static, in-memory [`NodeAddressResolver`] from a known map. Used by tests and
-/// any caller wiring a fixed binding set without a live chain.
+/// Static, in-memory [`NodeAddressResolver`] from a known map: a test double for
+/// [`ChainNodeAddressDirectory`].
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct StaticNodeAddressDirectory {
     map: Arc<HashMap<NodeId, Address>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl StaticNodeAddressDirectory {
     /// Build from a fixed `NodeId → Address` map.
     #[must_use]
@@ -69,6 +71,7 @@ impl StaticNodeAddressDirectory {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl NodeAddressResolver for StaticNodeAddressDirectory {
     fn address_of(&self, node_id: &NodeId) -> Option<Address> {
         self.map.get(node_id).copied()

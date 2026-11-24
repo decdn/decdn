@@ -36,13 +36,17 @@ pub use chain_origin_directory::ChainOriginDirectory;
 pub use chain_staker_set::ChainStakerSet;
 pub use lookup::{Lookup, LookupConfig, find_providers};
 pub use negative_cache::NegativeCandidateCache;
-pub use node_address::{
-    ChainNodeAddressDirectory, NodeAddressResolver, StaticNodeAddressDirectory,
-};
-pub use origin::{EmptyOriginDirectory, OriginDirectory, StaticOriginDirectory};
+#[cfg(any(test, feature = "test-support"))]
+pub use node_address::StaticNodeAddressDirectory;
+pub use node_address::{ChainNodeAddressDirectory, NodeAddressResolver};
+#[cfg(any(test, feature = "test-support"))]
+pub use origin::StaticOriginDirectory;
+pub use origin::{EmptyOriginDirectory, OriginDirectory};
 pub use publish::RepublishScheduler;
 pub use rate_limit::{DhtRateLimiter, DhtRejectLayer};
 pub use records::{AttestedBy, InsertOutcome, RecordStore, RecordStoreConfig};
 pub use routing::{NODE_ID_LEN, NodeId, RoutingTable, xor_distance};
 pub use seated_origins::{SeatedOriginSet, SeatedOrigins};
-pub use staker_set::{ConfigStakerSet, StakerSet};
+#[cfg(any(test, feature = "test-support"))]
+pub use staker_set::ConfigStakerSet;
+pub use staker_set::StakerSet;

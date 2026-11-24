@@ -10,6 +10,7 @@
 //! in [`super::chain_staker_set`] and is wired by the runtime once the
 //! alloy `Provider` is available.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashSet;
 
 use crate::dht::routing::NodeId;
@@ -49,37 +50,33 @@ pub trait StakerSet: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// In-memory [`StakerSet`] implementation, built from a parsed
-/// `NodeId` set or empty.
+/// In-memory [`StakerSet`] over a fixed `NodeId` set: a test double.
 ///
 /// The runtime wires the chain-backed `ChainStakerSet` (reads
 /// `CapacityBond.getRegisteredNodes()` at startup, then again on each registry
-/// refresh) — see `capacity_bond_registry::bootstrap`. This impl is what tests and
-/// explicit operator-supplied sets use: construct via [`Self::new`] with a known
-/// `HashSet`, or [`Self::empty`]. It implements the same `StakerSet` trait as
-/// the chain-backed impl, so the two are interchangeable.
+/// refresh) — see `capacity_bond_registry::bootstrap`.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct ConfigStakerSet {
     active: HashSet<NodeId>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl ConfigStakerSet {
-    /// Build from a parsed `NodeId` set.
+    /// Build from a known `NodeId` set.
     #[must_use]
     pub const fn new(active: HashSet<NodeId>) -> Self {
         Self { active }
     }
 
-    /// Empty set — useful in tests where no staker check is desired
-    /// (paired with a permissive handler config). Production code MUST
-    /// NOT use this without an explicit operator opt-in; an empty
-    /// staker set means every `Store` is rejected.
+    /// Empty set. An empty staker set rejects every `Store`.
     #[must_use]
     pub fn empty() -> Self {
         Self::new(HashSet::new())
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl StakerSet for ConfigStakerSet {
     fn is_active(&self, node_id: &NodeId) -> bool {
         self.active.contains(node_id)

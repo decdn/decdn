@@ -35,7 +35,7 @@
 //!   on-demand `getOrigins` call.
 //! - [`EmptyOriginDirectory`] (this module) — resolves nothing. What the
 //!   runtime installs when the chain contracts aren't configured.
-//! - [`StaticOriginDirectory`] (this module) — a fixed in-memory map, for tests
+//! - `StaticOriginDirectory` (this module, `test-support` only) — a fixed in-memory map, for tests
 //!   and any caller wiring a known origin set without a live chain. No config
 //!   key populates it; it has no production call site.
 //!
@@ -45,6 +45,7 @@
 //! With that fallback in place every lookup miss yields no origin candidates —
 //! see [`EmptyOriginDirectory`] for what that means for each consumer.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
 use alloy::primitives::{Address, U256};
@@ -109,14 +110,10 @@ impl OriginDirectory for EmptyOriginDirectory {
 }
 
 /// Static, in-memory [`OriginDirectory`] over a fixed namespace → origin-`NodeId`
-/// map. Used by tests and any caller wiring a known origin set without a live
-/// chain.
-///
-/// No config key populates this map and the runtime never constructs one — the
-/// chain-backed [`crate::dht::ChainOriginDirectory`] is the production path,
-/// and [`EmptyOriginDirectory`] is what stands in when it is unconfigured.
-/// Mirrors [`crate::dht::StaticNodeAddressDirectory`], the same `Chain*` /
-/// `Static*` pairing one module over.
+/// map: a test double. The chain-backed [`crate::dht::ChainOriginDirectory`] is
+/// the production path, and [`EmptyOriginDirectory`] stands in when it is
+/// unconfigured.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct StaticOriginDirectory {
     /// Map from namespace id to the list of authorised origin `NodeId`s.
@@ -125,6 +122,7 @@ pub struct StaticOriginDirectory {
     origins: HashMap<U256, Vec<NodeId>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl StaticOriginDirectory {
     /// Build from a `namespace → origins` map.
     #[must_use]
@@ -133,6 +131,7 @@ impl StaticOriginDirectory {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait::async_trait]
 impl OriginDirectory for StaticOriginDirectory {
     async fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId> {

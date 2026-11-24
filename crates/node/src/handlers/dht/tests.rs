@@ -39,27 +39,6 @@ fn accept_budget_reached_trips_at_each_bound() {
     ));
 }
 
-/// Both bounds must be finite and positive: a zero count cap would serve
-/// nothing, `u32::MAX` would reopen the unbounded-permit hole #845 closes,
-/// and a zero age deadline would break every connection before its first
-/// stream.
-#[test]
-fn budget_bounds_are_sane() {
-    // Bind to locals so the comparisons aren't const-folded (clippy's
-    // `assertions_on_constants` is fatal under CI's `CARGO_BUILD_WARNINGS=deny`).
-    let count_cap = MAX_DHT_REQUESTS_PER_CONN;
-    let age = MAX_DHT_CONN_AGE;
-    assert!(count_cap > 0, "a zero count cap serves nothing");
-    assert!(
-        count_cap < u32::MAX,
-        "an unbounded count cap reopens the dispatch-permit-pinning hole (#845)"
-    );
-    assert!(
-        age > Duration::ZERO,
-        "a zero age deadline would close every connection immediately"
-    );
-}
-
 /// The first stream gets the short accept window; every later stream gets
 /// the idle window that keeps a caller's pooled connection warm.
 #[test]

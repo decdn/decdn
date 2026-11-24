@@ -74,6 +74,12 @@ const MAX_DHT_REQUESTS_PER_CONN: u32 = 256;
 /// past it; the existing post-loop `conn.closed()` flush then releases.
 const MAX_DHT_CONN_AGE: Duration = Duration::from_mins(5);
 
+// Both bounds are finite and positive: a zero count cap would serve nothing,
+// `u32::MAX` would reopen the unbounded-permit hole #845 closes, and a zero age
+// deadline would close every connection before its first stream.
+const _: () = assert!(MAX_DHT_REQUESTS_PER_CONN > 0 && MAX_DHT_REQUESTS_PER_CONN < u32::MAX);
+const _: () = assert!(MAX_DHT_CONN_AGE.as_secs() > 0);
+
 /// Whether the per-connection accept loop has reached its budget (#845): the
 /// served-stream count cap or the connection-age deadline. Factored out of the
 /// `serve` loop so the unit test exercises the real gate the loop checks rather
@@ -175,9 +181,9 @@ impl DhtHandler {
         }
     }
 
-    /// Construct with a pre-built routing table. Used by tests and by the
-    /// bootstrap path that wants to seed the table before the handler
-    /// goes live.
+    /// Construct with a pre-built routing table, for a test that seeds the
+    /// table before the handler goes live.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     #[allow(clippy::too_many_arguments)] // wiring struct; each arg is distinct runtime state.
     pub const fn with_routing(

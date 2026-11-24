@@ -573,9 +573,7 @@ pub struct PoolStoreFiles {
 /// `redb`-backed persistent implementation of [`PoolStateStore`]: the seller
 /// view of one `PaymentPool` deployment over the shared [`PoolStoreFiles`].
 ///
-/// Construct via [`PoolStoreFiles::seller_view`], or
-/// [`PersistentPoolStateStore::open`] for a process that serves one
-/// deployment. The lane table is buffered in memory: `record`/`forget` mutate
+/// Construct via [`PoolStoreFiles::seller_view`]. The lane table is buffered in memory: `record`/`forget` mutate
 /// the working set only, and a caller must call [`PoolStateStore::flush`] to
 /// commit it to disk. The store is thread-safe — each redb file serialises its
 /// own writes via single-writer transactions, families commit on independent
@@ -615,19 +613,19 @@ impl Drop for PersistentPoolStateStore {
 impl PersistentPoolStateStore {
     /// Open the store files under `data_dir` and return the seller view of
     /// `deployment` over them: [`PoolStoreFiles::open`] then
-    /// [`PoolStoreFiles::seller_view`]. A process that serves several
-    /// deployments opens the files once and takes one view per deployment.
+    /// [`PoolStoreFiles::seller_view`], for a test that serves one deployment.
     ///
     /// # Errors
     ///
     /// Every error of [`PoolStoreFiles::open`] and
     /// [`PoolStoreFiles::seller_view`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn open(data_dir: &Path, deployment: Deployment) -> Result<Self, StoreError> {
         PoolStoreFiles::open(data_dir)?.seller_view(deployment)
     }
 
-    /// Testable form of [`Self::open`] that takes an injectable chmod
-    /// function; see [`PoolStoreFiles::open_with`].
+    /// `open` with an injectable chmod function; see
+    /// [`PoolStoreFiles::open_with`].
     #[cfg(test)]
     pub(crate) fn open_with<F>(
         data_dir: &Path,

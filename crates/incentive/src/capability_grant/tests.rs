@@ -53,9 +53,10 @@ fn reconstructed_capability_recovers_the_same_owner() {
     assert_eq!(grant.owner(&domain).unwrap(), owner);
 }
 
-/// Fixed-vector: a deterministic owner key + capability must recover a stable
-/// owner through the whole token path, catching a codec drift before a node
-/// does.
+/// Fixed-vector: a deterministic owner key + capability encode to a known
+/// token, and that token decodes back to the owner. A codec drift fails the
+/// pinned token before a node rejects a token a published installer handed
+/// out.
 #[test]
 fn fixed_vector_token_recovers_expected_owner() {
     let pk_hex = "2222222222222222222222222222222222222222222222222222222222222222";
@@ -64,6 +65,12 @@ fn fixed_vector_token_recovers_expected_owner() {
     let signed = sample_capability().sign(&owner, &domain).unwrap();
     let grant = CapabilityGrant::from_signed_capability(&signed);
     let token = grant.to_token();
+    assert_eq!(
+        token,
+        "dcap1:IBEiM0RVZneImQCqu8zd7v8AESIzRFVmd4iZqrvM3e7_FAAAAAAAAAAAAAAAAAAAAAAAAAChgK3iBIDm_\
+         okHQWG1m6zJLmjf6S9W_L-vbEz2ylI1sr9qbjbhpO5wKeyvFVTWOXcsjCNWBlbiLRGqDDe973zyabYdk-\
+         vuGVgBWw0b"
+    );
     let decoded = CapabilityGrant::from_token(&token).unwrap();
     assert_eq!(decoded.owner(&domain).unwrap(), owner.address());
 }

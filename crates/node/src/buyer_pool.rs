@@ -2511,8 +2511,9 @@ impl<P: Provider + Clone + 'static> BuyerPoolService<P> {
 
     /// Run one reclaim-sweep pass synchronously: complete the grace-window
     /// `reclaim` of the node's pool if it has been closed and its dispute window
-    /// has elapsed. Best-effort — errors are logged, never propagated. Exposed so
-    /// the runtime (or a test) can trigger an immediate pass.
+    /// has elapsed. Best-effort — errors are logged, never propagated. A test
+    /// hook for an immediate pass.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn sweep_reclaimable_once(&self) {
         reclaim_once(
             &self.contract,

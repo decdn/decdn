@@ -1,9 +1,8 @@
 use super::*;
-use crate::store::{MemoryPoolStateStore, PoolStateStore, StoreError};
 use crate::voucher::{Voucher, voucher_domain};
+use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{address, b256};
 use alloy::signers::local::PrivateKeySigner;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
 fn hydrate_seeds_registered_until_zero() {
@@ -75,56 +74,14 @@ fn clamp_to_registration_maps_the_zero_expiries() {
     assert_eq!(expired.registered_until, 0);
 }
 
-/// `PoolStateStore` whose `record` always errors. Proves the
-/// strict-durability invariant: `apply_voucher` MUST surface the store
-/// failure as `PoolError::Store(..)` and MUST NOT advance the in-memory
-/// `last_*` fields.
-struct FailingStore {
-    record_calls: AtomicUsize,
-}
-
-impl FailingStore {
-    fn new() -> Self {
-        Self {
-            record_calls: AtomicUsize::new(0),
-        }
-    }
-    fn record_calls(&self) -> usize {
-        self.record_calls.load(Ordering::SeqCst)
-    }
-}
-
-impl PoolStateStore for FailingStore {
-    fn load_all(&self) -> Result<Vec<LaneState>, StoreError> {
-        Ok(Vec::new())
-    }
-    fn record(&self, _state: &LaneState) -> Result<(), StoreError> {
-        self.record_calls.fetch_add(1, Ordering::SeqCst);
-        Err(StoreError::Io(std::io::Error::other(
-            "simulated fsync failure",
-        )))
-    }
-    fn forget(&self, _key: LaneKey) -> Result<(), StoreError> {
-        Ok(())
-    }
-    fn get(&self, _key: LaneKey) -> Result<Option<LaneState>, StoreError> {
-        Ok(None)
-    }
-}
-
 const CHAIN_ID: u64 = 421_614;
 const VERIFYING: Address = address!("0000000000000000000000000000000000001234");
 const PROVIDER: Address = address!("00000000000000000000000000000000000000b2");
 const POOL_ID: B256 = b256!("11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff");
 
 /// Shared test fixture: a fresh keypair, an empty `LaneState` (cap 10 USDC),
-/// the voucher EIP-712 domain, and an in-memory `PoolStateStore`.
-fn fixture() -> (
-    PrivateKeySigner,
-    LaneState,
-    Eip712Domain,
-    MemoryPoolStateStore,
-) {
+/// and the voucher EIP-712 domain.
+fn fixture() -> (PrivateKeySigner, LaneState, Eip712Domain) {
     let signer = PrivateKeySigner::random();
     let state = LaneState::hydrate(
         POOL_ID,
@@ -138,8 +95,26 @@ fn fixture() -> (
         LaneChain::NONE,
     );
     let domain = voucher_domain(CHAIN_ID, VERIFYING);
-    let store = MemoryPoolStateStore::new();
-    (signer, state, domain, store)
+    (signer, state, domain)
+}
+
+/// Advance `state` by `signed` the way the serve path does, and swap the
+/// successor in.
+fn advance(state: &mut LaneState, signed: &SignedVoucher) -> Result<VoucherApplied, PoolError> {
+    let (next, applied) = state.advance_presigned(signed)?;
+    *state = next;
+    Ok(applied)
+}
+
+/// Fold a reveal with no off-lock walk, so the lane hashes it against its own
+/// live tip.
+fn fold(
+    state: &LaneState,
+    root: B256,
+    index: u8,
+    preimage: B256,
+) -> Result<(LaneState, PreimageApplied), PoolError> {
+    state.advance_preimage_verified(root, index, preimage, None, false)
 }
 
 fn build(
@@ -200,11 +175,11 @@ fn err_of<T: std::fmt::Debug, E>(r: Result<T, E>) -> anyhow::Result<E> {
 
 #[test]
 fn first_voucher_advances_state() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     let signed =
         build(POOL_ID, signer.address(), PROVIDER, 1_000, 1_048_576).sign(&signer, &domain)?;
 
-    let applied = state.apply_voucher(&signed, &domain, &store)?;
+    let applied = advance(&mut state, &signed)?;
     anyhow::ensure!(state.last_amount == U256::from(1_000u64));
     anyhow::ensure!(state.last_bytes_delivered == U256::from(1_048_576u64));
     anyhow::ensure!(applied.amount_delta() == U256::from(1_000u64));
@@ -214,291 +189,64 @@ fn first_voucher_advances_state() -> anyhow::Result<()> {
 
 #[test]
 fn monotonic_progression_accepted() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     for (amount, bytes) in [(1_000u64, 1_048_576u64), (2_500, 2_621_440)] {
         let signed =
             build(POOL_ID, signer.address(), PROVIDER, amount, bytes).sign(&signer, &domain)?;
-        state.apply_voucher(&signed, &domain, &store)?;
+        advance(&mut state, &signed)?;
     }
     anyhow::ensure!(state.last_amount == U256::from(2_500u64));
     Ok(())
 }
 
 #[test]
-fn wrong_pool_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    let signed = build(B256::ZERO, signer.address(), PROVIDER, 1_000, 1).sign(&signer, &domain)?;
-    let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
-    anyhow::ensure!(matches!(err, PoolError::WrongPool { .. }), "{err:?}");
-    anyhow::ensure!(state.last_amount == U256::ZERO, "state must be unchanged");
-    Ok(())
-}
-
-#[test]
-fn wrong_provider_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    let other_provider = address!("000000000000000000000000000000000000cccc");
-    let signed =
-        build(POOL_ID, signer.address(), other_provider, 1_000, 1).sign(&signer, &domain)?;
-    let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
-    anyhow::ensure!(matches!(err, PoolError::WrongProvider { .. }), "{err:?}");
-    Ok(())
-}
-
-#[test]
 fn equal_amount_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     let v1 = build(POOL_ID, signer.address(), PROVIDER, 1_000, 1).sign(&signer, &domain)?;
-    state.apply_voucher(&v1, &domain, &store)?;
+    advance(&mut state, &v1)?;
 
     let v2 = build(POOL_ID, signer.address(), PROVIDER, 1_000, 2).sign(&signer, &domain)?;
-    let err = err_of(state.apply_voucher(&v2, &domain, &store))?;
+    let err = err_of(advance(&mut state, &v2))?;
     anyhow::ensure!(matches!(err, PoolError::AmountRegression { .. }), "{err:?}");
     Ok(())
 }
 
 #[test]
 fn lower_amount_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     let v1 = build(POOL_ID, signer.address(), PROVIDER, 5_000, 1).sign(&signer, &domain)?;
-    state.apply_voucher(&v1, &domain, &store)?;
+    advance(&mut state, &v1)?;
 
     let v2 = build(POOL_ID, signer.address(), PROVIDER, 4_000, 2).sign(&signer, &domain)?;
-    let err = err_of(state.apply_voucher(&v2, &domain, &store))?;
+    let err = err_of(advance(&mut state, &v2))?;
     anyhow::ensure!(matches!(err, PoolError::AmountRegression { .. }), "{err:?}");
     Ok(())
 }
 
 #[test]
 fn bytes_decrease_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     let v1 = build(POOL_ID, signer.address(), PROVIDER, 1_000, 1_048_576).sign(&signer, &domain)?;
-    state.apply_voucher(&v1, &domain, &store)?;
+    advance(&mut state, &v1)?;
 
     let v2 = build(POOL_ID, signer.address(), PROVIDER, 2_000, 524_288).sign(&signer, &domain)?;
-    let err = err_of(state.apply_voucher(&v2, &domain, &store))?;
+    let err = err_of(advance(&mut state, &v2))?;
     anyhow::ensure!(matches!(err, PoolError::BytesRegression { .. }), "{err:?}");
     Ok(())
 }
 
 #[test]
 fn amount_exceeds_cap_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     // cap is 10_000_000 (10 USDC); attempt 11 USDC.
     let signed =
         build(POOL_ID, signer.address(), PROVIDER, 11_000_000, 1).sign(&signer, &domain)?;
-    let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
+    let err = err_of(advance(&mut state, &signed))?;
     anyhow::ensure!(matches!(err, PoolError::CapExceeded { .. }), "{err:?}");
-    Ok(())
-}
-
-#[test]
-fn wrong_signer_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    // Sign with an unrelated key — the recovered address is not the lane's
-    // pinned capability signer.
-    let interloper = PrivateKeySigner::random();
-    let signed = build(POOL_ID, signer.address(), PROVIDER, 1_000, 1).sign(&interloper, &domain)?;
-    let err = err_of(state.apply_voucher(&signed, &domain, &store))?;
-    anyhow::ensure!(
-        matches!(err, PoolError::Signature(VoucherError::WrongSigner { .. })),
-        "{err:?}"
-    );
     anyhow::ensure!(
         state.last_amount == U256::ZERO,
-        "rejection must not advance"
+        "a rejection advances nothing"
     );
-    Ok(())
-}
-
-#[test]
-fn high_s_voucher_rejected_at_apply() -> anyhow::Result<()> {
-    // A high-`s` voucher recovers the correct signer off-chain but is
-    // unsettleable on-chain (#836). `apply_voucher` must reject it via the
-    // transitive `recover_signer` guard and leave state untouched.
-    let (signer, mut state, domain, store) = fixture();
-    let signed =
-        build(POOL_ID, signer.address(), PROVIDER, 1_000, 1_048_576).sign(&signer, &domain)?;
-    let twin = SignedVoucher {
-        signature: crate::sig_canon::high_s_twin(&signed.signature),
-        ..signed
-    };
-    let err = err_of(state.apply_voucher(&twin, &domain, &store))?;
-    anyhow::ensure!(
-        matches!(err, PoolError::Signature(VoucherError::InvalidSignature)),
-        "{err:?}"
-    );
-    anyhow::ensure!(
-        state.last_amount == U256::ZERO,
-        "rejection must not advance"
-    );
-    Ok(())
-}
-
-/// **Strict-durability regression (#527).** If `store.record` fails, the
-/// in-memory `LaneState` MUST NOT advance. Breaks if anyone reorders the
-/// `store.record(&next)?` and `*self = next` lines.
-#[test]
-fn store_failure_leaves_in_memory_state_unchanged() -> anyhow::Result<()> {
-    let (signer, mut state, domain, _mem_store) = fixture();
-    let snapshot = state.clone();
-    let failing = FailingStore::new();
-
-    let signed =
-        build(POOL_ID, signer.address(), PROVIDER, 1_000, 1_048_576).sign(&signer, &domain)?;
-    let err = state
-        .apply_voucher(&signed, &domain, &failing)
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("store failure must surface to caller"))?;
-    anyhow::ensure!(
-        matches!(err, PoolError::Store(_)),
-        "expected PoolError::Store, got {err:?}",
-    );
-    anyhow::ensure!(
-        state == snapshot,
-        "in-memory state must NOT advance when store.record fails",
-    );
-    anyhow::ensure!(
-        failing.record_calls() == 1,
-        "expected exactly one `record` call, got {}",
-        failing.record_calls(),
-    );
-    Ok(())
-}
-
-/// Companion: after a `record` failure, a subsequent successful apply MUST
-/// still work — the failure didn't poison the in-memory state for retries.
-#[test]
-fn store_failure_does_not_poison_subsequent_retries() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    let failing = FailingStore::new();
-    let signed =
-        build(POOL_ID, signer.address(), PROVIDER, 1_000, 1_048_576).sign(&signer, &domain)?;
-
-    let _err = state
-        .apply_voucher(&signed, &domain, &failing)
-        .err()
-        .ok_or_else(|| anyhow::anyhow!("expected store failure"))?;
-    anyhow::ensure!(state.last_amount == U256::ZERO);
-
-    state.apply_voucher(&signed, &domain, &store)?;
-    anyhow::ensure!(state.last_amount == U256::from(1_000u64));
-    Ok(())
-}
-
-/// Cover every rejection path leaves state untouched and never writes
-/// through — the issue #527 regression guard at the in-memory layer.
-#[test]
-fn rejected_voucher_does_not_advance_state() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    let v1 = build(POOL_ID, signer.address(), PROVIDER, 5_000, 1_000).sign(&signer, &domain)?;
-    state.apply_voucher(&v1, &domain, &store)?;
-    let snapshot = state.clone();
-    let interloper = PrivateKeySigner::random();
-    let other_provider = address!("000000000000000000000000000000000000cccc");
-
-    let cases: [(SignedVoucher, &str); 6] = [
-        (
-            build(B256::ZERO, signer.address(), PROVIDER, 6_000, 2_000).sign(&signer, &domain)?,
-            "wrong pool",
-        ),
-        (
-            build(POOL_ID, signer.address(), other_provider, 6_000, 2_000)
-                .sign(&signer, &domain)?,
-            "wrong provider",
-        ),
-        (
-            build(POOL_ID, signer.address(), PROVIDER, 5_000, 2_000).sign(&signer, &domain)?,
-            "equal amount",
-        ),
-        (
-            build(POOL_ID, signer.address(), PROVIDER, 6_000, 500).sign(&signer, &domain)?,
-            "bytes drop",
-        ),
-        (
-            build(POOL_ID, signer.address(), PROVIDER, 11_000_000, 2_000).sign(&signer, &domain)?,
-            "amount over cap",
-        ),
-        (
-            build(POOL_ID, signer.address(), PROVIDER, 6_000, 2_000).sign(&interloper, &domain)?,
-            "wrong signer",
-        ),
-    ];
-
-    for (voucher, reason) in &cases {
-        let _ = state.apply_voucher(voucher, &domain, &store);
-        anyhow::ensure!(state == snapshot, "{reason} must not advance state");
-    }
-    let persisted = store.load_all()?;
-    anyhow::ensure!(persisted.len() == 1, "exactly one lane persisted");
-    let only = persisted
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("expected one persisted entry"))?;
-    anyhow::ensure!(
-        *only == snapshot,
-        "rejected voucher path must not overwrite stored lane state",
-    );
-    Ok(())
-}
-
-/// Staging vouchers against an advancing candidate and recording ONLY the
-/// final state yields the same in-memory result AND the same single persisted
-/// row as applying each voucher through `apply_voucher`.
-#[test]
-fn stage_batch_then_record_once_equals_sequential_apply() -> anyhow::Result<()> {
-    let (signer, base, domain, batch_store) = fixture();
-
-    // Reference: apply three vouchers one-by-one (three records).
-    let mut seq_state = base.clone();
-    let seq_store = MemoryPoolStateStore::new();
-    let vouchers = [
-        (1_000u64, 1_048_576u64),
-        (2_000, 2_097_152),
-        (3_000, 3_145_728),
-    ];
-    for (amount, bytes) in vouchers {
-        let signed =
-            build(POOL_ID, signer.address(), PROVIDER, amount, bytes).sign(&signer, &domain)?;
-        seq_state.apply_voucher(&signed, &domain, &seq_store)?;
-    }
-
-    // Batched: stage each against an advancing candidate, record ONCE.
-    let mut candidate = base.clone();
-    for (amount, bytes) in vouchers {
-        let signed =
-            build(POOL_ID, signer.address(), PROVIDER, amount, bytes).sign(&signer, &domain)?;
-        let (next, _applied) = candidate.stage_voucher(&signed, &domain)?;
-        candidate = next;
-    }
-    batch_store.record(&candidate)?;
-
-    anyhow::ensure!(
-        candidate == seq_state,
-        "batched state must equal sequential"
-    );
-    anyhow::ensure!(candidate.last_amount() == U256::from(3_000u64));
-    anyhow::ensure!(batch_store.len() == 1, "batch persists exactly one row");
-    let persisted = batch_store.load_all()?;
-    let only = persisted.first().ok_or_else(|| anyhow::anyhow!("no row"))?;
-    anyhow::ensure!(*only == seq_state, "one record commits the whole batch");
-    Ok(())
-}
-
-/// Staging is pure: a rejected voucher leaves the candidate that produced it
-/// untouched, so a caller can keep the advanced state and reject the offender
-/// without rolling back.
-#[test]
-fn stage_voucher_rejects_without_advancing_candidate() -> anyhow::Result<()> {
-    let (signer, base, domain, _store) = fixture();
-    let v1 = build(POOL_ID, signer.address(), PROVIDER, 1_000, 1_048_576).sign(&signer, &domain)?;
-    let (after_v1, _) = base.stage_voucher(&v1, &domain)?;
-
-    // A stale-amount voucher against the advanced candidate must reject.
-    let bad =
-        build(POOL_ID, signer.address(), PROVIDER, 1_000, 2_097_152).sign(&signer, &domain)?;
-    let err = err_of(after_v1.stage_voucher(&bad, &domain))?;
-    anyhow::ensure!(matches!(err, PoolError::AmountRegression { .. }), "{err:?}");
-    anyhow::ensure!(after_v1.last_amount() == U256::from(1_000u64));
     Ok(())
 }
 
@@ -509,10 +257,10 @@ fn stage_voucher_rejects_without_advancing_candidate() -> anyhow::Result<()> {
 /// signed `amount` walks nothing.
 #[test]
 fn a_metering_voucher_opens_an_epoch_at_index_zero() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     let signed =
         build_metering(signer.address(), 1_000, 1_048_576, root(), PRICE).sign(&signer, &domain)?;
-    state.apply_voucher(&signed, &domain, &store)?;
+    advance(&mut state, &signed)?;
 
     let chain = state.chain();
     anyhow::ensure!(chain.chain_root == root());
@@ -527,15 +275,14 @@ fn a_metering_voucher_opens_an_epoch_at_index_zero() -> anyhow::Result<()> {
 /// anchor and one `CHUNK_BYTES` on the byte axis.
 #[test]
 fn one_reveal_adds_one_chunk_price_over_the_anchor() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 1_048_576, root(), PRICE)
             .sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
 
-    let (next, applied) = state.advance_preimage(root(), 1, reveal(1))?;
+    let (next, applied) = fold(&state, root(), 1, reveal(1))?;
     anyhow::ensure!(applied.advanced());
     anyhow::ensure!(applied.amount_delta() == U256::from(PRICE));
     anyhow::ensure!(applied.bytes_delta() == U256::from(crate::chain::CHUNK_BYTES));
@@ -549,14 +296,13 @@ fn one_reveal_adds_one_chunk_price_over_the_anchor() -> anyhow::Result<()> {
 /// must span an arbitrary gap and credit every step it crossed.
 #[test]
 fn a_skipped_gap_credits_every_step_it_crossed() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
 
-    let (next, applied) = state.advance_preimage(root(), 7, reveal(7))?;
+    let (next, applied) = fold(&state, root(), 7, reveal(7))?;
     anyhow::ensure!(applied.amount_delta() == U256::from(7 * PRICE));
     anyhow::ensure!(next.owed() == U256::from(1_000 + 7 * PRICE));
     Ok(())
@@ -569,11 +315,10 @@ fn a_skipped_gap_credits_every_step_it_crossed() -> anyhow::Result<()> {
 /// or a root the lane does not meter.
 #[test]
 fn preimage_frontier_names_the_walk_target_or_none() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
     // Fresh epoch: index 3 walks from the root at index 0.
     anyhow::ensure!(state.preimage_frontier(root(), 3) == Some((0, root())));
@@ -584,7 +329,7 @@ fn preimage_frontier_names_the_walk_target_or_none() -> anyhow::Result<()> {
             .is_none()
     );
 
-    let (state, _) = state.advance_preimage(root(), 5, reveal(5))?;
+    let (state, _) = fold(&state, root(), 5, reveal(5))?;
     // At/below the frontier is covered — no walk.
     anyhow::ensure!(state.preimage_frontier(root(), 5).is_none());
     anyhow::ensure!(state.preimage_frontier(root(), 3).is_none());
@@ -594,15 +339,13 @@ fn preimage_frontier_names_the_walk_target_or_none() -> anyhow::Result<()> {
 }
 
 /// The happy path: a walk run against the CURRENT frontier is trusted, and
-/// `advance_preimage_verified` yields exactly what the single-lock
-/// `advance_preimage` does.
+/// yields exactly what a fold that re-hashes under the lock does.
 #[test]
-fn a_verified_walk_against_the_live_frontier_matches_the_single_lock_form() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+fn a_verified_walk_against_the_live_frontier_matches_an_in_lock_walk() -> anyhow::Result<()> {
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
     let walked = state.preimage_frontier(root(), 4);
     let Some((wv, wtip)) = walked else {
@@ -613,10 +356,10 @@ fn a_verified_walk_against_the_live_frontier_matches_the_single_lock_form() -> a
 
     let (opt_next, opt_applied) =
         state.advance_preimage_verified(root(), 4, reveal(4), walked, ok)?;
-    let (ref_next, ref_applied) = state.advance_preimage(root(), 4, reveal(4))?;
+    let (ref_next, ref_applied) = fold(&state, root(), 4, reveal(4))?;
     anyhow::ensure!(
         opt_next == ref_next,
-        "optimistic apply diverged from the single-lock form"
+        "optimistic apply diverged from the in-lock walk"
     );
     anyhow::ensure!(opt_applied.amount_delta() == ref_applied.amount_delta());
     anyhow::ensure!(opt_next.chain().verified_index == 4);
@@ -629,11 +372,10 @@ fn a_verified_walk_against_the_live_frontier_matches_the_single_lock_form() -> a
 /// still lands correctly — the apply is never wrong, only occasionally re-walks.
 #[test]
 fn a_stale_walk_is_re_hashed_against_the_live_frontier() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
     // This stream snapshots the fresh frontier for a walk to index 5.
     let stale = state.preimage_frontier(root(), 5);
@@ -641,7 +383,7 @@ fn a_stale_walk_is_re_hashed_against_the_live_frontier() -> anyhow::Result<()> {
     let stale_ok = crate::chain::verify_forward(reveal(5), 5, root());
 
     // A sibling advances the lane to index 3 before this stream re-locks.
-    let (advanced, _) = state.advance_preimage(root(), 3, reveal(3))?;
+    let (advanced, _) = fold(&state, root(), 3, reveal(3))?;
 
     // Applied against the ADVANCED lane, the stale snapshot no longer matches
     // the live frontier `(3, reveal(3))`, so the value is re-hashed under the
@@ -661,14 +403,13 @@ fn a_stale_walk_is_re_hashed_against_the_live_frontier() -> anyhow::Result<()> {
 /// re-hashed under the lock — where the wrong preimage is caught.
 #[test]
 fn a_true_verdict_on_a_stale_frontier_cannot_bypass_the_walk() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
     let stale = state.preimage_frontier(root(), 5);
-    let (advanced, _) = state.advance_preimage(root(), 3, reveal(3))?;
+    let (advanced, _) = fold(&state, root(), 3, reveal(3))?;
 
     // A wrong preimage, but the caller lies that it verified — against the now
     // stale snapshot. The re-hash under the lock rejects it anyway.
@@ -686,13 +427,12 @@ fn a_true_verdict_on_a_stale_frontier_cannot_bypass_the_walk() -> anyhow::Result
 /// consulted, so a `None` walk with `false` verdict is still benign.
 #[test]
 fn a_covered_reveal_ignores_the_walk_verdict() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (advanced, _) = state.advance_preimage(root(), 5, reveal(5))?;
+    let (advanced, _) = fold(&state, root(), 5, reveal(5))?;
     let (next, applied) = advanced.advance_preimage_verified(root(), 3, reveal(3), None, false)?;
     anyhow::ensure!(!applied.advanced(), "a covered reveal folds nothing");
     anyhow::ensure!(
@@ -707,16 +447,15 @@ fn a_covered_reveal_ignores_the_walk_verdict() -> anyhow::Result<()> {
 /// reveal is ordinary once several streams share one lane.
 #[test]
 fn a_reveal_at_or_below_the_frontier_is_already_covered() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state, _) = state.advance_preimage(root(), 5, reveal(5))?;
+    let (state, _) = fold(&state, root(), 5, reveal(5))?;
 
     for index in [1u8, 4, 5] {
-        let (next, applied) = state.advance_preimage(root(), index, reveal(index))?;
+        let (next, applied) = fold(&state, root(), index, reveal(index))?;
         anyhow::ensure!(!applied.advanced(), "index {index} must advance nothing");
         anyhow::ensure!(next.chain().verified_index == 5, "frontier must hold");
     }
@@ -727,15 +466,14 @@ fn a_reveal_at_or_below_the_frontier_is_already_covered() -> anyhow::Result<()> 
 /// basis of the `BadPreimage` rejection.
 #[test]
 fn a_foreign_preimage_is_rejected() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
 
     let foreign = crate::chain::preimage_at(B256::repeat_byte(0x5F), 3);
-    let err = err_of(state.advance_preimage(root(), 3, foreign))?;
+    let err = err_of(fold(&state, root(), 3, foreign))?;
     anyhow::ensure!(
         matches!(
             err,
@@ -757,16 +495,15 @@ fn a_foreign_preimage_is_rejected() -> anyhow::Result<()> {
 /// `amount`: no reveal can extend it, at any index.
 #[test]
 fn a_sealed_voucher_cannot_be_extended() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build(POOL_ID, signer.address(), PROVIDER, 1_000, 0).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
     anyhow::ensure!(state.chain().chain_root.is_zero());
 
     for index in [1u8, 255] {
-        let (next, applied) = state.advance_preimage(B256::ZERO, index, reveal(index))?;
+        let (next, applied) = fold(&state, B256::ZERO, index, reveal(index))?;
         anyhow::ensure!(!applied.advanced());
         anyhow::ensure!(next.owed() == U256::from(1_000u64));
     }
@@ -778,13 +515,12 @@ fn a_sealed_voucher_cannot_be_extended() -> anyhow::Result<()> {
 /// by the roll itself and the new epoch starts clean at index 0.
 #[test]
 fn a_correctly_folded_rollover_preserves_the_total() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state_at_3, _) = state.advance_preimage(root(), 3, reveal(3))?;
+    let (state_at_3, _) = fold(&state, root(), 3, reveal(3))?;
     let owed_before = state_at_3.owed();
     anyhow::ensure!(owed_before == U256::from(1_000 + 3 * PRICE));
 
@@ -816,13 +552,12 @@ fn a_correctly_folded_rollover_preserves_the_total() -> anyhow::Result<()> {
 /// behind the node's frontier reaches it, and folds the bundle to recover.
 #[test]
 fn an_under_folded_rollover_is_refused() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state_at_9, _) = state.advance_preimage(root(), 9, reveal(9))?;
+    let (state_at_9, _) = fold(&state, root(), 9, reveal(9))?;
     let owed_before = state_at_9.owed();
 
     // Folds only 2 of the 9 chunks the node holds a preimage for.
@@ -860,13 +595,12 @@ fn an_under_folded_rollover_is_refused() -> anyhow::Result<()> {
 /// persisted them resumes here.
 #[test]
 fn a_rollover_at_the_anchor_over_a_proved_frontier_is_an_under_fold() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state_at_1, _) = state.advance_preimage(root(), 1, reveal(1))?;
+    let (state_at_1, _) = fold(&state, root(), 1, reveal(1))?;
 
     let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
     let at_anchor =
@@ -904,15 +638,14 @@ fn a_rollover_at_the_anchor_over_a_proved_frontier_is_an_under_fold() -> anyhow:
 /// an ordering regression, which the node treats as already satisfied.
 #[test]
 fn a_late_sealed_close_at_the_anchor_is_not_an_under_fold() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
+    let (signer, mut state, domain) = fixture();
     let sealed_close =
         build_metering(signer.address(), 1_000, 0, B256::ZERO, 0).sign(&signer, &domain)?;
-    state.apply_voucher(
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state_at_1, _) = state.advance_preimage(root(), 1, reveal(1))?;
+    let (state_at_1, _) = fold(&state, root(), 1, reveal(1))?;
 
     anyhow::ensure!(
         matches!(
@@ -929,13 +662,12 @@ fn a_late_sealed_close_at_the_anchor_is_not_an_under_fold() -> anyhow::Result<()
 /// adopting it would retire proved chunks from the lane's byte claim.
 #[test]
 fn a_rollover_folding_short_on_bytes_is_refused() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state_at_9, _) = state.advance_preimage(root(), 9, reveal(9))?;
+    let (state_at_9, _) = fold(&state, root(), 9, reveal(9))?;
     let bytes_before = state_at_9.owed_bytes();
 
     // Folds all 9 chunks on the money axis, only 2 on the byte axis.
@@ -974,7 +706,7 @@ fn the_under_fold_refusal_carries_a_resume_bundle() {
     });
     assert_eq!(
         reason,
-        Ok(decdn_protocol::client::VoucherRejectReason::UnderFold)
+        decdn_protocol::client::VoucherRejectReason::UnderFold
     );
     assert!(
         decdn_protocol::client::VoucherRejectReason::UnderFold.is_watermark_gated(),
@@ -986,13 +718,12 @@ fn the_under_fold_refusal_carries_a_resume_bundle() {
 /// nothing: a signature has since folded a frontier at least as deep.
 #[test]
 fn a_reveal_for_a_superseded_epoch_folds_nothing() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state_at_3, _) = state.advance_preimage(root(), 3, reveal(3))?;
+    let (state_at_3, _) = fold(&state, root(), 3, reveal(3))?;
     let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
     let (rolled, _) = state_at_3.advance_presigned(
         &build_metering(
@@ -1004,7 +735,7 @@ fn a_reveal_for_a_superseded_epoch_folds_nothing() -> anyhow::Result<()> {
         )
         .sign(&signer, &domain)?,
     )?;
-    let (after, applied) = rolled.advance_preimage(root(), 4, reveal(4))?;
+    let (after, applied) = fold(&rolled, root(), 4, reveal(4))?;
     anyhow::ensure!(!applied.advanced());
     anyhow::ensure!(after.owed() == rolled.owed());
     Ok(())
@@ -1015,13 +746,12 @@ fn a_reveal_for_a_superseded_epoch_folds_nothing() -> anyhow::Result<()> {
 /// epoch, so a reset here would silently discard proved chunks.
 #[test]
 fn re_asserting_the_same_root_holds_the_frontier() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (state_at_6, _) = state.advance_preimage(root(), 6, reveal(6))?;
+    let (state_at_6, _) = fold(&state, root(), 6, reveal(6))?;
 
     // A later voucher on the SAME epoch (a partial-chunk settlement, say).
     let same_epoch =
@@ -1038,13 +768,13 @@ fn re_asserting_the_same_root_holds_the_frontier() -> anyhow::Result<()> {
 /// the anchor, and every one of them is provable.
 #[test]
 fn a_full_depth_chain_is_claimable() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (deep, applied) = state.advance_preimage(
+    let (deep, applied) = fold(
+        &state,
         root(),
         crate::chain::MAX_CHAIN_LENGTH,
         reveal(crate::chain::MAX_CHAIN_LENGTH),
@@ -1070,11 +800,10 @@ fn a_full_depth_chain_is_claimable() -> anyhow::Result<()> {
 /// a chain the payer no longer has a seed for.
 #[test]
 fn a_non_advancing_voucher_replaces_a_chain_that_proved_nothing() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
 
     // A fresh root at the SAME cumulative — nothing was metered under the
@@ -1110,7 +839,8 @@ fn a_non_advancing_voucher_replaces_a_chain_that_proved_nothing() -> anyhow::Res
     rebuilt.verify_signer(signer.address(), &domain)?;
 
     // And the new epoch meters for real.
-    let (next, applied) = adopted.advance_preimage(
+    let (next, applied) = fold(
+        &adopted,
         next_root,
         1,
         crate::chain::preimage_at(B256::repeat_byte(0x6E), 1),
@@ -1134,13 +864,12 @@ fn a_non_advancing_voucher_replaces_a_chain_that_proved_nothing() -> anyhow::Res
 /// never collect the anchor at all.
 #[test]
 fn a_re_asserting_voucher_cannot_reprice_the_lane() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (proved, _) = state.advance_preimage(root(), 4, reveal(4))?;
+    let (proved, _) = fold(&state, root(), 4, reveal(4))?;
 
     // The same root, re-asserted at a higher price after a quote move.
     let repriced =
@@ -1178,13 +907,12 @@ fn a_re_asserting_voucher_cannot_reprice_the_lane() -> anyhow::Result<()> {
 /// a frontier the node has already proved.
 #[test]
 fn a_non_advancing_voucher_cannot_retire_a_proved_chain() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (proved, _) = state.advance_preimage(root(), 4, reveal(4))?;
+    let (proved, _) = fold(&state, root(), 4, reveal(4))?;
 
     let next_root = crate::chain::root_from_seed(B256::repeat_byte(0x6E));
     let stale =
@@ -1209,13 +937,12 @@ fn a_non_advancing_voucher_cannot_retire_a_proved_chain() -> anyhow::Result<()> 
 /// afterwards would name a root the lane never adopted.
 #[test]
 fn a_voucher_that_folds_the_proved_frontier_may_open_a_fresh_chain() -> anyhow::Result<()> {
-    let (signer, mut state, domain, store) = fixture();
-    state.apply_voucher(
+    let (signer, mut state, domain) = fixture();
+    advance(
+        &mut state,
         &build_metering(signer.address(), 1_000, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
-    let (proved, _) = state.advance_preimage(root(), 4, reveal(4))?;
+    let (proved, _) = fold(&state, root(), 4, reveal(4))?;
     let folded_amount = 1_000 + 4 * PRICE;
     anyhow::ensure!(proved.owed() == U256::from(folded_amount));
 
@@ -1256,7 +983,7 @@ fn a_voucher_that_folds_the_proved_frontier_may_open_a_fresh_chain() -> anyhow::
 /// never collect for and simply eat the difference.
 #[test]
 fn a_reveal_past_the_spending_cap_is_refused() -> anyhow::Result<()> {
-    let (signer, _, domain, store) = fixture();
+    let (signer, _, domain) = fixture();
     // A cap two chunks above the anchor, so the third reveal is the one that
     // cannot be paid for.
     let anchor = 1_000u64;
@@ -1272,20 +999,19 @@ fn a_reveal_past_the_spending_cap_is_refused() -> anyhow::Result<()> {
         None,
         LaneChain::NONE,
     );
-    state.apply_voucher(
+    advance(
+        &mut state,
         &build_metering(signer.address(), anchor, 0, root(), PRICE).sign(&signer, &domain)?,
-        &domain,
-        &store,
     )?;
 
-    let (at_cap, _) = state.advance_preimage(root(), 2, reveal(2))?;
+    let (at_cap, _) = fold(&state, root(), 2, reveal(2))?;
     anyhow::ensure!(
         at_cap.owed() == cap,
         "a reveal landing exactly ON the cap is still payable"
     );
     anyhow::ensure!(
         matches!(
-            at_cap.advance_preimage(root(), 3, reveal(3)),
+            fold(&at_cap, root(), 3, reveal(3)),
             Err(PoolError::CapExceeded { .. })
         ),
         "the reveal that would cross the cap must be refused, not credited"
@@ -1299,7 +1025,7 @@ fn a_reveal_past_the_spending_cap_is_refused() -> anyhow::Result<()> {
 /// claim past it is refused; the same bump that lands exactly on the cap is not.
 #[test]
 fn a_same_root_voucher_whose_frontier_crosses_the_cap_is_refused() -> anyhow::Result<()> {
-    let (signer, _, domain, store) = fixture();
+    let (signer, _, domain) = fixture();
     let anchor = 1_000u64;
     // Two reveals on top of the anchor, then a bump of `PRICE`: the claim is
     // `anchor + PRICE + 2 × PRICE`.
@@ -1317,12 +1043,11 @@ fn a_same_root_voucher_whose_frontier_crosses_the_cap_is_refused() -> anyhow::Re
             None,
             LaneChain::NONE,
         );
-        state.apply_voucher(
+        advance(
+            &mut state,
             &build_metering(signer.address(), anchor, 0, root(), PRICE).sign(&signer, &domain)?,
-            &domain,
-            &store,
         )?;
-        Ok(state.advance_preimage(root(), 2, reveal(2))?.0)
+        Ok(fold(&state, root(), 2, reveal(2))?.0)
     };
     let bump = build_metering(signer.address(), bumped, 0, root(), PRICE).sign(&signer, &domain)?;
 
@@ -1358,7 +1083,7 @@ fn a_same_root_voucher_whose_frontier_crosses_the_cap_is_refused() -> anyhow::Re
 /// nothing — there is no signature to submit, whatever reveals arrive.
 #[test]
 fn a_lane_with_no_voucher_holds_no_claim() {
-    let (_, state, _, _) = fixture();
+    let (_, state, _) = fixture();
     assert!(state.live_claim().is_none());
     assert_eq!(state.owed(), U256::ZERO);
 }

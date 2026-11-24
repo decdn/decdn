@@ -440,28 +440,53 @@ fn resolve_admin_url_prefers_flag() {
 
 #[test]
 fn admin_url_from_env_unset_is_none() {
-    assert_eq!(admin_url_from_env(None).expect("unset ok"), None);
+    assert_eq!(ADMIN_PORT.url_from_env(None).expect("unset ok"), None);
 }
 
 #[test]
 fn admin_url_from_env_valid_port_builds_loopback_url() {
     assert_eq!(
-        admin_url_from_env(Some("9999".to_string())).expect("valid ok"),
+        ADMIN_PORT
+            .url_from_env(Some("9999".to_string()))
+            .expect("valid ok"),
         Some("http://127.0.0.1:9999".to_string())
     );
     // Surrounding whitespace is tolerated (env values can carry it).
     assert_eq!(
-        admin_url_from_env(Some(" 9999 ".to_string())).expect("trimmed ok"),
+        ADMIN_PORT
+            .url_from_env(Some(" 9999 ".to_string()))
+            .expect("trimmed ok"),
         Some("http://127.0.0.1:9999".to_string())
     );
 }
 
 #[test]
 fn admin_url_from_env_zero_and_malformed_error() {
-    assert!(admin_url_from_env(Some("0".to_string())).is_err());
-    assert!(admin_url_from_env(Some("notaport".to_string())).is_err());
+    assert!(ADMIN_PORT.url_from_env(Some("0".to_string())).is_err());
+    assert!(
+        ADMIN_PORT
+            .url_from_env(Some("notaport".to_string()))
+            .is_err()
+    );
     // Out of u16 range.
-    assert!(admin_url_from_env(Some("70000".to_string())).is_err());
+    assert!(ADMIN_PORT.url_from_env(Some("70000".to_string())).is_err());
+}
+
+/// No path reads nothing, whatever the source. Tested at the helper rather
+/// than the resolver because `resolve_url(None, None)` reads
+/// `~/.decdn/node.toml` if it exists, which is non-hermetic on a developer
+/// machine with a real config file.
+#[test]
+fn port_from_config_file_returns_none_when_path_is_none() -> anyhow::Result<()> {
+    assert_eq!(
+        ADMIN_PORT.port_from_config_file(None, ConfigPathSource::Default)?,
+        None
+    );
+    assert_eq!(
+        ADMIN_PORT.port_from_config_file(None, ConfigPathSource::Explicit)?,
+        None
+    );
+    Ok(())
 }
 
 #[test]
@@ -469,7 +494,7 @@ fn port_from_config_file_missing_default_returns_none() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("absent.toml");
     assert_eq!(
-        port_from_config_file(Some(&path), ConfigPathSource::Default)?,
+        ADMIN_PORT.port_from_config_file(Some(&path), ConfigPathSource::Default)?,
         None
     );
     Ok(())
@@ -479,7 +504,8 @@ fn port_from_config_file_missing_default_returns_none() -> anyhow::Result<()> {
 fn port_from_config_file_missing_explicit_errors() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("absent.toml");
-    let err = port_from_config_file(Some(&path), ConfigPathSource::Explicit)
+    let err = ADMIN_PORT
+        .port_from_config_file(Some(&path), ConfigPathSource::Explicit)
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected explicit-missing error"))?
         .to_string();
@@ -496,7 +522,7 @@ fn port_from_config_file_reads_admin_port_default_path() -> anyhow::Result<()> {
     let path = dir.path().join("node.toml");
     std::fs::write(&path, b"[observability]\nadmin_port = 12345\n")?;
     assert_eq!(
-        port_from_config_file(Some(&path), ConfigPathSource::Default)?,
+        ADMIN_PORT.port_from_config_file(Some(&path), ConfigPathSource::Default)?,
         Some(12345)
     );
     Ok(())
@@ -512,7 +538,7 @@ fn port_from_config_file_reads_admin_port_explicit_path() -> anyhow::Result<()> 
     let path = dir.path().join("node.toml");
     std::fs::write(&path, b"[observability]\nadmin_port = 7777\n")?;
     assert_eq!(
-        port_from_config_file(Some(&path), ConfigPathSource::Explicit)?,
+        ADMIN_PORT.port_from_config_file(Some(&path), ConfigPathSource::Explicit)?,
         Some(7777)
     );
     Ok(())
@@ -523,7 +549,8 @@ fn port_from_config_file_errors_on_explicit_zero() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("node.toml");
     std::fs::write(&path, b"[observability]\nadmin_port = 0\n")?;
-    let err = port_from_config_file(Some(&path), ConfigPathSource::Default)
+    let err = ADMIN_PORT
+        .port_from_config_file(Some(&path), ConfigPathSource::Default)
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected error for explicit 0"))?
         .to_string();
@@ -539,7 +566,8 @@ fn port_from_config_file_errors_on_invalid_toml() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("broken.toml");
     std::fs::write(&path, b"not = valid = toml")?;
-    let err = port_from_config_file(Some(&path), ConfigPathSource::Default)
+    let err = ADMIN_PORT
+        .port_from_config_file(Some(&path), ConfigPathSource::Default)
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected parse error"))?
         .to_string();
@@ -558,14 +586,14 @@ fn port_from_config_file_ignores_unrelated_field_errors() -> anyhow::Result<()> 
     let path = dir.path().join("node.toml");
     // `network.bind_addr` would be a string in the real schema;
     // making it an integer is a guaranteed type-mismatch for the
-    // full FileConfig, but the narrow AdminPortConfig deserializer
-    // never sees `network` so it must round-trip fine.
+    // full FileConfig, but the bare-table read never looks at
+    // `network` so it must round-trip fine.
     std::fs::write(
         &path,
         b"[observability]\nadmin_port = 4242\n[network]\nbind_addr = 7\n",
     )?;
     assert_eq!(
-        port_from_config_file(Some(&path), ConfigPathSource::Default)?,
+        ADMIN_PORT.port_from_config_file(Some(&path), ConfigPathSource::Default)?,
         Some(4242)
     );
     Ok(())

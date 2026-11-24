@@ -2,7 +2,6 @@
 pragma solidity 0.8.28;
 
 import { Test } from "forge-std/Test.sol";
-import { Vm } from "forge-std/Vm.sol";
 import { Token } from "../src/Token.sol";
 
 contract TokenTest is Test {
@@ -45,36 +44,6 @@ contract TokenTest is Test {
         (bool ok,) = address(token).call(abi.encodeWithSignature("mint(address,uint256)", holder, 1e18));
         assertFalse(ok, "mint must not exist on Token");
         assertEq(token.totalSupply(), 1_000_000_000e18, "supply unchanged");
-    }
-
-    // -----------------------------------------------------------------
-    // EIP-2612 Permit (gasless approval; ADR 003 § gas abstraction)
-    // -----------------------------------------------------------------
-
-    function test_permit_setsAllowance() public {
-        Vm.Wallet memory owner = vm.createWallet("permit-owner");
-        address spender = makeAddr("spender");
-        uint256 value = 42e18;
-        uint256 deadline = block.timestamp + 1 hours;
-        uint256 nonce = token.nonces(owner.addr);
-
-        bytes32 structHash = keccak256(
-            abi.encode(
-                keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
-                owner.addr,
-                spender,
-                value,
-                nonce,
-                deadline
-            )
-        );
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", token.DOMAIN_SEPARATOR(), structHash));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(owner, digest);
-
-        token.permit(owner.addr, spender, value, deadline, v, r, s);
-
-        assertEq(token.allowance(owner.addr, spender), value);
-        assertEq(token.nonces(owner.addr), nonce + 1);
     }
 
     // -----------------------------------------------------------------

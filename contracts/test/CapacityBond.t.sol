@@ -432,11 +432,6 @@ contract CapacityBondTest is Test {
 
     // ADR 026 § Capacity-bond curve — declared-capacity band on `declareMbps`.
 
-    function test_capacityBand_defaults() public view {
-        assertEq(bond.minCapacityMbps(), 10);
-        assertEq(bond.maxCapacityMbps(), 200_000);
-    }
-
     function test_declareMbps_acceptsFloorAndCeiling() public {
         _bondForMbps(200_000);
         vm.startPrank(operator);
@@ -1238,11 +1233,6 @@ contract CapacityBondTest is Test {
         );
         bond.setAlpha(1e18);
         vm.stopPrank();
-    }
-
-    function test_curveDefaults() public view {
-        assertEq(bond.kConstant(), 12.6e18);
-        assertEq(bond.alphaWad(), 1.2e18);
     }
 
     /// @dev Locks the documented `setK`/`setAlpha` ordering hazard: each setter

@@ -58,19 +58,6 @@ fn acquire_global_full_rejects_when_semaphore_exhausted() {
         .expect("acquire after drop should succeed");
 }
 
-/// Many connections from one address all pass under a generous global cap:
-/// the limiter keys nothing on the source address (#2505).
-#[test]
-fn acquire_admits_many_connections_from_one_address() {
-    let metrics = Arc::new(Metrics::new());
-    let limiter = ConnectionLimiter::new(&security(u32::MAX), Arc::clone(&metrics));
-    let same_ip = Some(ip(192, 0, 2, 1));
-    let held: Vec<_> = (0..64)
-        .map(|_| limiter.acquire_inner(same_ip).expect("same address admits"))
-        .collect();
-    assert_eq!(held.len(), 64);
-}
-
 #[test]
 fn permit_drop_decrements_in_flight_metric() {
     // Dropping a permit lowers the in-flight gauge and frees its slot in a

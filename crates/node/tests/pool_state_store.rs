@@ -1,10 +1,9 @@
 //! End-to-end regression tests for issue #527: voucher replay across node
 //! restarts. The `replay_after_restart_is_rejected` test is the canonical
 //! reproduction — it drives the full
-//! `PersistentPoolStateStore` → `apply_voucher` → drop → reopen →
-//! `apply_voucher(replay)` path and asserts that the second `apply_voucher`
-//! rejects with `PoolError::AmountRegression`, the same revert reason the
-//! on-chain `PaymentPool.redeem` would surface.
+//! `PersistentPoolStateStore` → accept → drop → reopen → replay path and
+//! asserts that the replay rejects with `PoolError::AmountRegression`, the
+//! same revert reason the on-chain `PaymentPool.redeem` would surface.
 //!
 //! See [ADR 003 §Off-chain voucher state persistence] for the protocol rule
 //! these tests guard.
@@ -77,6 +76,19 @@ fn signed_voucher(
     Ok(v.sign(signer, domain)?)
 }
 
+/// Accept `signed` on `state` the way the serve path does: advance the lane,
+/// record the successor to `store`, then swap it in.
+fn accept(
+    state: &mut LaneState,
+    signed: &SignedVoucher,
+    store: &dyn PoolStateStore,
+) -> anyhow::Result<()> {
+    let (next, _) = state.advance_presigned(signed)?;
+    store.record(&next)?;
+    *state = next;
+    Ok(())
+}
+
 fn hydrate(
     store: &PersistentPoolStateStore,
     pool_id: B256,
@@ -113,7 +125,7 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
-        state.apply_voucher(&v5, &domain, &store)?;
+        accept(&mut state, &v5, &store)?;
         anyhow::ensure!(state.last_amount() == U256::from(5_000u64));
         // The lane store buffers `record` in memory; flush explicitly so the
         // restart this test simulates below observes a durable write.
@@ -125,7 +137,7 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
     // attempt a replay of amount=3000. A store that rebuilt fresh in-memory
     // state with `last_amount = 0` would accept it.
     let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-    let mut state = hydrate(&store, POOL_ID, &signer)?;
+    let state = hydrate(&store, POOL_ID, &signer)?;
     anyhow::ensure!(
         state.last_amount() == U256::from(5_000u64),
         "post-restart state must reflect the persisted last_amount, got {:?}",
@@ -134,7 +146,7 @@ fn replay_after_restart_is_rejected() -> anyhow::Result<()> {
 
     let v3 = signed_voucher(&signer, &domain, POOL_ID, 3_000, 3_000_000)?;
     let err = state
-        .apply_voucher(&v3, &domain, &store)
+        .advance_presigned(&v3)
         .err()
         .ok_or_else(|| anyhow::anyhow!("replay was accepted post-restart (issue #527)"))?;
     anyhow::ensure!(
@@ -160,17 +172,17 @@ fn replay_same_nonce_after_restart_is_rejected() -> anyhow::Result<()> {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
-        state.apply_voucher(&v5, &domain, &store)?;
+        accept(&mut state, &v5, &store)?;
         // The lane store buffers `record` in memory; flush explicitly so the
         // restart this test simulates below observes a durable write.
         store.flush()?;
     }
 
     let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
-    let mut state = hydrate(&store, POOL_ID, &signer)?;
+    let state = hydrate(&store, POOL_ID, &signer)?;
     let v5_replay = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
     let err = state
-        .apply_voucher(&v5_replay, &domain, &store)
+        .advance_presigned(&v5_replay)
         .err()
         .ok_or_else(|| anyhow::anyhow!("equal-amount replay was accepted post-restart"))?;
     anyhow::ensure!(
@@ -193,7 +205,7 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
         let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
         let mut state = make_state(POOL_ID, &signer);
         let v5 = signed_voucher(&signer, &domain, POOL_ID, 5_000, 5_000_000)?;
-        state.apply_voucher(&v5, &domain, &store)?;
+        accept(&mut state, &v5, &store)?;
         // The lane store buffers `record` in memory; flush explicitly so the
         // restart this test simulates below observes a durable write.
         store.flush()?;
@@ -202,7 +214,7 @@ fn forward_progress_after_restart_is_accepted() -> anyhow::Result<()> {
     let store = PersistentPoolStateStore::open(dir.path(), DEPLOYMENT)?;
     let mut state = hydrate(&store, POOL_ID, &signer)?;
     let v6 = signed_voucher(&signer, &domain, POOL_ID, 6_000, 6_000_000)?;
-    state.apply_voucher(&v6, &domain, &store)?;
+    accept(&mut state, &v6, &store)?;
     anyhow::ensure!(state.last_amount() == U256::from(6_000u64));
     anyhow::ensure!(state.last_bytes_delivered() == U256::from(6_000_000u64));
     Ok(())
@@ -243,7 +255,7 @@ fn registered_until_round_trips_across_restart() -> anyhow::Result<()> {
 
 /// `set_registered_until` writes must survive a `flush` → reopen round trip
 /// like `record` does, and once persisted, a later voucher-path `record`
-/// carrying `registered_until: 0` (the shape `apply_voucher` produces for a
+/// carrying `registered_until: 0` (the shape a voucher advance produces for a
 /// lane it has not yet observed a registration for) must not regress the
 /// persisted value after reopen — the clobber-safety guarantee this store
 /// exists to provide.
@@ -409,7 +421,7 @@ async fn concurrent_vouchers_across_distinct_lanes() -> anyhow::Result<()> {
     );
 
     // Drive 50 monotonic vouchers per lane concurrently. Each task runs its
-    // `apply_voucher` calls inside `spawn_blocking` because the store
+    // `accept` calls inside `spawn_blocking` because the store
     // implementation is sync (matches the runtime's required call pattern).
     let store_a = Arc::clone(&store);
     let store_b = Arc::clone(&store);
@@ -432,7 +444,7 @@ async fn concurrent_vouchers_across_distinct_lanes() -> anyhow::Result<()> {
                     chunk_price: U256::ZERO,
                 }
                 .sign(&signer_a, &domain_a)?;
-                state.apply_voucher(&v, &domain_a, &*store_a)?;
+                accept(&mut state, &v, &*store_a)?;
             }
             Ok(state.last_amount())
         })
@@ -453,7 +465,7 @@ async fn concurrent_vouchers_across_distinct_lanes() -> anyhow::Result<()> {
                     chunk_price: U256::ZERO,
                 }
                 .sign(&signer_b, &domain_b)?;
-                state.apply_voucher(&v, &domain_b, &*store_b)?;
+                accept(&mut state, &v, &*store_b)?;
             }
             Ok(state.last_amount())
         })
