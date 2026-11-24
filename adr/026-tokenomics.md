@@ -24,88 +24,7 @@ The protocol's economic model is defined by the following sections.
 
 ### Supply and distribution
 
-**Supply.** 1,000,000,000 TOKEN, fixed at genesis. No post-genesis minting function exists on the production token contract.
-
-#### Burnability
-
-TOKEN is `ERC20Burnable`; any contract may burn TOKEN it holds via `burn` / `burnFrom`. Burns reduce `totalSupply` and emit `Transfer(from, address(0), amount)`. The [§ Buyback and burn](#buyback-and-burn) path uses this; future contract surfaces that need a TOKEN sink integrate via the same standard interface without contract changes.
-
-#### Allocation
-
-Eleven groups summing to 100%.
-
-| # | Group | Allocation | Type | Category | Vesting / mechanic |
-|---|---|---:|---|---|---|
-| 1 | Core Contributors | 15% | Internal | Core Contributors | 12mo lock-up, 25% at cliff, then 36mo linear (monthly) |
-| 2 | DAO Treasury | 15% | Internal | Treasury | 30% at TGE, then 48mo linear (monthly) to Timelock-controlled wallet (operational Treasury) |
-| 3 | Protocol Owned Liquidity | 10% | External | Liquidity Provision | Treasury-owned position on a Uniswap V3 50/50 pool per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) |
-| 4 | App Incentives | 19% | External | Ecosystem Incentives | 20% at TGE, then 48mo linear (monthly) to Timelock-controlled multisig; publisher rebates + integration grants per [§ App Incentives](#app-incentives) |
-| 5 | Seed Investors | 11% | Internal | Private Investors | 6mo lock-up, 15% at cliff, then 36mo linear (monthly) |
-| 6 | Private Investors | 9% | Internal | Private Investors | 12mo lock-up, 15% at cliff, then 36mo linear (monthly) |
-| 7 | Market Making | 5% | External | Liquidity Provision | Genesis-liquid, MM-partner-allocated |
-| 8 | Misc. Marketing, PR, and KOLs | 5% | Internal | Marketing | 6mo lock-up, 10% at cliff, then 24mo linear (daily) |
-| 9 | Public Sale | 5% | External | Public Sale | Genesis-liquid (or 6mo lockup if regulatory posture requires) |
-| 10 | Advisors | 3% | Internal | Core Contributors | 6mo lock-up, 25% at cliff, then 24mo linear (monthly) |
-| 11 | Exchange Partnerships | 3% | External | Marketing | 10% at cliff (no lock-up), then 36mo linear (daily); co-marketing to CEX / MM partners |
-| | **Total** | **100%** | | | |
-
-**Categorical rollup.**
-
-| Category | Allocation | # Groups |
-|---|---:|---:|
-| Core Contributors | 18% | 2 |
-| Private Investors | 20% | 2 |
-| Treasury | 15% | 1 |
-| Public Sale | 5% | 1 |
-| Ecosystem Incentives | 19% | 1 |
-| Marketing | 8% | 2 |
-| Liquidity Provision | 15% | 2 |
-| **Total** | **100%** | **11** |
-
-**Internal / External rollup.** Internal (Core, Advisors, Seed, Private, Treasury, Misc Marketing) = 58%; External (POL, App Incentives, Market Making, Public Sale, Exchange Partnerships) = 42%.
-
-**Full initial unlock (TGE Day 1).** Exactly three groups unlock 100% at genesis:
-
-| Group | Allocation |
-|---|---:|
-| Protocol Owned Liquidity | 10% |
-| Market Making | 5% |
-| Public Sale | 5% |
-| **Total fully unlocked at TGE** | **20%** |
-
-This is the *unlock* set, not the *circulating sell-side float*. Of the 20% unlocked, only ~5–10% is circulating float — POL sits as a non-circulating treasury-owned LP position (removable only by governance) and the Market Making allocation is a market-neutral two-sided position; both are "Not a seller" per [§ Sell-pressure profile](#sell-pressure-profile). Public Sale (≤5%) is the only fully-unlocked group that is a net seller.
-
-Two further groups carry a **partial** TGE unlock under the vesting schedule above: DAO Treasury releases 30% at TGE (= 4.5% of supply, 45M TOKEN) and App Incentives releases 20% at TGE (= 3.8% of supply, 38M TOKEN). These are not in the 100%-unlock set; the released portions are sent to Timelock-controlled wallets (operational Treasury / App-Incentives multisig) and spent into the ecosystem, not sold — they are treasury-custodied, not sell-side float (analogous to POL). Misc. Marketing, PR, and KOLs and Exchange Partnerships follow formal lock-up/cliff/linear schedules (see the table above); both remain Treasury-administered ecosystem spend rather than profit-seeking holdings.
-
-**Genesis liquid float (TGE Day 1).**
-
-| Source | Allocation |
-|---|---:|
-| Public Sale | up to 5% (genesis-liquid or 6mo lockup if regulatory posture requires) |
-| Market-Maker partner allocation | 5% |
-| **Total liquid float at TGE** | **~5–10%** |
-
-The 10pp POL position, the DAO Treasury (30% / 45M) TGE unlock, and the App Incentives (20% / 38M) TGE unlock are treasury-custodied, not circulating float: POL is a governance-locked LP position, and the Treasury / App-Incentives releases are sent to Timelock-controlled wallets and spent into the ecosystem, not sold.
-
-#### Sell-pressure profile
-
-A qualitative economic-modeling lens over the [§ Allocation](#allocation) table — not an on-chain mechanic. Each group is typed by the sell pressure its tokens are expected to exert once unlocked, derived from the vesting column and the holder's incentive. The Allocation column below mirrors [§ Allocation](#allocation) — edit percentages there first:
-
-| Group | Allocation | Sell-pressure type | Potential seller |
-|---|---:|---|---|
-| Core Contributors | 15% | Moderate | Yes |
-| DAO Treasury | 15% | Conservative | Yes |
-| Protocol Owned Liquidity | 10% | Not a seller | No |
-| App Incentives | 19% | Moderate | Yes |
-| Seed Investors | 11% | Aggressive | Yes |
-| Private Investors | 9% | Aggressive | Yes |
-| Market Making | 5% | Not a seller | No |
-| Misc. Marketing, PR, and KOLs | 5% | Not a seller | No |
-| Public Sale | 5% | Aggressive | Yes |
-| Advisors | 3% | Aggressive | Yes |
-| Exchange Partnerships | 3% | Not a seller | No |
-
-**Rollup.** Potential sellers = 77% (7 groups: Core Contributors, DAO Treasury, App Incentives, Seed, Private, Public Sale, Advisors); not-a-seller = 23% (4 groups: POL, Market Making, Misc. Marketing, Exchange Partnerships). The Aggressive groups are the investor, advisor, and public-sale allocations whose tokens reach the holder fastest — short lock-up (Seed 6mo, Advisors 6mo; Private 12mo) followed by a cliff and linear unlock, or genesis-liquid (Public Sale) — relative to their cost basis; the not-a-seller groups are protocol-owned or market-neutral positions (POL is governance-locked liquidity; Market Making is two-sided; Misc. Marketing and Exchange Partnerships, though now on formal lock-up/cliff/linear schedules, are Treasury-administered ecosystem / co-marketing allocations spent into the ecosystem rather than sold).
+**Supply.** 1,000,000,000 TOKEN, fixed at genesis. TOKEN is a plain `ERC20` with `ERC20Permit`. The genesis mint is the only mint, so `totalSupply` stays at 1B.
 
 #### No auto-bond on vest
 
@@ -194,45 +113,43 @@ Each redemption splits in two steps. The split runs on two chains ([ADR 016 § D
 1. **Operator share, payment chain.** `PaymentPool.redeemMany` pays `operatorBps` of the paid amount to the operator in the same transaction. The reference deployment sets `operatorBps` to 6000 (60%). `operatorBps` is an immutable of each pool, so governance cannot lower it.
 2. **Protocol share, governance chain.** The rest of the redemption accrues in the pool. A permissionless `sweep` sends it to the governance-chain `FeeRouter` over CCTP, together with the operator's served bytes ([ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)).
 
-`FeeRouter` splits each swept amount by three governable values. `rebateBps` goes to the operator. `buybackBps` goes to `BuybackBurner` ([ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)). The treasury (the Timelock) receives the remainder. `rebateBps` is at most 9900, so buyback plus treasury keep at least 1% and vote weight stays earnable ([ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)). A non-zero `buybackBps` needs a non-zero burner address, and a non-zero treasury remainder needs a non-zero treasury address.
+`FeeRouter` splits each swept amount into two legs:
 
-The operator's total share is `operatorBps` plus the rebate part of the protocol share. The operator is paid on the payment chain where the redemption lands. The rebate arrives on the governance chain.
+- **Rebate leg.** `rebateBps` of the amount goes to the operator. The rebate applies only while the operator is active.
+- **Treasury leg.** The treasury (the Timelock) receives the remainder.
 
-| Setting | `rebateBps` | `buybackBps` | Operator | Buyback | Treasury |
-|---|---:|---:|---:|---:|---:|
-| Launch example | 7500 | 0 | 60% + 30% = 90% | 0% | 10% |
-| Steady example | 0 | 7500 | 60% | 30% | 10% |
+Governance sets `rebateBps` with `setSplit`. `rebateBps` is at most 9900, so the treasury leg keeps at least 1% of each deposit and vote weight stays earnable ([ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)). The treasury address is never zero.
 
-Buyback is a setting. Governance sets `buybackBps` above 0 and the burner address when the venue is ready. Governance sets `buybackBps` to 0 to switch it off. The activation criteria are in [ADR 018 § Activation Criteria (Production)](018-liquidity-strategy.md#activation-criteria-production). The table shows example values, not code defaults.
+**Weight credit.** Each deposit also credits served bytes to the operator for the current epoch. The treasury leg prices the credit. The rebate leg never prices it. The credit is `min(servedBytes, treasuryLeg × 1 MiB / deliveryFloor)`. The operator's declared capacity for the epoch then clamps it. An inactive operator gets no credit.
+
+The operator's total share is `operatorBps` plus the rebate leg. The operator is paid on the payment chain where the redemption lands. The rebate arrives on the governance chain.
+
+| Setting | `rebateBps` | Operator | Treasury |
+|---|---:|---:|---:|
+| Launch example | 7500 | 60% + 30% = 90% | 10% |
+| Steady example | 0 | 60% | 40% |
+
+The table shows example values, not code defaults.
 
 The per-epoch served-bytes counters do not drive payouts. `DecdnGovernor` reads them as the voting-weight source per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
 
 **No standing safety/insurance bucket.** There is no dedicated safety/insurance reserve and no `SafetyReserve` contract (`ADR 033`). User-facing incident recourse for downtime or bad-data delivery is **not** a protocol contract surface — see [§ Incident recourse](#incident-recourse-no-standing-reserve).
 
-**Node-to-node cache-miss paid pulls follow the same path as every other redemption.** There is no bypass. A self-routed pull pays the protocol share on every cycle. The USDC that stays with the protocol (buyback and treasury) is the wash-trading deterrent (see [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying)).
+**Node-to-node cache-miss paid pulls follow the same path as every other redemption.** There is no bypass. A self-routed pull pays the protocol share on every cycle. The USDC that stays with the protocol (the treasury leg) is the wash-trading deterrent (see [ADR 036 § Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying)).
 
-**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 4–20× cheaper than major traditional CDNs. No deCDN-specific premium. The protocol share is absorbed by operator net revenue, recovered through TOKEN-economy exposure (capacity-growth lock demand, deflationary burn) and externally-funded pre-seed USDC subsidies.
+**Gross client rate.** $0.01/GB — at parity with Bunny.net's budget tier and 4–20× cheaper than major traditional CDNs. No deCDN-specific premium. The protocol share is absorbed by operator net revenue, recovered through TOKEN-economy exposure (capacity-growth lock demand) and externally-funded pre-seed USDC subsidies.
 
-**Value accrual mechanism.** Two prongs:
-
-- **Capacity-growth lock demand.** Every new operator or tier upgrade is a new buyer of TOKEN to bond. The demand is mechanically tied to network capacity growth, not to a promise of yield.
-- **Deflationary burn.** The share governance sets as `buybackBps` is swapped to TOKEN and burned per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol). The burn raises TOKEN's mechanical demand and benefits every bond-holder uniformly.
-
-### Buyback and burn
-
-**Buyback-and-burn inflow.** The share governance sets as `buybackBps` flows to `BuybackBurner` from the governance-chain `FeeRouter` on each sweep. [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol) specifies the Uniswap V3 50/50 swap, TWAP, `minTokenOut`, POL custody, and per-epoch liquidity cap. The burner snapshots the protocol treasury as an immutable at construction. `rescueUSDC(amount)` recovers USDC that is stranded in the burner — inflow that arrived while the venue was unwired, or the balance held before a `setBuybackBurner` replacement — and sends it only to that fixed treasury. The hatch cannot redirect the buyback bucket to a caller-supplied address, so governance recovers stranded funds without gaining a drain path. TOKEN is always burned and never leaves the contract.
-
-**Operational constraint.** Burn must be TWAP-limited and liquidity-aware. Mature burn budgets can exceed available market depth, especially at low TOKEN prices — the [ADR 018 § TWAP policy](018-liquidity-strategy.md#twap-policy-multi-call-sub-swaps) governs the per-epoch liquidity ceiling (`epochLiquidityCapFraction`, default 10%, bounded `[1%, 30%]`).
+**Value accrual mechanism.** Capacity-growth lock demand. Every new operator or tier upgrade is a new buyer of TOKEN to bond. The demand is mechanically tied to network capacity growth, not to a promise of yield.
 
 ### Recognizing testnet operators
 
-There is **no dedicated on-chain credit and no earmarked allocation** for testnet operators. The protocol has no on-chain operator grant. The operational DAO Treasury (group 2) is a flat 15%: 30% at TGE, then 48-month linear. Any retroactive recognition of verified testnet contribution is a **discretionary off-chain Treasury TGE-unlock distribution** — liquid TOKEN on a cliff/linear schedule the foundation/Treasury sets — with **no protocol contract surface**. This keeps the contract set smaller and sidesteps on-chain grant/vest interactions; early-operator unit economics are carried by the off-chain USDC infrastructure subsidies in [§ Bootstrap mechanism — pre-seed USDC](#bootstrap-mechanism--pre-seed-usdc).
+There is **no dedicated on-chain credit and no earmarked allocation** for testnet operators. The protocol has no on-chain operator grant. Any retroactive recognition of verified testnet contribution is a **discretionary off-chain Treasury TGE-unlock distribution** — liquid TOKEN on a cliff/linear schedule the foundation/Treasury sets — with **no protocol contract surface**. This keeps the contract set smaller and sidesteps on-chain grant/vest interactions; early-operator unit economics are carried by the off-chain USDC infrastructure subsidies in [§ Bootstrap mechanism — pre-seed USDC](#bootstrap-mechanism--pre-seed-usdc).
 
 **Howey framing.** A discretionary off-chain distribution for prior verifiable work (testnet) is structurally distinct from ongoing service emission: the work that earned it is complete at TGE, and recipients receive liquid TOKEN, not a protocol-mediated yield. Shape matches a founding-contributor grant, not yield to passive bonders.
 
 ### App Incentives
 
-Group 4 (19% / 190M TOKEN) funds demand-side adoption — publishers serving content via deCDN and apps that integrate deCDN as their CDN backend. A customer-acquisition incentive aimed at consumers of the service, not at TOKEN bonders. The envelope carries a 5pp allocation routed from POL into the Publisher Rebates sub-program (the volume-scaling demand lever).
+App Incentives (19% / 190M TOKEN) funds demand-side adoption — publishers serving content via deCDN and apps that integrate deCDN as their CDN backend. A customer-acquisition incentive aimed at consumers of the service, not at TOKEN bonders. Publisher Rebates are the volume-scaling demand lever.
 
 **Distribution mechanism.** 20% unlocked at TGE, then 48-month linear (monthly) into a dedicated Timelock-controlled multisig (separate wallet from operational Treasury for accounting cleanliness). No on-chain contract; both sub-programs are Treasury-multisig-administered.
 
@@ -248,7 +165,7 @@ Group 4 (19% / 190M TOKEN) funds demand-side adoption — publishers serving con
 
 **Howey framing.** Publisher Rebates are TOKEN-denominated discounts to paying customers — analogous to airline frequent-flyer miles or AWS cloud credits, not investment contracts. Integration Grants are milestone-based work-for-hire payouts. Neither is conditional on the recipient holding TOKEN; neither generates an expectation of profit from "the efforts of others."
 
-**Constraints.** Co-marketing spend (case studies, conferences, advertising) is funded from the separate Misc. Marketing bucket (group 8), not from App Incentives.
+**Constraints.** Co-marketing spend (case studies, conferences, advertising) is funded from a separate marketing budget, not from App Incentives.
 
 ### Minimum bond is non-retroactive
 
@@ -284,7 +201,7 @@ Each epoch's counted bytes are capped at what the operator's declared capacity t
 - Vote weight scales with demonstrated served bytes, capped per epoch by declared capacity, not by bond size — see [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) for the full derivation.
 - **Per-operator voting cap = 10% of total bytes-weighted weight** (launches at the 10% ceiling, decrease-only within `[1%, 10%]`). Single biggest carrier still capped at 10%; cap is the primary defense against bytes-weighted concentration in a power-law-skewed CDN traffic distribution. Launching at the ceiling keeps quorum reachable while the operator set is thin, and every later move only decentralizes.
 
-**Non-operator TOKEN holders have ZERO voting weight.** No allocation category in the [§ Allocation](#allocation) categorical rollup — none of the 100% of supply — can vote unless it also bonds TOKEN to operate. Served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) further ties weight to delivered bytes, so a TOKEN holder who bonds without actually delivering bytes still accrues zero vote weight.
+**Non-operator TOKEN holders have ZERO voting weight.** No TOKEN holder can vote unless it also bonds TOKEN to operate. Served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) further ties weight to delivered bytes, so a TOKEN holder who bonds without actually delivering bytes still accrues zero vote weight.
 
 **Why this is right:**
 
@@ -294,7 +211,7 @@ Each epoch's counted bytes are capped at what the operator's declared capacity t
 
 **Operator guarantee.** The operator guarantee is the immutable `operatorBps` on each `PaymentPool`. Governance cannot lower it.
 
-**Investor disposition is consistent with the existing entity design.** Per the entity-structure design § Pattern A (Legal Fiction Separation), the existing structure already excludes investors and other non-operator holders from DAO voting by structure — DAO governance is permissionless and no-KYC; investor influence is routed to the Labs (C-Corp) equity layer (Series A+ board seats, standard preferred-stock protective provisions, indirect TOKEN exposure via Labs' ~15% treasury allocation). DAO voting is restricted to operators — a change to who-among-active-participants votes, not a removal of an investor right that ever existed in entity design. Term-sheet language should not promise a ve-lock passive-governance path, because that was never a designed-in investor right.
+**Investor disposition is consistent with the existing entity design.** Per the entity-structure design § Pattern A (Legal Fiction Separation), the existing structure already excludes investors and other non-operator holders from DAO voting by structure — DAO governance is permissionless and no-KYC; investor influence is routed to the Labs (C-Corp) equity layer (Series A+ board seats, standard preferred-stock protective provisions, indirect TOKEN exposure via Labs' TOKEN holdings). DAO voting is restricted to operators — a change to who-among-active-participants votes, not a removal of an investor right that ever existed in entity design. Term-sheet language should not promise a ve-lock passive-governance path, because that was never a designed-in investor right.
 
 **Governance parameters.**
 
@@ -327,7 +244,7 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 
 **Genesis-day operator math (1 Gbps operator, no starting TOKEN).**
 
-- Genesis: buys 50K TOKEN at POL discovery price (~$0.05–0.10 → $2,500–$5,000 capital outlay).
+- Genesis: buys 50K TOKEN at market price (~$0.05–0.10 → $2,500–$5,000 capital outlay).
 - Months 1–12: earns USDC fees from delivery + pre-seed USDC subsidy → roughly cost-neutral on bandwidth.
 - Months 1–24: climbs the 1G → ~3G → 10G tier by purchasing TOKEN on market as service revenue accrues. Operators reinvest USDC fee income into bond rather than relying on any protocol-issued TOKEN credit.
 - Month 12: operating at 5–10G tier, paid in USDC fees, governance-eligible (with age-ramp at full weight from month 6).
@@ -337,15 +254,6 @@ The voting set is narrow at launch (likely <50 operators in the first 6–12 mon
 
 There is no standing safety/insurance reserve; the `SafetyReserve` contract and its FeeRouter bucket do not exist (`ADR 033`). Relay / sequencer / payment-pool downtime and bad-data delivery have **no protocol-funded recourse surface** — reputation decay ([ADR 008](008-reputation.md#adr-008-reputation-system)) is the standing deterrent, and any discretionary restitution is a slow DAO Treasury governance action funded from the treasury share (no emergency-multisig fast-track). This scope suits the testnet-scale launch; a future ADR may add a funded recourse surface before mainnet carries real customer SLAs.
 
-### Liquidity Provision allocation (POL + Market Making)
-
-The 15% Liquidity Provision category splits across two top-level groups:
-
-- **Market Making — 5pp / 50M TOKEN** (group 7, genesis-liquid). Distributed to vetted market-maker partners under standard MM agreements for two-sided quoting on CEXes and DEX aggregators.
-- **Protocol-Owned Liquidity — 10pp / 100M TOKEN** (group 3, treasury-deployed). Held by DAO Treasury and deployed as a full-range 50/50 position on the Uniswap V3 pool per [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol). The USDC arm is funded from the DAO's treasury share of the `FeeRouter` split and the pool is created by the DAO itself; no pre-seed or team/investor capital seeds it. Earns trading fees (yield flows to Treasury, not to per-holder claims). Cannot be withdrawn without a governance proposal (timelock + quorum).
-
-POL is *protocol-owned*; it doesn't create passive yield to any external holder. Trading-fee yield is treasury-direct (not re-routed through `FeeRouter`), preserving the FeeRouter's strict per-byte-settlement accounting. The 15% combined allocation sits at the top of the typical 5–15% DeFi range and is defensible for an infrastructure protocol focused on liquidity depth as a primary value-accrual lever; the absence of a Liquidity Mining program eliminates the residual Howey prong-4 exposure that an LP-token-yield program would carry.
-
 ### Bootstrap mechanism — pre-seed USDC
 
 Bootstrap supply-side incentive is **$1M+ pre-seed USDC capital** (planning target: $3M), externally raised. USDC denomination insulates subsidy purchasing power from TOKEN price. The protocol commits to the funding mechanism (USDC, externally raised) and the size floor ($1M); the operational program structure is tracked separately as a foundation/team operational concern, not as a protocol decision.
@@ -354,7 +262,7 @@ Approximate use of pre-seed USDC:
 
 | Use | Approx allocation | Notes |
 |---|---:|---|
-| Operator infrastructure subsidies (direct USDC) | ~85% | Covers VPS/bandwidth for first 12 months for early operators; the primary lever making first-year operator unit economics positive (there is no on-chain TOKEN credit). Absorbs the whole POL-seed budget: POL is not seeded from pre-seed USDC — the DAO funds it from the treasury share of the `FeeRouter` split and creates the pool itself ([ADR 018 § Protocol-Owned Liquidity mechanics](018-liquidity-strategy.md#protocol-owned-liquidity-mechanics)) |
+| Operator infrastructure subsidies (direct USDC) | ~85% | Covers VPS/bandwidth for first 12 months for early operators; the primary lever making first-year operator unit economics positive (there is no on-chain TOKEN credit) |
 | Treasury incident-contingency buffer (USDC) | ~10% | Discretionary buffer for governance-approved incident restitution before fee inflows reach steady state (no dedicated reserve contract — held by the DAO Treasury) |
 | Audits, legal, contingency | ~5% | Operational, not protocol-bound |
 
@@ -362,7 +270,7 @@ Approximate use of pre-seed USDC:
 
 ### Governable parameters with safety bounds
 
-Capacity-curve parameters and the `FeeRouter` split are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model). The split (`rebateBps`, `buybackBps`, treasury remainder) has one bound: `rebateBps` is at most 9900. The parameters below carry bounds.
+Capacity-curve parameters and the `FeeRouter` split are governable, gated by 48-hour timelock per [ADR 009](009-governance.md#adr-009-governance-model). The split (`rebateBps` and the treasury remainder) has one bound: `rebateBps` is at most 9900. The parameters below carry bounds.
 
 | Parameter | Default | Min | Max |
 |---|---:|---:|---:|
@@ -373,7 +281,7 @@ Capacity-curve parameters and the `FeeRouter` split are governable, gated by 48-
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 10% | 1% | 10% |
 | `windowEpochs` (served-bytes voting window, on `FeeRouter`) | 13 | 4 | 26 |
-| `deliveryFloor` (net USDC micro-units per MB of weight, on `FeeRouter`) | 1 | 1 | 1000 |
+| `deliveryFloor` (treasury-leg USDC micro-units per MiB of weight, on `FeeRouter`) | 1 | 1 | 1000 |
 
 #### Setter contract-level bound enforcement
 
@@ -383,9 +291,9 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 ### Positive
 
-- **Smaller contract surface.** The economic contract set is `CapacityBond` (operator registry, capacity-curve bond), `FeeRouter` (governance-chain sweep receiver and split), `BuybackBurner`, `DecdnGovernor`, `TimelockController`, `PaymentPool`, and `TOKEN`. The content and origin contracts (`ContentBlacklist`, `OriginAssignment`, `PublisherRegistry`) and the bridge receiver `CctpSweepReceiver` sit outside it ([ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory)). No standing insurance reserve, no on-chain operator-credit grant/vest machinery, no epoch / claim / snapshot machinery, no separate emissions contract.
+- **Smaller contract surface.** The economic contract set is `CapacityBond` (operator registry, capacity-curve bond), `FeeRouter` (governance-chain sweep receiver and split), `DecdnGovernor`, `TimelockController`, `PaymentPool`, and `TOKEN`. The content and origin contracts (`ContentBlacklist`, `OriginAssignment`, `PublisherRegistry`) and the bridge receiver `CctpSweepReceiver` sit outside it ([ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory)). No standing insurance reserve, no on-chain operator-credit grant/vest machinery, no epoch / claim / snapshot machinery, no separate emissions contract.
 - **Cleaner regulatory posture on Howey prong 4.** Passive holding earns nothing. No delegator pool, no ve-lock yield, no per-holder claim on revenue. Operator-only governance + entity design Pattern A's existing exclusion of investors from DAO voting closes both the cashflow-rights and common-enterprise vectors.
-- **Mechanical value-accrual lever.** Capacity-growth lock demand scales with network throughput; the buyback share is the second deflationary prong.
+- **Mechanical value-accrual lever.** Capacity-growth lock demand scales with network throughput.
 - **No cashflow crisis at the operator layer.** `operatorBps` (60% in the reference deployment) liquid USDC per redemption is comfortably above infrastructure-cost coverage at the reference 1 Gbps / 30K GB/mo node.
 - **USDC pre-seed eliminates TOKEN-price reflexivity in bootstrap.** Subsidy purchasing power does not collapse with TOKEN price.
 - **Wash-trading is structurally defeated.** Operator revenue is per-byte (the operator share is paid by the client, not pooled), so faking traffic does not raise revenue. Governance vote weight is sourced from the governance-chain `FeeRouter.bytesInWindow` per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) — proven delivered bytes, capped per epoch by declared capacity — so over-declaring a tier does not translate into governance influence either; the cap only narrows counted bytes, it never grants weight for capacity that was declared but not delivered. The super-linear bond curve makes over-declared capacity a dead-capital drag with no governance or revenue upside.
@@ -394,14 +302,11 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 
 - **Capital-cost-to-operate at edge tier.** The super-linear curve makes 100 Gbps + tiers expensive: ~12.6M TOKEN bond at the 100G tier. Mitigated by α-tunability and by the off-chain USDC infrastructure subsidies for early operators; operators must otherwise buy TOKEN on market to climb tiers, by design (there is no on-chain TOKEN credit).
 - **Governance bootstrap depends on multisig discipline.** First 6–12 months run through a multisig; served-bytes-weighted DAO voting kicks in when the multisig executes the one-shot transition. Pre-transition parameter changes are constrained to the [§ Governable parameters with safety bounds](#governable-parameters-with-safety-bounds).
-- **Smaller external LP base in year 1.** No Liquidity Mining subsidy means external LP growth depends on organic trading-fee yield. POL provides the depth.
-- **Per-byte burn flow may exceed market depth at low TOKEN prices.** [ADR 018](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol)'s per-epoch liquidity cap on `BuybackBurner` is load-bearing.
 - **Operator-only DAO is politically narrow.** Investors, team, and treasury hold TOKEN but cannot vote unless they also operate. This is the deliberate regulatory-cleanliness commitment; consistent with the entity design Pattern A.
 
 ### Risks
 
 - **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G target bond (50K TOKEN). Governance changes to k can shift the entire bond curve. The k bound is parameterized via the 1G-tier bond range rather than as a raw range to constrain volatility; see [§ Deferred & Open](#deferred--open).
-- **POL governance surface.** The 10% POL position (group 3), combined with the 5% MM allocation (group 7), puts the Liquidity-Provision category at 15% — the top of the typical 5–15% DeFi range — and still needs explicit governance controls. See [ADR 018 § POL Governance](018-liquidity-strategy.md#pol-governance) for the canonical specification.
 - **Convex-capture-style wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This is structurally limited because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Tracked in [§ Deferred & Open](#deferred--open).
 
 ## Cross-ADR Impact
@@ -410,18 +315,16 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is served-bytes weight from the governance-chain `FeeRouter` bytes ledger, fed by sweeps, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders carry zero weight. The multisig bootstrap phase ends with a manual one-shot transition the multisig executes.
 - **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Defines the canonical DAO voting-weight formula the §Governance "Voting weight" section above points to. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, each epoch's bytes capped at what `CapacityBond.declaredMbpsAtEpoch` could physically deliver over that epoch, capped per-operator at `voteCapBps` against the bytes-weighted total. `windowEpochs` (default 13) is a governable parameter. Vote weight derives from proven delivered bytes, capped by declared capacity rather than granted by it, so the design has no capacity-shortfall penalty, no `min_delivery_ratio`, and no registration gate on discovery; discovery opens on `cdn/client/v1` serve operator latency and availability discovery, not declared-capacity enforcement.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `CapacityBond` is the operator registry and capacity-curve bond. `FeeRouter` is the governance-chain sweep receiver and split. Class diagrams reflect this surface.
-- **[ADR 018 — Liquidity Strategy](018-liquidity-strategy.md#adr-018-liquidity-strategy-uniswap-v3-5050-pol):** POL is 10% (group 3); MM is 5% (group 7); combined Liquidity-Provision category is 15%. `BuybackBurner` receives the `buybackBps` share of each sweep. §POL Governance formalizes rebalance / withdraw / fee-accounting rules.
 - **`ADR 014` — On-Chain Verification for Slashing Evidence:** RETIRED. The protocol has no on-chain evidence path. The `StreamResponse` signature is specified in [ADR 005 § Signer binding](005-protocol.md#signer-binding).
 - **`ADR 028` — Slashing Appeals:** RETIRED. With no slashing, there is nothing to appeal.
 - **`ADR 032` — SafetyReserve Appeal-Surface Contract Surface:** RETIRED. No appeal contract exists.
 - **`ADR 033` — Safety and Insurance Reserve:** RETIRED. There is no `SafetyReserve` contract and no safety bucket in the FeeRouter split.
 - **`ADR 034` — Gauge Boost and Voting Escrow:** RETIRED. The gauge-boost mechanism, `VotingEscrow` contract, and per-operator gauge-share cap are replaced by the capacity-bond curve.
-- **`ADR 035` — Delegator Pool:** RETIRED. The 7% delegator bucket and `DelegatorBuyer` pipeline do not exist; the router split has operator rebate, buyback and treasury.
+- **`ADR 035` — Delegator Pool:** RETIRED. The 7% delegator bucket and `DelegatorBuyer` pipeline do not exist; the router split has an operator rebate and a treasury leg.
 
 ## Deferred & Open
 
 1. **k governance volatility.** k=12.6 is a discovered constant for the chosen 1G-tier target bond (50K TOKEN). The current bound parameterizes k indirectly via the 1G-tier bond range [10K, 200K TOKEN]; an alternative is to make k immutable post-genesis and only governable via a one-shot setter behind a higher quorum. Recommend modeling impact in finance notebooks before locking the convention.
 2. **App Incentives 15/4 split governance.** The publisher-rebate / integration-grant split (150M / 40M indicative) is a governance norm, not on-chain enforced. Confirm DAO can rebalance within the 19% envelope without requiring an ADR amendment.
 3. **Liquid-bond wrappers.** A third-party contract could pool operator bonds and issue liquid receipts (analog to Convex/Lido). This isn't strictly possible under work-token because the bond is tied to a specific operator identity and capacity claim, but a registry of "bond-financed operators" backed by such wrappers is plausible. Flag for future ADR if observed.
-4. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the governance chain and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Most relevant for any holder cohort distributed without an operating expectation (Public Sale, MM-partner allocations).
-5. **POL trading-fee accounting.** The 10% POL position (group 3) earns trading fees that flow to Treasury directly (not re-routed through `FeeRouter`). The default is to keep `FeeRouter` accounting strictly tied to per-byte settlement; a future revisiting ADR may consider routing POL fees through the `FeeRouter` split if that improves predictability of treasury yield.
+4. **Cross-chain TOKEN holders.** TOKEN may be bridged. Bridged holders cannot operate on the governance chain and so cannot vote — this is consistent with operator-only governance but worth being explicit about. Most relevant for any holder cohort distributed without an operating expectation (for example, public-sale buyers).

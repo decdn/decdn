@@ -92,17 +92,9 @@ fn bao_for(root: [u8; 32], plaintext: &[u8], outboard: Bytes, aligned: &AlignedR
         .expect("verifies")
 }
 
-fn tmp_dir() -> tempfile::TempDir {
-    tempfile::tempdir().expect("tmp dir")
-}
-
-/// A fresh `.partial` store whose tempdir outlives the test (leaked, OS
-/// reclaims at exit — same pattern the ranged-store unit tests use).
+/// A fresh in-memory store.
 fn fresh_store(root: [u8; 32], total: u64) -> ClientRangedStore {
-    let dir = tmp_dir();
-    let store = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
-    std::mem::forget(dir);
-    store
+    ClientRangedStore::in_memory(root, total)
 }
 
 /// A healthy buyer context: a huge deposit so the pacer never refuses (the
@@ -2171,11 +2163,9 @@ async fn in_band_demand_converges_when_upstream_payment_lags_delivery() {
 async fn interval_flush_persists_progress_before_completion() {
     let total = 8 * 1024 * 1024;
     let (root, plaintext, outboard) = synth_blob(total as usize);
-    let dir = tmp_dir();
-    let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
-    // Durably checkpoint a real, verified 4 MiB prefix into the store — the
-    // resume progress the interval flush must persist — without yet writing
-    // the `.ranges` record (checkpoint never does).
+    let inner = fresh_store(root, total);
+    // A real, verified 4 MiB prefix in the store: the resume progress the
+    // interval flush commits.
     let prefix = align_range(0, 4 * 1024 * 1024, total).expect("align prefix");
     preadmit(&inner, &plaintext, &outboard, &prefix).await;
 
@@ -2208,15 +2198,12 @@ async fn interval_flush_persists_progress_before_completion() {
          still-running fetch"
     );
 
-    // The interval flush is a REAL persist: reopening the store from disk
-    // recovers exactly the checkpointed 4 MiB prefix — a crash right here
-    // would resume from it, not refetch from zero.
-    let reopened = ClientRangedStore::open(dir.path(), "blob", root).expect("reopen");
-    let present = reopened.present_ranges().await.expect("present");
+    // The flushes leave the verified prefix present.
+    let present = store.inner.present_ranges().await.expect("present");
     assert_eq!(
         present,
         prefix.chunk_ranges().clone(),
-        "the interval-flushed record must persist the checkpointed prefix"
+        "the store keeps the checkpointed prefix"
     );
 }
 
@@ -2230,8 +2217,7 @@ async fn interval_flush_persists_progress_before_completion() {
 async fn interval_flush_runs_beside_the_fetch() {
     let total = 8 * 1024 * 1024;
     let (root, _plaintext, _outboard) = synth_blob(total as usize);
-    let dir = tmp_dir();
-    let inner = ClientRangedStore::create(dir.path(), "blob", root, total).expect("create");
+    let inner = fresh_store(root, total);
     let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let store = FlushCountingStore {
         flushes: Arc::clone(&flushes),

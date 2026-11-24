@@ -113,8 +113,8 @@ impl Landing {
     /// Move the finalized `staging` blob to `dest`, returning its byte count.
     /// The blob has no reader after its first destination lands, so a rename
     /// replaces the full copy [`Self::materialize`] makes — no second write of
-    /// the blob and no second copy on disk. `staging` is already durable: the
-    /// ranged store's finalize syncs it. A rename the handle refuses (a staging directory
+    /// the blob and no second copy on disk. `staging` is already verified: the
+    /// store's export checks it. A rename the handle refuses (a staging directory
     /// that is a symlink the handle refuses) or the filesystem cannot do (a
     /// destination on another filesystem, `EXDEV`) falls back to
     /// [`Self::materialize`], which leaves `staging` in place for the next

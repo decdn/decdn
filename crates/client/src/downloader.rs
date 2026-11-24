@@ -2,13 +2,14 @@
 //! blobs — a bundle, or a single blob — to files in a directory.
 //!
 //! A `Downloader` is an OUTPUT + SCHEDULING adapter over the ONE shared
-//! acquire loop, not a second engine: each entry opens a [`ClientRangedStore`]
-//! beside its file and fills its missing ranges through [`crate::acquire`]
-//! across a [`SourceSet`] of the blob's holders — bao-verifying every byte and
-//! striping across every holder at full throughput. A source that faults cools
-//! and returns; the fetch ends on done, a fatal fault, or the stop policy. It
-//! then finalizes, promoting the `.partial` to the final file. So a resumed
-//! download re-pulls only what it lacks.
+//! acquire loop, not a second engine: each entry opens a [`crate::ClientRangedStore`]
+//! in a store beside its file (`<dest>.decdn`) and fills its missing ranges
+//! through [`crate::acquire`] across a [`SourceSet`] of the blob's holders —
+//! bao-verifying every byte and striping across every holder at full
+//! throughput. A source that faults cools and returns; the fetch ends on done,
+//! a fatal fault, or the stop policy. It then exports the blob to the final
+//! file and removes the store. So a resumed download re-pulls only what it
+//! lacks.
 //!
 //! It is the download half of the same loop the `Streamer` (the
 //! consumption-paced single-blob face) uses — the Downloader just uncaps the
@@ -21,22 +22,23 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::RangedStore;
 use crate::credential::{CredentialSlot, RunDemand};
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
+use crate::ranged_store::{BlobDir, StaleStoreEntry, store_dir_for};
 use crate::recovery::RecoveryGate;
 use crate::scheduler::{AcquireEnv, AcquireTarget, acquire};
 use crate::source::Funder;
 use crate::source_set::{Holder, SourceProvider, SourceSet};
 use crate::stop::{ProgressClock, StopPolicy};
-use crate::{ClientRangedStore, RangedStore};
+use decdn_bao_range::RangedStoreError;
 
 /// One blob to fetch and where to write it: the content `hash` (the bao root),
-/// its `total_bytes` (authoritative for keying the store and sizing the fetch),
-/// and the caller-chosen `dest` path the `.partial` and final file are keyed by.
+/// its `total_bytes` (authoritative for sizing the store and the fetch), and
+/// the caller-chosen `dest` path the store and the final file are keyed by.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTarget<'a> {
     /// The blob's BLAKE3 content address (its bao root); every ingested byte is
@@ -44,23 +46,22 @@ pub struct DownloadTarget<'a> {
     pub hash: [u8; 32],
     /// The blob's proven content length in bytes.
     pub total_bytes: crate::ProvenSize,
-    /// Where to write the finished blob. The `.partial` store and the promoted
-    /// final file are keyed by this path, so the finished file IS `dest`.
+    /// Where to write the finished blob. The store sits beside it, in
+    /// `<dest>.decdn`, and the finished file IS `dest`.
     pub dest: &'a Path,
 }
 
 /// Fetch content-addressed blobs — a bundle, or a single blob — to files in a
 /// directory, through the shared acquire loop ([`crate::acquire`] +
-/// [`ClientRangedStore`]) at full throughput.
+/// [`crate::ClientRangedStore`]) at full throughput.
 ///
 /// A `Downloader` is the download face over the same loop the
 /// [`crate::Streamer`] uses: it fetches across a [`SourceSet`] of the injected
 /// `holders`, built through the [`SourceProvider`], with up to `max_lanes`
-/// lanes and no consumption pacing, then promotes each finished blob to its
-/// file. A
-/// source that faults cools (in the command-wide [`PeerHealth`]) and returns;
-/// its ranges move to the other sources meanwhile. A resumed download (an
-/// existing `.partial`) re-pulls only its missing ranges.
+/// lanes and no consumption pacing, then exports each finished blob to its
+/// file. A source that faults cools (in the command-wide [`PeerHealth`]) and
+/// returns; its ranges move to the other sources meanwhile. A resumed download
+/// (an existing store beside the file) re-pulls only its missing ranges.
 ///
 /// Each target gets a fresh [`SourceSet`], so the provider builds each
 /// holder's lane once per target. A [`crate::StaticSources`] hands each lane
@@ -112,11 +113,11 @@ pub struct Downloader<P, F> {
     /// The largest blob accepted, in bytes, or `0` for no cap
     /// ([`Self::max_blob_bytes`]).
     max_blob_bytes: u64,
-    /// Targets fetched again from scratch after a finalize hash mismatch
-    /// ([`Self::refetched_targets`]).
-    refetched: AtomicU64,
     /// What the caller's run still needs ([`Self::run_demand`]).
     run: Option<Arc<RunDemand>>,
+    /// The store every target fetches into, which the caller owns
+    /// ([`Self::store`]); `None` keeps a store beside each `dest`.
+    shared: Option<BlobDir>,
 }
 
 impl<P, F> std::fmt::Debug for Downloader<P, F> {
@@ -146,9 +147,18 @@ impl<P, F> Downloader<P, F> {
             credentials: None,
             max_lanes: usize::MAX,
             max_blob_bytes: 0,
-            refetched: AtomicU64::new(0),
             run: None,
+            shared: None,
         }
+    }
+
+    /// Fetch every target into `store`, which the caller opened and removes:
+    /// a bundle run keeps one store for all its entries. The downloader
+    /// neither stops nor removes it.
+    #[must_use]
+    pub(crate) fn store(mut self, store: BlobDir) -> Self {
+        self.shared = Some(store);
+        self
     }
 
     /// Start every target from `holders`, in preference order, instead of
@@ -208,16 +218,6 @@ impl<P, F> Downloader<P, F> {
     pub fn health(mut self, health: Arc<PeerHealth>) -> Self {
         self.health = health;
         self
-    }
-
-    /// How many targets this downloader fetched again from scratch because
-    /// their finalized file did not match its hash. Such a pass drops every
-    /// byte the store held, including a prefix an earlier run resumed, so a
-    /// caller that counts resumed bytes apart from fetched ones reads this to
-    /// know the prefix was fetched again.
-    #[must_use]
-    pub fn refetched_targets(&self) -> u64 {
-        self.refetched.load(Ordering::Relaxed)
     }
 
     /// Cap the bytes held for every target at `max_blob_bytes` (`0` for no
@@ -287,38 +287,40 @@ where
     }
 
     /// Fetch every [`DownloadTarget`] to its own `dest` path, returning every
-    /// `dest`, in target order. Each blob's `.partial` and final file are
-    /// keyed by `dest` (its parent directory and file name), so a resumed
-    /// download re-pulls only what it lacks and the promoted file IS `dest` — no
-    /// post-finalize rename. The parent directory of each `dest` is created if
-    /// missing.
+    /// `dest`, in target order. The parent directory of each `dest` is created
+    /// if missing.
     ///
-    /// Each target opens a [`ClientRangedStore`] beside its file and fills it
-    /// through [`crate::acquire`] across a fresh [`SourceSet`] of the
-    /// holders, then finalizes — promoting `.partial` to `dest`. Writes land at
-    /// their absolute offsets, so out-of-order and multi-source fills assemble
-    /// correctly. The whole blob is fetched at full throughput, with no
-    /// read-ahead bound.
+    /// Each target keeps its store in `<dest>.decdn` beside `dest`, so a
+    /// resumed download re-pulls only what it lacks. It fills the store
+    /// through [`crate::acquire`] across a fresh [`SourceSet`] of the holders,
+    /// then exports the blob to `dest` and removes the store. A `dest` that
+    /// already holds the blob (an earlier run exported it) is not fetched
+    /// again. A downloader given a caller's store fetches every target into that one
+    /// instead, and leaves it in place.
+    /// Writes land at their absolute offsets, so out-of-order and
+    /// multi-source fills assemble correctly. The whole blob is fetched at full
+    /// throughput, with no read-ahead bound.
     ///
     /// `total_bytes` is the blob's proven size; the store records it before
-    /// the first leg opens.
-    /// The target `hash` is the bao root every ingested byte is verified
-    /// against: a wrong hash surfaces as a verification failure, never as
-    /// silent corruption. A finalize whose whole-file hash does not match
-    /// (bytes that drifted on disk after they verified) fetches the target
-    /// once more.
+    /// the first leg opens. The target `hash` is the bao root every ingested
+    /// byte is verified against: a wrong hash surfaces as a verification
+    /// failure, never as silent corruption. The exported file is hashed once
+    /// more: one whose bytes changed on disk after they verified is removed,
+    /// and the target is fetched again from an empty store. A caller's store
+    /// then holds a lost export, so the target ends with a stale-store error
+    /// instead.
     ///
     /// `stop` decides when a target that makes no verified progress gives up.
-    /// A target that gives up or fails keeps its landed bytes recorded in its
-    /// `.partial` for a resume, and is not finalized.
+    /// A target that gives up or fails keeps its landed bytes in its store for
+    /// a resume, and is not exported.
     ///
     /// # Errors
     ///
-    /// A `dest` with no file name, a store
-    /// open/create/finalize I/O error, a second [`crate::HashMismatch`] at
-    /// finalize, or the error the fetch ends a target with: a fatal fault, a
-    /// unanimous verdict of the sources, or [`crate::GaveUp`]. The first failing
-    /// target aborts the batch; targets already written stay on disk.
+    /// A `dest` with no file name, a store open, export or removal error, a
+    /// second exported file that fails its hash ([`crate::HashMismatch`]), or
+    /// the error the fetch ends a target with: a fatal fault, a unanimous
+    /// verdict of the sources, or [`crate::GaveUp`]. The first failing target
+    /// aborts the batch; targets already written stay on disk.
     pub async fn fetch_to_paths_until(
         &self,
         targets: &[DownloadTarget<'_>],
@@ -359,112 +361,254 @@ where
         let pacer = BudgetPacer::new();
         let mut written = Vec::with_capacity(targets.len());
         for target in targets {
-            let (dir, stem) = dest_store_location(target.dest)?;
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
-            // The whole blob is one tail: it runs to the proven size.
-            let whole = [(0, 0)];
-            // Off the runtime: opening a finalized blob hashes its final file.
-            let store = {
-                let (dir, stem) = (dir.clone(), stem.clone());
-                let (hash, total) = (target.hash, target.total_bytes.get());
-                tokio::task::spawn_blocking(move || {
-                    ClientRangedStore::open_or_create(&dir, &stem, hash, total)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("open ranged store task: {e}"))?
-                .map_err(|e| {
-                    anyhow::anyhow!("open ranged store for {}: {e}", target.dest.display())
-                })?
-            };
-            let mut sources = SourceSet::new(
-                &self.provider,
-                target.hash,
-                Arc::clone(&self.health),
-                self.holders.clone(),
-            );
-            let env = AcquireEnv {
-                pacer: &pacer,
-                funder: &self.funder,
-                recovery: &self.recovery,
-                credentials: self.credentials.as_ref(),
-                max_lanes: self.max_lanes.max(1),
-                stop,
-                on_progress,
-                ledgers,
-                // No consumption pacing: a download runs at full throughput.
-                pacing: None,
-                max_blob_bytes: self.max_blob_bytes,
-                run: self.run.as_deref(),
-            };
-            // A finalize whose hash does not match clears every claim and
-            // keeps the file, so one more pass fetches the blob again. A
-            // second mismatch is a local fault and ends the target.
-            let mut passes_left = 2u8;
-            loop {
-                passes_left = passes_left.saturating_sub(1);
-                // A dropped download still records the ranges that landed.
-                let flush_on_drop = store.flush_on_drop();
-                let fetched = acquire(
-                    AcquireTarget {
-                        store: &store,
-                        hash: target.hash,
-                        total_bytes: target.total_bytes,
-                        ranges: &whole,
-                    },
-                    &mut sources,
-                    &env,
-                )
-                .await;
-                flush_on_drop.disarm();
-                fetched?;
-                // `acquire` flushes the present record but does not promote; a
-                // download keeps the file, so finalize (verify + promote
-                // `.partial`) once every byte is present.
-                match store.finalize().await {
-                    Ok(()) => {
-                        written.push(target.dest.to_path_buf());
-                        break;
-                    }
-                    Err(err) if passes_left > 0 && is_hash_mismatch(&err) => {
-                        self.refetched.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
-                            dest = %target.dest.display(),
-                            "the finalized file does not match its hash; fetching it once more"
-                        );
-                    }
-                    Err(err) => return Err(err.into()),
-                }
-            }
+            self.fetch_one(target, ledgers, &pacer, on_progress, stop)
+                .await?;
+            written.push(target.dest.to_path_buf());
         }
         Ok(written)
     }
+
+    /// Fetch one target to its `dest` through its store: the caller's, or one
+    /// beside `dest`.
+    ///
+    /// An exported file that does not hash to the blob holds bytes that
+    /// changed on disk after they verified. A store beside `dest` went with
+    /// the export, so one more pass fetches the blob again from an empty
+    /// store; a second mismatch is a local fault and ends the target. Both
+    /// passes share one [`SourceSet`], so the second continues each lane's
+    /// voucher sequence. A caller's store keeps a lost export of the blob, so
+    /// the target ends with [`StaleStoreEntry`] instead.
+    async fn fetch_one(
+        &self,
+        target: &DownloadTarget<'_>,
+        ledgers: Option<&LaneLedgers>,
+        pacer: &BudgetPacer,
+        on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
+        stop: &StopPolicy,
+    ) -> anyhow::Result<()> {
+        let own_dir = match self.shared {
+            Some(_) => None,
+            None => Some(store_dir_for(target.dest)?),
+        };
+        if let Some(parent) = target.dest.parent().filter(|p| !p.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", parent.display()))?;
+        }
+        if dest_holds(target.dest, target.hash).await {
+            if let Some(dir) = &own_dir {
+                remove_leftover_store(dir).await;
+            }
+            return Ok(());
+        }
+        let mut sources = SourceSet::new(
+            &self.provider,
+            target.hash,
+            Arc::clone(&self.health),
+            self.holders.clone(),
+        );
+        let run = Run {
+            ledgers,
+            pacer,
+            on_progress,
+            stop,
+        };
+        for pass in 0..2u8 {
+            match self
+                .fetch_pass(own_dir.as_deref(), target, &mut sources, &run)
+                .await?
+            {
+                Pass::Exported => return Ok(()),
+                Pass::Drifted if own_dir.is_none() => {
+                    return Err(anyhow::Error::new(StaleStoreEntry));
+                }
+                Pass::Drifted if pass == 0 => tracing::warn!(
+                    hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
+                    dest = %target.dest.display(),
+                    "the exported file does not match its hash; fetching it once more"
+                ),
+                Pass::Drifted => {}
+            }
+        }
+        Err(anyhow::Error::new(crate::HashMismatch))
+    }
+
+    /// One pass of [`Self::fetch_one`]: through the store in `own_dir`, which
+    /// the pass opens and removes once the blob is exported, or through the
+    /// caller's store when `own_dir` is `None`.
+    async fn fetch_pass(
+        &self,
+        own_dir: Option<&Path>,
+        target: &DownloadTarget<'_>,
+        sources: &mut SourceSet<'_, P>,
+        run: &Run<'_>,
+    ) -> anyhow::Result<Pass> {
+        let Some(store_dir) = own_dir else {
+            let dir = self
+                .shared
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("a download with no store"))?;
+            self.fetch_target(dir, target, sources, run).await?;
+            return Ok(checked_export(target).await);
+        };
+        let dir = BlobDir::open(store_dir).await?;
+        if let Err(e) = self.fetch_target(&dir, target, sources, run).await {
+            if let Err(shutdown) = dir.shutdown().await {
+                tracing::warn!(error = %shutdown, "store shutdown after a failed fetch");
+            }
+            return Err(e);
+        }
+        dir.remove().await?;
+        Ok(checked_export(target).await)
+    }
+
+    /// Fill one target's blob into its store in `dir` and export it once
+    /// every byte is present.
+    async fn fetch_target(
+        &self,
+        dir: &BlobDir,
+        target: &DownloadTarget<'_>,
+        sources: &mut SourceSet<'_, P>,
+        run: &Run<'_>,
+    ) -> anyhow::Result<()> {
+        // The whole blob is one tail: it runs to the proven size.
+        let whole = [(0, 0)];
+        let store = dir
+            .blob(
+                target.hash,
+                target.total_bytes.get(),
+                Some(target.dest.to_path_buf()),
+            )
+            .await?;
+        // `dest` does not hold the blob, so a complete entry whose bytes
+        // cannot be read is the export that `dest` lost.
+        if store.is_lost_export().await {
+            return Err(anyhow::Error::new(StaleStoreEntry));
+        }
+        let env = AcquireEnv {
+            pacer: run.pacer,
+            funder: &self.funder,
+            recovery: &self.recovery,
+            credentials: self.credentials.as_ref(),
+            max_lanes: self.max_lanes.max(1),
+            stop: run.stop,
+            on_progress: run.on_progress,
+            ledgers: run.ledgers,
+            // No consumption pacing: a download runs at full throughput.
+            pacing: None,
+            max_blob_bytes: self.max_blob_bytes,
+            run: self.run.as_deref(),
+        };
+        // A store whose entry holds every range but is not recorded complete
+        // gives back its last chunk group at finalize: one more pass fetches
+        // it, and a second refusal ends the target.
+        let mut passes_left = 2u8;
+        loop {
+            passes_left = passes_left.saturating_sub(1);
+            acquire(
+                AcquireTarget {
+                    store: &store,
+                    hash: target.hash,
+                    total_bytes: target.total_bytes,
+                    ranges: &whole,
+                },
+                sources,
+                &env,
+            )
+            .await?;
+            match store.finalize().await {
+                Ok(()) => return Ok(()),
+                Err(RangedStoreError::Incomplete) if passes_left > 0 => {
+                    tracing::warn!(
+                        hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
+                        dest = %target.dest.display(),
+                        "the store holds every range but not the blob; fetching its last group again"
+                    );
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
 }
 
-/// Whether a finalize failed its whole-file hash ([`crate::HashMismatch`]).
-fn is_hash_mismatch(err: &decdn_bao_range::RangedStoreError) -> bool {
-    matches!(
-        err,
-        decdn_bao_range::RangedStoreError::Backend(inner) if inner.is::<crate::HashMismatch>()
-    )
+/// What every pass of one fetch shares.
+struct Run<'a> {
+    ledgers: Option<&'a LaneLedgers>,
+    pacer: &'a BudgetPacer,
+    on_progress: Option<&'a (dyn Fn(u64, u64) + Send + Sync + 'a)>,
+    stop: &'a StopPolicy,
 }
 
-/// The directory and stem a [`DownloadTarget`]'s `.partial` store lives under, so
-/// its promoted final path IS `dest` (no post-finalize rename): `dest`'s parent
-/// (or the current directory for a bare file name) and `dest`'s own file name.
-fn dest_store_location(dest: &Path) -> anyhow::Result<(PathBuf, String)> {
-    let dir = match dest.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let stem = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("download dest {} has no usable file name", dest.display()))?
-        .to_string();
-    Ok((dir, stem))
+/// How one pass of a target's fetch ended.
+enum Pass {
+    /// The blob is at `dest`, hashed.
+    Exported,
+    /// The exported file failed its hash and was removed, with the store.
+    Drifted,
+}
+
+/// How a pass that exported `target` ends: its `dest` hashes to the blob, or
+/// it does not and is removed.
+async fn checked_export(target: &DownloadTarget<'_>) -> Pass {
+    if dest_holds(target.dest, target.hash).await {
+        return Pass::Exported;
+    }
+    if let Err(e) = tokio::fs::remove_file(target.dest).await {
+        tracing::warn!(error = %e, "removing a file that failed its hash");
+    }
+    Pass::Drifted
+}
+
+/// The bytes [`dest_holds`] reads at once: large enough that hashing each
+/// read on every core keeps them all busy.
+const HASH_READ_BYTES: usize = 16 * 1024 * 1024;
+
+/// Whether `dest` holds the blob `hash`: an earlier run exported it, or this
+/// run's export kept its bytes. Hashed off the runtime, in large reads each
+/// hashed on every core, so a multi-GB blob costs one fast read; a file that
+/// cannot be read does not hold it.
+async fn dest_holds(dest: &Path, hash: [u8; 32]) -> bool {
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+        use std::io::Read as _;
+        let mut file = match std::fs::File::open(&dest) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; HASH_READ_BYTES];
+        loop {
+            // Fill the buffer before hashing it, so every `update_rayon`
+            // call but the last sees a whole read.
+            let mut filled = 0;
+            while filled < buf.len() {
+                let n = file.read(buf.get_mut(filled..).unwrap_or_default())?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            hasher.update_rayon(buf.get(..filled).unwrap_or_default());
+            if filled < buf.len() {
+                break;
+            }
+        }
+        Ok(*hasher.finalize().as_bytes() == hash)
+    })
+    .await
+    .is_ok_and(|held| held.unwrap_or(false))
+}
+
+/// Best-effort removal of a store an earlier run left after it exported its
+/// blob. A store directory left in place is clutter, not a fault.
+async fn remove_leftover_store(store_dir: &Path) {
+    match tokio::fs::remove_dir_all(store_dir).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(error = %e, dir = %store_dir.display(), "removing a leftover store");
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

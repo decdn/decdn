@@ -119,8 +119,7 @@ positioned-io = "0.3"
 # (`io::fsm::ResponseDecoder`, behind its `tokio_fsm` feature) drives. Needed
 # by name to implement the trait over a live paid pull, and bao-tree re-exports
 # only `AsyncSliceReader`/`AsyncSliceWriter`, not this one. Pinned to what
-# bao-tree 0.17 carries. Unrelated to `iroh-blobs`, so the client SDK that
-# depends on it stays iroh-blobs-free (#578).
+# bao-tree 0.17 carries.
 iroh-io = { version = "0.6", default-features = false }
 
 # Async runtime

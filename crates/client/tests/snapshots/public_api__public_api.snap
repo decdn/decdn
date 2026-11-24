@@ -343,7 +343,6 @@ pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u6
 pub const fn decdn_client::downloader::Downloader<P, F>::max_lanes(self, usize) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::new(P, F) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::recovery(self, alloc::sync::Arc<decdn_client::recovery::RecoveryGate>) -> Self
-pub fn decdn_client::downloader::Downloader<P, F>::refetched_targets(&self) -> u64
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub mod decdn_client::driver
@@ -889,7 +888,6 @@ pub const fn decdn_client::downloader::Downloader<P, F>::max_blob_bytes(self, u6
 pub const fn decdn_client::downloader::Downloader<P, F>::max_lanes(self, usize) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::new(P, F) -> Self
 pub fn decdn_client::downloader::Downloader<P, F>::recovery(self, alloc::sync::Arc<decdn_client::recovery::RecoveryGate>) -> Self
-pub fn decdn_client::downloader::Downloader<P, F>::refetched_targets(&self) -> u64
 impl<P, F> core::fmt::Debug for decdn_client::downloader::Downloader<P, F>
 pub fn decdn_client::downloader::Downloader<P, F>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct decdn_client::GaveUp

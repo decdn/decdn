@@ -67,7 +67,7 @@ BOOK_SRCS := \
   _build/part-3-payments.md \
   003-payments.md 012-client.md 024-account-abstraction.md \
   _build/part-4-tokenomics.md \
-  026-tokenomics.md 018-liquidity-strategy.md \
+  026-tokenomics.md \
   _build/part-5-verification.md \
   008-reputation.md 011-content-takedown.md \
   030-node-region-self-attestation.md \
@@ -89,7 +89,7 @@ BOOK_SRCS := \
 DENSITY_CFG := _build/book-density.typ _build/book-margins.yaml _build/table-autofit.lua
 
 .DEFAULT_GOAL := all
-.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers check-no-history-links check-refs
+.PHONY: all numeric book clean help check-book-list check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers check-refs
 
 all: adrs.pdf adrs-book.pdf
 
@@ -210,18 +210,7 @@ check-no-section-numbers:
 	  exit 1; \
 	else echo "no numeric §N refs or numbered headings (RFC/EIP/BIP § exempt)"; fi
 
-check-no-history-links:
-	@bad=""; for f in $(SRCS_REF); do \
-	  hits=$$(awk -v F="$$f" '/^```/{c=!c;next} !c{print F":"FNR": "$$0}' "$$f" \
-	    | grep -E '\]\([^)]*_history' || true); \
-	  if [ -n "$$hits" ]; then printf '%s\n' "$$hits"; bad=1; fi; \
-	done; \
-	if [ -n "$$bad" ]; then \
-	  echo "ERROR: canonical ADR link(s) above point into adr/_history/ — retired ADRs are archived for audit but MUST NOT be linked from canonical ADRs; reference them as inline-code names, e.g. \`ADR 033\`"; \
-	  exit 1; \
-	else echo "no canonical ADR links into _history"; fi
-
-check-refs: check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers check-no-history-links
+check-refs: check-bare-refs check-md-anchors check-anchor-targets check-no-section-numbers
 
 help:
 	@echo "make            build both PDFs (mermaid-rendered)"

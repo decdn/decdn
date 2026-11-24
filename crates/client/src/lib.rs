@@ -16,9 +16,9 @@
 //! | Pull a whole bundle manifest into a directory, with discovery, funding, resume and dedup handled | [`bundle::BundlePuller`] |
 //!
 //! The [`Downloader`] stripes a blob
-//! across every holder at once, and writes each verified range at its offset in
-//! a `.partial` file beside the destination. A rerun fetches only the ranges
-//! that file does not hold yet. The [`Streamer`] fetches at most one read-ahead
+//! across every holder at once, and writes each verified range into a store
+//! beside the destination (`<dest>.decdn`). A rerun fetches only the ranges
+//! that store does not hold yet. The [`Streamer`] fetches at most one read-ahead
 //! window ([`PullConfig::read_ahead_bytes`]) ahead of its reader, so a reader
 //! that stops early stops the spend within that window. The
 //! [`bundle::BundlePuller`] runs every step below for you over one pool: it
@@ -252,8 +252,8 @@ mod progress;
 /// Wallet-filled HTTP provider builder for opening, topping up, closing and reclaiming
 /// payment pools.
 pub mod provider;
-/// Client-side [`decdn_bao_range::RangedStore`] backend (#1621): a
-/// `.partial` + sidecar store built on `bao-tree`/`decdn-bao-range` only.
+/// Client-side [`decdn_bao_range::RangedStore`] backend (#1621, #2881): an
+/// iroh-blobs file store beside each download.
 #[doc(hidden)]
 pub mod ranged_store;
 /// The per-MiB rate a lane pays its node at most in one fetch.
@@ -844,8 +844,8 @@ pub struct BlobTooLarge {
 /// zero for a bounded open of `[0, len)` raises it too.
 ///
 /// Typed rather than a bare string because it is the ONE signal that proves a
-/// caller's partial download does not belong to this blob — a stale `.partial`
-/// left under the same `--output` by a fetch of a different or larger blob, or
+/// caller's partial download does not belong to this blob — a stale partial
+/// download left under the same `--output` by a fetch of a different or larger blob, or
 /// one that completed but was killed before its rename. A resumable client keys
 /// its discard-and-refetch on this and nothing else: classifying by exclusion
 /// ("any error that is not a voucher rejection") would sweep in ordinary stalls

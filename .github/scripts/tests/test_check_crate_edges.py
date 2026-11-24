@@ -226,7 +226,7 @@ def test_sponsord_e2e_may_depend_on_anything_but_a_sink():
 def test_leak_under_the_wire_types_reaches_only_the_sponsord_crates():
     """`sponsord-api` is under both sponsord servers and under nothing else guarded."""
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
-    ext["sponsord-api"] = ["iroh-blobs"]
+    ext["sponsord-api"] = ["aws-sdk-s3"]
     errors = run(external_edges=ext)
     assert [e.split()[0] for e in errors] == ["sponsord", "sponsord-onramp"], errors
     assert all("← sponsord-api ←" in e for e in errors), errors
@@ -255,30 +255,29 @@ def test_dev_dependencies_are_not_edges():
     assert run(dev=dev) == []
 
 
-def test_closure_must_not_reach_the_blob_store():
-    """A leak below the SDK reaches every guarded crate built on it but the CLI.
+def test_closure_must_not_reach_the_blob_store_from_the_onramp():
+    """Only the onramp may not link the blob store.
 
-    The CLI may link the blob store for its gateway cache, and the onramp sits
-    on the wire types alone, so those two are the guarded crates the leak
-    misses.
+    The SDK keeps each download in it, so the SDK and every guarded crate built
+    on it may link it; the onramp sits on the wire types alone. A leak below
+    the SDK blames nobody, and one below the wire types blames the onramp.
     """
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-common"].append("iroh-blobs")
+    assert run(external_edges=ext) == []
+
+    ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
+    ext["sponsord-api"] = ["iroh-blobs"]
     errors = run(external_edges=ext)
-    assert len(errors) == 2, errors
-    assert [e.split()[0] for e in errors] == ["decdn-client", "sponsord"], errors
-    for e in errors:
-        assert "iroh-blobs" in e
-        assert "decdn-common" in e, "the path should name the crate that introduced it"
+    assert [e.split()[0] for e in errors] == ["sponsord-onramp"], errors
+    assert "iroh-blobs" in errors[0]
+    assert "sponsord-api" in errors[0], "the path should name the crate that introduced it"
 
 
-def test_client_sdk_edge_to_the_blob_store_is_an_error():
+def test_client_sdk_may_link_the_blob_store():
     ext = {k: list(v) for k, v in EXTERNAL_EDGES.items()}
     ext["decdn-client"] = ["iroh-blobs"]
-    errors = run(external_edges=ext)
-    assert any(
-        e.startswith("decdn-client links iroh-blobs via iroh-blobs ← decdn-client") for e in errors
-    ), errors
+    assert run(external_edges=ext) == []
 
 
 def test_client_sdk_is_guarded_without_the_cli():
@@ -304,7 +303,7 @@ def test_cli_only_leak_does_not_blame_the_sdk():
 
 
 def test_cli_may_link_the_blob_store_through_the_cache():
-    """The gateway cache puts iroh-blobs in the CLI's closure, and only there."""
+    """The gateway cache puts iroh-blobs in the CLI's closure."""
     assert "iroh-blobs" in cce.MAY_LINK["decdn-cli"]
     assert run() == []
 

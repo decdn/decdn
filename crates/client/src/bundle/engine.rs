@@ -64,6 +64,7 @@ use iroh::{Endpoint, PublicKey, RelayUrl};
 use tokio_util::sync::CancellationToken;
 
 use super::landing::Landing;
+use super::run_store::RunStore;
 use super::skip_cache::{self, SavedManifest, SavedMtime};
 use super::{
     BundleEnd, BundleObserver, BundleOutcome, BundleReport, EntryFailure, EntryLanded, FaultHints,
@@ -78,6 +79,7 @@ use crate::lane_sources::{FirstLeg, LaneSources, discovery_span};
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
 use crate::pool_route::PoolPasses;
+use crate::ranged_store::{BlobDir, StaleStoreEntry};
 use crate::receipt::ReceiptEvidence;
 use crate::scheduler::{BUILD_DRAIN, fold_late_escrow};
 use crate::session::{ChainConfig, DepositPolicy, DiscoveryOptions, PaymentPoolChain, PullSite};
@@ -88,9 +90,8 @@ use crate::targets::{
     now_secs, open_and_order, open_pinned, pinned_targets,
 };
 use crate::{
-    ClientRangedStore, Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded,
-    LaneLedgers, PeerHealth, PoolReplaced, ProgressCallback, PullDeadlines, RecoveryGate,
-    RunDemand, StopPolicy,
+    Connections, CredentialSlot, DownloadTarget, Downloader, FundingNeeded, LaneLedgers,
+    PeerHealth, PoolReplaced, ProgressCallback, PullDeadlines, RecoveryGate, RunDemand, StopPolicy,
 };
 
 /// Group manifest entries by their blob `hash`, preserving first-seen order both
@@ -178,7 +179,7 @@ struct DiskState {
     whole_file: HashMap<[u8; 32], PathBuf>,
     /// The run's planned work by blob ([`planned_work`]): each group that
     /// still fetches, its planned download, and the prefix an earlier run
-    /// left in its `.partial`. Filled after the pre-pass.
+    /// left in its store. Filled after the pre-pass.
     work: HashMap<[u8; 32], PlannedWork>,
 }
 
@@ -207,7 +208,7 @@ fn colliding_paths(entries: &[ManifestEntry]) -> HashSet<String> {
 }
 
 /// One group's planned download, and the bytes an earlier run already
-/// fetched into its `.partial`, which a fetch's position counts but this run
+/// fetched into its store, which a fetch's position counts but this run
 /// does not pay for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PlannedWork {
@@ -217,7 +218,7 @@ struct PlannedWork {
 
 /// The run's planned work after the disk pre-pass, by blob: each hash group
 /// that still has a destination to write and no whole-file donor, at its
-/// declared size less what an earlier run left in its `.partial`. A group
+/// declared size less what an earlier run left in `store`. A group
 /// the pre-pass skips or links plans none, so it never counts toward the
 /// run's outstanding work while it waits for a jobs slot.
 async fn planned_work(
@@ -225,6 +226,7 @@ async fn planned_work(
     landing: &Landing,
     overwrite: bool,
     disk: &DiskState,
+    store: Option<&BlobDir>,
 ) -> HashMap<[u8; 32], PlannedWork> {
     let refs: Vec<&ManifestEntry> = entries.iter().collect();
     let mut work = HashMap::new();
@@ -240,10 +242,7 @@ async fn planned_work(
         if download == 0 {
             continue;
         }
-        let resumed = match staging_path(landing.root(), hash) {
-            Ok(staging) => span_bytes(&resumed_spans_off_runtime(&staging, hash).await),
-            Err(_) => 0,
-        };
+        let resumed = span_bytes(&resumed_spans(store, hash).await);
         work.insert(
             hash,
             PlannedWork {
@@ -719,8 +718,8 @@ fn ends_the_pull(err: &anyhow::Error) -> bool {
 /// A pull's byte accounting: `downloaded` is the content bytes this run fetched and
 /// paid for across the distinct blobs fetched (a blob materialized to several paths
 /// counts once, #1306); `reconstructed` is the total bytes written to disk (every
-/// materialized copy); `resumed` is the content bytes of `.partial` prefixes that
-/// earlier runs fetched and this run resumed. `downloaded` is content bytes, not
+/// materialized copy); `resumed` is the content bytes that earlier runs fetched
+/// into entry stores and this run resumed. `downloaded` is content bytes, not
 /// exact on-wire bytes: it omits bao proof overhead.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 struct Transfer {
@@ -885,8 +884,8 @@ const POLL_WATCH_LATE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Returns whether `cancel` stopped it.
 ///
 /// The cancel drops `drive`: every in-flight fetch stops where it is (its drop
-/// guard queues what it paid for recording, and its `.partial` is the next
-/// run's resume prefix). The flush channel's sender drops with `drive`, so
+/// guard queues what it paid for recording, and its store is the next run's
+/// resume prefix). The flush channel's sender drops with `drive`, so
 /// `flush` still writes every group that settled before it returns. A poll
 /// watch ([`warn_when_unpolled`]) runs beside `drive` until `drive` ends or
 /// `cancel` stops it.
@@ -1167,7 +1166,7 @@ fn merge_passes(first: PullRun, second: PullRun) -> PullRun {
     }
 }
 
-/// Record one group's run in [`PullCtx::pull_plain`]: forward its recordable
+/// Record one group's run in [`PullCtx::pull_groups`]: forward its recordable
 /// files to the skip-cache flush, put its outcomes in slot `i`, and return the
 /// fault that ends the whole pull, if its fetch failed with one.
 fn settle_group_run(
@@ -1316,7 +1315,7 @@ where
     fold_late_escrow(Err::<(), _>(stop), late).err()
 }
 
-/// The fault a pass of [`PullCtx::pull_plain`] ends with: `stopped`, the one
+/// The fault a pass of [`PullCtx::pull_groups`] ends with: `stopped`, the one
 /// [`run_groups`] returned. A pass that `halted` with no fault ran on a halt
 /// left over from before it, so its halted entries never ran: it fails
 /// rather than end complete with nothing pulled.
@@ -1547,9 +1546,25 @@ pub(super) struct PullCtx<P: Provider + Clone> {
     /// `(rtt_ms, rate_per_mb)` of each node the run's discovery rounds heard
     /// from, at its lowest RTT ([`super::BundlePuller::rate_hints`]).
     pub(super) rate_samples: std::sync::Mutex<HashMap<PublicKey, (f64, u64)>>,
+    /// The one store every entry and the manifest fetch keep their verified
+    /// bytes in ([`RunStore`]).
+    pub(super) run_store: RunStore,
 }
 
 impl<P: Provider + Clone> PullCtx<P> {
+    /// The run's store for `out_root` ([`RunStore::open`]). A store that
+    /// cannot open logs at `debug` and reads as none: the fetch that follows
+    /// surfaces the fault.
+    async fn store_at(&self, out_root: &Path) -> Option<&BlobDir> {
+        self.run_store.open(out_root).await.map_or_else(
+            |e| {
+                tracing::debug!("could not open the download store: {e:#}");
+                None
+            },
+            Some,
+        )
+    }
+
     /// The shared lane deps, assembled from `PullCtx`'s borrowed chain
     /// plumbing plus this run's per-fetch budgets — the same shape a single fetch
     /// builds, for every fetch of an entry ([`Self::acquire_entry`]).
@@ -1593,18 +1608,34 @@ impl<P: Provider + Clone> PullCtx<P> {
     ///
     /// The caller holds a jobs permit ([`FetchSlot`]) for the whole fetch. The
     /// fetch stops on `stop`. `max_blob_bytes` caps the blob's size claim (`0`
-    /// for no cap).
+    /// for no cap). `store` is where the fetch keeps its bytes (see
+    /// [`Self::acquire_entry`]).
     async fn fetch_to_staging(
         &self,
         hash: [u8; 32],
         staging: &Path,
         progress: Option<&ProgressCallback>,
         stop: &StopPolicy,
-        max_blob_bytes: u64,
-    ) -> anyhow::Result<bool> {
+        (max_blob_bytes, store): (u64, Option<BlobDir>),
+    ) -> anyhow::Result<()> {
         let targets = self.entry_targets(hash).await?;
-        self.acquire_entry(&targets, hash, staging, progress, stop, max_blob_bytes)
-            .await
+        self.acquire_entry(
+            &targets,
+            (hash, staging, store),
+            progress,
+            stop,
+            max_blob_bytes,
+        )
+        .await
+    }
+
+    /// The run's store for an entry staged at `staging` ([`RunStore::open`]).
+    ///
+    /// # Errors
+    ///
+    /// The store cannot open.
+    async fn entry_store(&self, staging: &Path) -> anyhow::Result<BlobDir> {
+        Ok(self.run_store.open(out_root_of(staging)?).await?.clone())
     }
 
     /// One entry's holders: the pinned node, opened for the blob's proven
@@ -1761,9 +1792,13 @@ impl<P: Provider + Clone> PullCtx<P> {
         rate_hints_of(&nodes, &samples, &store, now_secs())
     }
 
-    /// Fill blob `hash` into the ranged store beside `staging` through the
-    /// acquire loop, across `targets`' holders. The store is promoted to
-    /// `staging` once every byte is present.
+    /// Fill blob `hash` into `store` through the acquire loop, across
+    /// `targets`' holders. The blob is exported to `staging` once every byte is
+    /// present. An entry passes the run's store ([`Self::entry_store`]): a
+    /// lost export of the blob in it ([`StaleStoreEntry`]) fails the entry and
+    /// marks the store for removal at the run's end. The manifest passes `None`
+    /// and keeps a store of its own beside `staging`, which goes with the
+    /// export, so a later manifest fetch never meets a lost export of it.
     ///
     /// The entry's size is a proven one: a discovery answer's, or else a
     /// whole-blob first open's header. A manifest size that differs from the
@@ -1779,13 +1814,7 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// `LaneLedgers` (ADR 039), serializes its pool open-or-reuse on
     /// `open_lock`, and holds one of its provider's stream permits
     /// ([`LaneStreamCap`]). Each lane's voucher watermark is persisted before
-    /// the result returns, and the `.partial` beside `staging` stays for a
-    /// resume.
-    ///
-    /// It returns `true` when the store's finalized file failed its hash and
-    /// the fetch dropped every byte the store held and fetched the blob again
-    /// ([`Downloader::refetched_targets`]). A prefix an earlier run left is
-    /// then fetched and paid again.
+    /// the result returns, and the store keeps what landed for a resume.
     ///
     /// `max_blob_bytes` caps the blob's size claim (`0` for no cap): an entry
     /// runs under the run's [`Self::max_blob_bytes`], a manifest under
@@ -1793,12 +1822,11 @@ impl<P: Provider + Clone> PullCtx<P> {
     async fn acquire_entry(
         &self,
         targets: &ResolvedTargets,
-        hash: [u8; 32],
-        staging: &Path,
+        (hash, staging, store): ([u8; 32], &Path, Option<BlobDir>),
         progress: Option<&ProgressCallback>,
         stop: &StopPolicy,
         max_blob_bytes: u64,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<()> {
         let deps = self.drive_deps(max_blob_bytes)?;
         let sources = LaneSources::new(
             &deps,
@@ -1845,6 +1873,9 @@ impl<P: Provider + Clone> PullCtx<P> {
             if let Some(slot) = sources.credentials() {
                 downloader = downloader.credentials(slot);
             }
+            if let Some(store) = store {
+                downloader = downloader.store(store);
+            }
             Box::pin(downloader.fetch_to_paths_shared(
                 &[DownloadTarget {
                     hash,
@@ -1856,11 +1887,17 @@ impl<P: Provider + Clone> PullCtx<P> {
                 stop,
             ))
             .await
-            .map(|_paths| downloader.refetched_targets() > 0)
+            .map(|_paths| ())
         }
         .await;
         on_drop.disarm();
         sources.persist_watermarks().await;
+        if result
+            .as_ref()
+            .is_err_and(|err| err.downcast_ref::<StaleStoreEntry>().is_some())
+        {
+            self.run_store.note_lost_export();
+        }
         result.map_err(|err| match &self.hints {
             Some(hints) => hints.annotate(err, &sources.fault_context()),
             None => err,
@@ -2205,8 +2242,10 @@ impl<P: Provider + Clone> PullCtx<P> {
         // A manifest belongs to no pass: a halt a pull left set, by a caller
         // that dropped it mid-drain, does not stop it.
         let stop = self.stop.next_pass();
+        // Its own store, beside `staging`: the bytes leave the store at once,
+        // so nothing in the run's store refers to a file this removes.
         let cap = manifest_cap_bytes(self.max_blob_bytes);
-        self.fetch_to_staging(hash, &staging, None, &stop, cap)
+        self.fetch_to_staging(hash, &staging, None, &stop, (cap, None))
             .await?;
         let bytes =
             std::fs::read(&staging).with_context(|| format!("read {}", staging.display()))?;
@@ -2251,7 +2290,8 @@ impl<P: Provider + Clone> PullCtx<P> {
         let mut disk = resolve_disk_state(entries, &saved, out_root, overwrite).await;
         // The run's outstanding work starts at what the groups that still
         // fetch plan to pay for.
-        disk.work = planned_work(entries, &landing, overwrite, &disk).await;
+        let store = self.store_at(out_root).await;
+        disk.work = planned_work(entries, &landing, overwrite, &disk, store).await;
         let outstanding = disk
             .work
             .values()
@@ -2451,8 +2491,8 @@ impl<P: Provider + Clone> PullCtx<P> {
     /// [`Self::fetch_group`] then materializes to each destination, through
     /// [`Self::fetch_to_staging`].
     ///
-    /// Before it drives anything, the entry reads the bytes its ranged store
-    /// already holds from an earlier, interrupted run ([`resumed_spans`]); those
+    /// Before it drives anything, the entry reads the bytes the run's store
+    /// already holds of it from an earlier, interrupted run ([`resumed_spans`]); those
     /// are resumed, not paid. The paid count is the whole blob less its resumed
     /// bytes, and 0 for an already-finalized staging blob. It is a content
     /// count: bao proof overhead is not in it.
@@ -2467,15 +2507,12 @@ impl<P: Provider + Clone> PullCtx<P> {
         // bar's download meter; the `file` handle also carries the discovering
         // phase the byte callback cannot express.
         let progress = file.map(FileBar::callback);
-        // An already-finalized `<hex>` staging blob — a prior run promoted it, or
-        // this run finalized it and crashed in the promote-to-materialize window —
-        // is the complete blob, BLAKE3-verified when it was promoted. Materialize
-        // straight from it: `fetch_group` copies `staging` to each destination, so
-        // re-hash it once as a cheap guard and return. It must NEVER be re-driven:
-        // the ranged store keys resume on the `.ranges` sidecar, which promotion
-        // deletes, so `open_or_create` on a sidecar-less `<hex>` would `create`
-        // (truncate) it and re-pay for the whole blob. On a mismatch (a corrupt
-        // leftover) drop it and fall through to a normal fetch.
+        // An already-finalized `<hex>` staging blob — a prior run exported it, or
+        // this run did and crashed in the export-to-materialize window — is the
+        // complete blob. Materialize straight from it: `fetch_group` copies
+        // `staging` to each destination, so re-hash it once as a cheap guard and
+        // return. On a mismatch (a corrupt leftover) drop it and fall through to
+        // a normal fetch.
         if staging.try_exists().unwrap_or(false) {
             let staging_buf = staging.to_path_buf();
             let verified = tokio::task::spawn_blocking(move || {
@@ -2492,10 +2529,10 @@ impl<P: Provider + Clone> PullCtx<P> {
             remove_staging_off_runtime(staging).await;
         }
 
-        // What earlier runs already fetched into this entry's `.partial`: read now,
-        // before any drive of this run adds to it. `staging` is absent here, so
-        // the read opens the record alone and never hashes a final file.
-        let resumed = resumed_spans_off_runtime(staging, hash).await;
+        // What earlier runs already fetched of this blob: read now, before
+        // any drive of this run adds to it.
+        let store = self.store_at(out_root_of(staging)?).await;
+        let resumed = resumed_spans(store, hash).await;
 
         // Until the first byte lands, the entry is discovering holders — surfaced so
         // a slow or stalling discovery (a blob no asked node answers for) does not look
@@ -2508,12 +2545,17 @@ impl<P: Provider + Clone> PullCtx<P> {
         // The finalized-staging fast path above already returned, so `staging`
         // does not exist here. The paid count is the verified blob's length,
         // less what an earlier run left.
-        let refetched = self
-            .fetch_to_staging(hash, staging, progress, &self.stop, self.max_blob_bytes)
-            .await?;
+        let store = self.entry_store(staging).await?;
+        self.fetch_to_staging(
+            hash,
+            staging,
+            progress,
+            &self.stop,
+            (self.max_blob_bytes, Some(store)),
+        )
+        .await?;
         let len = tokio::fs::metadata(staging).await.map_or(0, |m| m.len());
-        let resumed = if refetched { 0 } else { span_bytes(&resumed) };
-        Ok(EntryBytes::whole_blob(len, resumed))
+        Ok(EntryBytes::whole_blob(len, span_bytes(&resumed)))
     }
 
     /// The group's share of the run's outstanding work: the work the
@@ -2593,9 +2635,9 @@ impl<P: Provider + Clone> PullCtx<P> {
         }
 
         // Staged once per group: the entry's fetch finalizes to
-        // `out_root/.decdn-partial/<hex>` (#1497), streaming its `<hex>.partial`
-        // + sidecars there — rather than buffering the blob — which is what lets a
-        // large entry top up mid-fetch. The staging path derived from `out_root`
+        // `out_root/.decdn-partial/<hex>` (#1497), streaming into the run's store
+        // rather than buffering the blob, which is what lets a large entry top
+        // up mid-fetch. The staging path derived from `out_root`
         // is only created once a group actually has something to write, never for
         // an all-skipped group.
         let staging = match staging_path(landing.root(), hash) {
@@ -2619,10 +2661,9 @@ impl<P: Provider + Clone> PullCtx<P> {
         let bytes = match fetched {
             Ok(bytes) => bytes,
             Err(e) => {
-                // `pull_entry` leaves the `<hex>.partial` +
-                // `.ranges` record in place on error: they are what the
-                // next run resumes from rather than re-paying for bytes already landed
-                // (same contract as `fetch`'s `<output>.partial` store).
+                // `pull_entry` leaves what landed in the run's store on
+                // error: it is what the next run resumes from rather than
+                // re-paying for bytes already landed.
                 return GroupRun::fetch_failed(slots, e);
             }
         };
@@ -2758,7 +2799,7 @@ struct EntryBytes {
     /// Content bytes this run fetched and paid for (see
     /// [`PullCtx::pull_entry_untimed`]).
     paid: u64,
-    /// Bytes an earlier, interrupted run fetched into the entry's `.partial`,
+    /// Bytes an earlier, interrupted run fetched into the entry's store,
     /// which this run resumed rather than fetched again.
     resumed: u64,
 }
@@ -2775,45 +2816,24 @@ impl EntryBytes {
     }
 }
 
-/// The byte spans of `staging`'s ranged store that earlier runs already
-/// fetched: the present set of its `.partial.ranges` record, as sorted,
-/// disjoint `(offset, len)` pairs: bytes an earlier run paid for. No record
-/// (a fresh entry) gives no spans.
+/// The byte spans of blob `hash` that earlier runs already fetched into
+/// `store`, as sorted, disjoint `(offset, len)` pairs: bytes an earlier run
+/// paid for. No store gives no spans.
 ///
-/// The caller reads this before it drives anything, with `staging` absent, so
-/// the read opens the record alone and never hashes a final file. The spans
-/// are for reporting only: a record it cannot read logs at `debug` and gives
-/// no spans, and the fetch that follows surfaces the fault.
-fn resumed_spans(staging: &Path, hash: [u8; 32]) -> Vec<(u64, u64)> {
-    present_spans(staging, hash).unwrap_or_else(|e| {
-        tracing::debug!(
-            "could not read the resume record beside {}: {e:#}",
-            staging.display()
-        );
-        Vec::new()
-    })
-}
-
-/// The byte spans `staging`'s ranged store records present, as `(offset, len)`.
-/// No record gives no spans. Call it with `staging` absent: opening a store
-/// whose final file exists hashes that file.
-fn present_spans(staging: &Path, hash: [u8; 32]) -> anyhow::Result<Vec<(u64, u64)>> {
-    let (dir, stem) = ranged_store_location(staging)?;
-    if !ClientRangedStore::has_record(&dir, &stem)? {
-        return Ok(Vec::new());
-    }
-    Ok(ClientRangedStore::open(&dir, &stem, hash)?.present_byte_ranges())
-}
-
-/// [`resumed_spans`] on the blocking pool. A failed join gives no spans.
-async fn resumed_spans_off_runtime(staging: &Path, hash: [u8; 32]) -> Vec<(u64, u64)> {
-    let staging = staging.to_path_buf();
-    tokio::task::spawn_blocking(move || resumed_spans(&staging, hash))
-        .await
-        .unwrap_or_else(|e| {
-            tracing::debug!("resume record task: {e}");
+/// The spans are for reporting only: a store it cannot read logs at `debug`
+/// and gives no spans, and the fetch that follows surfaces the fault.
+async fn resumed_spans(store: Option<&BlobDir>, hash: [u8; 32]) -> Vec<(u64, u64)> {
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    // No bound clamps a view that only lists what the store holds.
+    store.blob(hash, u64::MAX, None).await.map_or_else(
+        |e| {
+            tracing::debug!("could not read the download store: {e:#}");
             Vec::new()
-        })
+        },
+        |blob| blob.present_byte_ranges(),
+    )
 }
 
 /// The total length of `(offset, len)` spans, saturating. The caller passes
@@ -2846,6 +2866,19 @@ fn hash_file(path: &Path) -> anyhow::Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// The directory a run pulls into, given one of its staging paths
+/// (`<out_root>/.decdn-partial/<hex>`, [`staging_path`]).
+///
+/// # Errors
+///
+/// `staging` is not two levels below a directory.
+fn out_root_of(staging: &Path) -> anyhow::Result<&Path> {
+    staging
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow!("staging path {} has no output root", staging.display()))
+}
+
 /// The blob cap a manifest fetch runs under, given the run's `max_blob_bytes`:
 /// the lower of the two, with [`MAX_MANIFEST_MB`] for a run with no cap (`0`).
 fn manifest_cap_bytes(max_blob_bytes: u64) -> u64 {
@@ -2859,13 +2892,12 @@ fn manifest_cap_bytes(max_blob_bytes: u64) -> u64 {
 /// Per-hash staging file an entry's fetch finalizes to before `fetch_group`
 /// materializes it at the manifest's destination path(s) —
 /// `<out_root>/.decdn-partial/<hex>` (#1497). This is the *plain* final path:
-/// the entry's ranged store owns the `.partial` suffix and the `.ranges`
-/// record itself, streaming into `<hex>.partial` beside this and renaming to
-/// `<hex>` on `finalize`. Those sidecars are what survives
-/// an interrupted pull — a rerun resumes from them rather than re-paying for
-/// bytes already landed. Creates the staging directory (idempotent, and only
-/// ever called once a group has real work to do — an all-skipped group never
-/// creates one) but not the file itself; the ranged store does that.
+/// the run's store ([`RunStore`]) exports the blob to `<hex>` once complete.
+/// The store is what survives an interrupted pull — a rerun resumes from it
+/// rather than re-paying for bytes already landed.
+/// Creates the staging directory (idempotent, and only ever called once a
+/// group has real work to do — an all-skipped group never creates one) but
+/// not the file itself; the store's export does that.
 fn staging_path(out_root: &Path, hash: [u8; 32]) -> anyhow::Result<PathBuf> {
     let dir = out_root.join(STAGING_DIR);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -2885,25 +2917,13 @@ async fn remove_staging_off_runtime(staging: &Path) {
 
 /// Best-effort cleanup of a finalized staging blob whose content is safely
 /// elsewhere (materialized to disk, or read into memory) and so has nothing left
-/// to resume. Removes the plain `<hex>` finalized blob itself and, best-effort,
-/// any leftover `<hex>.partial{,.ranges}` sidecars: the ranged store's
-/// `finalize` normally clears those on success, but this is the belt to that
-/// brace and never runs on an errored entry (whose sidecars are the resume
-/// prefix a rerun needs). A leftover here is harmless clutter, not a
-/// correctness issue, so a removal failure is reported and swallowed rather
-/// than propagated.
+/// to resume. A leftover here is harmless clutter, not a correctness issue, so
+/// a removal failure is reported and swallowed rather than propagated.
 fn remove_staging(staging: &Path) {
-    let paths_to_remove = [
-        staging.to_path_buf(),
-        staging.with_extension("partial"),
-        staging.with_extension("partial.ranges"),
-    ];
-    for path in paths_to_remove {
-        if let Err(e) = std::fs::remove_file(&path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!("failed to remove staging file {}: {e}", path.display());
-        }
+    if let Err(e) = std::fs::remove_file(staging)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("failed to remove staging file {}: {e}", staging.display());
     }
 }
 
@@ -3219,24 +3239,6 @@ pub(super) fn temp_in_parent(target: &Path) -> std::io::Result<tempfile::NamedTe
         Some(p) => tempfile::NamedTempFile::new_in(p),
         None => tempfile::NamedTempFile::new_in("."),
     }
-}
-
-/// Where the [`ClientRangedStore`] for `output` lives: its directory (the
-/// output's parent, or the current dir) and its stem (the output's own file
-/// name). Keying the store by the output name makes its promoted final path
-/// `output` (no post-finalize rename), and its `.partial` sits beside the
-/// destination, so promotion is a same-filesystem atomic rename.
-fn ranged_store_location(output: &Path) -> anyhow::Result<(PathBuf, String)> {
-    let dir = match output.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let stem = output
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow!("{} has no usable file name", output.display()))?
-        .to_string();
-    Ok((dir, stem))
 }
 
 /// The [`Transfer`] for one whole-file hash-group: the blob is either paid for

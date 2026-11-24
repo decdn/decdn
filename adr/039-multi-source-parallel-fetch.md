@@ -72,7 +72,7 @@ A fetch that has no usable source waits for one. When a fetch stops, it reports 
 
 **The stop policy watches the whole fetch, not one source.** The lane watchdog judges one source at a time. A source can stay inside its watchdog while the fetch as a whole makes no progress. The client therefore also tracks the time since the last verified byte anywhere in the fetch, across every lane. A terminal session has no limit. A script gives up after 10 min with no verified byte. `--give-up-after-secs` overrides both. The clock excludes time the consumer spends behind bytes it has not yet read on `-o -`. When the limit expires, the client stops the fetch, flushes the present record, and exits with code 75.
 
-**A holder that faults and recovers finishes the fetch.** The client runs one acquire loop over every admitted holder. There is no separate single-source path to fall back to. A holder that stalls, drops, or errors cools and rejoins the loop once its cooldown ends or a verified byte resets it. The `.partial` store resumes, so recovery re-pays for nothing already delivered.
+**A holder that faults and recovers finishes the fetch.** The client runs one acquire loop over every admitted holder. There is no separate single-source path to fall back to. A holder that stalls, drops, or errors cools and rejoins the loop once its cooldown ends or a verified byte resets it. The download's store resumes, so recovery re-pays for nothing already delivered.
 
 An item is one blob that the command fetches. In a bundle pull, each entry is one item, and an item that ends does not stop the other entries. In a blob `decdn get`, the item is the whole fetch.
 

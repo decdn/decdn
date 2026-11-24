@@ -10,8 +10,8 @@
 --     future drift is still caught. ("Forward references" is NOT here — it
 --     is a Cross-ADR Impact alias, retained; see below.)
 --   * "Alternatives Considered" / "Considered Alternatives" / "Why not …"
---     — STRIPPED. Rejected-alternative records (a distinct concept; most live
---     in _history/, these patterns catch the inline remainder).
+--     — STRIPPED. Rejected-alternative records (a distinct concept; these
+--     patterns catch any inline remainder).
 --   * "Reading Order" — STRIPPED (book only). The architecture overview's
 --     chapter-by-chapter reading guide; in the book the part dividers and
 --     generated ToC *are* the reading order, so the prose list is
@@ -37,7 +37,7 @@ local strip_patterns = {
   "alternatives considered$",   -- "§6 — Alternatives Considered"
   "^open questions$",            -- legacy alias, retained defensively
   "^future work",                -- legacy: "Future Work" / "Future Work: …"
-  "^why not ",                   -- "Why not Uniswap V3, …"
+  "^why not ",                   -- "Why not a reserve pool, …"
   "^reading order$",             -- architecture overview's chapter list;
                                  -- book ToC + part dividers supersede it
 }

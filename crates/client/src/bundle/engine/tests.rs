@@ -1610,27 +1610,34 @@ fn planned_downloads_list_each_blob_once() {
     assert_eq!(planned[2].wire, 0);
 }
 
-/// The whole-blob path reads what an earlier run fetched from the resume
-/// record and pays only for the rest (#2236). A fresh entry and an
-/// unreadable record resume nothing.
-#[test]
-fn resumed_spans_read_the_record_an_earlier_run_left() {
+/// The whole-blob path reads what an earlier run fetched from the run's
+/// store and pays only for the rest (#2236). No store resumes nothing.
+#[tokio::test]
+async fn resumed_spans_read_the_store_an_earlier_run_left() {
     let tmp = tempfile::tempdir().expect("tmp");
     let content: Vec<u8> = (0..3 * GROUP + 99)
         .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
         .collect();
     let len = u64::try_from(content.len()).expect("fits u64");
     let hash = *blake3::hash(&content).as_bytes();
-    let staging = tmp.path().join("blob");
 
     assert!(
-        resumed_spans(&staging, hash).is_empty(),
-        "no record, no spans"
+        resumed_spans(None, hash).await.is_empty(),
+        "no store, no spans"
     );
 
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, hash);
+    // An earlier, interrupted run fetched `[0, GROUP)` into the store.
+    let dir = BlobDir::open(&tmp.path().join("store"))
+        .await
+        .expect("open store");
+    dir.blob(hash, len, None)
+        .await
+        .expect("open entry")
+        .admit_prefix(&content, GROUP)
+        .await
+        .expect("seed the store");
+    let resumed = resumed_spans(Some(&dir), hash).await;
+    dir.shutdown().await.expect("shut down store");
     assert_eq!(resumed, vec![(0, GROUP)]);
     assert_eq!(
         EntryBytes::whole_blob(len, span_bytes(&resumed)),
@@ -1642,12 +1649,6 @@ fn resumed_spans_read_the_record_an_earlier_run_left() {
     // A resumed count never exceeds the blob.
     assert_eq!(EntryBytes::whole_blob(10, 20).paid, 0);
     assert_eq!(EntryBytes::whole_blob(10, 20).resumed, 10);
-
-    std::fs::write(tmp.path().join("blob.partial.ranges"), b"not json").expect("corrupt");
-    assert!(
-        resumed_spans(&staging, hash).is_empty(),
-        "an unreadable record resumes nothing"
-    );
 }
 
 /// `hash_file` streams the whole file and returns its BLAKE3 hash, matching
@@ -1964,7 +1965,7 @@ fn group_transfer_of_a_blob_already_in_staging_downloads_nothing() {
     assert_eq!(t.reconstructed, 100);
 }
 
-/// A blob resumed from an earlier run's `.partial` downloads only what this
+/// A blob resumed from an earlier run's store downloads only what this
 /// run fetched; the resumed prefix is tallied apart and counted once per
 /// blob, however many paths it lands at (#2236).
 #[test]
@@ -3288,7 +3289,14 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
     disk.skip.insert("present.bin".to_string(), [2; 32]);
     disk.whole_file
         .insert([3; 32], tmp.path().join("elsewhere.bin"));
-    let work = planned_work(&entries, &Landing::open(tmp.path()).unwrap(), false, &disk).await;
+    let work = planned_work(
+        &entries,
+        &Landing::open(tmp.path()).unwrap(),
+        false,
+        &disk,
+        None,
+    )
+    .await;
     assert_eq!(
         work.get(&[1; 32]),
         Some(&PlannedWork {
@@ -3303,6 +3311,7 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
         &Landing::open(tmp.path()).unwrap(),
         true,
         &DiskState::default(),
+        None,
     )
     .await;
     assert_eq!(all.len(), 3, "an overwriting pull fetches every group");
@@ -3322,7 +3331,7 @@ async fn planned_work_leaves_out_colliding_entries() {
     for overwrite in [false, true] {
         let disk =
             resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), overwrite).await;
-        let work = planned_work(&entries, &landing, overwrite, &disk).await;
+        let work = planned_work(&entries, &landing, overwrite, &disk, None).await;
         assert_eq!(
             work.keys().collect::<Vec<_>>(),
             vec![&[3; 32]],

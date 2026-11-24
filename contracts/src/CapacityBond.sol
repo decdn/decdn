@@ -8,7 +8,6 @@ import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 
 import { ICapacityBond } from "./interfaces/ICapacityBond.sol";
@@ -148,7 +147,7 @@ contract CapacityBond is
     // -----------------------------------------------------------------
 
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
-    ERC20Burnable public immutable token;
+    IERC20 public immutable token;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IEd25519Verifier public immutable ed25519Verifier;
 
@@ -411,7 +410,7 @@ contract CapacityBond is
     ///                                  via `setCurrentTermsHash`; unbounded
     ///                                  (a hash has no monotonic direction).
     constructor(
-        ERC20Burnable token_,
+        IERC20 token_,
         IEd25519Verifier ed25519Verifier_,
         address admin,
         uint256 minBond_,
@@ -470,7 +469,7 @@ contract CapacityBond is
     ///         through a raised `minBond`.
     function bond(uint256 amount) external nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
-        IERC20(address(token)).safeTransferFrom(msg.sender, address(this), amount);
+        token.safeTransferFrom(msg.sender, address(this), amount);
         uint256 oldBalance = activeBond[msg.sender];
         uint256 newBalance = oldBalance + amount;
         activeBond[msg.sender] = newBalance;
@@ -557,7 +556,7 @@ contract CapacityBond is
             delete bondFloorAtActivation[msg.sender];
             delete _firstBondedAt[msg.sender];
         }
-        IERC20(address(token)).safeTransfer(msg.sender, amount);
+        token.safeTransfer(msg.sender, amount);
         emit Unbonded(msg.sender, amount, remaining);
     }
 

@@ -1,5 +1,8 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::ranged_store::{BlobDir, StaleStoreEntry};
 
 use super::DownloadTarget;
 use super::Downloader;
@@ -349,9 +352,8 @@ async fn two_holders_stripe_a_blake3_identical_file() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A pre-seeded `.partial` prefix (a resumed download) is not re-fetched: the
-/// source opens only the complement, and the promoted file is still
-/// identical.
+/// A prefix an earlier run left in the store is not re-fetched: the source
+/// opens only the complement, and the exported file is still identical.
 #[tokio::test]
 async fn a_pre_seeded_prefix_is_not_refetched() -> anyhow::Result<()> {
     let blob = payload(2 * 1024 * 1024);
@@ -363,9 +365,10 @@ async fn a_pre_seeded_prefix_is_not_refetched() -> anyhow::Result<()> {
 
     let dir = tempfile::tempdir()?;
     let stem = blake3::Hash::from_bytes(root).to_hex();
-    // Seed the first ~half on disk, as a prior run would.
+    // Seed the first ~half into the store, as a prior run would.
     let seeded_prefix = total / 2;
-    ClientRangedStore::seed_checkpointed_prefix(dir.path(), stem.as_str(), &blob, seeded_prefix)?;
+    ClientRangedStore::seed_download_prefix(&dir.path().join(stem.as_str()), &blob, seeded_prefix)
+        .await?;
 
     let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
     let paths = downloader
@@ -390,43 +393,37 @@ async fn a_pre_seeded_prefix_is_not_refetched() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         probe.opened_bytes() < total,
-        "a resumed download must fetch fewer than the whole blob's bytes ({} of {total})",
+        "a dedup'd download must fetch fewer than the whole blob's bytes ({} of {total})",
         probe.opened_bytes()
     );
     Ok(())
 }
 
-/// Leave the `.partial` an interrupted earlier run would beside `dest`: a
-/// ranged store of `blob` that holds the bao-verified `spans` and nothing
-/// else.
-async fn seed_record(
+/// Fetch `blob` to `dest` under a first claim of `claim`, from one fresh
+/// source. Returns the source, so the test can read what it opened, and the
+/// exported paths.
+async fn fetch_whole(
     blob: &[u8],
     dest: &std::path::Path,
-    spans: &[(u64, u64)],
-) -> anyhow::Result<()> {
-    use decdn_bao_range::RangedStore as _;
-    let total = u64::try_from(blob.len())?;
-    let root = *blake3::hash(blob).as_bytes();
-    let (dir, stem) = super::dest_store_location(dest)?;
-    let store = ClientRangedStore::open_or_create(&dir, &stem, root, total)?;
-    let outboard =
-        bao_tree::io::outboard::PreOrderMemOutboard::create(blob, decdn_bao_range::IROH_BLOCK_SIZE);
-    let outboard = bytes::Bytes::from(outboard.data);
-    for &(off, len) in spans {
-        let aligned = decdn_bao_range::align_range(off, len, total)?;
-        let start = usize::try_from(aligned.fetch_start())?;
-        let end = usize::try_from(aligned.fetch_end())?;
-        let bytes = blob
-            .get(start..end)
-            .ok_or_else(|| anyhow::anyhow!("span past the blob"))?;
-        let bao = decdn_bao_range::encode_verified_range(root, &aligned, bytes, outboard.clone())?;
-        store.admit(aligned, bao).await?;
-    }
-    store.flush_present_record()?;
-    Ok(())
+    claim: u64,
+) -> anyhow::Result<(ScriptedSource, Vec<std::path::PathBuf>)> {
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
+    let probe = source.clone();
+    let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+        .fetch_to_paths(
+            &[DownloadTarget {
+                hash: probe.root(),
+                total_bytes: ProvenSize::assume_for_tests(claim),
+                dest,
+            }],
+            None,
+        )
+        .await?;
+    Ok((probe, paths))
 }
 
-/// A resumed record that holds its head and its final group opens only the
+/// A resumed store that holds its head and its final group opens only the
 /// missing middle.
 #[tokio::test]
 async fn a_resumed_record_with_its_tail_opens_only_the_middle() -> anyhow::Result<()> {
@@ -436,22 +433,15 @@ async fn a_resumed_record_with_its_tail_opens_only_the_middle() -> anyhow::Resul
     let group = decdn_bao_range::CHUNK_GROUP_BYTES;
     let dir = tempfile::tempdir()?;
     let dest = dir.path().join("model.bin");
-    // An earlier run landed the head and the final group.
-    seed_record(&blob, &dest, &[(0, held), (total - group, group)]).await?;
+    // An earlier, interrupted run landed the head and the final group.
+    let store_dir = BlobDir::open(&crate::ranged_store::store_dir_for(&dest)?).await?;
+    let root = *blake3::hash(&blob).as_bytes();
+    let store = store_dir.blob(root, total, None).await?;
+    store.admit_range(&blob, 0, held).await?;
+    store.admit_range(&blob, total - group, group).await?;
+    store_dir.shutdown().await?;
 
-    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
-    let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
-    let probe = source.clone();
-    let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
-        .fetch_to_paths(
-            &[DownloadTarget {
-                hash: probe.root(),
-                total_bytes: ProvenSize::assume_for_tests(total),
-                dest: &dest,
-            }],
-            None,
-        )
-        .await?;
+    let (probe, paths) = fetch_whole(&blob, &dest, total).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the rerun promotes");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     let opened = probe.opened_ranges();
@@ -464,44 +454,203 @@ async fn a_resumed_record_with_its_tail_opens_only_the_middle() -> anyhow::Resul
     Ok(())
 }
 
-/// Bytes that drift on disk after they verified fail the finalize hash.
-/// The same fetch runs once more over the blob and completes.
+/// A destination that already holds the blob (an earlier run exported it and
+/// stopped before it removed its store) is not fetched again, and the
+/// leftover store goes.
 #[tokio::test]
-async fn a_finalize_hash_mismatch_fetches_again_and_completes() -> anyhow::Result<()> {
+async fn an_exported_dest_is_not_fetched_again() -> anyhow::Result<()> {
     let blob = payload(2 * 1024 * 1024);
     let total = u64::try_from(blob.len())?;
     let dir = tempfile::tempdir()?;
     let dest = dir.path().join("model.bin");
-    // A record that claims and proves every byte over a data file with one
-    // flipped byte: the drift the finalize hash exists to catch.
-    let mut drifted = blob.clone();
-    if let Some(b) = drifted.get_mut(1000) {
-        *b ^= 0xFF;
-    }
-    ClientRangedStore::seed_checkpointed_prefix(dir.path(), "model.bin", &drifted, total)?;
+    std::fs::write(&dest, &blob)?;
+    ClientRangedStore::seed_download_prefix(&dest, &blob, total).await?;
+    let store_dir = crate::ranged_store::store_dir_for(&dest)?;
+    anyhow::ensure!(store_dir.exists(), "the seeded store is on disk");
 
     let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
     let source = ScriptedSource::new(blob.clone())?.paying(Arc::clone(&ledger));
     let probe = source.clone();
-    let downloader = downloader(vec![candidate(source, ledger, 0xA1)])?;
     let target = DownloadTarget {
         hash: probe.root(),
         total_bytes: ProvenSize::assume_for_tests(total),
         dest: &dest,
     };
-    let paths = downloader.fetch_to_paths(&[target], None).await?;
-    anyhow::ensure!(paths == vec![dest.clone()], "the fetch promotes");
+    let paths = downloader(vec![candidate(source, ledger, 0xA1)])?
+        .fetch_to_paths(&[target], None)
+        .await?;
+    anyhow::ensure!(
+        paths == vec![dest.clone()],
+        "the target is reported written"
+    );
+    anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+    anyhow::ensure!(probe.opened_bytes() == 0, "nothing is fetched");
+    anyhow::ensure!(!store_dir.exists(), "the leftover store is removed");
+    Ok(())
+}
+
+/// Bytes that change in the store's data file after they verified fail the
+/// exported file's hash. The file is removed, and the same fetch runs once
+/// more from an empty store and completes.
+#[tokio::test]
+async fn an_export_that_fails_its_hash_fetches_again() -> anyhow::Result<()> {
+    let blob = payload(2 * 1024 * 1024);
+    let total = u64::try_from(blob.len())?;
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("model.bin");
+    ClientRangedStore::seed_download_prefix(&dest, &blob, total).await?;
+    let data_dir = crate::ranged_store::store_dir_for(&dest)?.join("data");
+    let data_file = std::fs::read_dir(&data_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "data"))
+        .ok_or_else(|| anyhow::anyhow!("no data file in {}", data_dir.display()))?;
+    let mut drifted = std::fs::read(&data_file)?;
+    if let Some(b) = drifted.get_mut(1000) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&data_file, &drifted)?;
+
+    let (probe, paths) = fetch_whole(&blob, &dest, total).await?;
+    anyhow::ensure!(paths == vec![dest.clone()], "the fetch exports");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
     anyhow::ensure!(
         probe.opened_bytes() >= total,
         "the second pass fetched the blob again: {}",
         probe.opened_bytes()
     );
+    Ok(())
+}
+
+/// The whole-file hash spans every read: a file several reads long that
+/// holds the blob matches, one with a byte changed in its last read does not,
+/// and a missing file holds nothing.
+#[tokio::test]
+async fn dest_holds_hashes_every_read_of_the_file() -> anyhow::Result<()> {
+    let len = 2 * super::HASH_READ_BYTES + 12_345;
+    let blob = payload(len);
+    let hash = *blake3::hash(&blob).as_bytes();
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("big.bin");
+    anyhow::ensure!(!super::dest_holds(&dest, hash).await, "no file");
+    std::fs::write(&dest, &blob)?;
+    anyhow::ensure!(super::dest_holds(&dest, hash).await, "the blob matches");
+    let mut changed = blob;
+    if let Some(b) = changed.last_mut() {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&dest, &changed)?;
     anyhow::ensure!(
-        downloader.refetched_targets() == 1,
-        "the downloader reports the target it fetched again"
+        !super::dest_holds(&dest, hash).await,
+        "a changed last read does not match"
     );
     Ok(())
+}
+
+/// A finished download exports its blob and removes its store.
+#[tokio::test]
+async fn a_finished_download_removes_its_store() -> anyhow::Result<()> {
+    let blob = payload(2 * 1024 * 1024);
+    let total = u64::try_from(blob.len())?;
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("model.bin");
+    let (_probe, paths) = fetch_whole(&blob, &dest, total).await?;
+    anyhow::ensure!(paths == vec![dest.clone()], "the fetch exports");
+    anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+    anyhow::ensure!(
+        !crate::ranged_store::store_dir_for(&dest)?.exists(),
+        "the store is removed"
+    );
+    Ok(())
+}
+
+/// Fetch the whole `blob` to `dest` through the caller's `store`.
+async fn fetch_into(store: &BlobDir, blob: &[u8], dest: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let total = u64::try_from(blob.len())?;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
+    let target = DownloadTarget {
+        hash: source.root(),
+        total_bytes: ProvenSize::assume_for_tests(total),
+        dest,
+    };
+    downloader(vec![candidate(source, ledger, 0xA1)])?
+        .store(store.clone())
+        .fetch_to_paths(&[target], None)
+        .await
+}
+
+/// A download through a caller's store exports its blob and leaves the store
+/// in place. Once the exported file is gone, the store holds a lost export,
+/// and a fetch of that blob through it ends with `StaleStoreEntry`.
+#[tokio::test]
+async fn a_callers_store_stays_and_a_lost_export_is_stale() -> anyhow::Result<()> {
+    let blob = payload(2 * 1024 * 1024);
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("model.bin");
+    let store = BlobDir::open(&dir.path().join("store")).await?;
+
+    let paths = fetch_into(&store, &blob, &dest).await?;
+    anyhow::ensure!(paths == vec![dest.clone()], "the fetch exports");
+    anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+    anyhow::ensure!(
+        dir.path().join("store").exists(),
+        "the caller's store stays"
+    );
+    anyhow::ensure!(
+        !crate::ranged_store::store_dir_for(&dest)?.exists(),
+        "no store beside dest"
+    );
+
+    std::fs::remove_file(&dest)?;
+    let err = fetch_into(&store, &blob, &dest)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a lost export must not fetch"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<StaleStoreEntry>().is_some(),
+        "a lost export is stale: {err:#}"
+    );
+    store.shutdown().await
+}
+
+/// An export through a caller's store that fails its hash cannot fetch
+/// again into that store: the target ends with `StaleStoreEntry`.
+#[tokio::test]
+async fn a_drifted_export_in_a_callers_store_is_stale() -> anyhow::Result<()> {
+    let blob = payload(2 * 1024 * 1024);
+    let total = u64::try_from(blob.len())?;
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("model.bin");
+    let store = BlobDir::open(&dir.path().join("store")).await?;
+    let root = *blake3::hash(&blob).as_bytes();
+    store
+        .blob(root, total, None)
+        .await?
+        .admit_prefix(&blob, total)
+        .await?;
+    let data_dir = dir.path().join("store").join("data");
+    let data_file = std::fs::read_dir(&data_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "data"))
+        .ok_or_else(|| anyhow::anyhow!("no data file in {}", data_dir.display()))?;
+    let mut drifted = std::fs::read(&data_file)?;
+    if let Some(b) = drifted.get_mut(1000) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&data_file, &drifted)?;
+
+    let err = fetch_into(&store, &blob, &dest)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a drifted export must not land"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<StaleStoreEntry>().is_some(),
+        "a drifted export is stale: {err:#}"
+    );
+    anyhow::ensure!(!dest.exists(), "the drifted file is removed");
+    store.shutdown().await
 }
 
 /// A lone source that stalls mid-blob trips the lane watchdog, cools, and
@@ -576,9 +725,10 @@ async fn a_download_with_no_progress_gives_up() -> anyhow::Result<()> {
 }
 
 /// A download dropped mid-fetch (a caller's Ctrl-C) before any periodic
-/// flush still records the bytes that landed, so a resume does not fetch
-/// and pay for them again.
-#[tokio::test(start_paused = true)]
+/// flush still keeps the bytes that landed in its store, so a resume does
+/// not fetch and pay for them again. On the real clock: the file store runs
+/// on its own runtime, which a paused clock does not wait for.
+#[tokio::test]
 async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
     const STALL: u64 = 6 * 1024 * 1024;
     let blob = payload(12 * 1024 * 1024);
@@ -608,17 +758,34 @@ async fn a_dropped_download_records_the_landed_prefix() -> anyhow::Result<()> {
         "the stalled download must still be running"
     );
 
-    let partial = ClientRangedStore::open(dir.path(), "model.bin", root)?;
+    let store_dir = reopen(&crate::ranged_store::store_dir_for(&dest)?).await?;
+    let partial = store_dir.blob(root, total, None).await?;
     let recorded = crate::driver::ranges_content_len(
         &decdn_bao_range::RangedStore::present_ranges(&partial).await?,
         total,
     );
+    store_dir.shutdown().await?;
     let landed = ClientRangedStore::checkpointed_len(STALL);
     anyhow::ensure!(
         recorded >= landed && recorded < total,
         "the landed prefix is recorded for a resume: {recorded}, want at least {landed}"
     );
     Ok(())
+}
+
+/// Open the store in `dir` that a dropped download left. A dropped store
+/// releases its database in the background, so the open retries for a short
+/// while on the real clock.
+async fn reopen(dir: &std::path::Path) -> anyhow::Result<crate::ranged_store::BlobDir> {
+    let mut last = None;
+    for _ in 0..100 {
+        match crate::ranged_store::BlobDir::open(dir).await {
+            Ok(store) => return Ok(store),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no open attempted")))
 }
 
 /// Static sources with no candidate fail early with a clear message: their

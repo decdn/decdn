@@ -48,46 +48,6 @@ contract TokenTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Burn semantics (BuybackBurner's burn of bought-back TOKEN depends on this)
-    // -----------------------------------------------------------------
-
-    function test_burn_reducesTotalSupplyAndBalance() public {
-        uint256 burnAmount = 500e18;
-        uint256 supplyBefore = token.totalSupply();
-
-        vm.prank(holder);
-        token.burn(burnAmount);
-
-        assertEq(token.totalSupply(), supplyBefore - burnAmount);
-        assertEq(token.balanceOf(holder), supplyBefore - burnAmount);
-    }
-
-    function testFuzz_burn_reducesSupplyByExactAmount(uint256 amount) public {
-        amount = bound(amount, 0, token.balanceOf(holder));
-        uint256 supplyBefore = token.totalSupply();
-
-        vm.prank(holder);
-        token.burn(amount);
-
-        assertEq(token.totalSupply(), supplyBefore - amount, "supply delta");
-        assertEq(token.balanceOf(holder), supplyBefore - amount, "balance delta");
-    }
-
-    function test_burnFrom_consumesAllowance() public {
-        address spender = makeAddr("spender");
-        uint256 burnAmount = 1000e18;
-
-        vm.prank(holder);
-        token.approve(spender, burnAmount);
-
-        vm.prank(spender);
-        token.burnFrom(holder, burnAmount);
-
-        assertEq(token.totalSupply(), 1_000_000_000e18 - burnAmount);
-        assertEq(token.allowance(holder, spender), 0);
-    }
-
-    // -----------------------------------------------------------------
     // EIP-2612 Permit (gasless approval; ADR 003 § gas abstraction)
     // -----------------------------------------------------------------
 

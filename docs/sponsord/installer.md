@@ -73,8 +73,8 @@ when it has a `?`, so the shell does not read it as a pattern.
    started while another runs gets a directory of its own.
 4. On success, deletes the download's state (the shared peer cache stays).
    On failure, keeps it: running the same command again resumes with the
-   same key and capability, without the gate, and `decdn` resumes from its
-   `.partial` files.
+   same key and capability, without the gate, and `decdn` resumes from the
+   store it keeps beside the download.
 
 A capability within about an hour of expiring is replaced by a fresh key
 and a new trip through the gate, so a download never starts on one that

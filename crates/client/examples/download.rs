@@ -7,8 +7,8 @@
 //! Set the `DECDN_*` variables that `common::Env::from_env` lists first. The
 //! download stripes across every verified holder, checks every byte against the
 //! hash, and cools a holder that faults while the others carry on. A download that stops keeps its
-//! `.partial` file beside the output, and a rerun fetches only the missing
-//! ranges.
+//! store beside the output (`<output>.decdn`), and a rerun fetches only the
+//! missing ranges.
 
 mod common;
 

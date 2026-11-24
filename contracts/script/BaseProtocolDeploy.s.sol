@@ -3,9 +3,6 @@ pragma solidity 0.8.28;
 
 import { Script } from "forge-std/Script.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import { ERC20Burnable } from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
-import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
 import { TimelockController } from "@openzeppelin/contracts/governance/TimelockController.sol";
 
@@ -22,11 +19,7 @@ import { ICapacityBondCredit } from "../src/interfaces/ICapacityBondCredit.sol";
 import { OriginAssignment } from "../src/OriginAssignment.sol";
 import { ManualVettingPolicy } from "../src/ManualVettingPolicy.sol";
 import { IVettingPolicy } from "../src/interfaces/IVettingPolicy.sol";
-import { GuardedBuybackBurner } from "../src/GuardedBuybackBurner.sol";
-import { BuybackVenueLib } from "./lib/BuybackVenueLib.sol";
-import { INonfungiblePositionManager } from "./interfaces/IUniswapV3PoolCreation.sol";
 import { IEd25519Verifier } from "../src/interfaces/IEd25519Verifier.sol";
-import { IUniswapV3Pool } from "../src/interfaces/IUniswapV3Pool.sol";
 import { ICapacityBondEjector } from "../src/interfaces/ICapacityBondEjector.sol";
 import { ICapacityBondActivity } from "../src/interfaces/ICapacityBondActivity.sol";
 import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistryOwnership.sol";
@@ -55,8 +48,7 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                         DEFAULT_ADMIN_ROLE holder of every target.
 ///           2. `_deployTargets`         — Token, CapacityBond,
 ///                                         FeeRouter (treasury = the
-///                                         TimelockController; buyback dormant —
-///                                         see BuybackBurner note below),
+///                                         TimelockController),
 ///                                         CctpSweepReceiver, ContentBlacklist,
 ///                                         PublisherRegistry, ManualVettingPolicy,
 ///                                         OriginAssignment. Deployer is admin of
@@ -107,92 +99,13 @@ import { IPublisherRegistryOwnership } from "../src/interfaces/IPublisherRegistr
 ///                                          `grantRole` to a wrong address does not
 ///                                          revert, so without this a half-wired
 ///                                          protocol would ship silently.
-///
-///         BuybackBurner is dormant by default: the FeeRouter is constructed with
-///         `buybackBurner_=address(0)` and `buybackBps_=0`, and governance
-///         activates the buyback later with `FeeRouter.setBuybackBurner` and
-///         `FeeRouter.setSplit`.
-///         The OPTIONAL genesis path (`BuybackActivation.activate`, OFF by default)
-///         instead seeds the venue pool, deploys the concrete burner, and flips the
-///         split in-script before the handoff — see `_activateBuyback` and the
-///         § Optional genesis buyback activation block below. When off, the deploy
-///         is byte-for-byte the dormant launch.
 abstract contract BaseProtocolDeploy is Script {
-    using SafeERC20 for IERC20;
-
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 internal constant DEFAULT_ADMIN_ROLE = 0x00;
 
-    // -----------------------------------------------------------------
-    // Optional genesis buyback activation (ADR 018 § Deploy-time genesis
-    // activation, ADR 016 § Optional deploy-time buyback activation).
-    //
-    // OFF by default: the base deploy always constructs `FeeRouter` dormant
-    // (`buybackBurner == address(0)`, shares `[9000, 0, 1000]`) and this whole
-    // path is skipped, so an un-activated genesis is byte-for-byte the pre-flag
-    // deploy. When ON, `_activateBuyback` runs the same coherent bundle a
-    // post-deploy governance activation would (ADR 018 § Activation Criteria) —
-    // seed the venue pool, deploy the concrete burner, flip the FeeRouter split
-    // to the steady-state `BuybackVenueLib.steadySplit()`, wire the keeper — but in-script,
-    // while the deployer still holds `GOVERNANCE_ROLE`, because at genesis the
-    // served-bytes voting weight that gates that governance call is zero (ADR
-    // 036) and no privileged role survives the handoff to bootstrap it.
-    //
-    // This is a testnet / genesis convenience. Mainnet leaves the flag OFF and
-    // activates through the ADR 018 governance-gated path once the pool is
-    // seeded, a private-RPC keeper is live, and the per-epoch cap is calibrated.
-
-    /// @dev Largest tick Uniswap V3 supports; the seed position spans the full
-    ///      range clamped to the fee tier's tick spacing (constant-product depth).
-    int24 internal constant UNIV3_MAX_TICK = 887_272;
-
-    /// @dev Uniswap V3 valid `sqrtPriceX96` bounds (`TickMath.MIN/MAX_SQRT_RATIO`).
-    ///      A seed price outside these makes the pool `initialize` revert with an
-    ///      opaque error deep inside the NonfungiblePositionManager, so the seed
-    ///      helper fail-fasts against them instead.
-    uint160 internal constant UNIV3_MIN_SQRT_RATIO = 4_295_128_739;
-    uint160 internal constant UNIV3_MAX_SQRT_RATIO = 1_461_446_703_485_210_103_287_273_052_203_988_822_378_723_970_342;
-    /// @dev Share of each seed leg the genesis mint must consume (99%). A
-    ///      full-range mint at the seed price consumes both legs up to rounding,
-    ///      so only a price moved before the mint lands can trip it.
-    uint256 internal constant SEED_MIN_BPS = 9900;
     /// @dev Ethereum mainnet, the governance chain the emergency-multisig checks
     ///      apply to.
     uint256 internal constant ETHEREUM_MAINNET_CHAIN_ID = 1;
-
-    /// @notice Pool seed amounts (raw). The script creates + seeds the 50/50
-    ///         Uniswap V3 pool in-script, so `_deriveTokenSeed` pairs `usdcSeed`
-    ///         1:1 by value at `targetPrice`.
-    struct PoolSeed {
-        uint256 usdcSeed; // USDC seed (raw, 6-dec)
-        uint256 tokenSeed; // TOKEN seed (raw, 18-dec)
-        // The input `tokenSeed` was derived from. Carried so `_assertPoolSeedDerived`
-        // can RE-DERIVE and compare rather than trust it: a caller-supplied
-        // `tokenSeed` is an unverifiable claim. With `targetPrice` recorded the seed
-        // is self-checking, and an unset one dies on `TargetPriceZero`.
-        uint256 targetPrice;
-    }
-
-    /// @notice Uniswap-venue inputs — the pool is created + seeded in-script.
-    ///         Every field is required when `activate` (see
-    ///         `_assertUniswapFieldsWired`).
-    struct UniswapVenueParams {
-        address swapRouter; // SwapRouter02 (swap + token-pull target)
-        address positionManager; // NonfungiblePositionManager (create + seed)
-        uint24 poolFee; // fee tier (e.g. 10000 = 1%)
-    }
-
-    /// @notice Genesis buyback-activation inputs. `activate == false` reproduces
-    ///         the dormant launch exactly; all other fields are then ignored.
-    struct BuybackActivation {
-        bool activate;
-        // Keeper granted KEEPER_ROLE in-script (required when `activate`).
-        address keeper;
-        // MEV-stack guard band (ADR 018 § Parameter Table).
-        GuardedBuybackBurner.GuardParams guard;
-        PoolSeed seed;
-        UniswapVenueParams uni;
-    }
 
     struct DeployConfig {
         // External dependencies
@@ -200,7 +113,7 @@ abstract contract BaseProtocolDeploy is Script {
         IEd25519Verifier ed25519Verifier;
         // Roles + recipients. The FeeRouter treasury bucket is not a config
         // field: it is always the TimelockController deployed by this script —
-        // the FeeRouter treasury destination (ADR 016 § Deployment Order step 7),
+        // the FeeRouter treasury destination (ADR 016 § Deployment Order step 6),
         // which is Timelock-custodied (step 3 / § Contracts Holding Funds).
         address deployer;
         address emergencyMultisig;
@@ -230,15 +143,11 @@ abstract contract BaseProtocolDeploy is Script {
         // (keccak256 of the shipped TERMS.md). Governance-swappable post-deploy
         // via CapacityBond.setCurrentTermsHash.
         bytes32 currentTermsHash;
-        // FeeRouter params (ADR 016 § Tunable Economics). `buybackBurner` may
-        // be `address(0)` iff `feeRouterBuybackBps == 0`; the FeeRouter
-        // constructor enforces it.
+        // FeeRouter params (ADR 016 § Tunable Economics).
         uint64 feeRouterEpochLength;
         uint64 feeRouterWindowEpochs;
         uint256 feeRouterRebateBps;
-        uint256 feeRouterBuybackBps;
         uint256 feeRouterDeliveryFloor;
-        address buybackBurner;
         // Governance-chain CCTP V2 contracts the `CctpSweepReceiver` binds.
         IMessageTransmitterV2 cctpMessageTransmitter;
         address cctpTokenMessenger;
@@ -255,9 +164,6 @@ abstract contract BaseProtocolDeploy is Script {
         CctpSweepReceiver sweepReceiver;
         OriginAssignment originAssignment;
         ManualVettingPolicy vettingPolicy;
-        // Zero unless genesis buyback activation ran (`BuybackActivation.activate`);
-        // then it is the concrete `GuardedBuybackBurner` wired into `FeeRouter`.
-        GuardedBuybackBurner buybackBurner;
     }
 
     error ZeroAddress(string field);
@@ -334,77 +240,14 @@ abstract contract BaseProtocolDeploy is Script {
     ///         check unwired.
     error BindingNotWired(address target, address expected, address actual);
 
-    /// @notice Genesis buyback activation was requested without a keeper — the
-    ///         keeper is mandatory because an activated buyback bucket with no
-    ///         `KEEPER_ROLE` holder can never `executeBuyback`, silently queueing
-    ///         USDC in the burner forever.
-    error MissingBuybackKeeper();
-    /// @notice Genesis activation left a required Uniswap field zero. A missing
-    ///         swap router, position manager, or fee tier ships a burner that can
-    ///         never swap while already receiving the buyback share of every
-    ///         sweep, or fails the seed with an opaque `extcodesize` revert.
-    error UniswapFieldsUnwired();
-    /// @notice `PoolSeed.tokenSeed` is not what `usdcSeed` + `targetPrice` derive.
-    ///         The seed sizes the genesis pool, so a wrong value anchors
-    ///         protocol-owned liquidity at the wrong price with nothing downstream
-    ///         to notice — a caller-supplied `tokenSeed` cannot be trusted, so the
-    ///         guard re-derives.
-    error PoolSeedNotDerived(uint256 tokenSeed, uint256 expected);
-    /// @notice The venue seed left the pool with no USDC depth — the per-epoch
-    ///         cap denominator (`usdc.balanceOf(pool)`) would be zero, so the
-    ///         "seed the pool before wiring" guard fails the deploy loudly.
-    error PoolNotSeeded(address pool);
-    /// @notice The minimum buyback exceeds the per-epoch cap at the seeded pool
-    ///         depth, so every buyback would revert.
-    error BuybackBandBelowEpochCap(uint256 minBuybackAmount, uint256 epochCap);
-    /// @notice The TOKEN/USDC pool already existed at a price other than the
-    ///         seed price, so seeding into it would sell at that price.
-    error PoolPreInitialized(address pool, uint160 current, uint160 expected);
-    /// @notice The deployer lacks the TOKEN/USDC balance the venue seed pulls.
-    error InsufficientSeedBalance(address token, uint256 have, uint256 need);
-    /// @notice Fee tier has no known Uniswap V3 tick spacing.
-    error UnsupportedFeeTier(uint24 fee);
-    /// @notice The derived `sqrtPriceX96` falls outside Uniswap V3's valid
-    ///         `[MIN_SQRT_RATIO, MAX_SQRT_RATIO]` range — seed amounts imply a price
-    ///         the pool cannot represent. Caught here so the deploy fails with a
-    ///         clear error instead of an opaque revert inside pool `initialize`.
-    error SqrtPriceOutOfRange(uint256 value);
-    /// @notice The genesis-activation target price was zero — the TOKEN seed is
-    ///         derived as `usdcSeed / targetPrice`, so a zero divides by zero.
-    error TargetPriceZero();
-    /// @notice Post-activation invariant — the FeeRouter split is not the
-    ///         steady-state `BuybackVenueLib.steadySplit()` after activation.
-    error BuybackSplitNotActivated(uint256 rebateBps, uint256 buybackBps);
-
     function _runFullDeploy(DeployConfig memory cfg) internal returns (Deployment memory d) {
-        return _runFullDeploy(cfg, _noBuybackActivation());
-    }
-
-    /// @dev The genesis-activation-aware pipeline. `_runFullDeploy(cfg)` delegates
-    ///      here with activation off, so every existing caller keeps the dormant
-    ///      launch unchanged. When `act.activate`, the buyback bundle runs after
-    ///      cross-contract wiring (deployer still holds `GOVERNANCE_ROLE`) and
-    ///      before the handoff, so the burner is handed to the Timelock alongside
-    ///      every other target.
-    function _runFullDeploy(DeployConfig memory cfg, BuybackActivation memory act)
-        internal
-        returns (Deployment memory d)
-    {
         TimelockController timelock = _deployTimelock(cfg);
         d = _deployTargets(cfg, timelock);
         _deployGovernor(cfg, d);
         _wireCrossContractRoles(cfg, d);
-        if (act.activate) _activateBuyback(cfg, act, d);
         _handOffGovernance(cfg, d);
         _assertNoBackDoors(cfg, d);
         _assertPeerRolesWired(cfg, d);
-        if (act.activate) _assertBuybackActivated(cfg, act, d);
-    }
-
-    /// @dev The all-off activation the single-arg entry point uses.
-    function _noBuybackActivation() internal pure returns (BuybackActivation memory act) {
-        // Every field defaults to zero; `activate == false` short-circuits the path.
-        return act;
     }
 
     // Phase 1 — TimelockController. Deployed before the targets so its address
@@ -470,9 +313,7 @@ abstract contract BaseProtocolDeploy is Script {
             windowEpochs_: cfg.feeRouterWindowEpochs,
             deliveryFloor_: cfg.feeRouterDeliveryFloor,
             admin: cfg.deployer,
-            rebateBps_: cfg.feeRouterRebateBps,
-            buybackBps_: cfg.feeRouterBuybackBps,
-            buybackBurner_: cfg.buybackBurner
+            rebateBps_: cfg.feeRouterRebateBps
         });
 
         // CctpSweepReceiver (ADR 016 § Bridge adapters): the CCTP V2 adapter
@@ -627,8 +468,7 @@ abstract contract BaseProtocolDeploy is Script {
         // defeating the emergency path. Granted here, before the handoff (the
         // deployer still holds GOVERNANCE_ROLE, PAUSER_ROLE's admin), so the
         // multisig can pause from block one. Post-freeze a compromised pauser is
-        // still rotatable through that same GOVERNANCE_ROLE admin. (BuybackBurner
-        // is also Pausable but is not deployed by this script — see the header.)
+        // still rotatable through that same GOVERNANCE_ROLE admin.
         d.bond.grantRole(d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
         d.router.grantRole(d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
 
@@ -653,8 +493,8 @@ abstract contract BaseProtocolDeploy is Script {
     // bypassing every other hardening. Renouncing it freezes the table: GOVERNANCE_ROLE
     // and the contract-held peer roles (their admin is the now-unheld DEFAULT_ADMIN_ROLE)
     // can no longer be granted or rotated. The narrow, genuinely-rotatable off-chain-key
-    // roles (PAUSER / EMERGENCY_MULTISIG / KEEPER) were re-homed to GOVERNANCE_ROLE
-    // admin in each constructor, so governance keeps exactly that minimal rotation
+    // roles (PAUSER / EMERGENCY_MULTISIG) are GOVERNANCE_ROLE-administered by
+    // each constructor, so governance keeps exactly that minimal rotation
     // power and nothing more. Migrating governance to a successor Governor is a
     // redeploy, consistent with the no-proxy philosophy.
     //
@@ -664,13 +504,10 @@ abstract contract BaseProtocolDeploy is Script {
     // is renounced no admin-gated grant/revoke can succeed — so the renounce is the
     // last role op on each target.
     function _handOffGovernance(DeployConfig memory cfg, Deployment memory d) internal {
-        address[] memory targets = _allGovernedTargets(d);
+        IAccessControl[6] memory targets = _governedTargets(d);
         address tl = address(d.timelock);
-        // The genesis-activated burner (if any) is inside `targets`: it is deployed
-        // with the deployer as admin so `_activateBuyback` can `setKeeper` in-script,
-        // and this loop closes that back door alongside every other target.
         for (uint256 i = 0; i < targets.length; i++) {
-            IAccessControl target = IAccessControl(targets[i]);
+            IAccessControl target = targets[i];
             target.grantRole(GOVERNANCE_ROLE, tl);
             target.revokeRole(GOVERNANCE_ROLE, cfg.deployer);
             // Last op on this target — freezes the role table. renounceRole drops
@@ -682,28 +519,6 @@ abstract contract BaseProtocolDeploy is Script {
         d.timelock.renounceRole(d.timelock.DEFAULT_ADMIN_ROLE(), cfg.deployer);
     }
 
-    /// @dev Every target whose GOVERNANCE_ROLE + DEFAULT_ADMIN_ROLE the handoff
-    ///      moves: the six fixed governed targets plus the genesis-activated
-    ///      burner when one was deployed. Dynamic because the burner is conditional;
-    ///      single source of truth for `_handOffGovernance` and `_assertNoBackDoors`
-    ///      so a target cannot be handed off by one and missed by the other.
-    function _allGovernedTargets(Deployment memory d) internal pure returns (address[] memory) {
-        IAccessControl[6] memory fixedTargets = _governedTargets(d);
-        bool hasBurner = address(d.buybackBurner) != address(0);
-        // Sized and indexed off `fixedTargets.length`, never a literal: widening
-        // `_governedTargets` — which its own docstring instructs a future target to do
-        // — would otherwise overwrite the new entry with the burner here, dropping it
-        // from BOTH the handoff and the invariant. They share this helper, so they
-        // would agree on the wrong answer and ship a deployer back door green.
-        uint256 n = fixedTargets.length;
-        address[] memory targets = new address[](hasBurner ? n + 1 : n);
-        for (uint256 i = 0; i < n; i++) {
-            targets[i] = address(fixedTargets[i]);
-        }
-        if (hasBurner) targets[n] = address(d.buybackBurner);
-        return targets;
-    }
-
     // Phase 6 — post-deploy invariant. Three checks per target: GOVERNANCE_ROLE
     // is off the deployer (no back door) and on the Timelock (governance is live,
     // not stranded), and DEFAULT_ADMIN_ROLE is held by no one (#2028 — the role
@@ -712,16 +527,16 @@ abstract contract BaseProtocolDeploy is Script {
     // contract ungoverned; one that left DEFAULT_ADMIN_ROLE on the Timelock would
     // leave the capture master key in place.
     function _assertNoBackDoors(DeployConfig memory cfg, Deployment memory d) internal view {
-        address[] memory targets = _allGovernedTargets(d);
+        IAccessControl[6] memory targets = _governedTargets(d);
         address tl = address(d.timelock);
 
         for (uint256 i = 0; i < targets.length; i++) {
-            IAccessControl target = IAccessControl(targets[i]);
+            IAccessControl target = targets[i];
             if (target.hasRole(GOVERNANCE_ROLE, cfg.deployer)) {
-                revert DeployerStillHoldsRole(targets[i], GOVERNANCE_ROLE);
+                revert DeployerStillHoldsRole(address(target), GOVERNANCE_ROLE);
             }
             if (!target.hasRole(GOVERNANCE_ROLE, tl)) {
-                revert GovernanceNotHandedOff(targets[i], GOVERNANCE_ROLE);
+                revert GovernanceNotHandedOff(address(target), GOVERNANCE_ROLE);
             }
             // DEFAULT_ADMIN_ROLE is renounced to no one (#2028), so neither the
             // deployer nor the Timelock may hold it — a Timelock holder would still
@@ -733,10 +548,10 @@ abstract contract BaseProtocolDeploy is Script {
             // `_setRoleAdmin` moves live-key roles off it and `_assertPeerRolesWired`
             // confirms those admins landed.
             if (target.hasRole(DEFAULT_ADMIN_ROLE, cfg.deployer)) {
-                revert AdminRoleNotRenounced(targets[i], cfg.deployer);
+                revert AdminRoleNotRenounced(address(target), cfg.deployer);
             }
             if (target.hasRole(DEFAULT_ADMIN_ROLE, tl)) {
-                revert AdminRoleNotRenounced(targets[i], tl);
+                revert AdminRoleNotRenounced(address(target), tl);
             }
         }
 
@@ -783,7 +598,7 @@ abstract contract BaseProtocolDeploy is Script {
         _requireRole(d.bond, d.bond.BLACKLIST_ROLE(), address(d.blacklist));
         // EMERGENCY_MULTISIG_ROLE on the blacklist.
         _requireRole(d.blacklist, d.blacklist.EMERGENCY_MULTISIG_ROLE(), cfg.emergencyMultisig);
-        // PAUSER_ROLE on every deployed Pausable target (BuybackBurner is not deployed).
+        // PAUSER_ROLE on every deployed Pausable target.
         _requireRole(d.bond, d.bond.PAUSER_ROLE(), cfg.emergencyMultisig);
         _requireRole(d.router, d.router.PAUSER_ROLE(), cfg.emergencyMultisig);
 
@@ -791,8 +606,7 @@ abstract contract BaseProtocolDeploy is Script {
         // so a compromised key can be rotated out after DEFAULT_ADMIN_ROLE is renounced.
         // A dropped constructor `_setRoleAdmin` would silently leave the role admined by
         // the now-unheld DEFAULT_ADMIN_ROLE — permanently frozen, unrotatable — and only
-        // this read surfaces it. Checked on every deployed Pausable target; the burner's
-        // own admins are asserted in `_assertBuybackActivated`.
+        // this read surfaces it. Checked on every deployed Pausable target.
         _requireRoleAdmin(d.bond, d.bond.PAUSER_ROLE(), GOVERNANCE_ROLE);
         _requireRoleAdmin(d.router, d.router.PAUSER_ROLE(), GOVERNANCE_ROLE);
         _requireRoleAdmin(d.blacklist, d.blacklist.EMERGENCY_MULTISIG_ROLE(), GOVERNANCE_ROLE);
@@ -838,253 +652,5 @@ abstract contract BaseProtocolDeploy is Script {
     function _governedTargets(Deployment memory d) internal pure returns (IAccessControl[6] memory) {
         IAccessControl router = IAccessControl(address(d.router));
         return [router, d.bond, d.blacklist, d.registry, d.originAssignment, d.vettingPolicy];
-    }
-
-    // -----------------------------------------------------------------
-    // Genesis buyback activation (optional — `BuybackActivation.activate`)
-    // -----------------------------------------------------------------
-
-    /// @dev Runs the full activation bundle between `_wireCrossContractRoles` and
-    ///      `_handOffGovernance`: create + seed the Uniswap V3 pool + concrete burner
-    ///      (deployer as admin), grant the burner's pauser + keeper, then flip the
-    ///      FeeRouter to the steady-state `BuybackVenueLib.steadySplit()`. Stores the
-    ///      burner on `d` so the handoff and the post-deploy asserts treat it as a
-    ///      governed target.
-    function _activateBuyback(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d) internal {
-        if (act.keeper == address(0)) revert MissingBuybackKeeper();
-        _assertUniswapFieldsWired(act);
-        _assertPoolSeedDerived(act);
-
-        GuardedBuybackBurner burner = _activateUniswap(cfg, act, d);
-
-        // The burner is Pausable: grant the emergency multisig PAUSER_ROLE while the
-        // deployer still admins it, so it ships with a live pauser like every other
-        // target (post-handoff this would need a 48h Timelock proposal).
-        burner.grantRole(burner.PAUSER_ROLE(), cfg.emergencyMultisig);
-
-        // Wire the single keeper while the deployer holds GOVERNANCE_ROLE on the
-        // burner; `setKeeper` is governance-gated, so post-handoff it needs a proposal.
-        burner.setKeeper(act.keeper);
-
-        // Flip the FeeRouter split. The deployer still holds GOVERNANCE_ROLE on
-        // the router here (pre-handoff). The burner lands before the non-zero
-        // buyback share, as `setSplit` requires.
-        d.router.setBuybackBurner(address(burner));
-        (uint256 rebateBps, uint256 buybackBps) = BuybackVenueLib.steadySplit();
-        d.router.setSplit(rebateBps, buybackBps);
-
-        d.buybackBurner = burner;
-    }
-
-    /// @dev Reject an activation missing any required Uniswap input. `vm.envAddress`
-    ///      rejects an *unset* variable but happily parses an explicit `0x0`, so a
-    ///      `UNISWAP_SWAP_ROUTER=0x0` deploy is reachable from env, not just a fixture.
-    ///      A zero `poolFee` is already rejected pre-broadcast by `PoolFeeOutOfRange`,
-    ///      and a zero `swapRouter` hits `ZeroAddress` in the burner constructor; a
-    ///      zero `positionManager` would otherwise fail with an opaque `extcodesize`
-    ///      revert mid-broadcast. This converts all three into one named revert before
-    ///      any gas is spent, and gives the runbook entry point (`ActivateBuyback`)
-    ///      the same protection via `BuybackVenueLib.WiringIncomplete`.
-    function _assertUniswapFieldsWired(BuybackActivation memory act) internal pure {
-        UniswapVenueParams memory u = act.uni;
-        if (u.swapRouter == address(0) || u.positionManager == address(0) || u.poolFee == 0) {
-            revert UniswapFieldsUnwired();
-        }
-    }
-
-    /// @dev Uniswap venue: create + seed the TOKEN/USDC V3 pool in-script, then
-    ///      deploy the concrete burner bound to it and `SwapRouter02`.
-    function _activateUniswap(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d)
-        internal
-        returns (GuardedBuybackBurner)
-    {
-        address pool = _createAndSeedUniswapPool(cfg, act, d);
-        // "Seed before wire" guard: a live pool must custody USDC, or the burner's
-        // per-epoch cap denominator (`usdc.balanceOf(pool)`) is zero.
-        uint256 depth = cfg.usdc.balanceOf(pool);
-        if (depth == 0) revert PoolNotSeeded(pool);
-        // The per-epoch cap at the seeded depth must admit at least one
-        // minimum-size buyback; otherwise every keeper buyback reverts
-        // `EpochCapExceeded` and nothing burns.
-        uint256 epochCap = depth * act.guard.epochLiquidityCapFraction_ / 10_000;
-        if (epochCap < act.guard.minBuybackAmount_) {
-            revert BuybackBandBelowEpochCap(act.guard.minBuybackAmount_, epochCap);
-        }
-
-        return BuybackVenueLib.deployUniswapBurner(
-            cfg.usdc,
-            ERC20Burnable(address(d.token)),
-            cfg.deployer,
-            address(d.timelock),
-            act.uni.swapRouter,
-            pool,
-            act.guard
-        );
-    }
-
-    /// @dev Create the TOKEN/USDC Uniswap V3 pool (idempotent) at the seed-implied
-    ///      price and seed a single full-range position, custodied by the Timelock
-    ///      (POL). Pulls both legs from the deployer, so the deployer MUST hold the
-    ///      seed TOKEN + USDC (set `INITIAL_TOKEN_HOLDER` to the deployer, or fund it).
-    function _createAndSeedUniswapPool(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d)
-        internal
-        returns (address pool)
-    {
-        IERC20 usdc = cfg.usdc;
-        IERC20 token = IERC20(address(d.token));
-
-        // Sort the legs; align amounts with the sorted order. `sqrtPriceX96`
-        // encodes token1-per-token0 in raw units, matching the seed ratio, so a
-        // full-range position deploys both legs without a residual.
-        (address token0, address token1, uint256 amount0, uint256 amount1) = address(usdc) < address(token)
-            ? (address(usdc), address(token), act.seed.usdcSeed, act.seed.tokenSeed)
-            : (address(token), address(usdc), act.seed.tokenSeed, act.seed.usdcSeed);
-
-        _requireSeedBalance(usdc, cfg.deployer, act.seed.usdcSeed);
-        _requireSeedBalance(token, cfg.deployer, act.seed.tokenSeed);
-
-        uint160 sqrtPriceX96 = _sqrtPriceX96(amount1, amount0);
-
-        INonfungiblePositionManager npm = INonfungiblePositionManager(act.uni.positionManager);
-        pool = npm.createAndInitializePoolIfNecessary(token0, token1, act.uni.poolFee, sqrtPriceX96);
-        _requirePoolAtPrice(pool, sqrtPriceX96);
-
-        // Scoped approvals for the seed pull (the manager pulls via a standard ERC20
-        // allowance); `forceApprove` handles non-standard return-less USDC.
-        IERC20(token0).forceApprove(address(npm), amount0);
-        IERC20(token1).forceApprove(address(npm), amount1);
-
-        int24 tickUpper = _fullRangeTick(act.uni.poolFee);
-        npm.mint(
-            INonfungiblePositionManager.MintParams({
-                token0: token0,
-                token1: token1,
-                fee: act.uni.poolFee,
-                tickLower: -tickUpper,
-                tickUpper: tickUpper,
-                amount0Desired: amount0,
-                amount1Desired: amount1,
-                // The `slot0` check above runs at simulation time; these minimums
-                // hold on-chain, so a price moved between the create and the mint
-                // transactions reverts the mint instead of seeding at that price.
-                // A full-range mint at the seed price uses both legs in full up to
-                // rounding; any unconsumed leg returns to the deployer.
-                amount0Min: amount0 * SEED_MIN_BPS / 10_000,
-                amount1Min: amount1 * SEED_MIN_BPS / 10_000,
-                recipient: address(d.timelock),
-                // Buffer, not `block.timestamp`: under `forge script` the deadline is
-                // encoded during the execution phase, but the tx mines a later block
-                // (on-chain simulation / broadcast) whose timestamp would already be
-                // past a zero-margin deadline — `Transaction too old`. The
-                // amounts-min guard the price, so a wide window is safe.
-                deadline: block.timestamp + 1 hours
-            })
-        );
-
-        // Reset any residual allowance the manager did not consume.
-        IERC20(token0).forceApprove(address(npm), 0);
-        IERC20(token1).forceApprove(address(npm), 0);
-    }
-
-    /// @dev A pool someone else initialized first keeps their price; seeding into
-    ///      it would sell the TOKEN leg at that price.
-    function _requirePoolAtPrice(address pool, uint160 sqrtPriceX96) internal view {
-        // slither-disable-next-line unused-return
-        (uint160 current,,,,,,) = IUniswapV3Pool(pool).slot0();
-        if (current != sqrtPriceX96) revert PoolPreInitialized(pool, current, sqrtPriceX96);
-    }
-
-    function _requireSeedBalance(IERC20 t, address holder, uint256 need) internal view {
-        uint256 have = t.balanceOf(holder);
-        if (have < need) revert InsufficientSeedBalance(address(t), have, need);
-    }
-
-    /// @notice Build a `PoolSeed` for the 50/50 Uniswap V3 pool. Solidity cannot
-    ///         make this the only way to build one — a struct literal or per-field
-    ///         assignment always compiles. What makes the invariant hold is that the
-    ///         inputs are recorded, so `_assertPoolSeedDerived` re-derives and compares
-    ///         rather than trusting a caller-supplied `tokenSeed`.
-    function _derivePoolSeed(uint256 usdcSeed, uint256 targetPrice) internal pure returns (PoolSeed memory) {
-        return
-            PoolSeed({
-                usdcSeed: usdcSeed, tokenSeed: _deriveTokenSeed(usdcSeed, targetPrice), targetPrice: targetPrice
-            });
-    }
-
-    /// @dev Reject a `PoolSeed` whose `tokenSeed` is not what `usdcSeed` +
-    ///      `targetPrice` derive. Without it a hand-built seed could carry an
-    ///      arbitrary `tokenSeed` — the mis-anchored pool `PoolSeedNotDerived`
-    ///      describes, seeding real protocol-owned liquidity at the wrong price.
-    ///      `_deriveTokenSeed` reverts `TargetPriceZero` on a default-constructed
-    ///      seed, so "never set" fails here too.
-    function _assertPoolSeedDerived(BuybackActivation memory act) internal pure {
-        uint256 expected = _deriveTokenSeed(act.seed.usdcSeed, act.seed.targetPrice);
-        if (act.seed.tokenSeed != expected) revert PoolSeedNotDerived(act.seed.tokenSeed, expected);
-    }
-
-    /// @dev The TOKEN seed that pairs `usdcSeed` at `targetPrice` — the price of one
-    ///      whole TOKEN in USDC base units (USDC is 6-dec, so `$0.01/TOKEN` is
-    ///      `10_000`). The USDC decimals cancel (`usdcSeed` and `targetPrice` share
-    ///      them), so the result is only scaled by TOKEN's 18 decimals:
-    ///        tokenSeed = usdcSeed · 1e18 / targetPrice
-    ///      The 50/50 constant-product Uniswap pool pairs value 1:1, so feeding the
-    ///      seeds in this proportion makes the pool initialize at exactly `targetPrice`.
-    function _deriveTokenSeed(uint256 usdcSeed, uint256 targetPrice) internal pure returns (uint256) {
-        if (targetPrice == 0) revert TargetPriceZero();
-        return Math.mulDiv(usdcSeed, 1e18, targetPrice);
-    }
-
-    /// @dev `sqrtPriceX96 = sqrt(amount1 / amount0) * 2**96`, computed with
-    ///      `mulDiv` (512-bit intermediate) so `amount1 * 2**192` cannot overflow
-    ///      before the division. Reverts if the price falls outside Uniswap V3's
-    ///      valid `[MIN_SQRT_RATIO, MAX_SQRT_RATIO]` band — a fail-fast in place of
-    ///      the opaque revert the pool `initialize` would otherwise throw.
-    function _sqrtPriceX96(uint256 amount1, uint256 amount0) internal pure returns (uint160) {
-        uint256 ratioX192 = Math.mulDiv(amount1, uint256(1) << 192, amount0);
-        uint256 s = Math.sqrt(ratioX192);
-        if (s < UNIV3_MIN_SQRT_RATIO || s > UNIV3_MAX_SQRT_RATIO) revert SqrtPriceOutOfRange(s);
-        return uint160(s);
-    }
-
-    /// @dev Full-range upper tick clamped to the fee tier's spacing (lower is the
-    ///      negation). Constant-product depth across the whole curve, so a freshly
-    ///      seeded pool always quotes a spot for the burner's TWAP.
-    function _fullRangeTick(uint24 fee) internal pure returns (int24) {
-        int24 spacing = _tickSpacing(fee);
-        // Divide-then-multiply is the intent: round the max tick DOWN to the
-        // nearest spacing multiple (Uniswap requires ticks land on the spacing).
-        // forge-lint: disable-next-line(divide-before-multiply)
-        return (UNIV3_MAX_TICK / spacing) * spacing;
-    }
-
-    function _tickSpacing(uint24 fee) internal pure returns (int24) {
-        if (fee == 100) return 1;
-        if (fee == 500) return 10;
-        if (fee == 3000) return 60;
-        if (fee == 10_000) return 200;
-        revert UnsupportedFeeTier(fee);
-    }
-
-    /// @dev Post-deploy invariant for the genesis activation: the FeeRouter runs
-    ///      the steady-state split against the wired burner, the keeper holds
-    ///      KEEPER_ROLE, and the emergency multisig can pause the burner. Mirrors
-    ///      `_assertPeerRolesWired` for the conditionally-deployed burner.
-    function _assertBuybackActivated(DeployConfig memory cfg, BuybackActivation memory act, Deployment memory d)
-        internal
-        view
-    {
-        GuardedBuybackBurner burner = d.buybackBurner;
-        if (d.router.buybackBurner() != address(burner)) {
-            revert BindingNotWired(address(d.router), address(burner), d.router.buybackBurner());
-        }
-        (uint256 wantRebate, uint256 wantBuyback) = BuybackVenueLib.steadySplit();
-        if (d.router.rebateBps() != wantRebate || d.router.buybackBps() != wantBuyback) {
-            revert BuybackSplitNotActivated(d.router.rebateBps(), d.router.buybackBps());
-        }
-        _requireRole(burner, burner.KEEPER_ROLE(), act.keeper);
-        _requireRole(burner, burner.PAUSER_ROLE(), cfg.emergencyMultisig);
-        // #2028 — both stay rotatable under GOVERNANCE_ROLE after the admin renounce.
-        _requireRoleAdmin(burner, burner.PAUSER_ROLE(), GOVERNANCE_ROLE);
-        _requireRoleAdmin(burner, burner.KEEPER_ROLE(), GOVERNANCE_ROLE);
     }
 }
