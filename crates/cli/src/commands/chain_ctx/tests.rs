@@ -95,6 +95,31 @@ fn bind_port_reads_the_network_section() {
     assert_eq!(file.network.and_then(|n| n.bind_port), Some(5000));
 }
 
+#[test]
+fn external_addrs_read_the_network_section() {
+    let file: FileConfig = toml::from_str(
+        "[network]\nexternal_addrs = [\"8.8.8.8:30443\", \"8.8.8.8:30443\", \"1.1.1.1:4433\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        file.external_addrs().unwrap(),
+        vec![
+            "8.8.8.8:30443".parse::<std::net::SocketAddr>().unwrap(),
+            "1.1.1.1:4433".parse().unwrap(),
+        ]
+    );
+    assert!(FileConfig::default().external_addrs().unwrap().is_empty());
+}
+
+#[test]
+fn external_addrs_refuse_a_private_entry() {
+    let file: FileConfig =
+        toml::from_str("[network]\nexternal_addrs = [\"192.168.1.2:4433\"]\n").unwrap();
+    let msg = format!("{:#}", file.external_addrs().unwrap_err());
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(msg.contains("192.168.1.2"), "{msg}");
+}
+
 /// Pull-through resolves by the daemon's role rule: on with no origin, off with
 /// one, and an explicit value wins either way. Both origin forms count.
 #[test]

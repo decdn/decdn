@@ -761,14 +761,18 @@ identity rotation, host clock skew breaking TLS.
    operator-tunable bind interface; fixes here are at the firewall, NAT,
    or port-forwarding layer. Open UDP `bind_port` for both IPv4 and IPv6.
    If the log shows `IPv6 bind failed`, the node is IPv4-only: enable IPv6
-   on the host or register `/ip4/` multiaddrs only.
+   on the host or register `/ip4/` multiaddrs only. Behind a port forward or
+   a load balancer, set the public `IP:port` peers dial in
+   `network.external_addrs` and restart the node (the key is not
+   hot-reloaded): the node then publishes that address in its pkarr record
+   and counts it as public at bring-up.
 2. If a peer's iroh key was rotated, neighbours referring to its prior
    `NodeId` will not reconnect until they re-discover the new identity via
    gossip. The node config carries no static bootstrap-peer list
    (`crates/common/src/config/types.rs` exposes `network.bind_port`,
-   `network.relay_urls`, and `network.discovery`; the optional
-   `network.discovery.peers` address book is keyed by `NodeId`, so a rotated
-   key orphans its entry rather than bridging the rotation); follow
+   `network.relay_urls`, `network.external_addrs`, and `network.discovery`;
+   the optional `network.discovery.peers` address book is keyed by `NodeId`,
+   so a rotated key orphans its entry rather than bridging the rotation); follow
    [`adr/appendix-operator-key-rotation.md`](../adr/appendix-operator-key-rotation.md)
    for the staged-rotation procedure that keeps connectivity continuous.
 3. Inspect `decdn_iroh_socket_*` metrics for connect failures; high

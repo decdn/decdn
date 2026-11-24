@@ -520,9 +520,9 @@ pub struct DecdnMetrics {
     /// address. Operator-visible name:
     /// `decdn_inbound_connections_relayed_total`.
     pub inbound_connections_relayed: Counter,
-    /// `1` when the host's default route has a public source address (ADR 001
-    /// § Node Discovery), `0` when the node is behind NAT. Sampled at
-    /// bring-up. Operator-visible name: `decdn_node_public_address`.
+    /// `1` when the host's default route has a public source address or
+    /// `network.external_addrs` configures one (ADR 001 § Node Discovery),
+    /// `0` when the node is behind NAT. Sampled at bring-up. Operator-visible name: `decdn_node_public_address`.
     pub node_public_address: Gauge,
     /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 022 §DHT Rate Limiting). One Counter per layer to match

@@ -96,10 +96,11 @@ This single transaction atomically:
 - Sets `active = true` in the registry.
 - Emits `TermsAccepted(nodeId, termsHash, timestamp)`.
 
-**Constructing `multiaddrs`:** The operator passes each address with `--multiaddr`. Without `--multiaddr`, `decdn setup` and `decdn node register` use the host's public addresses. For each address family, the CLI reads the source address of the default route. It keeps the address when it is a public IP, and registers `/ip4|ip6/<address>/udp/<network.bind_port>/quic-v1`. The CLI prints the address it chose.
+**Constructing `multiaddrs`:** The operator passes each address with `--multiaddr`. Without `--multiaddr`, `decdn setup` and `decdn node register` read `network.external_addrs` from the config file. When the key is set, the CLI registers `/ip4|ip6/<address>/udp/<port>/quic-v1` for each entry, with the entry's own port. The CLI does not add the host's addresses to this set. A bad entry stops the command before any prompt, key generation, or transaction. When the key is not set, the CLI uses the host's public addresses. For each address family, the CLI reads the source address of the default route. It keeps the address when it is a public IP, and registers `/ip4|ip6/<address>/udp/<network.bind_port>/quic-v1`. The CLI prints the address it chose.
 
 - **Hosts with a public IP** (dedicated and cloud servers): the default registers the public address.
-- **Hosts behind NAT** (home connections): the route source is a private address, so the default registers no address. Peers reach the node through the relay and hole-punching. An operator who forwards UDP `network.bind_port` passes the forwarded address with `--multiaddr`.
+- **Hosts behind a port forward or a load balancer** (a NAT forward, a cloud load balancer, a Kubernetes `LoadBalancer` service): the operator sets the public address in `network.external_addrs`. The port is the one peers dial. It can differ from `network.bind_port`. The default registers this address.
+- **Hosts behind NAT** (home connections): the route source is a private address, so the default registers no address. Peers reach the node through the relay and hole-punching. An operator who forwards UDP `network.bind_port` sets the forwarded address in `network.external_addrs` or passes it with `--multiaddr`.
 
 See [NAT and Multiaddr Handling](#nat-and-multiaddr-handling) below.
 
@@ -241,8 +242,8 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 **Address lifecycle:**
 
 1. On startup, the node binds `network.bind_port` on both address families: `0.0.0.0:PORT` and `[::]:PORT`. The IPv4 bind is required. The IPv6 bind is optional. A host without IPv6 starts on IPv4 only and logs a warning.
-2. iroh discovers the node's addresses. The node publishes its relay URL and its public IP addresses in its pkarr record ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)). iroh updates the record when an address changes.
-3. At bring-up, the node logs its reachability once and sets `decdn_node_public_address`. A node with a public address on its default route is public. A public node warns when its registry `multiaddrs` do not carry that address. A node without a public address is behind NAT, and relayed inbound is expected for it.
+2. iroh discovers the node's addresses. iroh also advertises each `network.external_addrs` address. The node publishes its relay URL and its public IP addresses in its pkarr record ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)). iroh updates the record when an address changes.
+3. At bring-up, the node logs its reachability once and sets `decdn_node_public_address`. A node with a public address on its default route is public. A node with a `network.external_addrs` address is public too. A public node warns when its registry `multiaddrs` do not carry one of these addresses. The warning names each missing address with its own port. A node without a public address is behind NAT, and relayed inbound is expected for it.
 4. If hole-punching fails, iroh uses a relay server as fallback. The relay URL is not registered on-chain.
 
 **Multiaddr registration:** registration writes the addresses from [Constructing `multiaddrs`](#phase-2--on-chain-setup). The registry record needs no update on a stable host.
@@ -250,6 +251,7 @@ iroh handles NAT traversal transparently via QUIC hole-punching and relay fallba
 **Multiaddr refresh:**
 
 - The operator runs `decdn node update-multiaddrs` when the host's public address changes, or when the bring-up line names a missing address. The node does not submit the update itself. The pkarr record carries the new address in the meantime.
+- When a forwarded or load-balancer address changes, the operator updates `network.external_addrs` and restarts the node. The pkarr record then carries the new address. The operator also runs `decdn node update-multiaddrs` for the registry record.
 - A governable cooldown prevents rapid address flipping by a compromised key ([ADR 003 § Multiaddr Update Policy](003-payments.md#multiaddr-update-policy)).
 
 **Multiaddr encoding:** `multiaddrs` is a packed `bytes` field: a sequence of `(uint16 length, bytes data)` entries. Each entry is a QUIC multiaddr string (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1`). A dual-stack node registers one entry per family on the same port (e.g., `/ip4/203.0.113.10/udp/4433/quic-v1` and `/ip6/2001:db8::10/udp/4433/quic-v1`). Maximum total size: 1,024 bytes (governable).

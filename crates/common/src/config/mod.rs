@@ -45,6 +45,26 @@ pub fn configured_bind_port(file_bind_port: Option<u16>) -> u16 {
         .or(file_bind_port)
         .unwrap_or(DEFAULT_BIND_PORT)
 }
+
+/// The configured external addresses as a command without `RunArgs` resolves
+/// them from `raw` (the config file's `network.external_addrs`): each entry
+/// parsed by [`crate::net::parse_external_addr`], in order, each address kept
+/// once. The same rule [`resolve_config`] applies.
+///
+/// # Errors
+///
+/// Returns the first bad entry's error, under `network.external_addrs[i]`.
+pub fn configured_external_addrs(raw: &[String]) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (i, entry) in raw.iter().enumerate() {
+        let addr = crate::net::parse_external_addr(entry)
+            .with_context(|| format!("network.external_addrs[{i}]"))?;
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    Ok(out)
+}
 /// Default maximum cache size in megabytes (100 GB) — sized for the large-file
 /// (AI model) wedge, where a node holds many multi-GB shards.
 const DEFAULT_CACHE_SIZE_MB: u64 = 102_400;
@@ -767,8 +787,12 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
     Ok(upper)
 }
 
-/// Resolve network fields, recording any malformed `relay_urls` entry into
-/// `bag` (#818).
+/// Resolve network fields, recording any malformed `relay_urls` or
+/// `external_addrs` entry into `bag` (#818).
+///
+/// Each `external_addrs` entry must pass [`crate::net::parse_external_addr`]:
+/// a public `IP:port`. A bad entry is recorded under
+/// `network.external_addrs[i]`. A repeated address is kept once.
 ///
 /// Each resolved relay URL is parse-checked with [`url::Url`] so
 /// `decdn config validate` fails fast and names a bad entry, instead of the
@@ -850,11 +874,26 @@ fn resolve_network_into(
         }
     }
 
+    let mut external_addrs = Vec::new();
+    let raw_external = file
+        .and_then(|n| n.external_addrs.as_deref())
+        .unwrap_or_default();
+    for (i, raw) in raw_external.iter().enumerate() {
+        if let Some(addr) = bag.try_with(
+            format!("network.external_addrs[{i}]"),
+            crate::net::parse_external_addr(raw),
+        ) && !external_addrs.contains(&addr)
+        {
+            external_addrs.push(addr);
+        }
+    }
+
     let discovery = resolve_discovery_into(file, bag);
 
     ResolvedNetwork {
         bind_port,
         relay_urls,
+        external_addrs,
         discovery,
     }
 }
@@ -3308,6 +3347,11 @@ fn expand_env(cfg: &mut FileConfig) -> anyhow::Result<()> {
         if let Some(urls) = n.relay_urls.as_mut() {
             for (idx, url) in urls.iter_mut().enumerate() {
                 *url = expand_value(url, &format!("network.relay_urls[{idx}]"))?;
+            }
+        }
+        if let Some(addrs) = n.external_addrs.as_mut() {
+            for (idx, addr) in addrs.iter_mut().enumerate() {
+                *addr = expand_value(addr, &format!("network.external_addrs[{idx}]"))?;
             }
         }
         // #863: `[network.discovery]` fields were skipped by `${VAR}` expansion

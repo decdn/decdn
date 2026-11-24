@@ -8,6 +8,11 @@
 //! its interface (a typical dedicated or cloud server) reports it; a host
 //! behind NAT (a home connection) reports none, because its route source is a
 //! private address.
+//!
+//! [`parse_external_addr`] holds the rule for one `network.external_addrs`
+//! entry, which both the daemon and the CLI apply. [`public_quic_addrs`] joins
+//! the host's public addresses and the configured ones into the set of QUIC
+//! addresses a remote peer can dial.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
@@ -98,6 +103,58 @@ pub fn quic_multiaddr(ip: IpAddr, port: u16) -> String {
         IpAddr::V4(v4) => format!("/ip4/{v4}/udp/{port}/quic-v1"),
         IpAddr::V6(v6) => format!("/ip6/{v6}/udp/{port}/quic-v1"),
     }
+}
+
+/// Parse one `network.external_addrs` entry: an `IP:port` socket address
+/// (IPv6 in brackets) whose IP is public and whose port is not 0.
+///
+/// The result is canonical: an IPv4-mapped IPv6 address becomes its IPv4
+/// address, and an IPv6 scope ID or flow label is dropped.
+///
+/// # Errors
+///
+/// Returns an error for a value that is not a socket address (a hostname, or
+/// an IP without a port), for port 0, and for an IP that [`is_publishable`]
+/// refuses. The message names the value or the IP.
+pub fn parse_external_addr(raw: &str) -> anyhow::Result<SocketAddr> {
+    let addr: SocketAddr = raw.trim().parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid socket address {raw:?}: expected IP:port; a hostname is not accepted"
+        )
+    })?;
+    anyhow::ensure!(
+        addr.port() != 0,
+        "{raw:?} has port 0; give the UDP port remote peers dial"
+    );
+    let ip = addr.ip().to_canonical();
+    anyhow::ensure!(
+        is_publishable(ip),
+        "{ip} is not a public address; no remote peer can dial it"
+    );
+    Ok(SocketAddr::new(ip, addr.port()))
+}
+
+/// The QUIC addresses a remote peer can dial: each of `route_public` (the
+/// host's public IPs, from [`route_public_ips`]) on `bind_port`, then each of
+/// `external` (the configured `network.external_addrs`) on its own port. An
+/// address that appears twice is kept once, at its first place.
+#[must_use]
+pub fn public_quic_addrs(
+    route_public: &[IpAddr],
+    bind_port: u16,
+    external: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = Vec::with_capacity(route_public.len() + external.len());
+    let candidates = route_public
+        .iter()
+        .map(|ip| SocketAddr::new(*ip, bind_port))
+        .chain(external.iter().copied());
+    for addr in candidates {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

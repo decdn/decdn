@@ -4,9 +4,44 @@ use super::*;
 fn explicit_multiaddrs_win_over_the_default() {
     let explicit = vec!["/ip4/198.51.100.7/udp/5000/quic-v1".to_string()];
     assert_eq!(
-        registration_multiaddrs(&explicit, &chain_ctx::FileConfig::default()),
+        registration_multiaddrs(&explicit, &chain_ctx::FileConfig::default()).unwrap(),
         explicit
     );
+}
+
+fn file(toml_src: &str) -> chain_ctx::FileConfig {
+    toml::from_str(toml_src).unwrap()
+}
+
+#[test]
+fn registration_multiaddrs_default_to_configured_external_addrs() {
+    // Each entry registers on its own port, not on `bind_port`.
+    let file = file(
+        "[network]\nbind_port = 4433\n\
+         external_addrs = [\"8.8.8.8:30443\", \"[2606:4700::1111]:4434\"]\n",
+    );
+    assert_eq!(
+        registration_multiaddrs(&[], &file).unwrap(),
+        vec![
+            "/ip4/8.8.8.8/udp/30443/quic-v1".to_string(),
+            "/ip6/2606:4700::1111/udp/4434/quic-v1".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn registration_multiaddrs_explicit_skips_a_bad_external_addr() {
+    let file = file("[network]\nexternal_addrs = [\"node.example:4433\"]\n");
+    let explicit = vec!["/ip4/8.8.8.8/udp/5000/quic-v1".to_string()];
+    assert_eq!(registration_multiaddrs(&explicit, &file).unwrap(), explicit);
+}
+
+#[test]
+fn registration_multiaddrs_refuse_a_private_external_addr() {
+    let file = file("[network]\nexternal_addrs = [\"8.8.8.8:4433\", \"10.0.0.5:4433\"]\n");
+    let msg = format!("{:#}", registration_multiaddrs(&[], &file).unwrap_err());
+    assert!(msg.contains("network.external_addrs[1]"), "{msg}");
+    assert!(msg.contains("10.0.0.5"), "{msg}");
 }
 
 #[test]

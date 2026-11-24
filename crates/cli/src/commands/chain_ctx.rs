@@ -20,8 +20,9 @@ use decdn_incentive::eth_identity::{self, PasswordSource, PasswordUse, ResolvedP
 use serde::Deserialize;
 
 /// Partial deserializer for the TOML config — only the `[blockchain]`,
-/// `[identity]`, `network.bind_port`, and `[cache]` pull-through flag and
-/// origin-table presence these commands need.
+/// `[identity]`, `network.bind_port`, `network.external_addrs`, and `[cache]`
+/// pull-through flag and origin-table presence these commands need.
+/// The file is read raw: no `${VAR}` expansion.
 /// Deliberately partial (like `node.rs`'s `AdminPortConfig`) so an operator's
 /// typo in an unrelated section can't block onboarding; serde-toml ignores
 /// unknown fields. A field read here is typed, so a wrongly typed value in it
@@ -40,6 +41,26 @@ impl FileConfig {
     /// [`decdn_common::config::configured_bind_port`]).
     pub fn bind_port(&self) -> u16 {
         decdn_common::config::configured_bind_port(self.network.as_ref().and_then(|n| n.bind_port))
+    }
+
+    /// `network.external_addrs`, validated by the daemon's rule (see
+    /// [`decdn_common::config::configured_external_addrs`]): public `IP:port`
+    /// addresses in configured order, each kept once. Empty when unset.
+    ///
+    /// The CLI reads the file raw, so an entry that holds `${VAR}` fails here
+    /// although the daemon expands it. The operator passes `--multiaddr`
+    /// instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first bad entry's error, under `network.external_addrs[i]`.
+    pub fn external_addrs(&self) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+        decdn_common::config::configured_external_addrs(
+            self.network
+                .as_ref()
+                .and_then(|n| n.external_addrs.as_deref())
+                .unwrap_or_default(),
+        )
     }
 
     /// `blockchain.rpc_url`, when the file sets it.
@@ -116,6 +137,7 @@ impl FileConfig {
 #[derive(Debug, Default, Deserialize)]
 struct FileNetwork {
     bind_port: Option<u16>,
+    external_addrs: Option<Vec<String>>,
 }
 
 /// The `[cache]` fields that decide pull-through. The origin tables are read

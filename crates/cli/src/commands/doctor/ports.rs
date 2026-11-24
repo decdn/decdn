@@ -3,10 +3,10 @@
 //! use while this node's daemon is running is expected, not a fault.
 
 use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 
 use decdn_common::config::ResolvedConfig;
-use decdn_common::net::{quic_multiaddr, route_public_ips};
+use decdn_common::net::{public_quic_addrs, quic_multiaddr, route_public_ips};
 
 use super::{Finding, Report, Severity};
 
@@ -67,25 +67,31 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 }
 
 /// Report whether the host takes direct inbound connections (ADR 001 § Node
-/// Discovery). Both outcomes pass: a host behind NAT is a supported setup whose
-/// inbound runs through the relay and hole-punching.
-pub(crate) fn classify_reachability(public: &[IpAddr], bind_port: u16) -> Finding {
+/// Discovery). `public` holds the QUIC addresses a remote peer can dial, each
+/// with its own port: the host's route-public IPs on `bind_port` and each
+/// configured `network.external_addrs` address, as the daemon counts them.
+/// Both outcomes pass: a host behind NAT is a supported setup whose inbound
+/// runs through the relay and hole-punching.
+pub(crate) fn classify_reachability(public: &[SocketAddr], bind_port: u16) -> Finding {
     if public.is_empty() {
         Finding {
             group: "Ports",
             id: "port.reachability",
             severity: Severity::Pass,
             title: "behind NAT: inbound peers arrive through the relay".to_string(),
-            detail: Some("no public address on the default route".to_string()),
+            detail: Some(
+                "no public address on the default route and no network.external_addrs".to_string(),
+            ),
             remediation: Some(format!(
-                "for direct inbound, forward UDP {bind_port} to this host and register the \
-                 forwarded address with `decdn node update-multiaddrs`"
+                "for direct inbound, forward UDP {bind_port} to this host, set the forwarded \
+                 address in network.external_addrs, restart the node, and register the \
+                 address with `decdn node update-multiaddrs`"
             )),
         }
     } else {
         let addrs: Vec<String> = public
             .iter()
-            .map(|ip| quic_multiaddr(*ip, bind_port))
+            .map(|a| quic_multiaddr(a.ip(), a.port()))
             .collect();
         Finding {
             group: "Ports",
@@ -102,7 +108,11 @@ pub(crate) fn classify_reachability(public: &[IpAddr], bind_port: u16) -> Findin
 /// admin ports, and the host's reachability.
 pub(crate) fn check_ports(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
     report.push(classify_reachability(
-        &route_public_ips(),
+        &public_quic_addrs(
+            &route_public_ips(),
+            cfg.network.bind_port,
+            &cfg.network.external_addrs,
+        ),
         cfg.network.bind_port,
     ));
     report.push(classify_bind(

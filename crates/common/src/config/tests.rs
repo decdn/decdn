@@ -295,6 +295,7 @@ fn expand_env_substitutes_each_relay_url() -> anyhow::Result<()> {
                 "${HOME}/relay-a".to_string(),
                 "${HOME}/relay-b".to_string(),
             ]),
+            external_addrs: None,
             discovery: None,
         }),
         ..Default::default()
@@ -331,6 +332,7 @@ fn expand_env_substitutes_discovery_fields() -> anyhow::Result<()> {
         network: Some(types::NetworkConfig {
             bind_port: None,
             relay_urls: None,
+            external_addrs: None,
             discovery: Some(types::DiscoveryConfig {
                 pkarr_url: Some("${HOME}/pkarr".to_string()),
                 dns_origin: Some("${HOME}/dns".to_string()),
@@ -389,6 +391,7 @@ fn expand_env_discovery_peer_error_order_is_deterministic() -> anyhow::Result<()
         network: Some(types::NetworkConfig {
             bind_port: None,
             relay_urls: None,
+            external_addrs: None,
             discovery: Some(types::DiscoveryConfig {
                 pkarr_url: None,
                 dns_origin: None,
@@ -620,6 +623,7 @@ fn expand_env_per_field_error_context() -> anyhow::Result<()> {
             c.network = Some(types::NetworkConfig {
                 bind_port: None,
                 relay_urls: Some(vec![v.to_string()]),
+                external_addrs: None,
                 discovery: None,
             });
         }),
@@ -3715,6 +3719,7 @@ fn net(port: u16) -> ResolvedNetwork {
     ResolvedNetwork {
         bind_port: port,
         relay_urls: Vec::new(),
+        external_addrs: Vec::new(),
         discovery: ResolvedDiscovery::default(),
     }
 }
@@ -4564,6 +4569,7 @@ fn resolve_network_cli_bind_port_overrides_file() {
     let file = types::NetworkConfig {
         bind_port: Some(6666),
         relay_urls: None,
+        external_addrs: None,
         discovery: None,
     };
     let resolved = resolve_network(&cli, Some(&file));
@@ -4576,6 +4582,7 @@ fn resolve_network_uses_file_when_cli_absent() {
     let file = types::NetworkConfig {
         bind_port: Some(6666),
         relay_urls: Some(vec!["https://relay.example".to_string()]),
+        external_addrs: None,
         discovery: None,
     };
     let resolved = resolve_network(&cli, Some(&file));
@@ -4595,6 +4602,7 @@ fn resolve_network_uses_relay_urls_list() {
             "https://relay-a.example".to_string(),
             "https://relay-b.example".to_string(),
         ]),
+        external_addrs: None,
         discovery: None,
     };
     let resolved = resolve_network(&cli, Some(&file));
@@ -4619,6 +4627,7 @@ fn resolve_network_cli_relay_url_overrides_file_list() {
     let file = types::NetworkConfig {
         bind_port: None,
         relay_urls: Some(vec!["https://list.example".to_string()]),
+        external_addrs: None,
         discovery: None,
     };
     let resolved = resolve_network(&cli, Some(&file));
@@ -4668,6 +4677,7 @@ fn resolve_network_accepts_well_formed_relay_urls() {
             "https://relay-a.example".to_string(),
             "relay://no-port-host".to_string(),
         ]),
+        external_addrs: None,
         discovery: None,
     };
     let mut bag = ConfigDiagnostics::new();
@@ -4685,6 +4695,7 @@ fn resolve_network_records_problem_for_malformed_relay_url() {
     let file = types::NetworkConfig {
         bind_port: None,
         relay_urls: Some(vec!["not a url".to_string()]),
+        external_addrs: None,
         discovery: None,
     };
     let mut bag = ConfigDiagnostics::new();
@@ -4708,6 +4719,7 @@ fn resolve_network_reports_each_malformed_relay_entry_by_index() {
             "https://good.example".to_string(),
             "also bad".to_string(),
         ]),
+        external_addrs: None,
         discovery: None,
     };
     let mut bag = ConfigDiagnostics::new();
@@ -4729,6 +4741,7 @@ fn resolve_network_redacts_credentials_in_malformed_relay_error() {
     let file = types::NetworkConfig {
         bind_port: None,
         relay_urls: Some(vec!["https://user:s3cret@host:notaport".to_string()]),
+        external_addrs: None,
         discovery: None,
     };
     let mut bag = ConfigDiagnostics::new();
@@ -4768,6 +4781,7 @@ fn network_with_discovery(discovery: types::DiscoveryConfig) -> types::NetworkCo
     types::NetworkConfig {
         bind_port: None,
         relay_urls: None,
+        external_addrs: None,
         discovery: Some(discovery),
     }
 }
@@ -7077,6 +7091,7 @@ fn network_cli_relay_override_of_a_file_list_warns() {
             "https://a.example".to_string(),
             "https://b.example".to_string(),
         ]),
+        external_addrs: None,
         discovery: None,
     };
     let notice = only_notice(notices_from(|bag| {
@@ -7099,6 +7114,7 @@ fn network_file_relay_list_alone_records_no_notice() {
     let file = types::NetworkConfig {
         bind_port: None,
         relay_urls: Some(vec!["https://a.example".to_string()]),
+        external_addrs: None,
         discovery: None,
     };
     assert!(
@@ -7227,4 +7243,123 @@ fn resolve_serve_rate_positive_with_zero_burst_rejects() {
     });
     let err = resolve_serve(Some(&p)).expect_err("rate>0+burst=0 must reject");
     assert!(format!("{err:#}").contains("serve.rate_limit.global_burst"));
+}
+
+fn network_with_external_addrs(addrs: &[&str]) -> types::NetworkConfig {
+    types::NetworkConfig {
+        bind_port: None,
+        relay_urls: None,
+        external_addrs: Some(addrs.iter().map(|a| (*a).to_string()).collect()),
+        discovery: None,
+    }
+}
+
+#[test]
+fn resolve_network_resolves_external_addrs_in_order_without_repeats() {
+    let file = network_with_external_addrs(&[
+        "8.8.8.8:30443",
+        "[2606:4700::1111]:4433",
+        "[::ffff:8.8.8.8]:30443",
+        "1.1.1.1:4433",
+    ]);
+    let resolved = resolve_network(&empty_network_args(), Some(&file));
+    let want: Vec<std::net::SocketAddr> = vec![
+        "8.8.8.8:30443".parse().unwrap(),
+        "[2606:4700::1111]:4433".parse().unwrap(),
+        "1.1.1.1:4433".parse().unwrap(),
+    ];
+    assert_eq!(resolved.external_addrs, want);
+}
+
+#[test]
+fn resolve_network_reports_each_bad_external_addr_by_index() {
+    let file = network_with_external_addrs(&[
+        "node.example:4433",
+        "8.8.8.8:4433",
+        "10.0.0.5:4433",
+        "8.8.8.8:0",
+    ]);
+    let mut bag = ConfigDiagnostics::new();
+    let resolved = resolve_network_into(&empty_network_args(), Some(&file), &mut bag);
+    assert_eq!(
+        resolved.external_addrs,
+        vec!["8.8.8.8:4433".parse::<std::net::SocketAddr>().unwrap()]
+    );
+    let msg = format!("{:#}", bag.into_result().unwrap_err());
+    assert!(msg.contains("configuration has 3 problem(s):"), "{msg}");
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(msg.contains("node.example:4433"), "{msg}");
+    assert!(!msg.contains("network.external_addrs[1]"), "{msg}");
+    assert!(msg.contains("network.external_addrs[2]"), "{msg}");
+    assert!(msg.contains("10.0.0.5"), "{msg}");
+    assert!(msg.contains("network.external_addrs[3]"), "{msg}");
+}
+
+#[test]
+fn resolve_network_external_addrs_default_empty() {
+    assert!(
+        resolve_network(&empty_network_args(), None)
+            .external_addrs
+            .is_empty()
+    );
+    let file = types::NetworkConfig::default();
+    assert!(
+        resolve_network(&empty_network_args(), Some(&file))
+            .external_addrs
+            .is_empty()
+    );
+}
+
+#[test]
+fn expand_env_substitutes_each_external_addr() -> anyhow::Result<()> {
+    let home = home_str()?;
+    let mut cfg = FileConfig {
+        network: Some(network_with_external_addrs(&[
+            "${HOME}-a:4433",
+            "${HOME}-b:4433",
+        ])),
+        ..Default::default()
+    };
+    expand_env(&mut cfg)?;
+    let addrs = cfg
+        .network
+        .as_ref()
+        .and_then(|n| n.external_addrs.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("external_addrs missing"))?;
+    anyhow::ensure!(
+        addrs == &[format!("{home}-a:4433"), format!("{home}-b:4433")],
+        "got: {addrs:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn network_accepts_external_addrs_key() {
+    let cfg: FileConfig = ::toml::from_str(
+        "[network]\nexternal_addrs = [\"8.8.8.8:30443\", \"[2606:4700::1111]:4433\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.network.and_then(|n| n.external_addrs),
+        Some(vec![
+            "8.8.8.8:30443".to_string(),
+            "[2606:4700::1111]:4433".to_string()
+        ])
+    );
+}
+
+#[test]
+fn configured_external_addrs_names_the_bad_index() {
+    let ok = configured_external_addrs(&["8.8.8.8:30443".to_string(), "8.8.8.8:30443".to_string()])
+        .unwrap();
+    assert_eq!(
+        ok,
+        vec!["8.8.8.8:30443".parse::<std::net::SocketAddr>().unwrap()]
+    );
+    let err =
+        configured_external_addrs(&["8.8.8.8:30443".to_string(), "192.168.1.2:4433".to_string()])
+            .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("network.external_addrs[1]"), "{msg}");
+    assert!(msg.contains("192.168.1.2"), "{msg}");
 }

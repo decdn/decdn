@@ -229,6 +229,12 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let cb_addr = resolved.capacity_bond_address;
     let json = args.chain.common.json;
     let dry_run = args.chain.common.dry_run;
+    // The register step reads `network.external_addrs` after `bond::execute`.
+    // Check it here, so a bad entry fails before any key generation, prompt
+    // or transaction.
+    if args.multiaddrs.is_empty() {
+        file.external_addrs()?;
+    }
 
     // ---- Keys (idempotent — generate only on a clean slate). ----
     let key_path = identity::key_path(&resolved.data_dir);
@@ -373,7 +379,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 .context("failed to write dry-run bond plan")?;
         }
         let readiness = read_readiness(&bond_contract, operator).await?;
-        let multiaddr_count = register::registration_multiaddrs(&args.multiaddrs, &file).len();
+        let multiaddr_count = register::registration_multiaddrs(&args.multiaddrs, &file)?.len();
         emit_readiness(json, &readiness, &args.region, multiaddr_count);
         if json {
             println!(
@@ -499,7 +505,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             if !json {
                 println!("register:");
             }
-            let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file);
+            let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file)?;
             let outcome = register::submit_registration(
                 &provider,
                 &signer,

@@ -32,6 +32,10 @@ pub struct ResolvedNetwork {
     /// relay connects the node warns and proceeds (iroh retries in the
     /// background).
     pub relay_urls: Vec<String>,
+    /// Configured external addresses (`network.external_addrs`): validated
+    /// public `IP:port` addresses in canonical form, in configured order,
+    /// each kept once. The node advertises each one. Empty when unset.
+    pub external_addrs: Vec<std::net::SocketAddr>,
     /// Operator-configurable address discovery (#818 scope 1). Empty
     /// ([`ResolvedDiscovery::is_empty`]) => the node keeps the n0-hosted
     /// pkarr/DNS default (`presets::N0`); otherwise the node builds on

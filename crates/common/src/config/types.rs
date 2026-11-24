@@ -103,6 +103,16 @@ pub struct NetworkConfig {
     /// never fatal: when no relay connects the node warns with each relay's
     /// last error and proceeds (iroh retries in the background).
     pub relay_urls: Option<Vec<String>>,
+    /// Public addresses where remote peers reach this node, for a node behind
+    /// a port forward or a load balancer. Each entry is `IP:port`, with an
+    /// IPv6 address in brackets (`"[2606:4700::1111]:4433"`). A hostname is
+    /// refused, and the IP must be public. The port is the one peers dial,
+    /// which can differ from [`Self::bind_port`]. The node publishes each
+    /// address in its address record and counts it as a public address in its
+    /// reachability check. `decdn setup` and `decdn node register` register
+    /// these addresses when no `--multiaddr` is given. A change takes effect
+    /// on restart.
+    pub external_addrs: Option<Vec<String>>,
     /// Operator-configurable address discovery (#818 scope 1). Absent => the
     /// node uses the n0-hosted pkarr/DNS discovery (`presets::N0`, unchanged).
     /// Present => the node drops the n0 discovery leg and composes only the

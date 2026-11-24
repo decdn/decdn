@@ -52,3 +52,63 @@ fn quic_multiaddr_formats_both_families() {
         "/ip6/2a01:4f8::1/udp/4433/quic-v1"
     );
 }
+
+#[test]
+fn parse_external_addr_accepts_public_v4_and_v6() {
+    assert_eq!(
+        parse_external_addr("8.8.8.8:30443").unwrap(),
+        "8.8.8.8:30443".parse::<SocketAddr>().unwrap()
+    );
+    assert_eq!(
+        parse_external_addr("[2606:4700::1111]:4433").unwrap(),
+        "[2606:4700::1111]:4433".parse::<SocketAddr>().unwrap()
+    );
+}
+
+#[test]
+fn parse_external_addr_refuses_hostnames_bare_ips_and_port_zero() {
+    for raw in ["node.example:4433", "8.8.8.8", "8.8.8.8:0", ""] {
+        let err = parse_external_addr(raw).unwrap_err().to_string();
+        assert!(err.contains(&format!("{raw:?}")), "{raw}: {err}");
+    }
+}
+
+#[test]
+fn parse_external_addr_refuses_non_public_ips() {
+    for (raw, ip) in [
+        ("10.0.0.5:4433", "10.0.0.5"),
+        ("100.64.0.1:4433", "100.64.0.1"),
+        ("203.0.113.10:4433", "203.0.113.10"),
+        ("[fd00::1]:4433", "fd00::1"),
+        ("[::ffff:10.0.0.1]:4433", "10.0.0.1"),
+    ] {
+        let err = parse_external_addr(raw).unwrap_err().to_string();
+        assert!(err.contains(ip), "{raw}: {err}");
+        assert!(err.contains("not a public address"), "{raw}: {err}");
+    }
+}
+
+#[test]
+fn parse_external_addr_canonicalises_v4_mapped() {
+    assert_eq!(
+        parse_external_addr("[::ffff:8.8.8.8]:4433").unwrap(),
+        "8.8.8.8:4433".parse::<SocketAddr>().unwrap()
+    );
+}
+
+#[test]
+fn public_quic_addrs_joins_route_and_external_without_repeats() {
+    let route: Vec<IpAddr> = vec!["8.8.8.8".parse().unwrap()];
+    let external: Vec<SocketAddr> = vec![
+        "8.8.8.8:4433".parse().unwrap(),
+        "1.1.1.1:30443".parse().unwrap(),
+        "1.1.1.1:30443".parse().unwrap(),
+    ];
+    assert_eq!(
+        public_quic_addrs(&route, 4433, &external),
+        vec![
+            "8.8.8.8:4433".parse::<SocketAddr>().unwrap(),
+            "1.1.1.1:30443".parse().unwrap(),
+        ]
+    );
+}
