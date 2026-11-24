@@ -1001,67 +1001,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ../.github/scripts/post-gas-snapshot-comment.sh /tmp/gas-diff.txt
 
-  solidity-fork-test:
-    name: solidity fork test
-    runs-on: ubuntu-latest
-    needs: changes
-    if: needs.changes.outputs.solidity == 'true' || github.event_name != 'pull_request'
-    defaults:
-      run:
-        working-directory: contracts
-    env:
-      FOUNDRY_PROFILE: fork
-      # Live RPC endpoint for the one fork suite, `GenesisBuybackActivation.fork`
-      # (issue #1090), which exercises the Arbitrum Sepolia deploy path #1083 takes.
-      # `contracts/foundry.toml`'s `arbitrum_sepolia` `[rpc_endpoints]` alias
-      # interpolates this var, so the two names change together. That suite forks at
-      # LATEST and creates + seeds its own pool, so a plain public (non-archive)
-      # endpoint suffices. The secret is absent on fork PRs (secrets are withheld)
-      # and in forks that never configured it — the run step below no-ops when it is
-      # unset and the suite self-skips on its own, so this job never blocks a PR for
-      # a missing secret.
-      ARBITRUM_SEPOLIA_RPC_URL: ${{ secrets.ARBITRUM_SEPOLIA_RPC_URL }}
-    steps:
-      # submodules: recursive — forge-std + openzeppelin-contracts are submodules.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          submodules: recursive
-      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
-        with:
-          version: v1.7.1
-      # A skipped step yields a SUCCESSFUL job, and the checks UI renders
-      # "solidity fork test ✓" identically whether the fork suite passed or never
-      # ran at all — telling them apart otherwise means opening the log and noticing
-      # an absence. This step always runs and puts the state in the job summary.
-      # Deliberately not a failure: fork PRs cannot have secrets by policy, and a
-      # hard gate here would turn main red whenever the secret is unavailable.
-      - name: Fork RPC configuration
-        if: always()
-        run: |
-          if [ -z "$ARBITRUM_SEPOLIA_RPC_URL" ]; then
-            echo "::warning::ARBITRUM_SEPOLIA_RPC_URL is not configured — the fork suite did not run"
-            echo "- ⚠️ \`ARBITRUM_SEPOLIA_RPC_URL\` unset — suite skipped" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- ✅ \`ARBITRUM_SEPOLIA_RPC_URL\` configured" >> "$GITHUB_STEP_SUMMARY"
-          fi
-      # The suite self-skips when the var is unset, which is what keeps an offline
-      # `forge test` green; the `if:` below only avoids burning a runner.
-      # `forge test --match-path` exits 0 on a glob that matches nothing, so a rename
-      # or a typo would otherwise go green — and, with the summary above, green next
-      # to a configured-secret checkmark. The count catches that rename; proving a
-      # test body ran is the `-vv` output's job.
-      - name: Fork tests (no-op when no fork RPC is set)
-        if: env.ARBITRUM_SEPOLIA_RPC_URL != ''
-        run: |
-          matched=$(ls -1 test/*.fork.t.sol 2>/dev/null | wc -l)
-          echo "- fork suites matched by the glob: $matched" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$matched" -eq 0 ]; then
-            echo "::error::test/*.fork.t.sol matched no files — the fork suites have moved or been renamed"
-            exit 1
-          fi
-          forge test --match-path 'test/*.fork.t.sol' -vv
-
   solidity-coverage:
     name: solidity coverage
     runs-on: ubuntu-latest
@@ -1270,7 +1209,6 @@ jobs:
       - run: make -C adr check-md-anchors
       - run: make -C adr check-anchor-targets
       - run: make -C adr check-no-section-numbers
-      - run: make -C adr check-no-history-links
 
   # Pytest suite for CI helper and path-filter regressions. Non-blocking by design
   # — excluded from ci-success.needs — so a regression in the helper surfaces

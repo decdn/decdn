@@ -18,8 +18,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build commands, ADR conventions, pre-
 
 - The next ADR number is 042. Name each file `NNN-topic.md`. Use a 3-digit prefix.
 - List `adr/` and find the highest number before you make a new ADR. Do not trust this note for the current number.
-- Do not use these numbers again: 004, 006, 007, 010, 014, 015, 020, 021, 023, 025, 027, 028, 029, 031, 032, 033, 034, 035. Each one is retired or reclassified.
-- Retired ADRs move to `adr/_history/`. Read the file there if you need the history. Do not add the history to this file.
+- Do not use these numbers again: 004, 006, 007, 010, 014, 015, 018, 020, 021, 023, 025, 027, 028, 029, 031, 032, 033, 034, 035. Each one is retired or reclassified.
+- Delete a retired ADR. Git history keeps it. Do not add the history to this file.
 - Write ADRs in ASD-STE100 Simplified Technical English: short sentences, active voice, present tense, one idea per sentence. Every ADR follows this. Keep new ADRs and edits the same.
 
 ## Common Commands
@@ -77,7 +77,7 @@ crates/
   sponsord/     — daemon binary `sponsord`: `SPONSORD_*` config, bearer-token axum API, metrics. Stateless; decides nothing about who gets a capability. Sink; footprint-guarded like `cli`
   sponsord-onramp/ — public onramp binary `sponsord-onramp`: a `Gate` trait (`TurnstileGate` built in) in front of a `CapabilitySource`, the in-memory browser→installer hand-off, and the `decdn.sh` / `decdn.ps1` installers it renders at startup. Also an embeddable library for a custom gate (`docs/sponsord/integrator.md`), so not a sink
   sponsord-e2e/ — test-only (`publish = false`): the real daemon router behind the real onramp, driven by the onramp's `decdn.sh`, against `FakePool`
-contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, PaymentPool, OriginAssignment, BuybackBurner, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites, plus Ed25519Verifier + BondMath helpers)
+contracts/      — Solidity contracts + Foundry (repo root, excluded from workspace; ships Token, CapacityBond, FeeRouter, PaymentPool, OriginAssignment, ContentBlacklist, PublisherRegistry, DecdnGovernor with test suites, plus Ed25519Verifier + BondMath helpers)
 ```
 
 **Dependency flow** (normal deps; `→` reads "depends on"): `node → cache, client, incentive, reputation, protocol, common, bao-range`; `cli → cache, client, incentive, common, protocol, bao-range, config-types`; `client → incentive, common, protocol, bao-range`; `incentive → common, protocol`; `cache → config-types, protocol, bao-range`; `common → config-types, protocol` (no longer `→ cache`, #578); `reputation → protocol`; `sponsord → sponsord-core, sponsord-api, incentive, common`; `sponsord-core → sponsord-api, client, incentive, common`; `sponsord-onramp → sponsord-api`. Four true leaves — `protocol`, `config-types`, `bao-range`, `sponsord-api` — so the client SDK and the sponsord servers link no blob store / AWS SDK. The CLI links `cache` store-only (no `s3` feature) for the `decdn gateway` cache, so it links the blob store and no AWS SDK. `e2e` depends on most of the graph, `sponsord-e2e` reaches the sponsord stack through dev-dependencies only, and nothing depends on either; likewise nothing depends on `cli` or `sponsord`. All four are sinks. This flow is enforced: `.github/scripts/check_crate_edges.py` holds it as a table (direct edges per crate, plus the transitive closures of `decdn-cli`, the `decdn-client` SDK, `sponsord` and `sponsord-onramp`, resolved per crate with `cargo tree -p`, staying free of `iroh-blobs` (the CLI excepted)/`aws-sdk-s3`/`aws-config`, the `aws-lc-*` crypto library and `jsonrpsee-server` — client builds link one TLS backend, ring, #2454) and runs in the `packaging` CI job and the `crate-edges` pre-commit hook. Changing an edge is a design change: update the table and this paragraph together.

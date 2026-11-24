@@ -34,9 +34,7 @@ contract LoopbackCctpTest is Test {
             windowEpochs_: 13,
             deliveryFloor_: 1,
             admin: address(this),
-            rebateBps_: 7500,
-            buybackBps_: 0,
-            buybackBurner_: address(0)
+            rebateBps_: 7500
         });
         CctpSweepReceiver receiver = new CctpSweepReceiver(usdc, cctp, address(cctp), IFeeRouter(address(router)));
 

@@ -5,7 +5,7 @@
 
 ## Context
 
-[ADR 026](026-tokenomics.md#adr-026-tokenomics) defines a work-token tokenomics model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), and exposes `firstBondedAt(operator)` as the source of the `age_ramp` tenure factor; (ii) a governance-chain `FeeRouter` that receives sweeps from payment-chain pools, splits each swept protocol share by governable `rebateBps`, `buybackBps` and a treasury remainder, and whose per-operator `bytesPerEpoch` accounting is the source of served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
+[ADR 026](026-tokenomics.md#adr-026-tokenomics) defines a work-token tokenomics model. The governance-relevant primitives are: (i) a single `CapacityBond` contract that holds operator bonds proportional to declared bandwidth (`bond = k × Mbps^α`), and exposes `firstBondedAt(operator)` as the source of the `age_ramp` tenure factor; (ii) a governance-chain `FeeRouter` that receives sweeps from payment-chain pools, splits each swept protocol share into a governable `rebateBps` and a treasury remainder, and whose per-operator `bytesPerEpoch` accounting is the source of served-bytes voting weight per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight).
 
 Governance — how protocol parameters are changed, who can change them, and what safety mechanisms exist — is a separate concern. The governance contracts (`DecdnGovernor`, `TimelockController`) ship in the day-one single-audit-pass surface ([ADR 016 § Contract Inventory](016-contract-interactions.md#contract-inventory)); what differs by phase is the governance *process*, not the contract surface. In the PoC, parameters are changed through a single admin key. At launch, a bootstrap multisig replaces the admin key while the operator set is too thin for operator-weighted DAO voting (served-bytes-weighted per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight)) to be safe. When the bootstrap multisig judges the operator set broad enough, it executes a one-shot transition to full operator-weighted DAO governance.
 
@@ -57,7 +57,7 @@ The clock is timestamp-based (ERC-6372 `mode=timestamp`) to align with `FeeRoute
 
 Quorum and proposal threshold are calibrated against `FeeRouter.totalBytesInWindow(epoch(ts), windowEpochs)` — the unramped sum of served bytes across all operators over the trailing window, each operator's epoch bytes clamped to its declared capacity — **not** total TOKEN supply and **not** the per-operator-capped weighted total. The Governor uses the unramped total as a tractable upper bound for the strictly-correct capped-and-ramped sum (which would be O(active_operators × N) to compute); the resulting quorum / threshold is mildly conservative. Voting weight tracks active operator service delivery rather than passive holdings; calibrating against it avoids the failure mode where the quorum bar trivially exceeds engaged voting power as TOKEN circulates.
 
-**Non-operator TOKEN holders carry zero voting weight.** Traders, passive holders, vesting recipients (Core Contributors, Advisors, Seed, Private, Treasury, Public Sale, Airdrop / Testnet, Marketing, LP/MM/POL), and any TOKEN not bonded into `CapacityBond` have no vote. Per [ADR 026 § Governance](026-tokenomics.md#governance), this is the work-token regulatory-cleanliness commitment: passive holding earns nothing — neither revenue nor governance privilege.
+**Non-operator TOKEN holders carry zero voting weight.** Traders, passive holders, vesting recipients (Core Contributors, Advisors, Seed, Private, Treasury, Public Sale, Airdrop / Testnet, Marketing), and any TOKEN not bonded into `CapacityBond` have no vote. Per [ADR 026 § Governance](026-tokenomics.md#governance), this is the work-token regulatory-cleanliness commitment: passive holding earns nothing — neither revenue nor governance privilege.
 
 #### Non-operator holder protection
 
@@ -87,16 +87,15 @@ All economic parameters across the protocol are governable within hardcoded safe
 
 #### FeeRouter split (per [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split))
 
-The governance-chain `FeeRouter` splits each swept protocol share. Governance sets the split through the Timelock. The rebate is at most 99%, so buyback plus treasury keep at least 1% and vote weight stays earnable ([ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)).
+The governance-chain `FeeRouter` splits each swept protocol share. Governance sets the split through the Timelock. The rebate is at most 99%, so the treasury keeps at least 1% and vote weight stays earnable ([ADR 016 § Tunable Economics](016-contract-interactions.md#tunable-economics)).
 
 | Parameter | Meaning |
 | --- | --- |
 | `rebateBps` | Share returned to the operator |
-| `buybackBps` | Share sent to `BuybackBurner`; 0 switches buyback off |
 | Treasury remainder | The rest goes to the Timelock treasury |
-| `buybackBurner`, `treasury` | Destination addresses |
+| `treasury` | Destination address of the remainder |
 
-A non-zero `buybackBps` needs a non-zero burner address. A non-zero treasury remainder needs a non-zero treasury address. The operator's own guarantee is the immutable `operatorBps` of each pool, which governance cannot change.
+The treasury address is never zero. The operator's own guarantee is the immutable `operatorBps` of each pool, which governance cannot change.
 
 #### CapacityBond curve and governance parameters (per [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve))
 
@@ -108,7 +107,7 @@ A non-zero `buybackBps` needs a non-zero burner address. A non-zero treasury rem
 | `age_ramp_months` | 6 | 1 | 24 |
 | Per-operator voting cap | 10% | 1% | 10% |
 | `windowEpochs` (served-bytes trailing window, on `FeeRouter`) | 13 | 4 | 26 |
-| `deliveryFloor` (net USDC micro-units per MB of weight, on `FeeRouter`) | 1 | 1 | 1000 |
+| `deliveryFloor` (treasury-leg USDC micro-units per MiB of weight, on `FeeRouter`) | 1 | 1 | 1000 |
 
 The α range upper-bounds at 1.8 to prevent a concentration penalty so steep that mid-tier operators are economically barred from upgrading; the lower bound at 1.0 ensures decentralization pressure is never fully disabled. k is parameterized via the 1G-tier bond range to constrain governance volatility — direct changes to k can shift the entire bond curve, so the bound is on the *resulting bond* rather than on k itself. The per-operator voting cap launches at its 10% ceiling and is decrease-only within `[1%, 10%]`; it is the primary defense against bytes-weighted concentration per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). The `windowEpochs` bounds are pinned in [ADR 036 § Governable parameters with safety bounds](036-served-bytes-voting-weight.md#governable-parameters-with-safety-bounds): below 4 epochs (~1 month) vote weight is too reactive to single-burst wash trading; above 26 epochs (~6 months) the trailing window lags actual operator-set composition and `DecdnGovernor._getVotes` cold-SLOAD gas rises to ~55K per voter per `castVote`.
 
@@ -123,7 +122,7 @@ The α range upper-bounds at 1.8 to prevent a concentration penalty so steep tha
 | Max namespaces per publisher | PublisherRegistry | 1 | 1000 |
 | Namespace transfer timelock | PublisherRegistry | 24 hours | 30 days |
 
-`PaymentPool` has no governance parameters. Its dispute window and operator share are immutables fixed per deployment (the payment-chain admission rule is in [ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)). There is no settlement-time fee skim or discount-stake mechanic on the payment contract. Buyback is the `buybackBps` share of the `FeeRouter` split. The only TOKEN-side requirement on operators is the capacity bond. At entry, it must meet the larger of the capacity-bond curve and the global `minBond` floor ([ADR 026 § Minimum bond is non-retroactive](026-tokenomics.md#minimum-bond-is-non-retroactive)).
+`PaymentPool` has no governance parameters. Its dispute window and operator share are immutables fixed per deployment (the payment-chain admission rule is in [ADR 016 § Deployment Tiers](016-contract-interactions.md#deployment-tiers)). There is no settlement-time fee skim or discount-stake mechanic on the payment contract. The only TOKEN-side requirement on operators is the capacity bond. At entry, it must meet the larger of the capacity-bond curve and the global `minBond` floor ([ADR 026 § Minimum bond is non-retroactive](026-tokenomics.md#minimum-bond-is-non-retroactive)).
 
 The 7-day voting period balances responsiveness with participation. Combined with the 1-day voting delay and the 48-hour timelock, the total governance delay is ~10 days minimum — longer than the standard OpenZeppelin Governor defaults, reflecting operator-class participation cadence.
 
@@ -172,7 +171,7 @@ CapacityBond parameters are defined in [ADR 026 § Capacity-bond curve](026-toke
 ### Negative
 
 - Served-bytes-weighted governance shifts capture risk from large TOKEN holders to high-traffic operators; safety bounds limit damage but cannot prevent rent-seeking within allowed parameter ranges (e.g., setting the treasury remainder of the swept protocol share to its maximum). The 10% per-operator voting cap and the age-ramp partially mitigate concentration. Real CDN traffic skews power-law, so the cap is load-bearing and may need tightening toward the 1% floor during early mainnet per [ADR 036 § Risks](036-served-bytes-voting-weight.md#risks).
-- Served-bytes-weighted voting is gameable by operators self-paying for delivery — the attacker's cost is the USDC that stays with the protocol (buyback and treasury), enforced on the governance chain by the credit formula. The attack is bounded by the per-operator cap and `age_ramp`, but cost-to-buy-10%-vote is non-zero. Per [ADR 036 § Threat Model — Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying).
+- Served-bytes-weighted voting is gameable by operators self-paying for delivery — the attacker's cost is the USDC that stays with the protocol (the treasury leg), enforced on the governance chain by the credit formula. The attack is bounded by the per-operator cap and `age_ramp`, but cost-to-buy-10%-vote is non-zero. Per [ADR 036 § Threat Model — Wash-trading as vote-buying](036-served-bytes-voting-weight.md#wash-trading-as-vote-buying).
 - 1-day voting delay + 7-day voting period + 48-hour timelock means ~10 days minimum to respond to non-emergency issues via governance
 - Governance participation typically skews low; 4% quorum (against total voting weight) may be difficult to reach consistently, especially during the bootstrap-multisig phase where served-bytes-weighted voting isn't yet active
 - Non-operator TOKEN holders — including investors, team, treasury, and vesting recipients — have zero DAO vote unless they also operate a node. This is the deliberate regulatory-cleanliness commitment but it materially narrows the political base of the DAO. See [Investor disposition](#investor-disposition) above.

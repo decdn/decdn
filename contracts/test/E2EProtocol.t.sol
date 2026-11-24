@@ -88,9 +88,7 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
             // Launch split: the operator gets 90% of a redemption end to end
             // (6000 in the pool, then 7500 of the swept 40%), the treasury 10%.
             feeRouterRebateBps: 7500,
-            feeRouterBuybackBps: 0,
             feeRouterDeliveryFloor: 1,
-            buybackBurner: address(0),
             cctpMessageTransmitter: IMessageTransmitterV2(address(cctp)),
             cctpTokenMessenger: address(cctp)
         });
@@ -151,7 +149,6 @@ contract E2EProtocolTest is Test, BaseProtocolDeploy {
         uint256 rebate = protocolShare * cfg.feeRouterRebateBps / 10_000;
         assertEq(usdc.balanceOf(operator), operatorShare + rebate, "operator share plus rebate");
         assertEq(usdc.balanceOf(address(d.timelock)), protocolShare - rebate, "treasury share");
-        assertEq(d.router.buybackBurner(), address(0), "buyback dormant at launch");
         assertEq(usdc.balanceOf(address(d.router)), 0, "router holds nothing");
 
         uint256 epoch = block.timestamp / cfg.feeRouterEpochLength;

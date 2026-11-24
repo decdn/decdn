@@ -1394,15 +1394,6 @@ impl ChainFixture {
     }
 }
 
-/// Build the contracts with `forge build` (a warm no-op once they are built)
-/// and return the `contracts/` directory, whose `out/` then holds a current
-/// artifact for every contract. Requires `forge` on `PATH`.
-pub async fn build_contracts() -> anyhow::Result<PathBuf> {
-    let contracts = contracts_dir()?;
-    forge_build(&contracts).await?;
-    Ok(contracts)
-}
-
 /// `crates/<package>/ → ../../contracts`, from the running test's package
 /// directory. `CARGO_MANIFEST_DIR` is read at run time, where cargo and nextest
 /// set it for every test process, not with `env!`: a compile-time read embeds

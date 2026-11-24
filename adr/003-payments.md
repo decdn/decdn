@@ -37,7 +37,7 @@ Key parameters:
 
 - Payment quantum: `chunk_bytes` = 1 MiB delivered per meter tick, a fixed constant every signer and node reads directly — no negotiation, no wire field (see [Chunk Cadence](#chunk-cadence)). A tick is a released hash-chain preimage, not a signature: one signed voucher opens a 255-chunk chain and a second closes it, so signatures are O(1) per transfer rather than one per interval
 - Minimum deposit: none on-chain beyond non-zero. Deposit sizing is node-informed policy, not a contract floor (see [Deposit Economics](#deposit-economics))
-- Fee routing: each redemption pays the operator `operatorBps` (60% in the reference deployment) in the same transaction. The remainder accrues in the pool and a sweep sends it to the governance-chain `FeeRouter`. The `FeeRouter` splits it into rebate, buyback and treasury, and the split is governable ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). See [FeeRouter Integration](#feerouter-integration).
+- Fee routing: each redemption pays the operator `operatorBps` (60% in the reference deployment) in the same transaction. The remainder accrues in the pool and a sweep sends it to the governance-chain `FeeRouter`. The `FeeRouter` splits it into a rebate to the operator and a treasury remainder, and the split is governable ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). See [FeeRouter Integration](#feerouter-integration).
 - Operator return is differentiated through the `CapacityBond` lock-to-capacity curve per [ADR 026](026-tokenomics.md#adr-026-tokenomics), not via a fee-discount mechanic on the payment contract.
 
 ### Capability delegation
@@ -798,15 +798,11 @@ The split of each sweep emits its own events from the governance-chain `FeeRoute
 
 The pool enforces no price floor and clamps no bytes. It settles each voucher's **cumulative** `amount` in full. It accrues the paid-proportional byte count in `pending`.
 
-The delivery floor is a governance-chain `FeeRouter` parameter. It prices vote weight: the `FeeRouter` credits `min(bytes, net * 1 MiB / deliveryFloor)` for each sweep, where `net` is the USDC that goes to the buyback and the treasury (see [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). This binds credited bytes to real USDC and restores the proportional-cost assumption that [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) relies on. A voucher cannot decouple a large `bytesDelivered` from a tiny `amount`, because the excess bytes earn no credit.
+The delivery floor is a governance-chain `FeeRouter` parameter. It prices vote weight: the `FeeRouter` credits `min(bytes, treasuryLeg * 1 MiB / deliveryFloor)` for each sweep, where `treasuryLeg` is the USDC that goes to the treasury (see [ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)). This binds credited bytes to real USDC and restores the proportional-cost assumption that [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight) relies on. A voucher cannot decouple a large `bytesDelivered` from a tiny `amount`, because the excess bytes earn no credit.
 
 Each redemption's byte count is bounded by that redemption's own payment: `bytesPaid = mulDiv(bytesDelta, paid, desired)`. A partial-drain payment accrues only the bytes its money buys.
 
 The node never mirrors the floor on the wire. It advertises its configured `rate_per_mb` verbatim and checks that each voucher pays that rate for the bytes the voucher covers, which protects its own per-delta revenue. A node that quotes below the floor keeps serving and keeps its money. It loses only vote-weight credit on the sub-floor bytes.
-
-### BuybackBurner
-
-`BuybackBurner` lives on the governance chain, not on a payment chain. Its members, guards and venue are specified in [ADR 018 § Buyback execution via Uniswap V3](018-liquidity-strategy.md#buyback-execution-via-uniswap-v3) and [ADR 016](016-contract-interactions.md#contract-inventory). The `FeeRouter` feeds it ([ADR 026 § FeeRouter split](026-tokenomics.md#feerouter-split)).
 
 ### FeeRouter Integration
 

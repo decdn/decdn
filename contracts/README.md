@@ -10,15 +10,14 @@ Deployable contracts in [`src/`](src/). `PaymentPool` runs on each payment chain
 
 | Contract | Purpose | ADR |
 |----------|---------|-----|
-| `Token` | Fixed-supply (1B) ERC20 with permit + burn; no mint post-genesis | [026](../adr/026-tokenomics.md) |
+| `Token` | Fixed-supply (1B) ERC20 with permit, minted once at genesis | [026](../adr/026-tokenomics.md) |
 | `CapacityBond` | Operator registry; custodies the TOKEN bond (released in one `unbond` call), supplies the active flag and declared capacity `FeeRouter` credits against | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
-| `FeeRouter` | Permissionless `deposit` of each sweep: rebate / buyback / treasury split and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
+| `FeeRouter` | Permissionless `deposit` of each sweep: rebate / treasury split and the canonical served-bytes accountant for vote weight | [026](../adr/026-tokenomics.md), [036](../adr/036-served-bytes-voting-weight.md) |
 | `CctpSweepReceiver` | Stateless CCTP V2 bridge adapter: receives a sweep and deposits each operator's share into `FeeRouter` | [016](../adr/016-contract-interactions.md#bridge-adapters) |
 | `PaymentPool` | Payment-chain USDC pool with off-chain vouchers and on-chain redemption; pays `operatorBps` at redemption and sweeps the rest over CCTP, up to 32 operators per transfer. Built on the bridge-neutral `PaymentPoolBase` | [003](../adr/003-payments.md) |
 | `OriginAssignment` | Namespace origin sets: a vetted publisher seats and unseats bonded operators as origins for its namespaces | [011](../adr/011-content-takedown.md) |
 | `ManualVettingPolicy` | Genesis vetting policy: a `VETTER_ROLE` holder approves which publishers may seat origins | [011](../adr/011-content-takedown.md#vetting-policies) |
 | `OpenVettingPolicy` | Vetting policy that vets every publisher; for local and test deployments only | [011](../adr/011-content-takedown.md#vetting-policies) |
-| `BuybackBurner` | Swaps the `buybackBps` share of each sweep for TOKEN and burns the proceeds; venue-neutral abstract base with a concrete Uniswap V3 subclass | [018](../adr/018-liquidity-strategy.md), [026](../adr/026-tokenomics.md) |
 | `ContentBlacklist` | Global + regional content-hash blacklist, operator- and origin-level blacklists | [011](../adr/011-content-takedown.md) |
 | `PublisherRegistry` | Permissionless namespace creation and timelocked namespace ownership transfer | [002](../adr/002-content-addressing.md) |
 | `DecdnGovernor` | Served-bytes-weighted on-chain governor with a Timelock executor | [036](../adr/036-served-bytes-voting-weight.md) |
@@ -36,22 +35,18 @@ Libraries:
 
 ```
 contracts/
-  src/            — contracts (PaymentPoolBase and the buyback bases abstract) + 3 libraries
+  src/            — contracts (PaymentPoolBase abstract) + 3 libraries
     interfaces/   — frozen external surfaces (I*.sol), including the CCTP V2 calls
   test/           — Foundry suite (*.t.sol + mocks/ + ed25519-vectors/)
   testnet/        — TestnetFaucet and LoopbackCctp (same-chain CCTP for local deploys)
   script/         — DeployProtocol (governance chain), DeployPaymentPool (each
-                    payment chain), BaseProtocolDeploy, ActivateBuyback,
+                    payment chain), BaseProtocolDeploy,
                     TransitionToGovernor, TestnetFaucet
-    interfaces/   — pool-creation surfaces used only by the deploy scripts
-    lib/          — BuybackVenueLib (shared burner construction + steady-state split)
   lib/            — submodules: openzeppelin-contracts, forge-std, solady, crypto-lib
 ```
 
-`TransitionToGovernor` broadcasts nothing; `ActivateBuyback` broadcasts only the
-burner deployment. Both then print the Timelock calldata for a governance action
-to schedule — neither can activate or transition anything itself. `TransitionToGovernor`
-ends the [ADR 009](../adr/009-governance.md#bootstrap-multisig-phase)
+`TransitionToGovernor` broadcasts nothing. It prints the Timelock calldata for a
+governance action to schedule, so it cannot transition anything itself. It ends the [ADR 009](../adr/009-governance.md#bootstrap-multisig-phase)
 bootstrap-multisig phase (only relevant if the deploy set `BOOTSTRAP_MULTISIG`):
 
 ```bash
