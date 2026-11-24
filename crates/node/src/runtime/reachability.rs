@@ -7,7 +7,8 @@
 //! which is expected. The report states which case applies, sets
 //! `decdn_node_public_address`, and warns only when a public node's registry
 //! `multiaddrs` do not carry one of its public addresses, since peers dial the
-//! registered address first.
+//! registered address first. When `network.external_addrs` is set, its
+//! addresses are the public ones and the host's own addresses do not count.
 
 use std::net::SocketAddr;
 
@@ -45,8 +46,9 @@ fn classify(public: &[SocketAddr], registered: &[SocketAddr]) -> Reachability {
 }
 
 /// Log the node's reachability once and set `decdn_node_public_address`.
-/// The public addresses are the host's route-public IPs on `bind_port` and
-/// each of `external_addrs` (`network.external_addrs`) on its own port.
+/// The public addresses are each of `external_addrs` (`network.external_addrs`)
+/// on its own port when there are any, else the host's route-public IPs on
+/// `bind_port`.
 /// `registered` is this node's own decoded registry `multiaddrs`.
 pub(super) fn report(
     metrics: &Metrics,

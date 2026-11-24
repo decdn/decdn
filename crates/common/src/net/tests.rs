@@ -97,18 +97,20 @@ fn parse_external_addr_canonicalises_v4_mapped() {
 }
 
 #[test]
-fn public_quic_addrs_joins_route_and_external_without_repeats() {
+fn public_quic_addrs_prefers_external_without_repeats() {
     let route: Vec<IpAddr> = vec!["8.8.8.8".parse().unwrap()];
     let external: Vec<SocketAddr> = vec![
-        "8.8.8.8:4433".parse().unwrap(),
         "1.1.1.1:30443".parse().unwrap(),
         "1.1.1.1:30443".parse().unwrap(),
     ];
     assert_eq!(
         public_quic_addrs(&route, 4433, &external),
-        vec![
-            "8.8.8.8:4433".parse::<SocketAddr>().unwrap(),
-            "1.1.1.1:30443".parse().unwrap(),
-        ]
+        vec!["1.1.1.1:30443".parse::<SocketAddr>().unwrap()],
+        "configured addresses replace the host's own"
+    );
+    assert_eq!(
+        public_quic_addrs(&route, 4433, &[]),
+        vec!["8.8.8.8:4433".parse::<SocketAddr>().unwrap()],
+        "with none configured, the host's public IPs on bind_port"
     );
 }

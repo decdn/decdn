@@ -7181,3 +7181,12 @@ fn configured_external_addrs_names_the_bad_index() {
     assert!(msg.contains("network.external_addrs[1]"), "{msg}");
     assert!(msg.contains("192.168.1.2"), "{msg}");
 }
+
+#[test]
+fn configured_external_addrs_names_an_unexpanded_var() {
+    let err = configured_external_addrs(&["${LB_IP}:30443".to_string()]).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(msg.contains("does not expand"), "{msg}");
+    assert!(msg.contains("--multiaddr"), "{msg}");
+}

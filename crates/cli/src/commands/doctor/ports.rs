@@ -68,8 +68,9 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 
 /// Report whether the host takes direct inbound connections (ADR 001 § Node
 /// Discovery). `public` holds the QUIC addresses a remote peer can dial, each
-/// with its own port: the host's route-public IPs on `bind_port` and each
-/// configured `network.external_addrs` address, as the daemon counts them.
+/// with its own port: each configured `network.external_addrs` address when
+/// there are any, else the host's route-public IPs on `bind_port`, as the
+/// daemon counts them.
 /// Both outcomes pass: a host behind NAT is a supported setup whose inbound
 /// runs through the relay and hole-punching.
 pub(crate) fn classify_reachability(public: &[SocketAddr], bind_port: u16) -> Finding {

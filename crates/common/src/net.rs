@@ -10,9 +10,9 @@
 //! private address.
 //!
 //! [`parse_external_addr`] holds the rule for one `network.external_addrs`
-//! entry, which both the daemon and the CLI apply. [`public_quic_addrs`] joins
-//! the host's public addresses and the configured ones into the set of QUIC
-//! addresses a remote peer can dial.
+//! entry, which both the daemon and the CLI apply. [`public_quic_addrs`] gives
+//! the set of QUIC addresses a remote peer can dial: the configured ones when
+//! there are any, else the host's public addresses.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 
@@ -134,21 +134,28 @@ pub fn parse_external_addr(raw: &str) -> anyhow::Result<SocketAddr> {
     Ok(SocketAddr::new(ip, addr.port()))
 }
 
-/// The QUIC addresses a remote peer can dial: each of `route_public` (the
-/// host's public IPs, from [`route_public_ips`]) on `bind_port`, then each of
-/// `external` (the configured `network.external_addrs`) on its own port. An
-/// address that appears twice is kept once, at its first place.
+/// The QUIC addresses a remote peer can dial. When `external` (the configured
+/// `network.external_addrs`) holds any address, these are its addresses, each
+/// on its own port: an operator who sets the key fronts the node with those
+/// addresses, so the host's own addresses do not count. Otherwise they are
+/// each of `route_public` (the host's public IPs, from [`route_public_ips`])
+/// on `bind_port`. An address that appears twice is kept once, at its first
+/// place.
 #[must_use]
 pub fn public_quic_addrs(
     route_public: &[IpAddr],
     bind_port: u16,
     external: &[SocketAddr],
 ) -> Vec<SocketAddr> {
-    let mut out: Vec<SocketAddr> = Vec::with_capacity(route_public.len() + external.len());
-    let candidates = route_public
-        .iter()
-        .map(|ip| SocketAddr::new(*ip, bind_port))
-        .chain(external.iter().copied());
+    let candidates: Vec<SocketAddr> = if external.is_empty() {
+        route_public
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, bind_port))
+            .collect()
+    } else {
+        external.to_vec()
+    };
+    let mut out: Vec<SocketAddr> = Vec::with_capacity(candidates.len());
     for addr in candidates {
         if !out.contains(&addr) {
             out.push(addr);

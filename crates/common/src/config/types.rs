@@ -109,9 +109,10 @@ pub struct NetworkConfig {
     /// refused, and the IP must be public. The port is the one peers dial,
     /// which can differ from [`Self::bind_port`]. The node publishes each
     /// address in its address record and counts it as a public address in its
-    /// reachability check. `decdn setup` and `decdn node register` register
-    /// these addresses when no `--multiaddr` is given. A change takes effect
-    /// on restart.
+    /// reachability check, in place of the host's own addresses. When the list
+    /// holds any address, `decdn setup` and `decdn node register` register
+    /// these addresses if no `--multiaddr` is given; an empty list counts as
+    /// unset. A change takes effect on restart.
     pub external_addrs: Option<Vec<String>>,
     /// Operator-configurable address discovery (#818 scope 1). Absent => the
     /// node uses the n0-hosted pkarr/DNS discovery (`presets::N0`, unchanged).

@@ -49,7 +49,8 @@ pub fn configured_bind_port(file_bind_port: Option<u16>) -> u16 {
 /// The configured external addresses as a command without `RunArgs` resolves
 /// them from `raw` (the config file's `network.external_addrs`): each entry
 /// parsed by [`crate::net::parse_external_addr`], in order, each address kept
-/// once. The same rule [`resolve_config`] applies.
+/// once. The same rule [`resolve_config`] applies. The caller reads the file
+/// raw, so an entry that holds `${VAR}` is refused with its own error.
 ///
 /// # Errors
 ///
@@ -57,6 +58,11 @@ pub fn configured_bind_port(file_bind_port: Option<u16>) -> u16 {
 pub fn configured_external_addrs(raw: &[String]) -> anyhow::Result<Vec<std::net::SocketAddr>> {
     let mut out = Vec::with_capacity(raw.len());
     for (i, entry) in raw.iter().enumerate() {
+        anyhow::ensure!(
+            !entry.contains("${"),
+            "network.external_addrs[{i}]: {entry:?} holds a ${{VAR}} reference, which this \
+             command does not expand; pass the address with --multiaddr"
+        );
         let addr = crate::net::parse_external_addr(entry)
             .with_context(|| format!("network.external_addrs[{i}]"))?;
         if !out.contains(&addr) {

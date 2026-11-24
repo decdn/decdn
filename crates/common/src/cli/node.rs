@@ -710,7 +710,7 @@ pub struct RegisterArgs {
     /// `/ip4/203.0.113.10/udp/4433/quic-v1`. Repeatable. The node listens on
     /// the same port over IPv4 and IPv6, so a dual-stack host also registers
     /// `/ip6/2001:db8::10/udp/4433/quic-v1`. Omitted, it defaults to each
-    /// `network.external_addrs` address when the config sets the key, else to
+    /// `network.external_addrs` address when that list holds any, else to
     /// the host's public address on `network.bind_port` when the default route
     /// has one. A host behind NAT registers none, and peers reach it through
     /// the relay; set the forwarded address in `network.external_addrs` or
