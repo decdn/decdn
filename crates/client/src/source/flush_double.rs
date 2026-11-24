@@ -113,8 +113,4 @@ impl IngestStore for FlushCountingStore {
     fn proven(&self) -> Option<u64> {
         IngestStore::proven(&self.inner)
     }
-
-    fn set_bound(&self, bound: u64) {
-        IngestStore::set_bound(&self.inner, bound);
-    }
 }
