@@ -1050,7 +1050,7 @@ impl<'a> BuyerPoolTable<'a> {
             Err(err) => return Err(StoreError::Backend(format!("open_table (delegate): {err}"))),
         };
         let range = table
-            .range::<&[u8; DELEGATE_LANE_KEY_LEN]>(&first..=&last)
+            .range(&first..=&last)
             .map_err(|err| StoreError::Backend(format!("range (delegate): {err}")))?;
         let mut out = Vec::new();
         for entry in range {

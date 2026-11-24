@@ -384,10 +384,11 @@ jsonrpsee = { version = "0.26", features = ["http-client", "macros"] }
 # Embedded persistent KV (used by `node` to fence voucher replay across
 # restarts — issue #527 / ADR 003 §Off-chain voucher state persistence).
 # Pure-Rust, ACID, single-file, fsync on commit via `Durability::Immediate`.
-# 4.2 floor: `pool_store::flush` commits its batch in ascending key order, and
-# the append fast path that makes that pay off arrives in 4.2. Below it the same
-# sort is a pessimization — measured at 1.31x MORE leaf pages on 4.1 — so the
-# floor is what keeps the sort a win rather than a regression.
+# `pool_store::flush` commits its batch in ascending key order to hit redb's
+# append fast path (4.2 and later). Below 4.2 the same sort is a pessimization —
+# measured at 1.31x MORE leaf pages on 4.1. No table stores an `Option<&str>`,
+# `Option<String>`, `Option<bool>` or `Option<char>`, so 5.0 reads files that 4.x
+# wrote. `iroh-blobs` links its own redb 4.x for its blob store's separate file.
 redb = "5.0"
 
 [workspace.lints.rust]

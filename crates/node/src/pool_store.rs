@@ -927,7 +927,7 @@ impl PoolStoreFiles {
         let out = DashMap::new();
         let (lo, hi) = lane_key_range(deployment);
         let iter = table
-            .range::<&[u8; LANE_KEY_LEN]>(&lo..=&hi)
+            .range(&lo..=&hi)
             .map_err(|err| StoreError::Backend(format!("table range: {err}")))?;
         for entry in iter {
             let (key_guard, value_guard) =
@@ -1580,7 +1580,7 @@ impl SettlementLedger for PoolStoreFiles {
         let start = sent_redeem_key(deployment, B256::ZERO);
         let end = sent_redeem_key(deployment, B256::repeat_byte(0xff));
         let iter = table
-            .range::<&[u8; SENT_REDEEM_KEY_LEN]>(&start..=&end)
+            .range(&start..=&end)
             .map_err(|err| StoreError::Backend(format!("range: {err}")))?;
         let mut out = Vec::new();
         for entry in iter {
@@ -1665,7 +1665,7 @@ impl SettlementLedger for PoolStoreFiles {
         let lo = settlement_key(deployment, block_number, 0);
         let hi = settlement_key(deployment, block_number, u64::MAX);
         let iter = table
-            .range::<&[u8; SETTLEMENT_KEY_LEN]>(&lo..=&hi)
+            .range(&lo..=&hi)
             .map_err(|err| StoreError::Backend(format!("table range: {err}")))?;
         for entry in iter {
             let (key, value) =
