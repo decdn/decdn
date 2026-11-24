@@ -796,8 +796,7 @@ in the list to redeem its unredeemed vouchers before its owner reclaims it.
 N log M does not decode` when a row in `settle.redb`'s `settlement_ledger_v2`
 table is not in this binary's layout. The redeemer keeps landing redemptions
 and keeps its paid watermarks; only the earnings figures are affected. The
-ledger shares `settle.redb` with both pending-settle sets and the sent
-`redeemMany` hashes the node reads receipts for on boot, so do not move the
+ledger shares `settle.redb` with the sent `redeemMany` hashes the node reads receipts for on boot, so do not move the
 file aside while a pool this node holds unredeemed vouchers on is closing.
 Wait until `decdn_unredeemed_usdc` reads 0. Then stop the node, move
 `settle.redb` aside and restart: the earnings history starts over, and

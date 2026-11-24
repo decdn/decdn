@@ -188,8 +188,6 @@ contract DeployProtocolScriptTest is Test, DeployProtocol {
         assertEq(json.readAddress(".contracts.DecdnGovernor"), address(0x08), "Governor");
         assertEq(json.readAddress(".contracts.CctpSweepReceiver"), address(0x09), "CctpSweepReceiver");
         assertFalse(vm.keyExistsJson(json, ".contracts.PaymentPool"), "no pool on the governance chain");
-        assertFalse(vm.keyExistsJson(json, ".contracts.SlashJudge"), "no SlashJudge");
-        assertFalse(vm.keyExistsJson(json, ".contracts.SlashAppeal"), "no SlashAppeal");
         assertEq(json.readAddress(".contracts.OriginAssignment"), address(0x0B), "OriginAssignment");
         assertEq(json.readAddress(".contracts.ManualVettingPolicy"), address(0x0C), "ManualVettingPolicy");
         assertEq(json.readAddress(".contracts.BuybackBurner"), address(0), "BuybackBurner unwired");

@@ -1856,13 +1856,8 @@ impl CacheEngine {
                 .collect::<HashSet<Hash>>(),
         );
         let prev_arc = self.inner.pinned.swap(Arc::clone(&new_arc));
-        // Same set-difference arithmetic as `PinnedHashes::diff` (in
-        // `decdn-config-types`), recomputed here over the store-hash
-        // sets instead of round-tripping back to leaf hashes. The two
-        // must stay behaviorally identical — `to_store_hash` is a
-        // bijection on the 32 bytes, so cardinalities and membership are
-        // preserved; if `PinnedHashes::diff` ever reports more than
-        // counts (e.g. a sample of changed hashes), update both.
+        // Counted over the store-hash sets: `to_store_hash` is a bijection
+        // on the 32 bytes, so the counts equal those of the leaf sets.
         let added = new_arc.iter().filter(|h| !prev_arc.contains(*h)).count();
         let removed = prev_arc.iter().filter(|h| !new_arc.contains(*h)).count();
         PinDiff { added, removed }

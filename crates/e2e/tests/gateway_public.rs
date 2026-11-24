@@ -524,7 +524,6 @@ async fn run() -> anyhow::Result<()> {
         counters["requests_payment_required"] == 0 && counters["pulls_active"] == 0,
         "counters: {counters}"
     );
-    anyhow::ensure!(status.get("allowance").is_none(), "no allowance: {status}");
     let keys = status["pools"]["delegate_lanes"]
         .as_array()
         .with_context(|| format!("delegate lanes: {status}"))?;

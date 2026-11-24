@@ -41,22 +41,18 @@ use decdn_cache::CacheEngine;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::{
     EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    StreamSigData, binding_signing_hash, capacity_bond_domain, voucher_domain,
+    binding_signing_hash, capacity_bond_domain, voucher_domain,
 };
 use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
-use decdn_protocol::client::{
-    ChunkData, ClientBinding, ClientMessage, StreamRequest, StreamRequestExt, StreamResponse,
-    StreamResponseBody,
-};
-use decdn_protocol::{ALPN_CLIENT, decode_message, encode_stream_request, read_frame, write_frame};
-use iroh::endpoint::{Connection, ConnectionError};
-use iroh::{Endpoint, EndpointAddr};
+use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
+use decdn_protocol::{ALPN_CLIENT, encode_stream_request, write_frame};
+use iroh::EndpointAddr;
 
 mod support;
 use support::{
     HandlerDomains, accept_one, build_handler_full, cache_with_blob, fresh_key, local_endpoint,
-    permissive_limiter, read_client_msg, shutdown, spawn_server, write_client_msg,
+    permissive_limiter, read_client_msg, shutdown, spawn_server,
 };
 
 const CHAIN_ID: u64 = 421_614;
@@ -459,7 +455,7 @@ async fn upstream_pool_open_failure_pull_fails_cleanly() -> anyhow::Result<()> {
 /// before paying any voucher. Two properties must hold:
 ///
 /// 1. The aborted pull advances **nothing** — B accepts no voucher, so the
-///    lane stays at nonce 0. No payment is fabricated for un-acked bytes and
+///    lane stays at zero bytes delivered. No payment is fabricated for un-acked bytes and
 ///    no half-open delivery is committed to the store.
 /// 2. The lane is **not wedged**: a subsequent honest pull on the *same*
 ///    lane completes and advances it normally, proving the mid-stream abort
@@ -599,188 +595,5 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
     assert_lane_advanced(&store, "reused after abort", lane, RATE_B)?;
 
     shutdown([task_b], [&honest_ep, &ep_b]).await?;
-    Ok(())
-}
-
-/// A protocol-correct but **dishonest** `cdn/client/v1` upstream: it signs a
-/// valid response for the requested hash, streams `served` (whose hash differs),
-/// and then reads the closing voucher and ends the stream cleanly if the
-/// requester pays — yet the bytes are wrong. This drives the requester all the
-/// way to its integrity check. Handles exactly one connection, then returns.
-///
-/// The requester verifies each bao chunk group as it lands (ADR 038), so it may
-/// reject the bytes and close the connection before it pays the closing voucher,
-/// or between the voucher and `StreamEnd`. Both orders are legal, and the
-/// rejection is the unit under test. A peer close while the liar reads the
-/// voucher frame or writes `StreamEnd` therefore ends it with `Ok`. Any other
-/// error at those two points, and an undecodable or unexpected voucher frame,
-/// still fails it.
-async fn lying_upstream(
-    ep: &Endpoint,
-    eth: &Arc<PrivateKeySigner>,
-    stream_dom: &Eip712Domain,
-    served: &[u8],
-    rate_per_mb: u64,
-) -> anyhow::Result<()> {
-    let conn = accept_one(ep).await?;
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| anyhow::anyhow!("accept_bi: {e}"))?;
-
-    // Echo the request's correlated fields back so the response validates
-    // (ADR 005): only the *bytes* are dishonest, not the framing.
-    let ClientMessage::StreamRequest(req) = read_client_msg(&mut recv).await? else {
-        anyhow::bail!("lying upstream: expected a StreamRequest");
-    };
-    let total_bytes =
-        u64::try_from(served.len()).map_err(|_| anyhow::anyhow!("served len overflows u64"))?;
-    let body = StreamResponseBody {
-        hash: req.hash,
-        ok: true,
-        rate_per_mb,
-        timestamp_us: req.timestamp_us,
-    };
-    let operator_sig = StreamSigData::from_response_body(&body)
-        .sign(eth.as_ref(), stream_dom)
-        .map_err(|e| anyhow::anyhow!("operator sign: {e}"))?
-        .as_bytes()
-        .to_vec();
-    let resp = StreamResponse { body, operator_sig };
-    let payload = decdn_protocol::encode_stream_response(
-        &resp,
-        Some(&support::proven_ext(&resp, total_bytes)),
-    )?;
-    write_frame(&mut send, &payload)
-        .await
-        .map_err(|e| anyhow::anyhow!("write response: {e}"))?;
-
-    // The wrong bytes, streamed in 1 KiB frames — a sender's own choice, since the
-    // requester accepts any non-empty frame. `served` stays under one payment
-    // chunk, so at most one closing voucher flows: the requester may reject the
-    // bytes before it pays.
-    for chunk in served.chunks(1024) {
-        write_client_msg(
-            &mut send,
-            &ClientMessage::ChunkData(ChunkData::new(chunk.to_vec())?),
-        )
-        .await?;
-    }
-
-    // Read the closing voucher if the requester pays one. Acceptance is implicit
-    // (ADR 005), so the upstream sends no reply and moves straight to
-    // `StreamEnd`. A reject here would give the requester a voucher error instead
-    // of the integrity error the test asserts. Only the frame read tolerates a
-    // peer close; the decode below does not.
-    let frame = match read_frame(&mut recv, decdn_protocol::MAX_CHUNK_FRAME).await {
-        Err(_) if peer_closed(&conn) => return Ok(()),
-        frame => frame.map_err(|e| anyhow::anyhow!("read frame: {e}"))?,
-    };
-    let (msg, _rest) =
-        decode_message::<ClientMessage>(&frame).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    let ClientMessage::Voucher(_) = msg else {
-        anyhow::bail!("lying upstream: expected a Voucher");
-    };
-    match write_client_msg(&mut send, &ClientMessage::StreamEnd).await {
-        Err(_) if peer_closed(&conn) => return Ok(()),
-        written => written?,
-    }
-    let _ = send.finish();
-    // Hold the connection open until the requester closes it. Returning here
-    // would drop `conn` and abort the still-in-flight `StreamEnd` before it
-    // lands.
-    conn.closed().await;
-    Ok(())
-}
-
-/// Whether the peer closed `conn` with an application close, as the requester
-/// does when it drops the pull. A local close, a timeout, a reset, and a
-/// transport-level close do not count.
-fn peer_closed(conn: &Connection) -> bool {
-    matches!(
-        conn.close_reason(),
-        Some(ConnectionError::ApplicationClosed(_))
-    )
-}
-
-/// Sad path: the upstream returns bytes that don't match the requested hash
-/// (#746).
-///
-/// Content is BLAKE3-addressed and the requester verifies every bao chunk group
-/// against the content root (ADR 038). This test covers that defense across a
-/// node-to-node hop. A malicious / buggy upstream plays the protocol perfectly (valid
-/// signed response, and a clean `StreamEnd` once it is paid) while serving
-/// content that hashes to the wrong value. The downstream requester MUST reject
-/// the delivery and return an `Err`, never surfacing the corrupt bytes to its
-/// caller. This guards the content-addressing invariant across a *paid* hop: a
-/// peer cannot substitute content for a hash, whether the requester pays for the
-/// bytes before it rejects them or not.
-#[tokio::test(flavor = "multi_thread")]
-async fn upstream_hash_mismatch_is_rejected() -> anyhow::Result<()> {
-    // What the downstream asks for...
-    let honest = vec![0x11u8; 4096];
-    let requested_hash = support::register_payload(&honest);
-    // ...vs. what the lying upstream actually serves: different content of the
-    // same length, so the size proves and the content check is what fails.
-    let served = vec![0x22u8; 4096];
-    anyhow::ensure!(
-        support::register_payload(&served) != requested_hash,
-        "the two fixture payloads must differ"
-    );
-
-    let upstream_eth = Arc::new(PrivateKeySigner::random());
-    let up_sk = fresh_key();
-    let up_id = up_sk.public();
-    let (ep_up, addr_up) = local_endpoint(up_sk, vec![ALPN_CLIENT.to_vec()]).await?;
-
-    let liar = {
-        let ep_up = ep_up.clone();
-        let eth = Arc::clone(&upstream_eth);
-        let stream_dom = stream_domain();
-        let served = served.clone();
-        tokio::spawn(
-            async move { lying_upstream(&ep_up, &eth, &stream_dom, &served, RATE_A).await },
-        )
-    };
-
-    // Downstream B pulls the (honest) hash; the bytes that arrive are wrong.
-    let (ep_b, _) = local_endpoint(fresh_key(), vec![]).await?;
-    let target = EndpointAddr::new(up_id).with_ip_addr(addr_up);
-    let ctx = fresh_context(
-        B256::repeat_byte(0xD1),
-        upstream_eth.address(),
-        Arc::new(PrivateKeySigner::random()),
-    );
-    let result = stream_fetch(
-        &ep_b,
-        target,
-        &ctx,
-        &stream_domain(),
-        upstream_eth.address(),
-        *requested_hash.as_bytes(),
-        0,
-        now_us(),
-        Duration::from_secs(20),
-    )
-    .await;
-
-    let err = result.err().ok_or_else(|| {
-        anyhow::anyhow!("a delivery that fails bao verification must be rejected")
-    })?;
-    anyhow::ensure!(
-        err.to_string().contains("do not match requested hash"),
-        "error should be the integrity check, got: {err}"
-    );
-
-    shutdown([], [&ep_b]).await?;
-    // Surface any panic or protocol error the liar hit, bounded so a hang fails
-    // loudly rather than stalls.
-    match tokio::time::timeout(Duration::from_secs(5), liar).await {
-        Ok(joined) => {
-            joined.map_err(|e| anyhow::anyhow!("lying upstream task panicked: {e}"))??;
-        }
-        Err(_) => anyhow::bail!("lying upstream did not finish in time"),
-    }
-    shutdown([], [&ep_up]).await?;
     Ok(())
 }

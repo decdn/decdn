@@ -286,9 +286,6 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("missing first lane"))?;
     assert_eq!(first.outstanding_micro_usdc, 2_000_000);
-    // The shared-pool model tracks no per-voucher nonce; the admin surface
-    // reports 0 unconditionally.
-    assert_eq!(first.last_nonce, 0);
     assert!(first.settlement_eligible, "2 USDC >= 1 USDC threshold");
     assert!(first.pool_id.starts_with("0x"));
     assert_eq!(

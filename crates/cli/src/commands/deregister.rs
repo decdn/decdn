@@ -35,7 +35,7 @@
 //! a blacklist-ejected operator's `registerNode` reverts until governance calls
 //! `unEjectNode`, so pointing them at `decdn node register` would be wrong.
 
-use std::io::{self, IsTerminal, Write};
+use std::io;
 use std::path::Path;
 
 use alloy::primitives::{Address, B256};
@@ -44,6 +44,7 @@ use decdn_common::cli;
 use decdn_incentive::capacity_bond::CapacityBond;
 
 use crate::commands::chain_ctx;
+use crate::commands::rotate_key::confirm_or_bail;
 
 /// Entry point for `decdn node deregister`.
 pub async fn run(args: &cli::DeregisterArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
@@ -70,7 +71,7 @@ pub async fn run(args: &cli::DeregisterArgs, global_config: Option<&Path>) -> an
     // of the two inactive states the operator is in, and the two have different
     // exits.
     ensure_active(&plan)?;
-    confirm_or_bail(&plan, args.yes)?;
+    confirm_or_bail(|w| write_disclosure(w, &plan), "deregistration", args.yes)?;
 
     // Caller-owned slot (#1355): from the send onward the transaction is
     // broadcast and may take effect, so an unreadable receipt must still print
@@ -179,72 +180,10 @@ fn ensure_active(plan: &Plan) -> anyhow::Result<()> {
     )
 }
 
-/// What the confirmation gate decides, before any IO. Split from
-/// [`confirm_or_bail`] the way `unbond::decide_confirmation` is, so the gate is
-/// testable without a TTY.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Confirmation {
-    /// `--yes` supplied: disclose the consequences, but skip the prompt.
-    Bypassed,
-    /// Ask on the terminal.
-    Prompt,
-    /// Headless and unconfirmed: refuse rather than assume consent.
-    NeedFlag,
-}
-
-/// Decide whether to prompt. Every run of this command that reaches the gate
-/// is submitting the deregistration.
-pub(crate) const fn decide_confirmation(yes: bool, interactive: bool) -> Confirmation {
-    if yes {
-        Confirmation::Bypassed
-    } else if interactive {
-        Confirmation::Prompt
-    } else {
-        Confirmation::NeedFlag
-    }
-}
-
-/// Disclose the consequences and, on a terminal, wait for `y`.
-///
-/// `--yes` suppresses the *prompt*, never the disclosure — "don't ask" must not
-/// silently become "don't tell", the same rule `unbond` follows. The bond line
-/// is the load-bearing one: it is the misconception this command most invites.
-fn confirm_or_bail(plan: &Plan, yes: bool) -> anyhow::Result<()> {
-    // Interactive only when BOTH streams are terminals: the warning goes to
-    // stderr and the answer is read from stdin, so if either is redirected the
-    // operator can't see what they'd be agreeing to (same rule as `unbond`).
-    let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
-    let decision = decide_confirmation(yes, interactive);
-
-    let mut err = io::stderr().lock();
-    write_disclosure(&mut err, plan)?;
-
-    match decision {
-        // Disclosed above; the operator asked not to be asked.
-        Confirmation::Bypassed => Ok(()),
-        Confirmation::NeedFlag => anyhow::bail!(
-            "deregistration not confirmed: no interactive terminal detected — re-run with \
-             `--yes` (or `--dry-run` to preview)."
-        ),
-        Confirmation::Prompt => {
-            write!(err, "Proceed? [y/N] ")?;
-            err.flush()?;
-            let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-            // Allowlist, not denylist: an empty line (Ctrl-D / EOF) lands on the
-            // deny side rather than being read as assent.
-            let answer = line.trim().to_ascii_lowercase();
-            anyhow::ensure!(
-                answer == "y" || answer == "yes",
-                "deregistration cancelled."
-            );
-            Ok(())
-        }
-    }
-}
-
-/// The consequence disclosure, pure so its wording is pinned by a test.
-pub(crate) fn write_disclosure(w: &mut impl io::Write, plan: &Plan) -> io::Result<()> {
+/// The consequence disclosure, pure so its wording is pinned by a test. The
+/// bond line is the load-bearing one: it is the misconception this command
+/// most invites.
+pub(crate) fn write_disclosure(w: &mut dyn io::Write, plan: &Plan) -> io::Result<()> {
     writeln!(
         w,
         "About to deregister this node. It leaves the active node set immediately and stops \

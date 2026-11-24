@@ -705,10 +705,10 @@ fn revoke_output_names_the_unseated_operator() {
     assert!(s.contains("status=dry_run submitted=false"), "{s}");
 }
 
-// JSON writers are the machine-consumable contract — round-trip each so a
+// JSON writers are the machine-consumable contract — pin each one's shape so a
 // renamed key or wrong-shaped value fails loudly.
 #[test]
-fn namespace_json_round_trips() {
+fn namespace_json_shape() {
     let dry = NamespaceOutcome {
         operator: None,
         registry: Address::repeat_byte(0x01),
@@ -744,7 +744,7 @@ fn namespace_json_round_trips() {
 }
 
 #[test]
-fn assign_json_round_trips() {
+fn assign_json_shape() {
     let landed = Address::repeat_byte(0x11);
     let untried = Address::repeat_byte(0x22);
     let o = AssignOutcome {
@@ -873,7 +873,7 @@ fn revoke_status_labels_and_hashes_match_their_states() {
 }
 
 #[test]
-fn revoke_json_round_trip() {
+fn revoke_json_shape() {
     let revoke = RevokeOutcome {
         operator: None,
         origin_assignment: Address::repeat_byte(0x02),

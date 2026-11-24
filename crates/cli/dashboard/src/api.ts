@@ -285,7 +285,6 @@ export interface LaneSnapshot {
   /** The pool owner; null when the node could not name it. */
   counterparty: string | null;
   voucher_signer: string;
-  last_nonce: number;
   /** The node's whole accrued claim on the lane, redeemed or not. */
   outstanding_micro_usdc: number;
   unredeemed_micro_usdc: number;

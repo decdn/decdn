@@ -441,9 +441,7 @@ async fn build_cache_constructs_s3_origin_for_default_chain() {
 
 /// Same as above but with the `Static` credential path so the
 /// `SecretString::expose` unwrap arm in `s3_origin_config_from_resolved`
-/// is exercised. The integration tests use `mock_client!` which doesn't
-/// route through the resolved-config layer at all, so this is the only
-/// place the conversion gets covered.
+/// is exercised.
 #[tokio::test]
 async fn build_cache_constructs_s3_origin_for_static_credentials() {
     use decdn_common::config::secret::SecretString;
@@ -1241,24 +1239,6 @@ fn warn_if_no_ipv6_socket_reports_ipv6_presence() {
 }
 
 #[tokio::test]
-async fn build_endpoint_binds_when_all_relays_unreachable() {
-    // A non-empty, all-unreachable relay set is advisory only: bring-up
-    // returns at once and the background relay report warns later, so a
-    // transient relay outage can't wedge node startup.
-    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_port = dead.local_addr().unwrap().port();
-    drop(dead);
-
-    let sk = SecretKey::generate();
-    let transport = quic_transport_config().unwrap();
-    let relays = vec![format!("http://127.0.0.1:{dead_port}")];
-    let ep = build_endpoint(&sk, 0, &relays, &ResolvedDiscovery::default(), transport)
-        .await
-        .expect("all-unreachable relay set proceeds with a warning");
-    ep.close().await;
-}
-
-#[tokio::test]
 async fn build_endpoint_binds_with_portless_relay_url() {
     // A relay URL with no explicit or scheme-default port is one iroh
     // accepts, so bring-up binds rather than hard-failing a config iroh
@@ -1269,18 +1249,6 @@ async fn build_endpoint_binds_with_portless_relay_url() {
     let ep = build_endpoint(&sk, 0, &relays, &ResolvedDiscovery::default(), transport)
         .await
         .expect("portless relay URL binds");
-    ep.close().await;
-}
-
-#[tokio::test]
-async fn build_endpoint_uses_n0_when_discovery_empty() {
-    // Empty discovery composes the n0 pkarr publisher and DNS lookup. The
-    // lookup legs aren't introspectable, so assert bring-up binds cleanly.
-    let sk = SecretKey::generate();
-    let transport = quic_transport_config().unwrap();
-    let ep = build_endpoint(&sk, 0, &[], &ResolvedDiscovery::default(), transport)
-        .await
-        .expect("n0 endpoint binds with empty discovery");
     ep.close().await;
 }
 

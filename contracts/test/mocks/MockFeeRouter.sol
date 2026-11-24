@@ -19,10 +19,6 @@ contract MockFeeRouter is IFeeRouter {
         epochLength = epochLength_;
     }
 
-    function setWindowEpochs(uint64 n) external {
-        windowEpochs = n;
-    }
-
     /// @notice The mock collapses `windowEpochsAt(timepoint)` to the current
     ///         `windowEpochs` — sufficient for `DecdnGovernor` math tests
     ///         that do not exercise mid-proposal window changes.

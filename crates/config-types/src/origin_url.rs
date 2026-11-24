@@ -60,13 +60,6 @@ impl OriginUrl {
     pub const fn as_url(&self) -> &Url {
         &self.0
     }
-
-    /// Consume into the underlying [`url::Url`].
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // Destructuring a non-Copy newtype is not const.
-    pub fn into_url(self) -> Url {
-        self.0
-    }
 }
 
 impl std::fmt::Display for OriginUrl {

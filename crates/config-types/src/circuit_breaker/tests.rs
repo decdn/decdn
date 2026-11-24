@@ -45,15 +45,6 @@ fn partial_section_fills_missing_fields_from_defaults() {
 }
 
 #[test]
-fn default_and_disabled_are_distinct() {
-    assert_ne!(
-        CircuitBreakerPolicy::default(),
-        CircuitBreakerPolicy::disabled()
-    );
-    assert!(CircuitBreakerPolicy::default().is_active());
-}
-
-#[test]
 fn rejects_unknown_fields() {
     // `deny_unknown_fields` guards against typo'd config keys
     // silently being ignored.

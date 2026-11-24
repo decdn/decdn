@@ -299,7 +299,6 @@
             "pool_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
             "counterparty": "0xAbaBabaBABaBAbAbABABaBABAbabABAbAbaBabab",
             "voucher_signer": "0xCdCdCdCDCdcDcDCdCdCDCdCDCdcdcDcDcdcDCDcd",
-            "last_nonce": 812,
             "outstanding_micro_usdc": 3200,
             "unredeemed_micro_usdc": 41000,
             "deposit_micro_usdc": 5000000,

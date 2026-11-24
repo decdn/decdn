@@ -197,7 +197,7 @@ impl NodeFixture {
     /// the signed bytes that become evidence.
     pub async fn set_rate_per_mb(&self, rate: u64) -> anyhow::Result<u64> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
-        let rewritten = rewrite_rate_per_mb(&config, rate)?;
+        let rewritten = rewrite_int(&config, "payment", "rate_per_mb", rate)?;
         std::fs::write(&self.config_path, rewritten).context("write node config")?;
 
         self.restart().await.context("restart after reprice")?;
@@ -224,7 +224,12 @@ impl NodeFixture {
     /// restart's health wait rather than silently disabling the leg.
     pub async fn set_buyer_working_deposit(&self, micro_usdc: u64) -> anyhow::Result<u64> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
-        let rewritten = rewrite_buyer_working_deposit(&config, micro_usdc)?;
+        let rewritten = rewrite_int(
+            &config,
+            "blockchain",
+            "buyer_working_deposit_micro_usdc",
+            micro_usdc,
+        )?;
         std::fs::write(&self.config_path, rewritten).context("write node config")?;
 
         self.restart()
@@ -248,7 +253,12 @@ impl NodeFixture {
     /// by rewriting the config and bouncing the process ([`Self::restart`]).
     pub async fn set_pool_min_remaining_deposit(&self, micro_usdc: u64) -> anyhow::Result<()> {
         let config = std::fs::read_to_string(&self.config_path).context("read node config")?;
-        let rewritten = rewrite_pool_min_remaining_deposit(&config, micro_usdc)?;
+        let rewritten = rewrite_int(
+            &config,
+            "blockchain",
+            "pool_min_remaining_deposit_micro_usdc",
+            micro_usdc,
+        )?;
         std::fs::write(&self.config_path, rewritten).context("write node config")?;
 
         self.restart()
@@ -341,7 +351,7 @@ impl NodeFixture {
     }
 
     /// Launch an empty bonded cache node whose misses use paid node-to-node
-    /// pull-through, gated by the chain-backed authorized-origin directory.
+    /// pull-through.
     pub async fn launch_pull_through_cache(
         chain: &ChainFixture,
         region: &str,
@@ -784,29 +794,6 @@ impl NodeFixture {
         line_with_all(&log, needles).map(str::to_owned)
     }
 
-    /// Poll [`Self::log_line`] until a line with every one of `needles` appears,
-    /// or `timeout` elapses.
-    pub async fn wait_for_log_line(
-        &self,
-        needles: &[&str],
-        timeout: Duration,
-    ) -> anyhow::Result<String> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if let Some(line) = self.log_line(needles) {
-                return Ok(line);
-            }
-            anyhow::ensure!(
-                tokio::time::Instant::now() < deadline,
-                "decdn-node logged no line holding all of {needles:?} within {timeout:?} \
-                 (only events at or above $DECDN_NODE_LOG, default `warn`, are captured); \
-                 its last {LOG_TAIL_LINES} lines:\n{}",
-                self.log.tail(LOG_TAIL_LINES)
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-
     /// Scrape the daemon's Prometheus endpoint and return the current value of a
     /// single unlabelled counter/gauge by name, or `0` if it is absent (a
     /// registered-but-never-incremented counter is reported as `0`).
@@ -1117,63 +1104,25 @@ metrics_bind = "127.0.0.1"
     rendered
 }
 
-/// Rewrite `payment.rate_per_mb` in a node TOML config, preserving every other
-/// key. Separate from [`NodeFixture::set_rate_per_mb`] so its parse → mutate →
-/// `toml::to_string` round-trip is testable without a live daemon (#1378): the
-/// serializer's `ValueAfterTable` hazard (a scalar written after a sub-table in
-/// `[cache]`) is handled because each table gets its own buffer, but a
-/// `toml` bump could silently break it — this is the plain-`cargo nextest`
-/// guard, mirroring `render_config_emits_parseable_toml`.
-fn rewrite_rate_per_mb(config: &str, rate: u64) -> anyhow::Result<String> {
+/// Rewrite the integer `[table] key` in a node TOML config, preserving every
+/// other key. Backs [`NodeFixture::set_rate_per_mb`],
+/// [`NodeFixture::set_buyer_working_deposit`] and
+/// [`NodeFixture::set_pool_min_remaining_deposit`], and is separate from them so
+/// its parse → mutate → `toml::to_string` round-trip is testable without a live
+/// daemon (#1378): the serializer's `ValueAfterTable` hazard (a scalar written
+/// after a sub-table in `[cache]`) is handled because each table gets its own
+/// buffer, but a `toml` bump could silently break it — this is the
+/// plain-`cargo nextest` guard, mirroring `render_config_emits_parseable_toml`.
+fn rewrite_int(config: &str, table: &str, key: &str, value: u64) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;
-    let payment = doc
-        .get_mut("payment")
+    let section = doc
+        .get_mut(table)
         .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("node config has no [payment] table"))?;
-    payment.insert(
-        "rate_per_mb".to_string(),
-        toml::Value::Integer(i64::try_from(rate).context("rate_per_mb overflows i64")?),
-    );
-    toml::to_string(&doc).context("render node config")
-}
-
-/// Rewrite `blockchain.buyer_working_deposit_micro_usdc` in a node TOML config,
-/// preserving every other key. Separate from
-/// [`NodeFixture::set_buyer_working_deposit`] so its parse → mutate →
-/// `toml::to_string` round-trip is testable without a live daemon, mirroring
-/// [`rewrite_rate_per_mb`]. The `[blockchain]` table holds only scalars, so it is
-/// free of the `ValueAfterTable` serializer hazard `[cache]` carries; the
-/// whole-doc round-trip is still guarded by `set_buyer_working_deposit_round_trips_through_toml`.
-fn rewrite_buyer_working_deposit(config: &str, micro_usdc: u64) -> anyhow::Result<String> {
-    let mut doc: toml::Table = config.parse().context("parse node config")?;
-    let blockchain = doc
-        .get_mut("blockchain")
-        .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
-    blockchain.insert(
-        "buyer_working_deposit_micro_usdc".to_string(),
-        toml::Value::Integer(i64::try_from(micro_usdc).context("deposit overflows i64")?),
-    );
-    toml::to_string(&doc).context("render node config")
-}
-
-/// Rewrite the `[blockchain]` refundable-floor knob
-/// (`pool_min_remaining_deposit_micro_usdc`) in a node TOML config, preserving
-/// every other key. Separate from [`NodeFixture::set_pool_min_remaining_deposit`]
-/// so its parse → mutate → `toml::to_string` round-trip is testable without a live
-/// daemon, mirroring [`rewrite_buyer_working_deposit`]. The `[blockchain]` table holds
-/// only scalars, so it is free of the `[cache]` `ValueAfterTable` serializer hazard.
-fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::Result<String> {
-    let mut doc: toml::Table = config.parse().context("parse node config")?;
-    let blockchain = doc
-        .get_mut("blockchain")
-        .and_then(toml::Value::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("node config has no [blockchain] table"))?;
-    blockchain.insert(
-        "pool_min_remaining_deposit_micro_usdc".to_string(),
+        .ok_or_else(|| anyhow::anyhow!("node config has no [{table}] table"))?;
+    section.insert(
+        key.to_string(),
         toml::Value::Integer(
-            i64::try_from(micro_usdc)
-                .context("pool_min_remaining_deposit_micro_usdc overflows i64")?,
+            i64::try_from(value).with_context(|| format!("{table}.{key} overflows i64"))?,
         ),
     );
     toml::to_string(&doc).context("render node config")
@@ -1183,7 +1132,7 @@ fn rewrite_pool_min_remaining_deposit(config: &str, micro_usdc: u64) -> anyhow::
 /// `[payment_pool]`, preserving every other key. Separate from
 /// [`NodeFixture::set_payment_pool_address`] so its parse → mutate →
 /// `toml::to_string` round-trip is testable without a live daemon, mirroring
-/// [`rewrite_rate_per_mb`].
+/// [`rewrite_int`].
 fn rewrite_payment_pool_address(config: &str, payment_pool: Address) -> anyhow::Result<String> {
     let mut doc: toml::Table = config.parse().context("parse node config")?;
     let chain = doc
@@ -1206,7 +1155,7 @@ fn rewrite_payment_pool_address(config: &str, payment_pool: Address) -> anyhow::
 /// with `discovery_peers` in a node TOML config, preserving every other key.
 /// Separate from [`NodeFixture::repoint_payment_pool`] so its parse → mutate →
 /// `toml::to_string` round-trip is testable without a live daemon, mirroring
-/// [`rewrite_rate_per_mb`]. Peers take the `addrs = ["127.0.0.1:{port}"]` shape
+/// [`rewrite_int`]. Peers take the `addrs = ["127.0.0.1:{port}"]` shape
 /// [`render_config`] writes.
 fn rewrite_payment_pool(
     config: &str,
@@ -1239,8 +1188,7 @@ fn rewrite_payment_pool(
     toml::to_string(&doc).context("render node config")
 }
 
-/// How many trailing log lines a [`NodeFixture::wait_for_log_line`] timeout
-/// reports.
+/// How many trailing log lines a daemon-exit timeout reports.
 const LOG_TAIL_LINES: usize = 20;
 
 /// How long [`NodeFixture::terminate`] and [`NodeFixture::respawn_expecting_exit`]

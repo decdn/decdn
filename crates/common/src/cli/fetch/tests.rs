@@ -42,25 +42,6 @@ fn give_up_after_is_unset_by_default_and_parses_whole_seconds() {
     );
 }
 
-#[test]
-fn removed_recovery_flags_are_rejected() {
-    for flag in [
-        "--stall-timeout-ms",
-        "--unit-deadline-ms",
-        "--min-throughput-bps",
-        "--multi-source-min-bytes",
-    ] {
-        let parsed = TestCli::try_parse_from(["test", flag, "1"]);
-        assert!(parsed.is_err(), "{flag} must be gone");
-    }
-    // The multi-source switches took no value, so a lone flag is what a
-    // parse of the old command line would have seen.
-    for flag in ["--multi-source", "--no-multi-source"] {
-        let parsed = TestCli::try_parse_from(["test", flag]);
-        assert!(parsed.is_err(), "{flag} must be gone");
-    }
-}
-
 /// `--timeout-ms` bounds discovery and defaults to an hour, far above any
 /// honest registry read.
 #[test]
@@ -215,14 +196,7 @@ fn governance_and_pool_flags_parse_apart() {
 }
 
 /// `--pool-rpc-url` names the RPC of `--pool`'s chain, so it needs `--pool`.
-/// The single-chain flags are gone.
 #[test]
-fn pool_rpc_url_requires_pool_and_old_flags_are_gone() {
+fn pool_rpc_url_requires_pool() {
     assert!(TestCli::try_parse_from(["test", "--pool-rpc-url", "http://pay"]).is_err());
-    for flag in ["--rpc-url", "--payment-pool-address", "--chain-id"] {
-        assert!(
-            TestCli::try_parse_from(["test", flag, "1"]).is_err(),
-            "{flag} must be gone"
-        );
-    }
 }

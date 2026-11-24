@@ -16,6 +16,9 @@ fn civil_round_trips_across_epochs_and_leap_days() {
         assert_eq!(civil_from_days(days), (y, m, d), "{y}-{m}-{d}");
     }
     assert_eq!(days_from_civil(1970, 1, 1), 0);
+    assert_eq!(days_from_civil(1970, 1, 2), 1);
+    // 2000-03-01 is 11017 days after the epoch.
+    assert_eq!(days_from_civil(2000, 3, 1), 11_017);
     assert_eq!(civil_from_days(0), (1970, 1, 1));
     assert_eq!(civil_from_days(-1), (1969, 12, 31));
 }

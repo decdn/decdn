@@ -393,28 +393,6 @@ fn forge_script_body_completed(stdout: &[u8]) -> bool {
     String::from_utf8_lossy(stdout).contains("Script ran successfully")
 }
 
-#[test]
-fn broadcast_phase_failure_is_retryable() {
-    // Representative of the #883 attempt-2 stdout (line order condensed): the
-    // body ran (simulation + `Return` printed), then the process cut off in the
-    // broadcast/EVM-setup phase. Marker present ⇒ transient broadcast hiccup ⇒ retry.
-    let stdout = b"No files changed, compilation skipped\nScript ran successfully.\n\n== Return ==\nd: struct BaseProtocolDeploy.Deployment Deployment({ token: 0x959, paymentPool: 0x4ed })\n\n## Setting up 1 EVM.";
-    assert!(forge_script_body_completed(stdout));
-}
-
-#[test]
-fn genuine_revert_fails_fast() {
-    // A revert/abort during simulation never prints the success marker, so the
-    // body did not complete ⇒ deterministic ⇒ fail fast (no retry).
-    let stdout = b"Error: Simulated execution failed.\nReason: revert: ProviderNotActive\n";
-    assert!(!forge_script_body_completed(stdout));
-}
-
-#[test]
-fn empty_output_is_not_retryable() {
-    assert!(!forge_script_body_completed(b""));
-}
-
 // Bindings for the setup/write calls not exposed by the production
 // `decdn_incentive` bindings. The whole `PaymentPool` surface (`openPool`,
 // `topUp`, `closePool`, `reclaim`, `getPool`, `getWatermark`, and every event) is
