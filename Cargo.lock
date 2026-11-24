@@ -2724,7 +2724,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -2972,7 +2972,7 @@ dependencies = [
  "postcard",
  "proptest",
  "rand 0.10.4",
- "redb",
+ "redb 5.0.0",
  "rpassword",
  "serde",
  "serde_json",
@@ -3027,7 +3027,7 @@ dependencies = [
  "postcard",
  "proptest",
  "rand 0.10.4",
- "redb",
+ "redb 5.0.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -4581,7 +4581,7 @@ dependencies = [
  "bytes",
  "cfg_aliases",
  "chrono",
- "constant_time_eq 0.4.2",
+ "constant_time_eq 0.6.1",
  "data-encoding",
  "derive_more",
  "genawaiter",
@@ -4601,7 +4601,7 @@ dependencies = [
  "postcard",
  "rand 0.10.4",
  "range-collections",
- "redb",
+ "redb 4.6.0",
  "ref-cast",
  "reflink-copy",
  "self_cell",
@@ -6773,6 +6773,15 @@ name = "redb"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "096b1dd5ec053c9c2a5a26a93aafeadf73ebcb710ea54dc3151f17a8e20535ef"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "redb"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11175cc688ba1b9d3cec4fe582fd82cb97e2a82e28ccc8101b7b8030a8003280"
 dependencies = [
  "libc",
 ]
@@ -9614,7 +9623,7 @@ dependencies = [
  "indexmap 2.14.2",
  "libc",
  "memchr",
- "nix 0.31.4",
+ "nix 0.32.0",
  "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
