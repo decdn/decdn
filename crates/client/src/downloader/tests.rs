@@ -674,7 +674,10 @@ async fn a_callers_store_stays_and_a_lost_export_is_stale() -> anyhow::Result<()
     let paths = fetch_into(&store, &blob, &dest).await?;
     anyhow::ensure!(paths == vec![dest.clone()], "the fetch exports");
     anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
-    anyhow::ensure!(store.path().exists(), "the caller's store stays");
+    anyhow::ensure!(
+        dir.path().join("store").exists(),
+        "the caller's store stays"
+    );
     anyhow::ensure!(
         !crate::ranged_store::store_dir_for(&dest)?.exists(),
         "no store beside dest"
@@ -707,7 +710,7 @@ async fn a_drifted_export_in_a_callers_store_is_stale() -> anyhow::Result<()> {
         .await?
         .admit_prefix(&blob, total)
         .await?;
-    let data_dir = store.path().join("data");
+    let data_dir = dir.path().join("store").join("data");
     let data_file = std::fs::read_dir(&data_dir)?
         .flatten()
         .map(|e| e.path())

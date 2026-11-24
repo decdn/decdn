@@ -1841,14 +1841,17 @@ pub(super) struct PullCtx<P: Provider + Clone> {
 }
 
 impl<P: Provider + Clone> PullCtx<P> {
-    /// The run's store for `out_root` when one is open or on disk
-    /// ([`RunStore::existing`]). A store that cannot open logs at `debug` and
-    /// reads as none: the fetch that follows surfaces the fault.
-    async fn existing_store(&self, out_root: &Path) -> Option<&BlobDir> {
-        self.run_store.existing(out_root).await.unwrap_or_else(|e| {
-            tracing::debug!("could not open the download store: {e:#}");
-            None
-        })
+    /// The run's store for `out_root` ([`RunStore::open`]). A store that
+    /// cannot open logs at `debug` and reads as none: the fetch that follows
+    /// surfaces the fault.
+    async fn store_at(&self, out_root: &Path) -> Option<&BlobDir> {
+        self.run_store.open(out_root).await.map_or_else(
+            |e| {
+                tracing::debug!("could not open the download store: {e:#}");
+                None
+            },
+            Some,
+        )
     }
 
     /// The shared lane deps, assembled from `PullCtx`'s borrowed chain
@@ -2612,7 +2615,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let mut disk = resolve_disk_state(entries, &saved, out_root, overwrite).await;
         // The run's outstanding work starts at what the groups that still
         // fetch plan to pay for.
-        let store = self.existing_store(out_root).await;
+        let store = self.store_at(out_root).await;
         disk.work = planned_work(entries, &landing, overwrite, &fetch_plan, &disk, store).await;
         let outstanding = disk
             .work
@@ -2802,10 +2805,7 @@ impl<P: Provider + Clone> PullCtx<P> {
         let started = std::time::Instant::now();
         self.pull_entry_untimed(hash, hints, total, staging, index, fetch_plan, file, slot)
             .await
-            .inspect(|&bytes| {
-                self.run_store.settle(hash);
-                self.report_landed(hash, total, staging, bytes, started.elapsed());
-            })
+            .inspect(|&bytes| self.report_landed(hash, total, staging, bytes, started.elapsed()))
     }
 
     /// Report a landed entry to the observer: its size in `staging`, the time
@@ -2930,7 +2930,7 @@ impl<P: Provider + Clone> PullCtx<P> {
 
         // What earlier runs already fetched of this blob: read now, before
         // any drive of this run adds to it.
-        let store = self.existing_store(out_root_of(staging)?).await;
+        let store = self.store_at(out_root_of(staging)?).await;
         let resumed = resumed_spans(store, hash).await;
 
         // Until the first byte lands, the entry is discovering holders — surfaced so
@@ -3118,7 +3118,6 @@ impl<P: Provider + Clone> PullCtx<P> {
         // already on disk costs nothing. It downloads nothing, so it contributes
         // nothing to the total bar's download meter — no credit, no bar.
         if !slots.iter().any(|s| matches!(s, Slot::Write { .. })) {
-            self.run_store.settle(hash);
             return GroupRun::done(
                 slots
                     .into_iter()
@@ -3144,7 +3143,6 @@ impl<P: Provider + Clone> PullCtx<P> {
         {
             // A whole-file link downloads nothing, so it adds nothing to the
             // total bar's download meter.
-            self.run_store.settle(hash);
             return GroupRun::done(materialize_from_donor(landing, slots, donor, len).await);
         }
 
@@ -3508,7 +3506,7 @@ impl<P: Provider + Clone> RangeDriver for AcquireRangeDriver<'_, '_, P> {
     fn store(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
         Box::pin(async move {
             let out_root = out_root_of(self.staging).ok()?;
-            self.ctx.existing_store(out_root).await.cloned()
+            self.ctx.store_at(out_root).await.cloned()
         })
     }
 

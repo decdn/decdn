@@ -455,8 +455,8 @@ The rules below apply to every pull:
   expires, the pull stops all entries and exits with code 75. The pull
   keeps one download store for all its entries
   (`.decdn-partial/store/`), and the store keeps what each entry fetched, so
-  a rerun pays for no byte twice. The pull removes the store when no entry
-  needs it.
+  a rerun pays for no byte twice. A pull that lands every entry removes the
+  store.
 - **Output** files are written under the output directory at each entry's
   relative path, resolved with the § Path-safety rules above (`..`,
   absolute, and escaping paths rejected). The pull holds the output

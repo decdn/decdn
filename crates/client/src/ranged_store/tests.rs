@@ -510,32 +510,3 @@ async fn an_export_whose_file_moves_is_a_lost_export() -> anyhow::Result<()> {
     assert!(reopened.is_lost_export().await);
     dir.shutdown().await
 }
-
-/// `partial_hashes` lists the blobs the store holds only part of, and no
-/// complete one.
-#[tokio::test]
-async fn partial_hashes_lists_only_partial_blobs() -> anyhow::Result<()> {
-    let total = 2 * GROUP;
-    let (whole_root, whole_data, whole_ob) = synth_blob(usize::try_from(total)?);
-    // A longer blob, so another root.
-    let (part_root, part_data, part_ob) = synth_blob(usize::try_from(total + GROUP)?);
-    let tmp = tempfile::tempdir()?;
-    let dir = BlobDir::open(tmp.path()).await?;
-
-    let whole = decdn_bao_range::align_range(0, total, total)?;
-    dir.blob(whole_root, total, None)
-        .await?
-        .admit(
-            whole.clone(),
-            bao_for(whole_root, &whole_data, whole_ob, &whole),
-        )
-        .await?;
-    let head = decdn_bao_range::align_range(0, GROUP, total + GROUP)?;
-    dir.blob(part_root, total + GROUP, None)
-        .await?
-        .admit(head.clone(), bao_for(part_root, &part_data, part_ob, &head))
-        .await?;
-
-    assert_eq!(dir.partial_hashes().await?, vec![part_root]);
-    dir.shutdown().await
-}

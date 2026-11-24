@@ -1067,7 +1067,12 @@ impl BundlePuller {
         overwrite: bool,
         cancel: &CancellationToken,
     ) -> BundleOutcome {
-        Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await
+        self.ctx.run_store.pull_started();
+        let outcome = Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await;
+        if matches!(outcome.end, BundleEnd::Complete) && outcome.report.failed == 0 {
+            self.ctx.run_store.pull_settled();
+        }
+        outcome
     }
 
     /// Every pool replacement this puller's funding recovery steps made, in
@@ -1107,18 +1112,11 @@ impl BundlePuller {
         self.ctx.rate_hints()
     }
 
-    /// Every blob this puller's download store in `out_dir` holds only part
-    /// of, with the verified bytes it holds of each: the partial downloads a
-    /// later pull resumes from. A directory with no store holds none.
-    pub async fn partial_downloads(&self, out_dir: &Path) -> Vec<([u8; 32], u64)> {
-        self.ctx.run_store.partials(out_dir).await
-    }
-
     /// Wait for every queued peer-record and watermark write to land, and close
-    /// the run's download store: it is removed once it holds nothing a later
-    /// pull needs. Call it before the process exits, after a cancelled pull
-    /// too, so the next run resumes each lane from what it paid and each
-    /// entry from what it fetched.
+    /// the run's download store: it is removed once every pull settled every
+    /// entry, and kept for the next run otherwise. Call it before the process
+    /// exits, after a cancelled pull too, so the next run resumes each lane
+    /// from what it paid and each entry from what it fetched.
     pub async fn finish(self) {
         self.ctx.writes.settle().await;
         self.ctx.run_store.close().await;

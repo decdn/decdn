@@ -134,38 +134,6 @@ impl BlobDir {
         ClientRangedStore::open_in(Store::from(self.fs.clone()), root, bound_hint, export_to).await
     }
 
-    /// The directory the store lives in.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// The hashes of every blob the store holds only part of.
-    ///
-    /// # Errors
-    ///
-    /// The store cannot list its blobs or answer for one.
-    pub(crate) async fn partial_hashes(&self) -> anyhow::Result<Vec<[u8; 32]>> {
-        let store = Store::from(self.fs.clone());
-        let hashes = store
-            .blobs()
-            .list()
-            .hashes()
-            .await
-            .map_err(|e| anyhow::anyhow!("list store {}: {e}", self.path.display()))?;
-        let mut partial = Vec::new();
-        for hash in hashes {
-            let status = store
-                .blobs()
-                .status(hash)
-                .await
-                .map_err(|e| anyhow::anyhow!("store status of {hash}: {e}"))?;
-            if matches!(status, BlobStatus::Partial { .. }) {
-                partial.push(*hash.as_bytes());
-            }
-        }
-        Ok(partial)
-    }
-
     /// Commit everything the store holds and stop it. A store that is dropped
     /// instead stops without waiting, and its last half second of writes may
     /// not reach its database; the store rebuilds what it can of them from
