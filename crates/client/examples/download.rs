@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
                 hash: *hash.as_bytes(),
                 total_bytes,
                 dest: &dest,
-                ranges: None,
             }],
             None,
         )

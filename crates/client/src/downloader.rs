@@ -8,9 +8,7 @@
 //! striping across every holder at full throughput. A source that faults cools
 //! and returns; the fetch ends on done, a fatal fault, or the stop policy. It
 //! then finalizes, promoting the `.partial` to the final file. So a resumed
-//! download re-pulls only what it lacks, and a bundle layer above can pre-seed
-//! held ranges (its chunk-hint dedup) into the `.partial` and the same fetch
-//! fills only the complement.
+//! download re-pulls only what it lacks.
 //!
 //! It is the download half of the same loop the `Streamer` (the
 //! consumption-paced single-blob face) uses — the Downloader just uncaps the
@@ -38,8 +36,7 @@ use crate::{ClientRangedStore, RangedStore};
 
 /// One blob to fetch and where to write it: the content `hash` (the bao root),
 /// its `total_bytes` (authoritative for keying the store and sizing the fetch),
-/// the caller-chosen `dest` path the `.partial` and final file are keyed by,
-/// and the byte ranges to fill.
+/// and the caller-chosen `dest` path the `.partial` and final file are keyed by.
 #[derive(Debug, Clone, Copy)]
 pub struct DownloadTarget<'a> {
     /// The blob's BLAKE3 content address (its bao root); every ingested byte is
@@ -50,11 +47,6 @@ pub struct DownloadTarget<'a> {
     /// Where to write the finished blob. The `.partial` store and the promoted
     /// final file are keyed by this path, so the finished file IS `dest`.
     pub dest: &'a Path,
-    /// The `(offset, len)` byte ranges to fill, or `None` for the whole blob.
-    /// The fetch promotes the blob only when every byte is present, so a
-    /// caller that writes the bytes outside them itself (a bundle entry's
-    /// donor splice) finds them in the `.partial` beside `dest`.
-    pub ranges: Option<&'a [(u64, u64)]>,
 }
 
 /// Fetch content-addressed blobs — a bundle, or a single blob — to files in a
@@ -68,8 +60,7 @@ pub struct DownloadTarget<'a> {
 /// file. A
 /// source that faults cools (in the command-wide [`PeerHealth`]) and returns;
 /// its ranges move to the other sources meanwhile. A resumed download (an
-/// existing `.partial`, e.g. a bundle layer's chunk-hint dedup) re-pulls only
-/// its missing ranges.
+/// existing `.partial`) re-pulls only its missing ranges.
 ///
 /// Each target gets a fresh [`SourceSet`], so the provider builds each
 /// holder's lane once per target. A [`crate::StaticSources`] hands each lane
@@ -96,7 +87,7 @@ pub struct DownloadTarget<'a> {
 ///     dest: &Path,
 /// ) -> anyhow::Result<()> {
 ///     let downloader = Downloader::new(StaticSources::new(candidates)?, funder);
-///     let target = DownloadTarget { hash, total_bytes, dest, ranges: None };
+///     let target = DownloadTarget { hash, total_bytes, dest };
 ///     downloader.fetch_to_paths(&[target], None).await?;
 ///     Ok(())
 /// }
@@ -275,7 +266,6 @@ where
                 hash,
                 total_bytes,
                 dest,
-                ranges: None,
             })
             .collect();
         self.fetch_to_paths(&targets, on_progress).await
@@ -296,21 +286,16 @@ where
         self.fetch_to_paths_until(targets, on_progress, &stop).await
     }
 
-    /// Fetch every [`DownloadTarget`] to its own `dest` path, returning the
-    /// `dest` of each target it promoted, in target order. A target without
-    /// explicit ranges is always promoted, so a whole-blob batch returns every
-    /// `dest`; a ranged target that leaves bytes missing is not in the result,
-    /// because no file exists at its `dest`. Each blob's `.partial` and final file are
+    /// Fetch every [`DownloadTarget`] to its own `dest` path, returning every
+    /// `dest`, in target order. Each blob's `.partial` and final file are
     /// keyed by `dest` (its parent directory and file name), so a resumed
     /// download re-pulls only what it lacks and the promoted file IS `dest` — no
     /// post-finalize rename. The parent directory of each `dest` is created if
     /// missing.
     ///
-    /// Each target opens a [`ClientRangedStore`] beside its file and fills its
-    /// ranges through [`crate::acquire`] across a fresh [`SourceSet`] of the
-    /// holders, then finalizes — promoting `.partial` to `dest`. A target with
-    /// explicit [`DownloadTarget::ranges`] that leave bytes missing is not
-    /// finalized: its landed ranges stay in the `.partial`. Writes land at
+    /// Each target opens a [`ClientRangedStore`] beside its file and fills it
+    /// through [`crate::acquire`] across a fresh [`SourceSet`] of the
+    /// holders, then finalizes — promoting `.partial` to `dest`. Writes land at
     /// their absolute offsets, so out-of-order and multi-source fills assemble
     /// correctly. The whole blob is fetched at full throughput, with no
     /// read-ahead bound.
@@ -380,7 +365,6 @@ where
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", dir.display()))?;
             // The whole blob is one tail: it runs to the proven size.
             let whole = [(0, 0)];
-            let ranges = target.ranges.unwrap_or(&whole);
             // Off the runtime: opening a finalized blob hashes its final file.
             let store = {
                 let (dir, stem) = (dir.clone(), stem.clone());
@@ -427,7 +411,7 @@ where
                         store: &store,
                         hash: target.hash,
                         total_bytes: target.total_bytes,
-                        ranges,
+                        ranges: &whole,
                     },
                     &mut sources,
                     &env,
@@ -437,12 +421,7 @@ where
                 fetched?;
                 // `acquire` flushes the present record but does not promote; a
                 // download keeps the file, so finalize (verify + promote
-                // `.partial`) once every byte is present. Explicit ranges can
-                // leave bytes to another writer, and the `.partial` then stays
-                // for that writer.
-                if target.ranges.is_some() && !store.is_complete().await? {
-                    break;
-                }
+                // `.partial`) once every byte is present.
                 match store.finalize().await {
                     Ok(()) => {
                         written.push(target.dest.to_path_buf());

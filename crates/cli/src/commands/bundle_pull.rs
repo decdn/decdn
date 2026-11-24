@@ -709,10 +709,9 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// One-line `--json` summary. `fetched`/`linked`/`skipped`/`failed` are entry
 /// counts; `downloaded` is the content bytes this run fetched and paid for across
 /// the distinct blobs fetched (a blob shared across several paths counts once,
-/// #1306; a range-dedup blob counts only the bytes it did not splice from disk)
-/// and `reconstructed` is the total bytes written to disk this run — they diverge
-/// when one blob is materialized to several paths or when range-dedup spliced part
-/// of a blob. `downloaded` is a content-size tally, not an exact on-wire
+/// #1306) and `reconstructed` is the total bytes written to disk this run — they
+/// diverge when one blob is materialized to several paths. `downloaded` is a
+/// content-size tally, not an exact on-wire
 /// measurement: it excludes bao proof overhead.
 ///
 /// `paid_bytes` is the bytes this run's vouchers and hash-chain reveals paid
@@ -734,8 +733,7 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 ///
 /// `resumed_bytes` is the content bytes of a `.partial` prefix that an earlier,
 /// interrupted run fetched and paid for, which this run resumed rather than
-/// fetched again. It is never part of `downloaded`. A byte that this run also
-/// spliced from disk counts only in `spliced_bytes`.
+/// fetched again. It is never part of `downloaded`.
 ///
 /// `excluded` counts the manifest entries this run does not pull: the ones the
 /// `--include`/`--exclude` filter dropped and the ones deselected under
@@ -749,15 +747,6 @@ fn edit_in_editor(buffer: &str) -> anyhow::Result<String> {
 /// count of distinct blobs materialized from an on-disk whole-file donor (verified
 /// by re-hash before use), and `reused_bytes` sums those blobs' sizes once each —
 /// bytes served from disk with no download and no payment.
-///
-/// `spliced_bytes` and `hints_ignored` report the range-dedup outcome so a run
-/// whose hints saved bytes is distinguishable from one whose hints did not:
-/// `spliced_bytes` is the total bytes served from a local donor splice (bytes NOT
-/// downloaded or paid for), and `hints_ignored` counts range-dedup hints dropped
-/// by a fault — a chunk set with no file size, or whose sizes do not sum to the
-/// file size, a donor that failed its verification re-hash (or was unreadable), or
-/// a self-heal whole-file re-drive that discarded already-spliced donors. Both are
-/// reporting only and never affect payment.
 #[derive(Serialize)]
 struct PullReport {
     output: String,
@@ -777,8 +766,6 @@ struct PullReport {
     /// every lane.
     wire_bytes: u64,
     reconstructed: u64,
-    spliced_bytes: u64,
-    hints_ignored: u64,
     /// Content bytes of `.partial` prefixes that earlier runs fetched and this
     /// run resumed; never part of `downloaded`.
     resumed_bytes: u64,
@@ -1198,7 +1185,7 @@ fn print_estimate(puller: &BundlePuller, manifest: &BundleManifest, common: &Cli
             .iter()
             .fold((0u64, 0u64), |(download, wire), b| {
                 (
-                    download.saturating_add(b.download),
+                    download.saturating_add(b.size.unwrap_or(0)),
                     wire.saturating_add(b.wire),
                 )
             });
@@ -1321,31 +1308,23 @@ impl PullObserver {
 }
 
 impl BundleObserver for PullObserver {
-    fn run_started(&self, download_total: Option<u64>, content_total: Option<u64>) {
+    fn run_started(&self, total: Option<u64>) {
         // The kept manifest is known: enable the renderer (silent off a
         // terminal or under `--json`). Its total bar meters the run's
-        // download, with the whole on-disk content size in the header.
-        let _ = self.progress.set(PullProgress::new(
-            self.json,
-            download_total,
-            content_total,
-            &self.label,
-        ));
+        // download.
+        let _ = self
+            .progress
+            .set(PullProgress::new(self.json, total, &self.label));
         if let Some(activity) = &self.activity {
-            activity.run_started(download_total);
+            activity.run_started(total);
         }
     }
 
-    fn file_started(
-        &self,
-        paths: &[String],
-        download_total: u64,
-        reconstruct_total: u64,
-    ) -> Arc<dyn FileObserver> {
+    fn file_started(&self, paths: &[String], total: u64) -> Arc<dyn FileObserver> {
         let label = pull_progress::file_label(paths);
         let bar = match self.progress.get() {
-            Some(progress) => progress.file_bar(&label, download_total, reconstruct_total),
-            None => PullProgress::disabled().file_bar(&label, download_total, reconstruct_total),
+            Some(progress) => progress.file_bar(&label, total),
+            None => PullProgress::disabled().file_bar(&label, total),
         };
         match &self.activity {
             Some(activity) => activity.file_started(paths, Arc::new(bar)),
@@ -1359,7 +1338,6 @@ impl BundleObserver for PullObserver {
         }
         let bytes = EntryBytes {
             paid: landed.paid,
-            spliced: landed.spliced,
             resumed: landed.resumed,
         };
         tracing::info!(
@@ -1387,20 +1365,19 @@ impl FaultHints for CliFaultHints {
     }
 }
 
-/// The content bytes one landed entry paid for, spliced from disk, and
-/// resumed from an earlier run. No byte counts in two of them.
+/// The content bytes one landed entry paid for and resumed from an earlier
+/// run. No byte counts in both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EntryBytes {
     paid: u64,
-    spliced: u64,
     resumed: u64,
 }
 
 /// A finished entry's line at `-v` (#2120): its size, the time it took, and
 /// its rate over the bytes this run paid for. When the entry resumed bytes
-/// from an earlier run or spliced bytes from disk, the line reports each
-/// non-zero one apart from the paid bytes (#2189, #2236). The time covers the
-/// whole entry: probing, every drive, any splice and the whole-file check.
+/// from an earlier run, the line reports them apart from the paid bytes
+/// (#2189). The time covers the whole entry: probing, every drive and the
+/// whole-file check.
 fn entry_done_line(
     hash: [u8; 32],
     size: u64,
@@ -1413,23 +1390,14 @@ fn entry_done_line(
     } else {
         fetch::fmt_rate(0.0)
     };
-    let detail = if bytes.spliced == 0 && bytes.resumed == 0 {
+    let detail = if bytes.resumed == 0 {
         rate
     } else {
-        let mut parts = vec![format!(
-            "{} downloaded at {rate}",
-            indicatif::HumanBytes(bytes.paid)
-        )];
-        if bytes.resumed > 0 {
-            parts.push(format!("{} resumed", indicatif::HumanBytes(bytes.resumed)));
-        }
-        if bytes.spliced > 0 {
-            parts.push(format!(
-                "{} spliced from disk",
-                indicatif::HumanBytes(bytes.spliced)
-            ));
-        }
-        parts.join(", ")
+        format!(
+            "{} downloaded at {rate}, {} resumed",
+            indicatif::HumanBytes(bytes.paid),
+            indicatif::HumanBytes(bytes.resumed)
+        )
     };
     format!(
         "get: {}: {} in {secs:.1}s ({detail})",
@@ -1501,14 +1469,13 @@ fn chain_has<E: std::error::Error + 'static>(err: &anyhow::Error) -> bool {
 }
 
 /// The `--json` dry-run plan of `entries` into `out`: each entry's path, its
-/// hash in the manifest's `b3:<hex>` form, its size and its chunk count.
+/// hash in the manifest's `b3:<hex>` form and its size.
 fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
     serde_json::json!({
         "output": out,
         "count": entries.len(),
         "entries": entries.iter().map(|e| serde_json::json!({
             "path": e.path, "hash": format_hash(e.hash), "size": e.size,
-            "chunks": e.chunks.as_ref().map(Vec::len),
         })).collect::<Vec<_>>(),
     })
 }
@@ -1614,17 +1581,12 @@ async fn dry_run(
             manifest.entries.len()
         );
         for e in &manifest.entries {
-            let chunks = e
-                .chunks
-                .as_ref()
-                .map(|c| format!(", {} chunks", c.len()))
-                .unwrap_or_default();
             // Escaped: a manifest that reached here without `parse` can still
             // carry a control character, which the terminal would interpret.
             let path = pull_progress::terminal_safe(&e.path);
             match e.size {
-                Some(n) => println!("  {path} ({n} bytes{chunks})"),
-                None => println!("  {path}{chunks}"),
+                Some(n) => println!("  {path} ({n} bytes)"),
+                None => println!("  {path}"),
             }
         }
         if let Some(view) = view {
@@ -1681,7 +1643,7 @@ fn report(rep: &BundleReport, excluded: u64, output: &Path, json: bool) -> anyho
     } else {
         println!("{}", counts_line(&summary));
         // `downloaded X (paid P) → reconstructed Y`: the arrow half only when
-        // dedup made the two differ, the paid part unless the run neither
+        // the two differ, the paid part unless the run neither
         // downloaded nor paid.
         println!(
             "{}",
@@ -1709,18 +1671,6 @@ fn report(rep: &BundleReport, excluded: u64, output: &Path, json: bool) -> anyho
                 rep.reused
             );
         }
-        // The range-dedup outcome, shown only when a hint mattered: a run that
-        // spliced bytes from disk, or one whose hints were dropped by a fault. A
-        // plain pull with no usable hints stays silent (both are zero), so a
-        // hint-carrying bundle whose hints all lie (spliced 0, some ignored)
-        // does not print the same summary as an unhinted one.
-        if rep.spliced_bytes > 0 || rep.hints_ignored > 0 {
-            println!(
-                "range-dedup: spliced {} from disk, {} hint(s) ignored",
-                human_bytes(rep.spliced_bytes),
-                rep.hints_ignored
-            );
-        }
     }
 
     if rep.failed > 0 {
@@ -1744,8 +1694,6 @@ fn pull_report(rep: &BundleReport, excluded: u64, output: &Path) -> PullReport {
         paid_bytes: rep.paid_bytes,
         wire_bytes: rep.wire_bytes,
         reconstructed: rep.reconstructed,
-        spliced_bytes: rep.spliced_bytes,
-        hints_ignored: rep.hints_ignored,
         resumed_bytes: rep.resumed_bytes,
         reused: rep.reused,
         reused_bytes: rep.reused_bytes,
@@ -1768,7 +1716,7 @@ fn counts_line(rep: &PullReport) -> String {
 }
 
 /// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files —
-/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges`, `<hex>.assembly` — whose hash is not in
+/// `<hex>`, `<hex>.partial`, `<hex>.partial.ranges` — whose hash is not in
 /// `keep`, and total the disk space they take ([`allocated_bytes`]). Other
 /// names (a record's temporary file) are not counted. A missing or unreadable
 /// directory holds nothing.
@@ -1786,7 +1734,6 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
         let stem = name
             .strip_suffix(".partial.ranges")
             .or_else(|| name.strip_suffix(".partial"))
-            .or_else(|| name.strip_suffix(".assembly"))
             .unwrap_or(name);
         let Ok(hash) = blake3::Hash::from_hex(stem) else {
             continue;
@@ -1809,10 +1756,10 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
     }
 }
 
-/// The disk space a file takes. A range-dedup `.assembly` is sized to the whole
-/// blob before any byte lands, so its length can be far above the space that
-/// deleting it frees. On Unix the allocated blocks give that space; elsewhere
-/// the length is the best figure.
+/// The disk space a file takes. A ranged `.partial` holds the ranges its
+/// sources wrote at their offsets, so its length can be far above the space
+/// that deleting it frees. On Unix the allocated blocks give that space;
+/// elsewhere the length is the best figure.
 fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
@@ -1896,8 +1843,8 @@ pub(crate) fn human_bytes(n: u64) -> String {
 /// The end-of-pull transfer line. `downloaded X` carries the wire bytes the
 /// run paid for as `(paid P)`, left out only when the run neither downloaded
 /// nor paid anything. `paid` is wire bytes and `downloaded` content bytes, so
-/// on a clean pull `paid` runs ahead by the bao proof overhead. When dedup
-/// saved a transfer, `downloaded` and `reconstructed`
+/// on a clean pull `paid` runs ahead by the bao proof overhead. When one blob
+/// lands at several paths, `downloaded` and `reconstructed`
 /// differ and both are shown with an arrow; otherwise the `→ reconstructed`
 /// half is omitted rather than repeating the same figure.
 fn transfer_line(downloaded: u64, paid: u64, reconstructed: u64) -> String {

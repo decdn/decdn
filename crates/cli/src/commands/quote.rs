@@ -14,9 +14,8 @@
 //! ```
 //!
 //! A blob's size is the nearest holder's report. A bundle's size is its
-//! manifest's planned download for a fresh pull: a blob two paths name, and
-//! a chunk two blobs share, count once, and a file already on disk still
-//! counts. The manifest comes from the output directory's cache, or from a
+//! manifest's planned download for a fresh pull: a blob two paths name
+//! counts once, and a file already on disk still counts. The manifest comes from the output directory's cache, or from a
 //! small paid pull that caches it. That pull opens no pool unless
 //! `--open-pool` lets it.
 //!
@@ -402,9 +401,11 @@ impl Plan {
         match self {
             Self::Blob(hash) => vec![*hash],
             Self::Bundle { blobs, .. } => {
-                let mut sized: Vec<&PlannedBlob> =
-                    blobs.iter().filter(|b| b.download > 0).collect();
-                sized.sort_by_key(|b| std::cmp::Reverse(b.download));
+                let mut sized: Vec<&PlannedBlob> = blobs
+                    .iter()
+                    .filter(|b| b.size.is_some_and(|n| n > 0))
+                    .collect();
+                sized.sort_by_key(|b| std::cmp::Reverse(b.size));
                 sized
                     .into_iter()
                     .take(CENSUS_ENTRY_SAMPLE)
@@ -493,7 +494,7 @@ pub(crate) fn view(
     let mut blob_size = None;
     for asked in &census.hashes {
         // The blob's wire bytes: a blob URI's from the nearest holder's
-        // size, a bundle blob's from its planned download ranges.
+        // size, a bundle blob's from its planned download.
         let wire = match plan {
             Plan::Blob(_) => {
                 blob_size = asked.size_hint().map(decdn_client::ProvenSize::get);
@@ -546,17 +547,21 @@ pub(crate) fn view(
             let mut total = 0u64;
             let mut wire = 0u64;
             for blob in blobs {
-                total = total.saturating_add(blob.download);
+                let size = blob.size.unwrap_or(0);
+                total = total.saturating_add(size);
                 wire = wire.saturating_add(blob.wire);
                 if sampled.contains(&blob.hash) {
-                    sampled_bytes = sampled_bytes.saturating_add(blob.download);
+                    sampled_bytes = sampled_bytes.saturating_add(size);
                 } else {
                     unsampled = unsampled.saturating_add(blob.wire);
                 }
             }
             let sample = Sample {
                 blobs: census.hashes.len(),
-                sized: blobs.iter().filter(|b| b.download > 0).count(),
+                sized: blobs
+                    .iter()
+                    .filter(|b| b.size.is_some_and(|n| n > 0))
+                    .count(),
                 bytes: sampled_bytes,
             };
             let unsized_blobs = blobs.iter().filter(|b| b.size.is_none()).count();

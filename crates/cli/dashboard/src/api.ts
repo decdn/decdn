@@ -166,7 +166,7 @@ export type PullFields = PullTarget & {
   downloaded_bytes: number;
   /** What earlier, interrupted runs fetched and this run resumed. */
   resumed_bytes: number;
-  /** What came from files already on disk, whole or spliced. */
+  /** What came from whole files already on disk. */
   reused_bytes: number;
   /** Null until the run knows what it fetches. */
   expected_bytes: number | null;

@@ -9,10 +9,6 @@ fn sample() -> SavedFile {
             secs: 1_757_800_000,
             nanos: 5,
         },
-        chunks: Some(vec![SavedChunk {
-            hash: "b3:bb".into(),
-            size: 10,
-        }]),
         source: SavedSource::new([3; 32], "src/b.txt"),
     }
 }
@@ -122,28 +118,6 @@ fn merge_overlays_updates_and_keeps_untouched() {
 }
 
 #[test]
-fn saved_hints_places_offsets_and_validates_sum() {
-    let rec = SavedFile {
-        hash: "b3:aa".into(),
-        size: 30,
-        mtime: SavedMtime { secs: 1, nanos: 0 },
-        chunks: Some(vec![
-            SavedChunk {
-                hash: "b3:c0".into(),
-                size: 10,
-            },
-            SavedChunk {
-                hash: "b3:c1".into(),
-                size: 20,
-            },
-        ]),
-        source: sample().source,
-    };
-    let got = saved_hints(&rec).expect("hints");
-    assert_eq!(got, vec![("b3:c0".into(), 0, 10), ("b3:c1".into(), 10, 20)]);
-}
-
-#[test]
 fn records_iterates_all_saved_files() {
     let tmp = tempfile::tempdir().expect("tmp");
     let mut updates = BTreeMap::new();
@@ -153,23 +127,6 @@ fn records_iterates_all_saved_files() {
     let loaded = load(tmp.path());
     let paths: Vec<&str> = loaded.records().map(|(p, _)| p).collect();
     assert_eq!(paths, vec!["g1/a.dll", "g2/a.dll"]);
-}
-
-#[test]
-fn saved_hints_rejects_bad_sum_and_absent_chunks() {
-    let mut rec = SavedFile {
-        hash: "b3:aa".into(),
-        size: 99,
-        mtime: SavedMtime { secs: 1, nanos: 0 },
-        chunks: Some(vec![SavedChunk {
-            hash: "b3:c0".into(),
-            size: 10,
-        }]),
-        source: sample().source,
-    };
-    assert!(saved_hints(&rec).is_none()); // 10 != 99
-    rec.chunks = None;
-    assert!(saved_hints(&rec).is_none());
 }
 
 /// A record holds a hash by its bytes, whatever spelling wrote it, and a

@@ -70,7 +70,6 @@ pub decdn_client::bundle::BundleReport::downloaded: u64
 pub decdn_client::bundle::BundleReport::failed: u64
 pub decdn_client::bundle::BundleReport::failures: alloc::vec::Vec<decdn_client::bundle::EntryFailure>
 pub decdn_client::bundle::BundleReport::fetched: u64
-pub decdn_client::bundle::BundleReport::hints_ignored: u64
 pub decdn_client::bundle::BundleReport::linked: u64
 pub decdn_client::bundle::BundleReport::not_run: u64
 pub decdn_client::bundle::BundleReport::paid_bytes: u64
@@ -79,7 +78,6 @@ pub decdn_client::bundle::BundleReport::resumed_bytes: u64
 pub decdn_client::bundle::BundleReport::reused: u64
 pub decdn_client::bundle::BundleReport::reused_bytes: u64
 pub decdn_client::bundle::BundleReport::skipped: u64
-pub decdn_client::bundle::BundleReport::spliced_bytes: u64
 pub decdn_client::bundle::BundleReport::warnings: alloc::vec::Vec<alloc::string::String>
 pub decdn_client::bundle::BundleReport::wire_bytes: u64
 #[non_exhaustive] pub struct decdn_client::bundle::EntryFailure
@@ -91,7 +89,6 @@ pub decdn_client::bundle::EntryLanded::hash: [u8; 32]
 pub decdn_client::bundle::EntryLanded::paid: u64
 pub decdn_client::bundle::EntryLanded::resumed: u64
 pub decdn_client::bundle::EntryLanded::size: u64
-pub decdn_client::bundle::EntryLanded::spliced: u64
 #[non_exhaustive] pub struct decdn_client::bundle::ForeignPath
 pub decdn_client::bundle::ForeignPath::path: alloc::string::String
 pub decdn_client::bundle::ForeignPath::reason: decdn_client::bundle::ForeignReason
@@ -99,13 +96,7 @@ pub struct decdn_client::bundle::MalformedManifest(_)
 impl core::error::Error for decdn_client::bundle::MalformedManifest
 impl core::fmt::Display for decdn_client::bundle::MalformedManifest
 pub fn decdn_client::bundle::MalformedManifest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-#[non_exhaustive] pub struct decdn_client::bundle::ManifestChunk
-pub decdn_client::bundle::ManifestChunk::hash: [u8; 32]
-pub decdn_client::bundle::ManifestChunk::size: u64
-impl decdn_client::bundle::ManifestChunk
-pub const fn decdn_client::bundle::ManifestChunk::new([u8; 32], u64) -> Self
 #[non_exhaustive] pub struct decdn_client::bundle::ManifestEntry
-pub decdn_client::bundle::ManifestEntry::chunks: core::option::Option<alloc::vec::Vec<decdn_client::bundle::ManifestChunk>>
 pub decdn_client::bundle::ManifestEntry::hash: [u8; 32]
 pub decdn_client::bundle::ManifestEntry::path: alloc::string::String
 pub decdn_client::bundle::ManifestEntry::size: core::option::Option<u64>
@@ -113,14 +104,12 @@ impl decdn_client::bundle::ManifestEntry
 pub fn decdn_client::bundle::ManifestEntry::land_at(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn decdn_client::bundle::ManifestEntry::manifest_path(&self) -> &str
 pub fn decdn_client::bundle::ManifestEntry::new(impl core::convert::Into<alloc::string::String>, [u8; 32], core::option::Option<u64>) -> Self
-pub fn decdn_client::bundle::ManifestEntry::with_chunks(self, alloc::vec::Vec<decdn_client::bundle::ManifestChunk>) -> Self
 pub struct decdn_client::bundle::NodeSelection
 pub struct decdn_client::bundle::NotAManifest(_)
 impl core::error::Error for decdn_client::bundle::NotAManifest
 impl core::fmt::Display for decdn_client::bundle::NotAManifest
 pub fn decdn_client::bundle::NotAManifest::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct decdn_client::bundle::PlannedBlob
-pub decdn_client::bundle::PlannedBlob::download: u64
 pub decdn_client::bundle::PlannedBlob::hash: [u8; 32]
 pub decdn_client::bundle::PlannedBlob::size: core::option::Option<u64>
 pub decdn_client::bundle::PlannedBlob::wire: u64
@@ -129,17 +118,14 @@ pub const decdn_client::bundle::MAX_MANIFEST_MB: u64
 pub const decdn_client::bundle::STAGING_DIR: &str
 pub trait decdn_client::bundle::BundleObserver: core::marker::Send + core::marker::Sync
 pub fn decdn_client::bundle::BundleObserver::entry_landed(&self, &decdn_client::bundle::EntryLanded)
-pub fn decdn_client::bundle::BundleObserver::file_started(&self, &[alloc::string::String], u64, u64) -> alloc::sync::Arc<dyn decdn_client::bundle::FileObserver>
+pub fn decdn_client::bundle::BundleObserver::file_started(&self, &[alloc::string::String], u64) -> alloc::sync::Arc<dyn decdn_client::bundle::FileObserver>
 pub fn decdn_client::bundle::BundleObserver::pool_replaced(&self, &decdn_client::source::PoolReplaced)
-pub fn decdn_client::bundle::BundleObserver::run_started(&self, core::option::Option<u64>, core::option::Option<u64>)
+pub fn decdn_client::bundle::BundleObserver::run_started(&self, core::option::Option<u64>)
 pub fn decdn_client::bundle::BundleObserver::warning(&self, &str)
 pub trait decdn_client::bundle::FileObserver: core::marker::Send + core::marker::Sync
 pub fn decdn_client::bundle::FileObserver::delivered(&self, u64, u64)
 pub fn decdn_client::bundle::FileObserver::discovering(&self)
 pub fn decdn_client::bundle::FileObserver::finished(&self)
-pub fn decdn_client::bundle::FileObserver::hashed(&self, u64)
-pub fn decdn_client::bundle::FileObserver::pending(&self)
-pub fn decdn_client::bundle::FileObserver::reconstructing(&self)
 pub fn decdn_client::bundle::foreign_paths(&decdn_client::bundle::BundleManifest, &std::path::Path) -> alloc::vec::Vec<decdn_client::bundle::ForeignPath>
 pub fn decdn_client::bundle::format_hash([u8; 32]) -> alloc::string::String
 pub fn decdn_client::bundle::parse_hash(&str) -> anyhow::Result<[u8; 32]>
@@ -344,7 +330,6 @@ pub mod decdn_client::downloader
 pub struct decdn_client::downloader::DownloadTarget<'a>
 pub decdn_client::downloader::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::downloader::DownloadTarget::hash: [u8; 32]
-pub decdn_client::downloader::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
 pub decdn_client::downloader::DownloadTarget::total_bytes: decdn_bao_range::size_proof::ProvenSize
 pub struct decdn_client::downloader::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: SourceProvider, F: decdn_client::source::Funder
@@ -891,7 +876,6 @@ pub fn decdn_client::receipt::ReceiptAmount::try_from(decdn_client::Cumulative) 
 pub struct decdn_client::DownloadTarget<'a>
 pub decdn_client::DownloadTarget::dest: &'a std::path::Path
 pub decdn_client::DownloadTarget::hash: [u8; 32]
-pub decdn_client::DownloadTarget::ranges: core::option::Option<&'a [(u64, u64)]>
 pub decdn_client::DownloadTarget::total_bytes: decdn_bao_range::size_proof::ProvenSize
 pub struct decdn_client::Downloader<P, F>
 impl<P, F> decdn_client::downloader::Downloader<P, F> where P: SourceProvider, F: decdn_client::source::Funder

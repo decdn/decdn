@@ -1,31 +1,24 @@
 //! Multi-bar progress for a bundle `decdn get`.
 //!
 //! A bundle pull fetches many blobs concurrently, so it renders a stack of
-//! per-file bars — one per pull that holds a `--jobs` slot, plus any that wait
-//! for a sibling's donor chunks — above one bottom **total** bar, all sharing
-//! an [`indicatif::MultiProgress`], under a one-line
-//! header naming the run and its download vs on-disk sizes. A finished file's bar
+//! per-file bars — one per pull that holds a `--jobs` slot — above one bottom
+//! **total** bar, all sharing an [`indicatif::MultiProgress`], under a one-line
+//! header naming the run and its download size. A finished file's bar
 //! clears, so only active pulls stay on screen. A blank **pad** bar under the
 //! total gains a row for each cleared file bar and gives one back for each new
 //! one, so the stack never shrinks: the container redraws in place, and an
 //! in-place redraw never erases the rows a shrunk stack leaves below it.
 //!
-//! The **total** bar meters the run's **download** — the bytes actually fetched
-//! after shared-chunk dedup (`download_bytes`), fixed up front as its denominator so
-//! it reads "downloaded of the whole download" from the start. Only delivered bytes
-//! fold into it (each file's delivery callback, capped at that file's download
-//! size); bytes spliced from disk are free and never inflate it, so its rate and ETA
-//! describe real transfer, not reconstruction. The header shows the download total
-//! beside the whole on-disk content size (`total_content_bytes`), so the dedup
-//! saving is visible.
+//! The **total** bar meters the run's **download**: the content bytes of the
+//! distinct blobs the run pulls, fixed up front as its denominator so it reads
+//! "downloaded of the whole download" from the start. Only delivered bytes fold
+//! into it (each file's delivery callback, capped at that file's size), so its
+//! rate and ETA describe real transfer.
 //!
-//! A **per-file** bar reads `downloaded/download-total (reconstructed)` plus a phase
-//! word. During the download it tracks the pull's delivered content against the
-//! blob's download size; when the download is done but a deferred chunk is still
-//! being fetched by a sibling it shows `pending siblings…`; during the whole-file
-//! verify it shows `reconstructing…` and fills with bytes hashed, so a multi-GB
-//! reconstruction never sits as a frozen row; before the first byte it shows
-//! `discovering…`. A per-file bar carries no rate/ETA: with `--jobs` pulls sharing
+//! A **per-file** bar reads `downloaded/total` plus a phase word. During the
+//! download it tracks the pull's delivered content against the blob's size;
+//! before the first byte it shows `discovering…`. A per-file bar carries no
+//! rate/ETA: with `--jobs` pulls sharing
 //! one link, a single file's rate is only its share of the bandwidth and reads as
 //! stuck whenever another file has the bandwidth, while the total bar keeps moving.
 //!
@@ -209,8 +202,7 @@ impl Drop for Inner {
 
 /// The bottom total bar plus the rate meter behind its `{msg}`. Every downloaded
 /// byte folded into the total passes through [`inc`](Self::inc), which samples the
-/// meter; bytes spliced from disk never reach it, so its rate is a transfer rate.
-/// Cloning shares the same bar and meter.
+/// meter, so its rate is a transfer rate. Cloning shares the same bar and meter.
 #[derive(Clone)]
 pub(crate) struct TotalBar {
     /// The `indicatif` bar, in download bytes with a fixed length.
@@ -289,37 +281,23 @@ impl PullProgress {
     /// when stderr is not a terminal or the run is `--json`, so non-interactive
     /// output is unchanged.
     ///
-    /// `download_total` is the run's **download** size — the bytes actually fetched
-    /// after shared-chunk dedup (`download_bytes`) and the fixed total-bar
-    /// denominator. `content_total` is the whole on-disk size (`total_content_bytes`),
-    /// shown alongside in the header so the dedup saving is visible. `label` names
-    /// the run (the output directory). `download_total` `None`/0 (the manifest
-    /// declared no sizes) omits the total bar and renders only per-file bars.
-    pub(crate) fn new(
-        json: bool,
-        download_total: Option<u64>,
-        content_total: Option<u64>,
-        label: &str,
-    ) -> Self {
+    /// `download_total` is the run's **download** size: the content bytes of the
+    /// distinct blobs it pulls, and the fixed total-bar denominator. `label`
+    /// names the run (the output directory). `download_total` `None`/0 (the
+    /// manifest declared no sizes) omits the total bar and renders only
+    /// per-file bars.
+    pub(crate) fn new(json: bool, download_total: Option<u64>, label: &str) -> Self {
         if json || !std::io::stderr().is_terminal() {
             return Self::disabled();
         }
         let mp = crate::logging::progress_container();
-        // Header: what the run downloads vs what lands on disk after dedup. Printed
-        // once above the live bars; only when a download size is known and dedup
-        // actually saves bytes is the "on disk" figure worth showing. It goes out
-        // through `suspend` with its own newline: the container redraws in place
-        // (`logging::new_container`), and an in-place redraw returns to the start
-        // of a `println` line that has no bar under it yet and overwrites it.
+        // Header: what the run downloads, printed once above the live bars when
+        // a download size is known. It goes out through `suspend` with its own
+        // newline: the container redraws in place (`logging::new_container`),
+        // and an in-place redraw returns to the start of a `println` line that
+        // has no bar under it yet and overwrites it.
         if let Some(dl) = download_total.filter(|n| *n > 0) {
-            let header = match content_total.filter(|c| *c > dl) {
-                Some(content) => format!(
-                    "{label} · {} to download · {} on disk",
-                    indicatif::HumanBytes(dl),
-                    indicatif::HumanBytes(content),
-                ),
-                None => format!("{label} · {} to download", indicatif::HumanBytes(dl)),
-            };
+            let header = format!("{label} · {} to download", indicatif::HumanBytes(dl));
             mp.suspend(|| eprintln!("{header}"));
         }
         let download_total = download_total.filter(|n| *n > 0);
@@ -357,11 +335,10 @@ impl PullProgress {
     }
 
     /// The per-file bar style: a bold label, a free-form `{msg}` (the file's
-    /// `downloaded/download-total (reconstructed)` counts plus a phase word, all
-    /// formatted by [`FilePhase`]), and the wide bar. The counts live in `{msg}`
-    /// rather than the built-in `{bytes}/{total_bytes}` so the same row can read as
-    /// download progress and then as reconstruction without the bar's own length
-    /// having to mean two different things.
+    /// `downloaded/total` counts plus a phase word, both formatted by
+    /// [`FilePhase`]), and the wide bar. The counts live in `{msg}` rather than
+    /// the built-in `{bytes}/{total_bytes}` so an entry with no declared size
+    /// shows its delivered count alone.
     fn file_style() -> indicatif::ProgressStyle {
         indicatif::ProgressStyle::with_template("{prefix:.bold} {msg}[{wide_bar:.cyan/blue}]")
             .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
@@ -369,8 +346,8 @@ impl PullProgress {
     }
 
     /// Insert a new per-file bar above the total bar (or above the pad when there
-    /// is no total bar), style and label it, set its length to the file's download
-    /// size (the download-phase denominator), and start its steady tick — all
+    /// is no total bar), style and label it, set its length to the file's size,
+    /// and start its steady tick — all
     /// after the insert (see [`TICK`] for why nothing touches the bar before the
     /// container owns it). The bar then takes a freed row back from the pad.
     fn insert_file_bar(
@@ -392,20 +369,13 @@ impl PullProgress {
     }
 
     /// A per-file bar for a whole-blob pull, labeled `label` and inserted above the
-    /// total bar. `download_total` is the blob's download (pay-now) bytes — the
-    /// bar's download-phase length and the `x/y` denominator; `reconstruct_total` is
-    /// the bytes it splices from disk — shown in parentheses and, during the verify,
-    /// the extra span the bar fills. Their sum is the blob's whole size. The bar's
-    /// download progress also folds into the total bar's download meter.
+    /// total bar. `download_total` is the blob's size: the bar's length and the
+    /// `x/y` denominator. The bar's download progress also folds into the total
+    /// bar's download meter.
     ///
     /// When disabled the returned [`FileBar`] is silent: it has no delivery
     /// callback, and ignores every report.
-    pub(crate) fn file_bar(
-        &self,
-        label: &str,
-        download_total: u64,
-        reconstruct_total: u64,
-    ) -> FileBar {
+    pub(crate) fn file_bar(&self, label: &str, download_total: u64) -> FileBar {
         let Some(i) = &self.inner else {
             return FileBar::disabled();
         };
@@ -413,14 +383,12 @@ impl PullProgress {
         let phase = FilePhase {
             bar,
             download_total,
-            reconstruct_total,
         };
         phase.render(0, download_total, "");
         // The delivery callback advances this file's download and folds the same
-        // downloaded bytes into the total bar's download meter (capped at the file's
-        // download size — a dedup entry's driver never delivers past its pay-now
-        // ranges, but the cap keeps the total honest regardless; an unsized entry's
-        // cap is 0, so it displays progress from `expected` but adds nothing).
+        // downloaded bytes into the total bar's download meter, capped at the
+        // file's size (an unsized entry's cap is 0, so it displays progress from
+        // `expected` but adds nothing).
         let total = i.total.clone();
         let cb_phase = phase.clone();
         // The file's download bytes the total already holds: every fetch of the
@@ -459,25 +427,22 @@ impl PullProgress {
     }
 }
 
-/// One file's (or fetch-once hash group's) live bar state: the bar, its download
-/// and reconstruct sizes, and the formatting of its `x/y (z) phase-word` message.
-/// Cloning shares the same underlying bar.
+/// One file's (or fetch-once hash group's) live bar state: the bar, its size,
+/// and the formatting of its `x/y phase-word` message. Cloning shares the same
+/// underlying bar.
 #[derive(Clone)]
 struct FilePhase {
     bar: indicatif::ProgressBar,
-    /// Download (pay-now) bytes — the `x/y` denominator and download-phase length.
+    /// The blob's size: the `x/y` denominator and the bar's length.
     download_total: u64,
-    /// Bytes spliced from disk — shown in `(…)` and, during verify, the extra span.
-    reconstruct_total: u64,
 }
 
 impl FilePhase {
-    /// Set the message to `downloaded/display-total[ (reconstructed)][ word]`, in
-    /// human byte units. `display_total` is the denominator to show — the download
-    /// total for a sized entry, or `0` for an entry with no known size yet, in which
-    /// case only the delivered count renders. `word` is a phase hint
-    /// (`pending siblings…`, `reconstructing…`, `discovering…`) or empty during a
-    /// plain download.
+    /// Set the message to `downloaded/display-total[ word]`, in human byte
+    /// units. `display_total` is the denominator to show — the size of a sized
+    /// entry, or `0` for an entry with no known size yet, in which case only the
+    /// delivered count renders. `word` is a phase word (`discovering…`) or empty
+    /// during a plain download.
     fn render(&self, downloaded: u64, display_total: u64, word: &str) {
         let counts = if display_total > 0 {
             format!(
@@ -488,25 +453,19 @@ impl FilePhase {
         } else {
             indicatif::HumanBytes(downloaded).to_string()
         };
-        let recon = if self.reconstruct_total > 0 {
-            format!(" ({})", indicatif::HumanBytes(self.reconstruct_total))
-        } else {
-            String::new()
-        };
         let tail = if word.is_empty() {
             String::new()
         } else {
             format!(" {word}")
         };
-        self.bar.set_message(format!("{counts}{recon}{tail} "));
+        self.bar.set_message(format!("{counts}{tail} "));
     }
 
     /// Advance the download: position tracks the delivered bytes and the counts
-    /// re-render. A sized entry meters against its download total; an entry with no
-    /// declared size (allowed by the manifest) has no download total, so it borrows
-    /// the stream's `expected` length for display only — it still contributes
-    /// nothing to the total bar (the fold is capped at the download total, which is
-    /// `0` here).
+    /// re-render. A sized entry meters against its size; an entry with no
+    /// declared size (allowed by the manifest) borrows the stream's `expected`
+    /// length for display only — it still contributes nothing to the total bar
+    /// (the fold is capped at the entry's size, which is `0` here).
     fn download(&self, received: u64, expected: u64) {
         let display_total = if self.download_total > 0 {
             self.download_total
@@ -522,29 +481,9 @@ impl FilePhase {
         self.render(received, display_total, "");
     }
 
-    /// Enter the `pending siblings…` wait: the download is done (bar full), and the
-    /// blob is now waiting for a sibling to register a deferred chunk.
-    fn pending(&self) {
-        self.bar.set_position(self.download_total);
-        self.render(
-            self.download_total,
-            self.download_total,
-            "pending siblings…",
-        );
-    }
-
     /// Enter the `discovering…` phase: probing holders before any byte arrives.
     fn discovering(&self) {
         self.render(0, self.download_total, "discovering…");
-    }
-
-    /// Enter the `reconstructing…` verify: the bar now spans the whole blob size
-    /// (download + reconstruct) and fills with bytes hashed.
-    fn start_reconstructing(&self) {
-        self.bar
-            .set_length(self.download_total.saturating_add(self.reconstruct_total));
-        self.bar.set_position(0);
-        self.render(self.download_total, self.download_total, "reconstructing…");
     }
 }
 
@@ -577,14 +516,6 @@ impl FileBar {
             p.discovering();
         }
     }
-
-    /// Show the `pending siblings…` phase (download done, waiting on a sibling to
-    /// register a deferred chunk).
-    pub(crate) fn set_pending(&self) {
-        if let Some(p) = &self.phase {
-            p.pending();
-        }
-    }
 }
 
 /// A file bar follows one blob of a [`decdn_client::bundle::BundlePuller`]
@@ -598,22 +529,6 @@ impl decdn_client::bundle::FileObserver for FileBar {
 
     fn discovering(&self) {
         self.set_discovering();
-    }
-
-    fn pending(&self) {
-        self.set_pending();
-    }
-
-    fn reconstructing(&self) {
-        if let Some(p) = &self.phase {
-            p.start_reconstructing();
-        }
-    }
-
-    fn hashed(&self, bytes: u64) {
-        if let Some(p) = &self.phase {
-            p.bar.set_position(bytes);
-        }
     }
 
     fn finished(&self) {

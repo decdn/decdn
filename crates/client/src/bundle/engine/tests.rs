@@ -1,9 +1,5 @@
-use super::super::{
-    BundleManifest, MAX_MANIFEST_BYTES, MalformedManifest, ManifestChunk, NotAManifest,
-};
+use super::super::{BundleManifest, MAX_MANIFEST_BYTES, MalformedManifest, NotAManifest};
 use super::*;
-use crate::ProvenSize;
-use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
 use std::assert_matches;
 
@@ -557,93 +553,6 @@ async fn a_command_fault_stops_every_later_entry() {
     assert_eq!(halts, 1);
 }
 
-/// #2283: with every group in flight and one `--jobs` slot, a group that
-/// gives its slot back while it waits for a donor lets the next group
-/// start, and finishes once it takes a slot again.
-#[tokio::test]
-async fn a_donor_waiter_frees_its_slot_for_the_next_group() {
-    let gate = JobGate::new(1);
-    let order = std::sync::Mutex::new(Vec::new());
-    let donor_ready = tokio::sync::Notify::new();
-    let run = |i: u8| {
-        let (gate, order, donor_ready) = (&gate, &order, &donor_ready);
-        async move {
-            let slot = FetchSlot::acquire(gate).await?;
-            order.lock().unwrap().push(format!("{i}"));
-            if i == 0 {
-                let ready = donor_ready.notified();
-                slot.release();
-                ready.await;
-                slot.ensure().await?;
-                order.lock().unwrap().push("0 again".to_owned());
-            }
-            if i == 1 {
-                donor_ready.notify_one();
-            }
-            anyhow::Ok(())
-        }
-    };
-    let stopped = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        run_groups(vec![0u8, 1, 2, 3], 4, run, |_, r| r.err(), || {}),
-    )
-    .await
-    .expect("a waiter that kept its slot would starve group 1");
-    assert!(stopped.is_none());
-    let order = order.lock().unwrap().clone();
-    assert_eq!(order.len(), 5);
-    assert_eq!(order.first().map(String::as_str), Some("0"));
-    assert_eq!(
-        order.get(1).map(String::as_str),
-        Some("1"),
-        "group 1 starts while group 0 waits"
-    );
-}
-
-/// #2283: a slot taken again after a donor wait queues behind at most the
-/// one new group already in admission, ahead of every group still to
-/// start, so an entry whose donors arrived does not wait out the bundle.
-#[tokio::test]
-async fn a_retaken_slot_waits_behind_at_most_one_new_group() {
-    use std::task::Poll;
-
-    use futures_util::poll;
-
-    let gate = JobGate::new(1);
-    let waiter = FetchSlot::acquire(&gate).await.expect("first slot");
-    let mut b = std::pin::pin!(FetchSlot::acquire(&gate));
-    let mut c = std::pin::pin!(FetchSlot::acquire(&gate));
-    assert!(poll!(b.as_mut()).is_pending(), "b queues for the permit");
-    assert!(poll!(c.as_mut()).is_pending(), "c queues for admission");
-
-    waiter.release();
-    let Poll::Ready(Ok(b_slot)) = poll!(b.as_mut()) else {
-        panic!("b takes the released permit");
-    };
-    assert!(
-        poll!(c.as_mut()).is_pending(),
-        "c is admitted, queued for the permit"
-    );
-    let mut d = std::pin::pin!(FetchSlot::acquire(&gate));
-    assert!(poll!(d.as_mut()).is_pending(), "d queues for admission");
-    let mut retake = std::pin::pin!(waiter.ensure());
-    assert!(poll!(retake.as_mut()).is_pending());
-
-    drop(b_slot);
-    let Poll::Ready(Ok(c_slot)) = poll!(c.as_mut()) else {
-        panic!("c, admitted first, takes the next permit");
-    };
-    assert!(poll!(d.as_mut()).is_pending());
-    drop(c_slot);
-    assert_matches!(
-        poll!(retake.as_mut()),
-        Poll::Ready(Ok(())),
-        "the retake comes before d"
-    );
-    assert!(poll!(d.as_mut()).is_pending());
-    assert!(waiter.held());
-}
-
 /// An item still in flight [`GROUP_DRAIN`] after a command-wide fault is
 /// dropped, and its drop guard runs: a fetch dropped this way still persists
 /// its lanes' watermarks (`fetch::SettleOnDrop` in `acquire_entry`).
@@ -836,12 +745,7 @@ fn a_halted_fetch_marks_its_writes_not_run() {
             EntryOutcome::Failed { .. }
         ]
     );
-    let report = bundle_report(
-        &run.outcomes,
-        Transfer::default(),
-        DedupSummary::default(),
-        Vec::new(),
-    );
+    let report = bundle_report(&run.outcomes, Transfer::default(), Vec::new());
     assert_eq!(
         (
             report.fetched,
@@ -1114,12 +1018,7 @@ fn a_group_that_never_settled_is_not_run() {
             EntryOutcome::NotRun
         ]
     );
-    let report = bundle_report(
-        &outcomes,
-        Transfer::default(),
-        DedupSummary::default(),
-        Vec::new(),
-    );
+    let report = bundle_report(&outcomes, Transfer::default(), Vec::new());
     assert_eq!((report.fetched, report.not_run), (1, 2));
 }
 
@@ -1318,17 +1217,12 @@ fn build_completed_updates_records_present_omits_failed() {
             path: "ok.txt".into(),
             hash: [0xaa; 32],
             size: Some(4),
-            chunks: Some(vec![ManifestChunk {
-                hash: [0xbb; 32],
-                size: 4,
-            }]),
             landed_from: None,
         },
         ManifestEntry {
             path: "bad.txt".into(),
             hash: [0xcc; 32],
             size: Some(9),
-            chunks: None,
             landed_from: None,
         },
     ];
@@ -1345,7 +1239,6 @@ fn build_completed_updates_records_present_omits_failed() {
     let rec = upd.get("ok.txt").expect("rec");
     assert_eq!(rec.hash, format_hash([0xaa; 32]));
     assert_eq!(rec.size, 4);
-    assert!(rec.chunks.is_some());
     // Failed → omitted even though the (stale) file is present on disk.
     assert!(!upd.contains_key("bad.txt"));
 }
@@ -1360,14 +1253,12 @@ fn build_completed_updates_records_linked_and_skipped() {
             path: "linked.txt".into(),
             hash: [0x11; 32],
             size: Some(2),
-            chunks: None,
             landed_from: None,
         },
         ManifestEntry {
             path: "skipped.txt".into(),
             hash: [0x22; 32],
             size: Some(4),
-            chunks: None,
             landed_from: None,
         },
     ];
@@ -1399,14 +1290,12 @@ fn build_completed_updates_omits_entry_absent_from_outcomes() {
             path: "done.txt".into(),
             hash: [0x33; 32],
             size: Some(3),
-            chunks: None,
             landed_from: None,
         },
         ManifestEntry {
             path: "pending.txt".into(),
             hash: [0x44; 32], // new hash, not yet fetched
             size: Some(3),
-            chunks: None,
             landed_from: None,
         },
     ];
@@ -1433,7 +1322,6 @@ fn saved_file(hash: &str, size: u64) -> skip_cache::SavedFile {
         hash: hash.into(),
         size,
         mtime: SavedMtime { secs: 1, nanos: 0 },
-        chunks: None,
         source: test_source(),
     }
 }
@@ -1589,520 +1477,25 @@ fn safe_join_rejects_absolute_and_empty_components() {
     assert!(safe_join(Path::new("/out"), "").is_err());
 }
 
-#[test]
-fn complement_runs_gap_in_the_middle() {
-    let donor = [(16384u64, 16384u64)];
-    assert_eq!(
-        complement_runs(&donor, 49152),
-        vec![(0, 16384), (32768, 16384)]
-    );
-}
+const GROUP: u64 = decdn_bao_range::CHUNK_GROUP_BYTES;
 
-#[test]
-fn complement_runs_empty_donor_is_the_whole_blob() {
-    assert_eq!(complement_runs(&[], 49152), vec![(0, 49152)]);
-}
-
-#[test]
-fn complement_runs_full_coverage_is_empty() {
-    assert_eq!(complement_runs(&[(0, 49152)], 49152), Vec::new());
-}
-
-#[test]
-fn complement_runs_coalesces_unsorted_overlapping_donor() {
-    // Two abutting ranges covering [16384, 49152) in reverse, overlapping
-    // order — coalesces to one run, leaving only the leading gap.
-    let donor = [(32768u64, 16384u64), (16384u64, 16384u64)];
-    assert_eq!(complement_runs(&donor, 49152), vec![(0, 16384)]);
-}
-
-#[test]
-fn complement_runs_total_zero_is_empty() {
-    assert_eq!(complement_runs(&[(0, 10)], 0), Vec::new());
-}
-
-const GROUP: u64 = CHUNK_GROUP_BYTES;
-
-fn chunk(size: u64, byte: u8) -> ManifestChunk {
-    ManifestChunk {
-        hash: [byte; 32],
-        size,
-    }
-}
-
-/// A chunked entry's hints accumulate offsets by the running size sum, in
-/// order, and validate that the chunk sizes reconstruct the whole-file size.
-#[test]
-fn hints_of_accumulates_offsets_and_validates_the_size_sum() {
-    let e = ManifestEntry {
-        path: "m.bin".into(),
-        hash: [0xff; 32],
-        size: Some(100),
-        chunks: Some(vec![chunk(60, 0xaa), chunk(40, 0xbb)]),
-        landed_from: None,
-    };
-    let hints = hints_of(&e).expect("valid hints");
-    assert_eq!(hints.len(), 2);
-    assert_eq!(
-        (hints[0].hash, hints[0].offset, hints[0].len),
-        ([0xaa; 32], 0, 60)
-    );
-    assert_eq!(
-        (hints[1].hash, hints[1].offset, hints[1].len),
-        ([0xbb; 32], 60, 40)
-    );
-}
-
-/// Chunk sizes that do not sum to the whole-file size are a malformed hint set:
-/// the entry falls back to a plain whole-file fetch (`None`).
-#[test]
-fn hints_of_rejects_a_size_sum_that_disagrees_with_the_whole_file() {
-    let e = ManifestEntry {
-        path: "m.bin".into(),
-        hash: [0xff; 32],
-        size: Some(100),
-        chunks: Some(vec![chunk(60, 0xaa), chunk(30, 0xbb)]),
-        landed_from: None,
-    };
-    assert!(hints_of(&e).is_none());
-}
-
-/// No whole-file `size` to validate against drops back to a plain fetch.
-#[test]
-fn hints_of_needs_a_size() {
-    let no_size = ManifestEntry {
-        path: "m.bin".into(),
-        hash: [0xff; 32],
-        size: None,
-        chunks: Some(vec![chunk(60, 0xaa)]),
-        landed_from: None,
-    };
-    assert!(hints_of(&no_size).is_none());
-}
-
-/// A materialized chunk placed at a group-aligned offset yields a donor range
-/// equal to the inward-aligned hint span, read from the donor at the matching
-/// source offset; the complement is `total` minus that range.
-#[test]
-fn plan_dedup_aligns_a_donor_inward_and_takes_the_complement() {
-    let total = 3 * GROUP;
-    let h = [0x11; 32];
-    let mut index = HashMap::new();
-    // The chunk lives at offset 0 (len one group) in the donor file.
-    index.insert(
-        h,
-        MaterializedRange {
-            source: PathBuf::from("/tmp/donorA"),
-            offset: 0,
-            len: GROUP,
-        },
-    );
-    // The recipient places the same chunk at the second group.
-    let hints = [Hint {
-        hash: h,
-        offset: GROUP,
-        len: GROUP,
-    }];
-    let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
-
-    assert_eq!(plan.donor.len(), 1);
-    let d = &plan.donor[0];
-    assert_eq!(d.dst, (GROUP, GROUP));
-    assert_eq!(d.source, PathBuf::from("/tmp/donorA"));
-    assert_eq!(d.src_offset, 0);
-    assert_eq!(d.chunk_hash, h);
-    assert_eq!((d.chunk_src_offset, d.chunk_len), (0, GROUP));
-    assert_eq!(plan.drive, vec![(0, GROUP), (2 * GROUP, GROUP)]);
-}
-
-/// An unaligned hint contributes only its interior whole groups; the donor's
-/// source offset tracks the inward shift, and the partial edge groups fall into
-/// the complement.
-#[test]
-fn plan_dedup_drops_partial_edge_groups_into_the_complement() {
-    let total = 4 * GROUP;
-    let h = [0x22; 32];
-    let mut index = HashMap::new();
-    // Chunk at donor offset 5000, spanning 2*GROUP + a bit.
-    index.insert(
-        h,
-        MaterializedRange {
-            source: PathBuf::from("/tmp/donorB"),
-            offset: 5000,
-            len: 2 * GROUP + 500,
-        },
-    );
-    // Recipient places it at offset 100, so [100, 100 + 2*GROUP + 500).
-    let hints = [Hint {
-        hash: h,
-        offset: 100,
-        len: 2 * GROUP + 500,
-    }];
-    let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
-
-    assert_eq!(plan.donor.len(), 1);
-    let d = &plan.donor[0];
-    // The span [100, 100 + 2*GROUP + 500) straddles boundaries GROUP and
-    // 2*GROUP, so exactly ONE whole group — [GROUP, 2*GROUP) — is inside it;
-    // the sub-group head and tail fall into the complement.
-    assert_eq!(d.dst, (GROUP, GROUP));
-    // Source offset shifts by (GROUP - 100) from the chunk's donor start.
-    assert_eq!(d.src_offset, 5000 + (GROUP - 100));
-    assert_eq!(plan.drive, vec![(0, GROUP), (2 * GROUP, 2 * GROUP)]);
-}
-
-/// A chunk not in the index contributes no donor: the complement is the whole
-/// blob (the plain path then handles it).
-#[test]
-fn plan_dedup_with_no_materialized_chunk_is_all_complement() {
-    let total = 2 * GROUP;
-    let hints = [Hint {
-        hash: [0x33; 32],
-        offset: 0,
-        len: GROUP,
-    }];
-    let plan = plan_reassembly(
-        &hints,
-        &HashMap::new(),
-        &FetchPlan::default(),
-        [0; 32],
-        total,
-    );
-    assert!(plan.donor.is_empty());
-    assert_eq!(plan.drive, vec![(0, total)]);
-}
-
-/// A hint smaller than one chunk group (or unaligned so no whole group fits)
-/// contributes no donor, even when the chunk is materialized.
-#[test]
-fn plan_dedup_sub_group_hint_contributes_no_donor() {
-    let total = GROUP;
-    let h = [0x44; 32];
-    let mut index = HashMap::new();
-    index.insert(
-        h,
-        MaterializedRange {
-            source: PathBuf::from("/tmp/donorC"),
-            offset: 0,
-            len: 1000,
-        },
-    );
-    let hints = [Hint {
-        hash: h,
-        offset: 0,
-        len: 1000,
-    }];
-    let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
-    assert!(plan.donor.is_empty());
-    assert_eq!(plan.drive, vec![(0, total)]);
-}
-
-/// Review #2 (money-band): a recipient hint that names a real donor chunk hash
-/// but claims a DIFFERENT length is one side lying about the chunk. It must not
-/// dedup — leaving its range in the complement (paid for and bao-verified)
-/// instead of trusting a placement that would run past the donor's real chunk
-/// end. Without the length check `plan_dedup` produces a donor of the longer
-/// claimed span, which `splice_donors` then cannot copy.
-#[test]
-fn plan_dedup_skips_a_donor_whose_claimed_length_disagrees() {
-    let total = 2 * GROUP;
-    let h = [0x55; 32];
-    let mut index = HashMap::new();
-    // The donor genuinely holds a ONE-group chunk under this hash.
-    index.insert(
-        h,
-        MaterializedRange {
-            source: PathBuf::from("/tmp/donorX"),
-            offset: 0,
-            len: GROUP,
-        },
-    );
-    // The recipient claims the SAME hash but a longer, two-group length.
-    let hints = [Hint {
-        hash: h,
-        offset: 0,
-        len: 2 * GROUP,
-    }];
-    let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
-    assert!(
-        plan.donor.is_empty(),
-        "a length-mismatched donor must not be spliced"
-    );
-    assert_eq!(plan.drive, vec![(0, total)]);
-}
-
-/// Review #2 (money-band): a per-donor copy that would run past the donor
-/// file's end (a mismatched aligned span, a truncated or racing donor) is not a
-/// hard failure — `splice_donors` queues the aligned range for a paid,
-/// bao-verified re-fetch and leaves the assembly file untouched for it, rather
-/// than returning `Err` and failing the whole entry.
-#[test]
-fn splice_donors_refetches_when_a_copy_would_run_past_the_donor_end() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let donor_path = tmp.path().join("donor");
-    let assembly = tmp.path().join("out.assembly");
-
-    // The donor holds exactly ONE group of bytes, so its chunk verifies — but
-    // the donor range below asks to copy TWO groups from offset 0, which EOFs.
-    let chunk_bytes: Vec<u8> = (0..GROUP)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    std::fs::write(&donor_path, &chunk_bytes).expect("write donor");
-    let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
-
-    let total = 3 * GROUP;
-    std::fs::File::create(&assembly)
-        .and_then(|f| f.set_len(total))
-        .expect("presize assembly");
-
-    let donor = DonorRange {
-        // Aligned span of TWO groups, but only one group is readable at
-        // `src_offset` — the copy hits EOF.
-        dst: (GROUP, 2 * GROUP),
-        refetch: (GROUP, 2 * GROUP),
-        source: donor_path,
-        src_offset: 0,
-        chunk_hash,
-        chunk_src_offset: 0,
-        chunk_len: GROUP,
-    };
-
-    let failed = splice_donors(&assembly, std::slice::from_ref(&donor))
-        .expect("a copy that EOFs must not fail the splice");
-    let refetch: Vec<(u64, u64)> = failed.iter().map(|d| d.refetch).collect();
-    assert_eq!(refetch, vec![(GROUP, 2 * GROUP)]);
-
-    // Nothing was written into the assembly for the untrusted donor — the
-    // whole file stays at its pre-sized zero value.
-    let got = std::fs::read(&assembly).expect("read assembly");
-    assert!(
-        got.iter().all(|&b| b == 0),
-        "an EOF-ing donor copy must leave the assembly untouched"
-    );
-}
-
-/// Review #1 (money-band): when a range drive COMPLETES the store — a resumed
-/// run whose store already held the donor-overlap ranges, so the very first
-/// complement drive finalizes and renames `<hex>.partial` -> `<hex>` —
-/// `reassemble_dedup` must treat the entry as done and splice nothing. The
-/// [`FinalizingDriver`] simulates that finalize on its first drive; the
-/// post-drive `staging.try_exists()` guard returns before any assembly is
-/// built.
-#[tokio::test]
-async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
-    // A driver that, on its first (complement) drive, finalizes the blob by
-    // creating the plain `<hex>` staging file and leaving no `.partial`.
-    struct FinalizingDriver {
-        hash: [u8; 32],
-        staging: PathBuf,
-        drives: std::cell::Cell<u32>,
-    }
-    impl RangeDriver for FinalizingDriver {
-        fn hash(&self) -> [u8; 32] {
-            self.hash
-        }
-        fn staging(&self) -> &Path {
-            &self.staging
-        }
-        fn drive<'a>(
-            &'a self,
-            _ranges: &'a [(u64, u64)],
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-            Box::pin(async move {
-                self.drives.set(self.drives.get() + 1);
-                std::fs::write(&self.staging, b"finalized").expect("finalize staging");
-                Ok(())
-            })
-        }
-    }
-
-    let tmp = tempfile::tempdir().expect("tmp");
-    let staging = tmp.path().join("blob");
-    let driver = FinalizingDriver {
-        hash: [0x11; 32],
-        staging: staging.clone(),
-        drives: std::cell::Cell::new(0),
-    };
-    // A reassembly plan with a real donor (the path is never read — the guard
-    // returns before any splice) and nothing deferred.
-    let plan = ReassemblePlan {
-        donor: vec![DonorRange {
-            dst: (GROUP, GROUP),
-            refetch: (GROUP, GROUP),
-            source: tmp.path().join("donor-never-read"),
-            src_offset: 0,
-            chunk_hash: [0x11; 32],
-            chunk_src_offset: 0,
-            chunk_len: GROUP,
-        }],
-        deferred: Vec::new(),
-        drive: vec![(0, GROUP)],
-    };
-    let index = ChunkIndex::default();
-    let fetch_plan = FetchPlan::default();
-
-    // The store held the donor group from an earlier run.
-    let resumed = [(GROUP, GROUP)];
-    let res = reassemble_dedup(
-        &driver,
-        &plan,
-        2 * GROUP,
-        &resumed,
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await;
-
-    assert!(
-        res.is_ok(),
-        "a first pay-now drive that finalizes the blob must succeed: {res:?}"
-    );
-    assert_eq!(driver.drives.get(), 1, "only the pay-now drive ran");
-    assert!(staging.try_exists().expect("stat staging"));
-    // No splice ran, so the resumed group counts as resumed, not paid (#2236).
-    let outcome = res.expect("checked above");
-    assert_eq!(outcome.spliced_bytes, 0);
-    assert_eq!(outcome.resumed_bytes, GROUP);
-    assert_eq!(
-        EntryBytes::dedup(2 * GROUP, outcome),
-        EntryBytes {
-            paid: GROUP,
-            spliced: 0,
-            resumed: GROUP,
-        }
-    );
-}
-
-/// A deferred chunk whose whole span is spliced: `dst` is the hint's span
-/// and `refetch` the groups it touches.
-fn whole_deferred(hint: Hint) -> DeferredChunk {
-    DeferredChunk {
-        hint,
-        dst: (hint.offset, hint.len),
-        refetch: outward_groups((hint.offset, hint.len), u64::MAX),
-    }
-}
-
-/// A chunked entry, built from `(chunk_size, chunk_hash_byte)` pairs whose sizes
-/// sum to the whole-file size, with a whole-file hash of `[whole; 32]`.
-fn mentry(whole: u8, size: u64, chunks: &[(u64, u8)]) -> ManifestEntry {
+/// A sized entry with a whole-file hash of `[whole; 32]`.
+fn mentry(whole: u8, size: u64) -> ManifestEntry {
     ManifestEntry {
         path: format!("e{whole:02x}"),
         hash: [whole; 32],
         size: Some(size),
-        chunks: Some(chunks.iter().map(|&(s, b)| chunk(s, b)).collect()),
         landed_from: None,
     }
 }
 
-/// A shared chunk is assigned to its SMALLEST containing entry, so the fetcher
-/// finishes soonest; a unique chunk is left unassigned (its sole entry pays).
-#[test]
-fn fetch_plan_assigns_shared_chunk_to_smallest_entry() {
-    let a = mentry(0x0a, 100, &[(40, 0xc0), (60, 0xc1)]);
-    let b = mentry(0x0b, 300, &[(60, 0xc1), (240, 0xc2)]);
-    let plan = build_fetch_plan(&[a, b]);
-    assert_eq!(plan.assigned.get(&[0xc1; 32]), Some(&[0x0a; 32]));
-    assert!(!plan.assigned.contains_key(&[0xc0; 32]));
-    assert!(!plan.assigned.contains_key(&[0xc2; 32]));
-}
-
-/// Equal-size sharers tie-break on the whole-file hash, and the assignment is
-/// independent of manifest order.
-#[test]
-fn fetch_plan_tie_breaks_by_whole_hash_and_is_order_independent() {
-    let p1 = build_fetch_plan(&[
-        mentry(0x0a, 60, &[(60, 0xc1)]),
-        mentry(0x0b, 60, &[(60, 0xc1)]),
-    ]);
-    let p2 = build_fetch_plan(&[
-        mentry(0x0b, 60, &[(60, 0xc1)]),
-        mentry(0x0a, 60, &[(60, 0xc1)]),
-    ]);
-    assert_eq!(p1.assigned, p2.assigned);
-    let winner = std::cmp::min([0x0a; 32], [0x0b; 32]);
-    assert_eq!(p1.assigned.get(&[0xc1; 32]), Some(&winner));
-}
-
-/// An entry defers a chunk the plan assigns to a smaller sibling (it will splice
-/// it), and drives its own unique chunk.
-#[test]
-fn plan_reassembly_defers_a_chunk_assigned_to_a_sibling() {
-    let total = 3 * GROUP + 50_000;
-    let b = mentry(0x0b, total, &[(3 * GROUP, 0x01), (50_000, 0x02)]);
-    let fetch_plan = build_fetch_plan(&[
-        mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]),
-        mentry(0x0b, total, &[(3 * GROUP, 0x01), (50_000, 0x02)]),
-    ]);
-    let hints = hints_of(&b).expect("valid hints");
-    let plan = plan_reassembly(&hints, &HashMap::new(), &fetch_plan, [0x0b; 32], total);
-    // c1 (assigned to the smaller a) is deferred; nothing is a donor yet.
-    assert_eq!(plan.deferred.len(), 1);
-    assert_eq!(plan.deferred[0].hint.hash, [0x01; 32]);
-    assert!(plan.donor.is_empty());
-    // The drive is the complement of c1's interior — the c2 region.
-    assert_eq!(plan.drive, vec![(3 * GROUP, 50_000)]);
-}
-
-/// An assigned fetcher that plans after a recipient has paid for and
-/// registered its chunk (a rerun that resumes it, say) splices that chunk
-/// instead of paying for it a second time: a registered chunk is a donor
-/// whoever the fetch plan assigned it to.
-#[test]
-fn plan_reassembly_splices_its_own_assigned_chunk_once_a_sibling_registered_it() {
-    let a = mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]);
-    let fetch_plan = build_fetch_plan(&[
-        mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]),
-        mentry(
-            0x0b,
-            3 * GROUP + 50_000,
-            &[(3 * GROUP, 0x01), (50_000, 0x02)],
-        ),
-    ]);
-    assert_eq!(fetch_plan.assigned.get(&[0x01; 32]), Some(&[0x0a; 32]));
-    let registered = HashMap::from([(
-        [0x01; 32],
-        MaterializedRange {
-            source: PathBuf::from("b"),
-            offset: 0,
-            len: 3 * GROUP,
-        },
-    )]);
-    let hints = hints_of(&a).expect("valid hints");
-    let plan = plan_reassembly(&hints, &registered, &fetch_plan, [0x0a; 32], 3 * GROUP);
-    assert_eq!(plan.donor.len(), 1);
-    assert!(
-        plan.drive.is_empty(),
-        "nothing is paid twice: {:?}",
-        plan.drive
-    );
-}
-
-/// A shared chunk with no group-aligned interior cannot be spliced, so it is
-/// paid (driven) rather than deferred, even when assigned to a sibling.
-#[test]
-fn plan_reassembly_pays_a_sub_group_shared_chunk_it_cannot_splice() {
-    let b = mentry(0x0b, 200, &[(100, 0x09), (100, 0x08)]);
-    let fetch_plan = build_fetch_plan(&[
-        mentry(0x0a, 100, &[(100, 0x09)]),
-        mentry(0x0b, 200, &[(100, 0x09), (100, 0x08)]),
-    ]);
-    let hints = hints_of(&b).expect("valid hints");
-    let plan = plan_reassembly(&hints, &HashMap::new(), &fetch_plan, [0x0b; 32], 200);
-    assert!(plan.deferred.is_empty());
-    assert_eq!(plan.drive, vec![(0, 200)]);
-}
-
-/// Groups are scheduled smallest whole-file first (unsized last), tie-broken by
-/// hash, so a shared chunk's assigned fetcher runs before its larger consumers.
+/// Groups are scheduled smallest whole-file first (unsized last), tie-broken
+/// by hash.
 #[test]
 fn groups_ordered_smallest_first_stable() {
-    let big = mentry(0x01, 900, &[(900, 0x91)]);
-    let small = mentry(0x02, 10, &[(10, 0x92)]);
-    let mid = mentry(0x03, 100, &[(100, 0x93)]);
+    let big = mentry(0x01, 900);
+    let small = mentry(0x02, 10);
+    let mid = mentry(0x03, 100);
     let refs = vec![&big, &small, &mid];
     let ordered = order_groups_smallest_first(group_by_hash(&refs));
     let sizes: Vec<_> = ordered
@@ -2123,17 +1516,15 @@ fn groups_ordered_by_any_declared_size_not_just_the_first() {
         path: "a".into(),
         hash: whole,
         size: None,
-        chunks: None,
         landed_from: None,
     };
     let sized_dup = ManifestEntry {
         path: "b".into(),
         hash: whole,
         size: Some(10),
-        chunks: None,
         landed_from: None,
     };
-    let big = mentry(0x01, 900, &[(900, 0x91)]);
+    let big = mentry(0x01, 900);
     let refs = vec![&big, &unsized_first, &sized_dup];
     let ordered = order_groups_smallest_first(group_by_hash(&refs));
     let sizes: Vec<_> = ordered
@@ -2141,42 +1532,6 @@ fn groups_ordered_by_any_declared_size_not_just_the_first() {
         .map(|g| g.entries.iter().find_map(|e| e.size))
         .collect();
     assert_eq!(sizes, vec![Some(10), Some(900)]);
-}
-
-/// The run download total counts each shared chunk once (under its assigned
-/// holder) and every unique byte, so a bundle that shares content downloads less
-/// than its whole on-disk size; the per-blob split reports the same figures.
-#[test]
-fn download_bytes_counts_shared_chunks_once() {
-    let a = mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]);
-    let total_b = 3 * GROUP + 50_000;
-    let b = mentry(0x0b, total_b, &[(3 * GROUP, 0x01), (50_000, 0x02)]);
-    let fetch_plan = build_fetch_plan(&[
-        mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]),
-        mentry(0x0b, total_b, &[(3 * GROUP, 0x01), (50_000, 0x02)]),
-    ]);
-
-    // a downloads its whole 3*GROUP (it is c1's assigned holder); b downloads only
-    // its unique c2 (50_000) and splices c1 from a.
-    let empty = HashMap::new();
-    let refs_a = vec![&a];
-    let refs_b = vec![&b];
-    let group_a = group_by_hash(&refs_a).pop().expect("group a");
-    let group_b = group_by_hash(&refs_b).pop().expect("group b");
-    assert_eq!(
-        blob_download_reconstruct(&group_a, &fetch_plan, &empty),
-        (3 * GROUP, 0)
-    );
-    assert_eq!(
-        blob_download_reconstruct(&group_b, &fetch_plan, &empty),
-        (50_000, 3 * GROUP)
-    );
-
-    // The run total is the sum: 3*GROUP + 50_000, well under the on-disk content.
-    assert_eq!(
-        download_bytes(&[a, b], &fetch_plan),
-        Some(3 * GROUP + 50_000)
-    );
 }
 
 /// A run's rate hints take this run's discovery sample over the peer store,
@@ -2219,368 +1574,40 @@ fn rate_hints_of_prefer_the_run_then_the_store() -> anyhow::Result<()> {
 }
 
 /// The planned downloads list each distinct blob once, in first-seen order,
-/// with a shared chunk under its assigned holder alone, and sum to the run's
-/// download total.
+/// and each pays its whole blob with its bao proof tree on the wire.
 #[test]
-fn planned_downloads_match_the_run_total() {
-    let a = mentry(0x0a, 3 * GROUP, &[(3 * GROUP, 0x01)]);
+fn planned_downloads_list_each_blob_once() {
+    let a = mentry(0x0a, 3 * GROUP);
     let total_b = 3 * GROUP + 50_000;
-    let b = mentry(0x0b, total_b, &[(3 * GROUP, 0x01), (50_000, 0x02)]);
+    let b = mentry(0x0b, total_b);
     let mut a_again = a.clone();
     a_again.path = "again".into();
     let unsized_blob = ManifestEntry {
         path: "unsized".into(),
         hash: [0x0c; 32],
         size: None,
-        chunks: None,
         landed_from: None,
     };
     let entries = [a.clone(), b.clone(), a_again, unsized_blob];
     let planned = planned_downloads(&entries);
-    let rows: Vec<_> = planned
-        .iter()
-        .map(|p| (p.hash, p.size, p.download))
-        .collect();
+    let rows: Vec<_> = planned.iter().map(|p| (p.hash, p.size)).collect();
     assert_eq!(
         rows,
         vec![
-            (a.hash, Some(3 * GROUP), 3 * GROUP),
-            (b.hash, Some(total_b), 50_000),
-            ([0x0c; 32], None, 0),
+            (a.hash, Some(3 * GROUP)),
+            (b.hash, Some(total_b)),
+            ([0x0c; 32], None),
         ]
     );
-    // Wire bytes carry each blob's own proof: the plain blob pays its whole
-    // tree; the blob that splices its shared chunk pays for its one range
-    // plus the proof path down its own tree, more than the range alone.
-    let whole = decdn_bao_range::align_range_clamped(0, 3 * GROUP, 3 * GROUP)
-        .unwrap()
-        .wire_len();
-    assert_eq!(planned[0].wire, whole);
-    assert!(planned[1].wire > planned[1].download, "{:?}", planned[1]);
+    let wire = |total| {
+        decdn_bao_range::align_range_clamped(0, total, total)
+            .unwrap()
+            .wire_len()
+    };
+    assert_eq!(planned[0].wire, wire(3 * GROUP));
+    assert_eq!(planned[1].wire, wire(total_b));
+    assert!(planned[1].wire > total_b, "{:?}", planned[1]);
     assert_eq!(planned[2].wire, 0);
-    let sum: u64 = planned.iter().map(|p| p.download).sum();
-    assert_eq!(
-        Some(sum),
-        download_bytes(&entries, &build_fetch_plan(&entries))
-    );
-}
-
-/// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` opens
-/// the entry's ranged store the way the real drive does (`open_or_create`) and
-/// admits each requested range's bao-verified bytes into it, so the store's
-/// record names them present. It never finalizes `<hex>` itself, so
-/// `reassemble_dedup` exercises its splice + whole-file verify + promote path.
-/// Records every driven range.
-struct RecordingDriver {
-    hash: [u8; 32],
-    staging: PathBuf,
-    content: Vec<u8>,
-    driven: std::sync::Mutex<Vec<(u64, u64)>>,
-}
-impl RangeDriver for RecordingDriver {
-    fn hash(&self) -> [u8; 32] {
-        self.hash
-    }
-    fn staging(&self) -> &Path {
-        &self.staging
-    }
-    fn drive<'a>(
-        &'a self,
-        ranges: &'a [(u64, u64)],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(async move {
-            use decdn_bao_range::RangedStore as _;
-            let total = u64::try_from(self.content.len()).expect("content len fits u64");
-            let (dir, stem) = ranged_store_location(&self.staging).expect("location");
-            let store = ClientRangedStore::open_or_create(&dir, &stem, self.hash, total)
-                .expect("open ranged store");
-            let outboard = bao_tree::io::outboard::PreOrderMemOutboard::create(
-                &self.content,
-                decdn_bao_range::IROH_BLOCK_SIZE,
-            );
-            let outboard = bytes::Bytes::from(outboard.data);
-            for &(off, len) in ranges {
-                self.driven.lock().expect("driven lock").push((off, len));
-                let aligned = decdn_bao_range::align_range(off, len, total).expect("align");
-                let start = usize::try_from(aligned.fetch_start()).expect("start fits usize");
-                let end = usize::try_from(aligned.fetch_end()).expect("end fits usize");
-                let bao = decdn_bao_range::encode_verified_range(
-                    self.hash,
-                    &aligned,
-                    &self.content[start..end],
-                    outboard.clone(),
-                )
-                .expect("encode range");
-                store.admit(aligned, bao).await.expect("admit range");
-            }
-            Ok(())
-        })
-    }
-}
-
-/// A [`RangeDriver`] whose every drive fails, as an interrupted run's would.
-struct FailingDriver {
-    hash: [u8; 32],
-    staging: PathBuf,
-}
-impl RangeDriver for FailingDriver {
-    fn hash(&self) -> [u8; 32] {
-        self.hash
-    }
-    fn staging(&self) -> &Path {
-        &self.staging
-    }
-    fn drive<'a>(
-        &'a self,
-        _ranges: &'a [(u64, u64)],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(async { Err(anyhow!("interrupted")) })
-    }
-}
-
-/// Spliced donor bytes never enter the entry's ranged store: the store holds
-/// only bao-verified bytes, so an interrupted entry leaves no donor byte in
-/// its `.partial` for a later run to resume from.
-#[tokio::test]
-async fn spliced_bytes_never_enter_the_store() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8") | 1)
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let half = usize::try_from(2 * GROUP).expect("fits usize");
-
-    let donor_path = tmp.path().join("donor");
-    std::fs::write(&donor_path, &content[..half]).expect("write donor");
-    let donor_hash = *blake3::hash(&content[..half]).as_bytes();
-    let deferred_hash = *blake3::hash(&content[half..]).as_bytes();
-
-    let staging = tmp.path().join("blob");
-    let driver = FailingDriver {
-        hash: whole,
-        staging: staging.clone(),
-    };
-    let plan = ReassemblePlan {
-        donor: vec![DonorRange {
-            dst: (0, 2 * GROUP),
-            refetch: (0, 2 * GROUP),
-            source: donor_path,
-            src_offset: 0,
-            chunk_hash: donor_hash,
-            chunk_src_offset: 0,
-            chunk_len: 2 * GROUP,
-        }],
-        deferred: vec![whole_deferred(Hint {
-            hash: deferred_hash,
-            offset: 2 * GROUP,
-            len: 2 * GROUP,
-        })],
-        drive: Vec::new(),
-    };
-    let index = ChunkIndex::default();
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
-    index.mark_finished([0xaa; 32]);
-
-    let res = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await;
-    assert!(res.is_err(), "the fallback drive fails: {res:?}");
-    assert!(!staging.exists(), "nothing is promoted");
-    let partial = std::fs::read(partial_path(&staging)).unwrap_or_default();
-    assert!(
-        partial.iter().all(|&b| b == 0),
-        "the store's `.partial` holds no spliced byte"
-    );
-}
-
-/// Bytes the ranged store holds are bao-verified, so they win over a splice
-/// at the same offsets. A donor whose own chunk verifies but whose placement
-/// in this entry is wrong over a range the store already holds costs nothing:
-/// the whole-file hash matches and no self-heal re-drive runs.
-#[tokio::test]
-async fn verified_store_bytes_win_over_a_spliced_byte() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let (group, half) = (
-        usize::try_from(GROUP).expect("fits usize"),
-        usize::try_from(2 * GROUP).expect("fits usize"),
-    );
-
-    // An earlier run fetched `[0, GROUP)` into the store.
-    let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, whole);
-    assert_eq!(resumed, vec![(0, GROUP)]);
-
-    // The donor's chunk verifies against its own hint, but its first group
-    // is not this entry's bytes.
-    let mut donor_bytes = content[..half].to_vec();
-    for b in &mut donor_bytes[..group] {
-        *b = b.wrapping_add(1);
-    }
-    let donor_path = tmp.path().join("donor");
-    std::fs::write(&donor_path, &donor_bytes).expect("write donor");
-    let donor_hash = *blake3::hash(&donor_bytes).as_bytes();
-
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-    let plan = ReassemblePlan {
-        donor: vec![DonorRange {
-            dst: (0, 2 * GROUP),
-            refetch: (0, 2 * GROUP),
-            source: donor_path,
-            src_offset: 0,
-            chunk_hash: donor_hash,
-            chunk_src_offset: 0,
-            chunk_len: 2 * GROUP,
-        }],
-        deferred: Vec::new(),
-        drive: vec![(2 * GROUP, 2 * GROUP)],
-    };
-    let index = ChunkIndex::default();
-
-    reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &resumed,
-        None,
-        &index,
-        &FetchPlan::default(),
-        None,
-        &|| {},
-    )
-    .await
-    .expect("reassembly must succeed");
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert_eq!(
-        driver.driven.lock().expect("driven lock").clone(),
-        vec![(2 * GROUP, 2 * GROUP)],
-        "no self-heal re-drive"
-    );
-    assert!(
-        !assembly_path(&staging).exists(),
-        "the assembly file is promoted"
-    );
-    assert!(
-        !partial_path(&staging).exists(),
-        "the store's `.partial` is removed once the entry is promoted"
-    );
-}
-
-/// An entry resumed from an earlier run's `.partial` whose splice then
-/// covers part of that prefix: the overlap counts once, as spliced, and only
-/// the bytes neither resumed nor spliced count as paid (#2236).
-#[tokio::test]
-async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let half = usize::try_from(2 * GROUP).expect("fits usize");
-
-    // An earlier, interrupted run fetched `[0, 3*GROUP)` into the store.
-    let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_checkpointed_prefix(tmp.path(), "blob", &content, 3 * GROUP)
-        .expect("seed the resume record");
-    let resumed = resumed_spans(&staging, whole);
-    assert_eq!(resumed, vec![(0, 3 * GROUP)]);
-
-    // This run splices `[0, 2*GROUP)` from a donor and pays for the deferred
-    // `[2*GROUP, 4*GROUP)` when its sibling finishes without producing it.
-    let donor_path = tmp.path().join("donor");
-    std::fs::write(&donor_path, &content[..half]).expect("write donor");
-    let donor_hash = *blake3::hash(&content[..half]).as_bytes();
-    let deferred_hash = *blake3::hash(&content[half..]).as_bytes();
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-    let plan = ReassemblePlan {
-        donor: vec![DonorRange {
-            dst: (0, 2 * GROUP),
-            refetch: (0, 2 * GROUP),
-            source: donor_path,
-            src_offset: 0,
-            chunk_hash: donor_hash,
-            chunk_src_offset: 0,
-            chunk_len: 2 * GROUP,
-        }],
-        deferred: vec![whole_deferred(Hint {
-            hash: deferred_hash,
-            offset: 2 * GROUP,
-            len: 2 * GROUP,
-        })],
-        drive: Vec::new(),
-    };
-    let index = ChunkIndex::default();
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
-    index.mark_finished([0xaa; 32]);
-
-    let outcome = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &resumed,
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await
-    .expect("reassembly must succeed");
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert_eq!(
-        outcome.spliced_bytes,
-        2 * GROUP,
-        "the splice keeps priority"
-    );
-    assert_eq!(outcome.resumed_bytes, GROUP, "only the unspliced prefix");
-    assert_eq!(
-        EntryBytes::dedup(total, outcome),
-        EntryBytes {
-            paid: GROUP,
-            spliced: 2 * GROUP,
-            resumed: GROUP,
-        }
-    );
-}
-
-/// A self-heal whole-blob re-drive discards every splice, so the resumed
-/// prefix counts whole: the store still holds it, and the re-drive does not
-/// fetch it again.
-#[test]
-fn a_self_heal_outcome_counts_the_whole_resumed_prefix() {
-    let outcome = DedupOutcome::of(&[], &[(0, 3 * GROUP), (GROUP, GROUP)], 4 * GROUP, 2);
-    assert_eq!(outcome.spliced_bytes, 0);
-    assert_eq!(outcome.resumed_bytes, 3 * GROUP);
-    assert_eq!(EntryBytes::dedup(4 * GROUP, outcome).paid, GROUP);
 }
 
 /// The whole-blob path reads what an earlier run fetched from the resume
@@ -2609,7 +1636,6 @@ fn resumed_spans_read_the_record_an_earlier_run_left() {
         EntryBytes::whole_blob(len, span_bytes(&resumed)),
         EntryBytes {
             paid: len - GROUP,
-            spliced: 0,
             resumed: GROUP,
         }
     );
@@ -2624,951 +1650,10 @@ fn resumed_spans_read_the_record_an_earlier_run_left() {
     );
 }
 
-/// Two donor chunks of a blob, `[0, cut)` and `[cut, 4*GROUP)`, each written
-/// to its own donor file, with the index entries a plan resolves them by.
-/// `cut` is not a chunk-group boundary.
-fn two_donor_fixture(
-    dir: &Path,
-    content: &[u8],
-    cut: u64,
-) -> (Vec<Hint>, HashMap<[u8; 32], MaterializedRange>) {
-    let c = usize::try_from(cut).expect("fits usize");
-    let total = u64::try_from(content.len()).expect("fits u64");
-    let mut hints = Vec::new();
-    let mut index = HashMap::new();
-    for (name, bytes, offset) in [("a", &content[..c], 0), ("b", &content[c..], cut)] {
-        let path = dir.join(name);
-        std::fs::write(&path, bytes).expect("write donor");
-        let hash = *blake3::hash(bytes).as_bytes();
-        let len = u64::try_from(bytes.len()).expect("fits u64");
-        hints.push(Hint { hash, offset, len });
-        index.insert(
-            hash,
-            MaterializedRange {
-                source: path,
-                offset: 0,
-                len,
-            },
-        );
-    }
-    assert_eq!(hints.iter().map(|h| h.len).sum::<u64>(), total);
-    (hints, index)
-}
-
-/// Two adjacent donor chunks that meet inside a chunk group form one spliced
-/// run: the boundary group is spliced from both sides, so nothing is driven.
-#[test]
-fn plan_dedup_adjacent_donors_at_an_unaligned_boundary_leave_no_drive_gap() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content = vec![7u8; usize::try_from(total).expect("fits usize")];
-    let cut = GROUP + 5000;
-    let (hints, index) = two_donor_fixture(tmp.path(), &content, cut);
-
-    let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
-
-    assert!(plan.drive.is_empty(), "drive: {:?}", plan.drive);
-    let dsts: Vec<(u64, u64)> = plan.donor.iter().map(|d| d.dst).collect();
-    assert_eq!(dsts, vec![(0, cut), (cut, total - cut)]);
-    assert!(plan.donor.iter().all(|d| d.src_offset == 0));
-    assert_eq!(plan.donor[1].refetch, (GROUP, total - GROUP));
-}
-
-/// A donor next to a chunk that must be driven splices only up to the last
-/// group boundary inside it: the shared group is driven once, with the
-/// driven chunk.
-#[test]
-fn plan_dedup_donor_next_to_a_driven_chunk_drives_the_shared_group_once() {
-    let total = 3 * GROUP;
-    let cut = GROUP + 5000;
-    let donor_hash = [0x44; 32];
-    let mut index = HashMap::new();
-    index.insert(
-        donor_hash,
-        MaterializedRange {
-            source: PathBuf::from("/tmp/donor"),
-            offset: 0,
-            len: cut,
-        },
-    );
-    let hints = [
-        Hint {
-            hash: donor_hash,
-            offset: 0,
-            len: cut,
-        },
-        Hint {
-            hash: [0x45; 32],
-            offset: cut,
-            len: total - cut,
-        },
-    ];
-
-    let plan = plan_reassembly(&hints, &index, &FetchPlan::default(), [0; 32], total);
-
-    let dsts: Vec<(u64, u64)> = plan.donor.iter().map(|d| d.dst).collect();
-    assert_eq!(dsts, vec![(0, GROUP)]);
-    assert_eq!(plan.drive, vec![(GROUP, 2 * GROUP)]);
-}
-
-/// A donor chunk that meets a deferred chunk inside a group also forms one
-/// run with it: neither side's partial group is driven.
-#[test]
-fn plan_dedup_donor_meeting_a_deferred_chunk_leaves_no_drive_gap() {
-    let total = 3 * GROUP;
-    let cut = GROUP + 5000;
-    let (donor_hash, deferred_hash) = ([0x46; 32], [0x47; 32]);
-    let mut index = HashMap::new();
-    index.insert(
-        donor_hash,
-        MaterializedRange {
-            source: PathBuf::from("/tmp/donor"),
-            offset: 0,
-            len: cut,
-        },
-    );
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(deferred_hash, [0xaa; 32]);
-    let hints = [
-        Hint {
-            hash: donor_hash,
-            offset: 0,
-            len: cut,
-        },
-        Hint {
-            hash: deferred_hash,
-            offset: cut,
-            len: total - cut,
-        },
-    ];
-
-    let plan = plan_reassembly(&hints, &index, &fetch_plan, [0x0b; 32], total);
-
-    assert!(plan.drive.is_empty(), "drive: {:?}", plan.drive);
-    assert_eq!(plan.donor[0].dst, (0, cut));
-    assert_eq!(plan.deferred[0].dst, (cut, total - cut));
-    assert_eq!(plan.deferred[0].refetch, (GROUP, 2 * GROUP));
-}
-
-#[test]
-fn spliced_runs_merge_touching_spans_and_round_only_the_run_ends_inward() {
-    let total = 10 * GROUP;
-    // Two touching spans that meet mid-group, and one apart from them.
-    let spans = [
-        (100, GROUP),
-        (GROUP + 100, 2 * GROUP),
-        (5 * GROUP + 1, 2 * GROUP),
-    ];
-    assert_eq!(
-        spliced_runs(&spans, total),
-        vec![(GROUP, 3 * GROUP), (6 * GROUP, 7 * GROUP)]
-    );
-    // A run with no whole group inside it is dropped.
-    assert!(spliced_runs(&[(1, GROUP)], total).is_empty());
-}
-
-/// The blob end counts as a group boundary: a run that reaches it keeps its
-/// final partial group.
-#[test]
-fn spliced_runs_keep_the_blob_end() {
-    let total = 2 * GROUP + 700;
-    assert_eq!(
-        spliced_runs(&[(GROUP, GROUP + 700)], total),
-        vec![(GROUP, total)]
-    );
-}
-
-/// Adjacent donors meeting mid-group reassemble the blob with nothing paid for.
-#[tokio::test]
-async fn reassemble_dedup_splices_a_boundary_group_from_two_donors() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let (hints, map) = two_donor_fixture(tmp.path(), &content, GROUP + 5000);
-    let plan = plan_reassembly(&hints, &map, &FetchPlan::default(), whole, total);
-    let staging = tmp.path().join("blob");
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-
-    let outcome = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &ChunkIndex::default(),
-        &FetchPlan::default(),
-        None,
-        &|| {},
-    )
-    .await
-    .expect("reassembly must succeed");
-
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert!(driver.driven.lock().expect("driven lock").is_empty());
-    assert_eq!(outcome.spliced_bytes, total);
-}
-
-/// A donor that fails its verification re-hash is fetched again over every
-/// group its span touches — including the boundary group it shares with a
-/// good neighbour — and the blob still reassembles byte-exact.
-#[tokio::test]
-async fn reassemble_dedup_refetches_the_outward_group_span_of_a_failed_donor() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let cut = GROUP + 5000;
-    let (hints, map) = two_donor_fixture(tmp.path(), &content, cut);
-    let plan = plan_reassembly(&hints, &map, &FetchPlan::default(), whole, total);
-    // Corrupt donor B on disk after planning: its chunk no longer re-hashes.
-    std::fs::write(tmp.path().join("b"), vec![0u8; 16]).expect("corrupt donor b");
-    let staging = tmp.path().join("blob");
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-
-    let outcome = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &ChunkIndex::default(),
-        &FetchPlan::default(),
-        None,
-        &|| {},
-    )
-    .await
-    .expect("reassembly must succeed");
-
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert_eq!(
-        driver.driven.lock().expect("driven lock").clone(),
-        vec![(GROUP, total - GROUP)],
-        "the failed donor's whole groups are driven, boundary group included"
-    );
-    // The drive wrote and paid for donor A's share of the boundary group.
-    assert_eq!(outcome.spliced_bytes, GROUP);
-    assert_eq!(outcome.hints_ignored, 1);
-}
-
-/// A deferred chunk whose fetcher finishes without producing it is driven
-/// over every group its span touches, so the boundary group it shares with a
-/// spliced donor ends up whole.
-#[tokio::test]
-async fn reconcile_deferred_falls_back_to_the_outward_group_span() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let cut = GROUP + 5000;
-    let (hints, mut map) = two_donor_fixture(tmp.path(), &content, cut);
-    // Chunk b is not materialized: it is assigned to a sibling that has
-    // already finished without registering it.
-    let b_hash = hints[1].hash;
-    map.remove(&b_hash);
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(b_hash, [0xaa; 32]);
-    let index = ChunkIndex::default();
-    index.mark_finished([0xaa; 32]);
-    let plan = plan_reassembly(&hints, &map, &fetch_plan, whole, total);
-    assert!(plan.drive.is_empty(), "drive: {:?}", plan.drive);
-    let staging = tmp.path().join("blob");
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-
-    let outcome = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await
-    .expect("reassembly must succeed");
-
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert_eq!(
-        driver.driven.lock().expect("driven lock").clone(),
-        vec![(GROUP, total - GROUP)]
-    );
-    // The fallback drive wrote and paid for donor A's share of the boundary group.
-    assert_eq!(outcome.spliced_bytes, GROUP);
-}
-
-/// A re-fetch of a failed donor at the first splice can cover part of a
-/// deferred chunk that the tail splices later. The overlap is paid, so it
-/// does not count as spliced.
-#[tokio::test]
-async fn spliced_bytes_exclude_a_first_splice_refetch_under_a_tail_splice() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let cut = GROUP + 5000;
-    let (hints, mut map) = two_donor_fixture(tmp.path(), &content, cut);
-    // Chunk a is deferred to a sibling that has already registered it.
-    let a_hash = hints[0].hash;
-    map.remove(&a_hash);
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(a_hash, [0xaa; 32]);
-    let plan = plan_reassembly(&hints, &map, &fetch_plan, whole, total);
-    assert_eq!(plan.deferred.len(), 1);
-    assert_eq!(plan.donor.len(), 1);
-    let index = ChunkIndex::default();
-    index.register(Some(&hints[..1]), &tmp.path().join("a"));
-    // Donor b fails its re-hash, so the first splice re-fetches its groups.
-    std::fs::write(tmp.path().join("b"), vec![0u8; 16]).expect("corrupt donor b");
-    let staging = tmp.path().join("blob");
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-
-    let outcome = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await
-    .expect("reassembly must succeed");
-
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert_eq!(
-        driver.driven.lock().expect("driven lock").clone(),
-        vec![(GROUP, total - GROUP)]
-    );
-    assert_eq!(outcome.spliced_bytes, GROUP);
-    assert_eq!(outcome.hints_ignored, 1);
-}
-
-/// The bytes of `spliced` that no `driven` span covers, over `[0, total)`.
-fn net_spliced(spliced: &[(u64, u64)], driven: &[(u64, u64)], total: u64) -> u64 {
-    span_bytes(&uncovered_runs(spliced, driven, total))
-}
-
-#[test]
-fn uncovered_runs_keeps_the_uncovered_parts_as_disjoint_spans() {
-    assert_eq!(
-        uncovered_runs(&[(300, 100), (0, 100)], &[(50, 100), (350, 10)], 1000),
-        vec![(0, 50), (300, 50), (360, 40)]
-    );
-    // Overlapping inputs coalesce, and the result clamps to `total`.
-    assert_eq!(
-        uncovered_runs(&[(0, 60), (40, 100)], &[], 100),
-        vec![(0, 100)]
-    );
-    assert!(uncovered_runs(&[(0, 100)], &[(0, 100)], 1000).is_empty());
-}
-
-#[test]
-fn net_spliced_subtracts_only_the_driven_overlap() {
-    // Disjoint: nothing driven under the splice.
-    assert_eq!(net_spliced(&[(0, 100)], &[(200, 50)], 1000), 100);
-    // Nested: the drive sits inside the splice.
-    assert_eq!(net_spliced(&[(0, 100)], &[(20, 30)], 1000), 70);
-    // The drive covers the whole splice.
-    assert_eq!(net_spliced(&[(10, 20)], &[(0, 100)], 1000), 0);
-    // Touching spans share no byte.
-    assert_eq!(net_spliced(&[(0, 100)], &[(100, 100)], 1000), 100);
-    // Overlapping drives count once, across several splices, in any order.
-    assert_eq!(
-        net_spliced(
-            &[(300, 100), (0, 100)],
-            &[(50, 100), (60, 10), (350, 100)],
-            1000
-        ),
-        100
-    );
-    assert_eq!(net_spliced(&[], &[(0, 10)], 1000), 0);
-    assert_eq!(net_spliced(&[(0, 10)], &[], 1000), 10);
-}
-
-/// A deferred chunk whose assigned fetcher registers its donor only AFTER the
-/// consumer has started is still spliced at the tail — never driven — so the
-/// shared bytes are paid for once (by the sibling) and copied here from disk.
-#[tokio::test]
-async fn reconcile_deferred_splices_a_late_registered_donor() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-
-    // Deferred chunk = the first two groups; its hash is what the donor must
-    // re-hash to. The consumer's own pay-now range is the last two groups.
-    let deferred_len = 2 * GROUP;
-    let dl = usize::try_from(deferred_len).expect("fits usize");
-    let chunk_hash = *blake3::hash(&content[..dl]).as_bytes();
-
-    let staging = tmp.path().join("blob");
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-    let plan = ReassemblePlan {
-        donor: Vec::new(),
-        deferred: vec![whole_deferred(Hint {
-            hash: chunk_hash,
-            offset: 0,
-            len: deferred_len,
-        })],
-        drive: vec![(deferred_len, 2 * GROUP)],
-    };
-    let index = std::sync::Arc::new(ChunkIndex::default());
-    let mut fetch_plan = FetchPlan::default();
-    // The deferred chunk is assigned to some sibling whole hash.
-    fetch_plan.assigned.insert(chunk_hash, [0xaa; 32]);
-
-    // Register the donor a moment after the consumer starts, simulating a
-    // sibling finishing mid-run.
-    let donor_path = tmp.path().join("donor");
-    std::fs::write(&donor_path, &content[..dl]).expect("write donor");
-    let index_bg = index.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        index_bg.register(
-            Some(&[Hint {
-                hash: chunk_hash,
-                offset: 0,
-                len: deferred_len,
-            }]),
-            &donor_path,
-        );
-    });
-
-    let res = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await;
-    assert!(res.is_ok(), "reassembly must succeed: {res:?}");
-    assert!(staging.try_exists().expect("stat staging"));
-    let got = std::fs::read(&staging).expect("read staging");
-    assert_eq!(
-        got, content,
-        "reassembled blob must match the whole content"
-    );
-    // The deferred range was spliced, never driven.
-    let driven_ranges = driver.driven.lock().expect("driven lock").clone();
-    assert!(
-        driven_ranges.iter().all(|&(off, _)| off >= deferred_len),
-        "the deferred range must be spliced, not driven: {driven_ranges:?}"
-    );
-}
-
-/// When a deferred chunk's assigned fetcher FINISHES without registering it (a
-/// failed fetcher), the tail reconcile drives (pays for) the range itself, so
-/// the entry still completes — liveness, never a hang.
-#[tokio::test]
-async fn reconcile_deferred_pays_when_the_assigned_fetcher_never_produces_it() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let deferred_len = 2 * GROUP;
-    let dl = usize::try_from(deferred_len).expect("fits usize");
-    let chunk_hash = *blake3::hash(&content[..dl]).as_bytes();
-
-    let staging = tmp.path().join("blob");
-    let driver = RecordingDriver {
-        hash: whole,
-        staging: staging.clone(),
-        content: content.clone(),
-        driven: std::sync::Mutex::new(Vec::new()),
-    };
-    let plan = ReassemblePlan {
-        donor: Vec::new(),
-        deferred: vec![whole_deferred(Hint {
-            hash: chunk_hash,
-            offset: 0,
-            len: deferred_len,
-        })],
-        drive: vec![(deferred_len, 2 * GROUP)],
-    };
-    let index = std::sync::Arc::new(ChunkIndex::default());
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(chunk_hash, [0xaa; 32]);
-
-    // The assigned fetcher finishes shortly, producing nothing.
-    let index_bg = index.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        index_bg.mark_finished([0xaa; 32]);
-    });
-
-    let res = reassemble_dedup(
-        &driver,
-        &plan,
-        total,
-        &[],
-        None,
-        &index,
-        &fetch_plan,
-        None,
-        &|| {},
-    )
-    .await;
-    assert!(res.is_ok(), "reassembly must succeed via fallback: {res:?}");
-    let got = std::fs::read(&staging).expect("read staging");
-    assert_eq!(got, content);
-    // The deferred range was driven (paid) as a fallback.
-    let driven_ranges = driver.driven.lock().expect("driven lock").clone();
-    assert!(
-        driven_ranges
-            .iter()
-            .any(|&(off, len)| off == 0 && len == deferred_len),
-        "the deferred range must be driven as a fallback: {driven_ranges:?}"
-    );
-}
-
-/// A [`RecordingDriver`] that drives under a `--jobs` [`FetchSlot`], as the
-/// production driver does, and records whether the slot was held for each
-/// drive.
-struct SlotDriver<'s, 'g> {
-    inner: RecordingDriver,
-    slot: &'s FetchSlot<'g>,
-    held_on_drive: std::sync::Mutex<Vec<bool>>,
-}
-impl RangeDriver for SlotDriver<'_, '_> {
-    fn hash(&self) -> [u8; 32] {
-        self.inner.hash()
-    }
-    fn staging(&self) -> &Path {
-        self.inner.staging()
-    }
-    fn drive<'a>(
-        &'a self,
-        ranges: &'a [(u64, u64)],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-        Box::pin(async move {
-            self.slot.ensure().await?;
-            self.held_on_drive
-                .lock()
-                .expect("held lock")
-                .push(self.slot.held());
-            self.inner.drive(ranges).await
-        })
-    }
-    fn release_slot(&self) {
-        self.slot.release();
-    }
-    fn retake_slot(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>> {
-        Box::pin(self.slot.ensure())
-    }
-}
-
-/// #2283: an entry whose complement has landed and that only waits for a
-/// sibling's donor chunks gives its `--jobs` slot to a queued entry, and
-/// takes one again for the fallback drive when the sibling finishes
-/// without them. With one slot, a waiter that kept it would starve the
-/// queued entry until the wait ended.
-#[tokio::test]
-async fn a_donor_waiter_gives_its_slot_to_a_queued_entry_and_retakes_it_to_drive() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let deferred_len = 2 * GROUP;
-    let dl = usize::try_from(deferred_len).expect("fits usize");
-    let chunk_hash = *blake3::hash(&content[..dl]).as_bytes();
-
-    let gate = JobGate::new(1);
-    let slot = FetchSlot::acquire(&gate).await.expect("first slot");
-    let staging = tmp.path().join("blob");
-    let driver = SlotDriver {
-        inner: RecordingDriver {
-            hash: whole,
-            staging: staging.clone(),
-            content: content.clone(),
-            driven: std::sync::Mutex::new(Vec::new()),
-        },
-        slot: &slot,
-        held_on_drive: std::sync::Mutex::new(Vec::new()),
-    };
-    let plan = ReassemblePlan {
-        donor: Vec::new(),
-        deferred: vec![whole_deferred(Hint {
-            hash: chunk_hash,
-            offset: 0,
-            len: deferred_len,
-        })],
-        drive: vec![(deferred_len, 2 * GROUP)],
-    };
-    let index = ChunkIndex::default();
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(chunk_hash, [0xaa; 32]);
-
-    // The queued entry: it waits for the one slot, holds it briefly, then
-    // its sibling (the assigned fetcher) finishes without the chunk.
-    let queued = async {
-        let got = tokio::time::timeout(std::time::Duration::from_secs(10), gate.permit())
-            .await
-            .is_ok_and(|permit| permit.is_ok());
-        index.mark_finished([0xaa; 32]);
-        got
-    };
-    let (res, queued_ran) = tokio::join!(
-        reassemble_dedup(
-            &driver,
-            &plan,
-            total,
-            &[],
-            None,
-            &index,
-            &fetch_plan,
-            None,
-            &|| {},
-        ),
-        queued
-    );
-    assert!(res.is_ok(), "reassembly must succeed via fallback: {res:?}");
-    assert!(
-        queued_ran,
-        "the waiter must give its slot to the queued entry"
-    );
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    let held = driver.held_on_drive.lock().expect("held lock").clone();
-    assert_eq!(
-        held,
-        vec![true, true],
-        "the complement drive and the fallback drive each run under a slot"
-    );
-    assert!(slot.held(), "the entry ends holding its slot again");
-}
-
-/// #2283: a waiter whose donor arrives needs no fallback drive, yet it
-/// takes its slot back as the wait ends: the splice, the whole-file hash and
-/// the materialize after it are heavy disk work `--jobs` bounds too.
-#[tokio::test]
-async fn a_waiter_whose_donor_arrives_holds_its_slot_again_for_the_splice() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let total = 4 * GROUP;
-    let content: Vec<u8> = (0..total)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let whole = *blake3::hash(&content).as_bytes();
-    let deferred_len = 2 * GROUP;
-    let dl = usize::try_from(deferred_len).expect("fits usize");
-    let chunk_hash = *blake3::hash(&content[..dl]).as_bytes();
-    let hint = Hint {
-        hash: chunk_hash,
-        offset: 0,
-        len: deferred_len,
-    };
-
-    let gate = JobGate::new(1);
-    let slot = FetchSlot::acquire(&gate).await.expect("first slot");
-    let staging = tmp.path().join("blob");
-    let driver = SlotDriver {
-        inner: RecordingDriver {
-            hash: whole,
-            staging: staging.clone(),
-            content: content.clone(),
-            driven: std::sync::Mutex::new(Vec::new()),
-        },
-        slot: &slot,
-        held_on_drive: std::sync::Mutex::new(Vec::new()),
-    };
-    let plan = ReassemblePlan {
-        donor: Vec::new(),
-        deferred: vec![whole_deferred(hint)],
-        drive: vec![(deferred_len, 2 * GROUP)],
-    };
-    let index = ChunkIndex::default();
-    let mut fetch_plan = FetchPlan::default();
-    fetch_plan.assigned.insert(chunk_hash, [0xaa; 32]);
-    let donor_path = tmp.path().join("donor");
-    std::fs::write(&donor_path, &content[..dl]).expect("write donor");
-
-    // The sibling fetcher takes the freed slot, registers the donor, and
-    // gives the slot back as it ends.
-    let sibling = async {
-        let permit = gate.permit().await.expect("the waiter freed its slot");
-        index.register(Some(&[hint]), &donor_path);
-        drop(permit);
-    };
-    let (res, ()) = tokio::join!(
-        reassemble_dedup(
-            &driver,
-            &plan,
-            total,
-            &[],
-            None,
-            &index,
-            &fetch_plan,
-            None,
-            &|| {},
-        ),
-        sibling
-    );
-    assert!(res.is_ok(), "reassembly must succeed: {res:?}");
-    assert_eq!(std::fs::read(&staging).expect("read staging"), content);
-    assert_eq!(
-        driver.held_on_drive.lock().expect("held lock").len(),
-        1,
-        "only the complement was driven: the donor was spliced"
-    );
-    assert!(slot.held(), "the entry holds its slot again after the wait");
-}
-
-/// Review #3 (money-band): the run-end sweep removes a normal donor staging
-/// blob but KEEPS one `mark_retained` flagged (its group failed to
-/// materialize), so a rerun resumes from the finalized `<hex>` instead of
-/// re-paying the whole blob.
-#[tokio::test]
-async fn run_end_sweep_keeps_a_retained_donor_and_removes_a_normal_one() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let normal = tmp.path().join("normal");
-    let retained = tmp.path().join("retained");
-    std::fs::write(&normal, b"n").expect("write normal");
-    std::fs::write(&retained, b"r").expect("write retained");
-
-    let index = ChunkIndex::default();
-    index.register(
-        Some(&[Hint {
-            hash: [1; 32],
-            offset: 0,
-            len: 1,
-        }]),
-        &normal,
-    );
-    index.register(
-        Some(&[Hint {
-            hash: [2; 32],
-            offset: 0,
-            len: 1,
-        }]),
-        &retained,
-    );
-    // The retained donor's blob is paid for but its materialize failed.
-    index.mark_retained(&retained);
-
-    sweep_donor_sources(&index).await;
-
-    assert!(
-        !normal.exists(),
-        "a normal donor source is swept at run end"
-    );
-    assert!(
-        retained.exists(),
-        "a retained (materialize-failed) donor source survives the sweep"
-    );
-}
-
-/// A [`ChunkIndex::seed_disk`] source is an on-disk OUTPUT file, not a
-/// staging blob: [`ChunkIndex::sources`] (the run-end sweep's deletion list)
-/// must exclude it, or a materialized output would be deleted. It is still
-/// resolvable as a splice donor for planning.
-#[test]
-fn chunk_index_seeded_source_survives_sweep() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let out = tmp.path().join("kept.bin");
-    std::fs::write(&out, b"donorbytes").expect("write");
-    let idx = ChunkIndex::default();
-    idx.seed_disk([7u8; 32], &out, 0, 10);
-    // A seeded output path is NOT a sweepable staging source.
-    assert!(idx.sources().is_empty());
-    // But it IS resolvable as a donor for planning.
-    let guard = idx.map.lock().unwrap_or_else(PoisonError::into_inner);
-    assert!(guard.contains_key(&[7u8; 32]));
-}
-
-/// `splice_donors` happy path: a donor file holds a verified chunk at some
-/// offset (with padding on both sides), and the aligned subset lands at the
-/// correct recipient offset in the assembly file — nothing else in it is
-/// touched, and nothing is queued for refetch.
-#[test]
-fn splice_donors_copies_a_verified_subset_into_the_assembly() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let donor_path = tmp.path().join("donor");
-    let assembly = tmp.path().join("out.assembly");
-
-    // The chunk occupies exactly one group, padded on both sides in the donor
-    // file so the source offset is not trivially zero.
-    let chunk_bytes: Vec<u8> = (0..GROUP)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let pad_before = 100usize;
-    let mut donor_data = vec![0xEEu8; pad_before];
-    donor_data.extend_from_slice(&chunk_bytes);
-    donor_data.extend_from_slice(&[0xEE; 50]);
-    std::fs::write(&donor_path, &donor_data).expect("write donor");
-
-    let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
-    let total = 2 * GROUP;
-    // splice_donors only opens `assembly` for write, so pre-size it (zeros)
-    // the way `create_assembly_off_runtime` does before splicing runs.
-    std::fs::File::create(&assembly)
-        .and_then(|f| f.set_len(total))
-        .expect("presize assembly");
-
-    let donor = DonorRange {
-        dst: (GROUP, GROUP),
-        refetch: (GROUP, GROUP),
-        source: donor_path,
-        src_offset: u64::try_from(pad_before).expect("pad_before fits in u64"),
-        chunk_hash,
-        chunk_src_offset: u64::try_from(pad_before).expect("pad_before fits in u64"),
-        chunk_len: GROUP,
-    };
-
-    let refetch = splice_donors(&assembly, std::slice::from_ref(&donor)).expect("splice");
-    assert!(refetch.is_empty(), "{refetch:?}");
-
-    let got = std::fs::read(&assembly).expect("read assembly");
-    let g = usize::try_from(GROUP).expect("GROUP fits in usize");
-    assert_eq!(&got[g..2 * g], &chunk_bytes[..], "spliced subset mismatch");
-    assert!(
-        got[..g].iter().all(|&b| b == 0),
-        "untouched region must stay zero"
-    );
-}
-
-/// A donor whose recorded chunk bytes no longer hash to the hint's chunk hash
-/// (corruption, or a stale/overwritten donor file) is never trusted: its range
-/// is pushed to the refetch list and no bytes are written into the assembly
-/// file for it.
-#[test]
-fn splice_donors_refetches_a_corrupted_donor_chunk() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let donor_path = tmp.path().join("donor");
-    let assembly = tmp.path().join("out.assembly");
-
-    let chunk_bytes: Vec<u8> = (0..GROUP)
-        .map(|i| u8::try_from(i % 251).expect("i % 251 fits in u8"))
-        .collect();
-    let chunk_hash = *blake3::hash(&chunk_bytes).as_bytes();
-
-    // Write a CORRUPTED copy of the chunk to the donor file (flip one byte),
-    // so the on-disk bytes no longer match `chunk_hash`.
-    let mut corrupted = chunk_bytes.clone();
-    let mid = corrupted.len() / 2;
-    corrupted[mid] ^= 0xFF;
-    std::fs::write(&donor_path, &corrupted).expect("write corrupted donor");
-
-    let total = 2 * GROUP;
-    std::fs::File::create(&assembly)
-        .and_then(|f| f.set_len(total))
-        .expect("presize assembly");
-
-    let donor = DonorRange {
-        dst: (GROUP, GROUP),
-        refetch: (GROUP, GROUP),
-        source: donor_path,
-        src_offset: 0,
-        chunk_hash,
-        chunk_src_offset: 0,
-        chunk_len: GROUP,
-    };
-
-    let failed = splice_donors(&assembly, std::slice::from_ref(&donor)).expect("splice");
-    let refetch: Vec<(u64, u64)> = failed.iter().map(|d| d.refetch).collect();
-    assert_eq!(refetch, vec![donor.refetch]);
-
-    // No (wrong) bytes were written for the untrusted donor: the recipient
-    // range stays at its pre-sized zero value.
-    let got = std::fs::read(&assembly).expect("read assembly");
-    let g = usize::try_from(GROUP).expect("GROUP fits in usize");
-    assert!(
-        got[g..2 * g].iter().all(|&b| b == 0),
-        "untrusted donor must not write into the assembly"
-    );
-}
-
-/// `chunk_verified` is a straightforward hash-match gate: true for bytes that
-/// hash to `expected`, false for a mismatch — the boundary condition
-/// `splice_donors` relies on to decide trust.
-#[test]
-fn chunk_verified_matches_true_and_false() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let p = tmp.path().join("f");
-    let data = vec![9u8; 2000];
-    std::fs::write(&p, &data).expect("write");
-    let hash = *blake3::hash(&data).as_bytes();
-
-    let mut f = std::fs::File::open(&p).expect("open");
-    assert!(chunk_verified(&mut f, 0, 2000, hash));
-
-    let mut f2 = std::fs::File::open(&p).expect("open");
-    assert!(!chunk_verified(&mut f2, 0, 2000, [0u8; 32]));
-}
-
-/// `copy_exact` copies precisely the requested length, no more, from the
-/// source's current position to the destination's current position.
-#[test]
-fn copy_exact_copies_only_the_requested_length() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let src_path = tmp.path().join("src");
-    let out_path = tmp.path().join("out");
-    std::fs::write(&src_path, b"hello world").expect("write src");
-    std::fs::write(&out_path, []).expect("write out");
-
-    let mut src = std::fs::File::open(&src_path).expect("open src");
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&out_path)
-        .expect("open out");
-    copy_exact(&mut src, &mut out, 5).expect("copy_exact");
-    drop(out);
-
-    let got = std::fs::read(&out_path).expect("read out");
-    assert_eq!(&got[..], b"hello");
-}
-
-/// `hash_partial` streams the whole file and returns its BLAKE3 hash, matching
+/// `hash_file` streams the whole file and returns its BLAKE3 hash, matching
 /// a direct in-memory hash of the same bytes.
 #[test]
-fn hash_partial_matches_direct_blake3_of_file_contents() {
+fn hash_file_matches_direct_blake3_of_file_contents() {
     let tmp = tempfile::tempdir().expect("tmp");
     let p = tmp.path().join("f");
     let data: Vec<u8> = (0..5000u32)
@@ -3576,7 +1661,7 @@ fn hash_partial_matches_direct_blake3_of_file_contents() {
         .collect();
     std::fs::write(&p, &data).expect("write");
 
-    let got = hash_partial(&p).expect("hash_partial");
+    let got = hash_file(&p).expect("hash_file");
     assert_eq!(got, *blake3::hash(&data).as_bytes());
 }
 
@@ -3620,30 +1705,6 @@ fn parse_manifest_keeps_the_blob_hash() {
     assert_eq!(m.hash(), *blake3::hash(json).as_bytes());
 }
 
-#[test]
-fn parse_manifest_accepts_chunked_entry_in_order() {
-    let m = parse_json(&serde_json::json!({"version": 1, "entries": [{
-        "path": "m.bin", "hash": format_hash([0xff; 32]), "size": 100,
-        "chunks": [
-            {"hash": format_hash([0xc0; 32]), "size": 60},
-            {"hash": format_hash([0xc1; 32]), "size": 40},
-        ],
-    }]}))
-    .unwrap();
-    let chunks = m.entries[0].chunks.as_ref().expect("chunked entry");
-    let hashes: Vec<[u8; 32]> = chunks.iter().map(|c| c.hash).collect();
-    assert_eq!(hashes, vec![[0xc0; 32], [0xc1; 32]]);
-}
-
-#[test]
-fn parse_manifest_plain_entry_has_no_chunks() {
-    let m = parse_json(&serde_json::json!({"version": 1, "entries": [
-        {"path": "a.txt", "hash": format_hash([0xab; 32]), "size": 4},
-    ]}))
-    .unwrap();
-    assert!(m.entries[0].chunks.is_none());
-}
-
 /// A parser takes every spelling `parse_hash` takes: `b3:`, `0x` or no
 /// prefix, with upper- or lowercase hex digits.
 #[test]
@@ -3664,10 +1725,10 @@ fn parse_manifest_accepts_every_hash_spelling() {
     }
 }
 
-/// One malformed entry or chunk hash makes the whole manifest
-/// [`MalformedManifest`], and the error names the entry.
+/// One malformed entry hash makes the whole manifest [`MalformedManifest`],
+/// and the error names the entry.
 #[test]
-fn parse_manifest_rejects_a_malformed_entry_or_chunk_hash() {
+fn parse_manifest_rejects_a_malformed_entry_hash() {
     let assert_malformed = |manifest: serde_json::Value, what: &str| {
         let err = parse_json(&manifest).unwrap_err();
         assert!(err.is::<MalformedManifest>(), "{manifest}: {err:#}");
@@ -3690,13 +1751,6 @@ fn parse_manifest_rejects_a_malformed_entry_or_chunk_hash() {
             r#"bundle entry "bad" has a malformed hash"#,
         );
     }
-    assert_malformed(
-        serde_json::json!({"version": 1, "entries": [{
-            "path": "bad", "hash": good, "size": 4,
-            "chunks": [{"hash": good, "size": 2}, {"hash": "b3:zz", "size": 2}],
-        }]}),
-        r#"bundle entry "bad" has a malformed chunk 1 hash"#,
-    );
 }
 
 /// Two entries whose paths name one file on a case- or
@@ -3901,23 +1955,10 @@ fn group_transfer_counts_the_blob_once_and_every_written_copy() {
     assert_eq!(t.reconstructed, 300);
 }
 
-/// A range-dedup fetch pays only for the bytes it did not splice from disk,
-/// so `downloaded` is its paid tally, not the blob size — while every copy on
-/// disk is still a whole file.
+/// A blob an earlier run already finalized in staging pays nothing, while
+/// its copy on disk is still a whole file.
 #[test]
-fn group_transfer_downloads_only_the_paid_bytes_of_a_spliced_blob() {
-    let outcomes = vec![EntryOutcome::Fetched(100), EntryOutcome::Linked];
-    let spliced = EntryBytes {
-        paid: 30,
-        spliced: 70,
-        resumed: 0,
-    };
-    let t = group_transfer(&outcomes, Some(spliced));
-    assert_eq!(t.downloaded, 30);
-    assert_eq!(t.reconstructed, 200);
-    assert_eq!(t.resumed, 0);
-
-    // A blob already finalized in staging by an earlier run pays nothing.
+fn group_transfer_of_a_blob_already_in_staging_downloads_nothing() {
     let t = group_transfer(&[EntryOutcome::Fetched(100)], Some(EntryBytes::default()));
     assert_eq!(t.downloaded, 0);
     assert_eq!(t.reconstructed, 100);
@@ -3976,13 +2017,12 @@ fn skipping(entries: &[ManifestEntry]) -> DiskState {
     }
 }
 
-/// An unchunked, unsized entry at `path` whose hash is `[hash; 32]`.
+/// An unsized entry at `path` whose hash is `[hash; 32]`.
 fn entry(path: &str, hash: u8) -> ManifestEntry {
     ManifestEntry {
         path: path.into(),
         hash: [hash; 32],
         size: None,
-        chunks: None,
         landed_from: None,
     }
 }
@@ -4285,7 +2325,7 @@ async fn a_group_whose_path_crosses_a_symlink_out_of_the_root_fails_that_entry_o
             let landing = landing.clone();
             let staging = staging.clone();
             off_runtime("materialize", move || {
-                landing.first_write(&staging, &dest, false)
+                landing.move_into_place(&staging, &dest)
             })
         },
         |src, dest| link_off_runtime(landing.clone(), src, dest),
@@ -4473,7 +2513,6 @@ async fn resolve_disk_state_skips_matching_file_by_rehash() {
         path: "a.txt".into(),
         hash: h,
         size: Some(u64::try_from(body.len()).expect("len")),
-        chunks: None,
         landed_from: None,
     }];
     // Empty saved manifest → falls to the re-hash gate, still skips (content matches).
@@ -4511,7 +2550,6 @@ async fn resolve_disk_state_fast_skips_on_matching_record_without_rehash() {
             hash: format_hash(claimed),
             size,
             mtime,
-            chunks: None,
             source: test_source(),
         },
     );
@@ -4522,7 +2560,6 @@ async fn resolve_disk_state_fast_skips_on_matching_record_without_rehash() {
         path: "a.txt".into(),
         hash: claimed, // equals the saved record's hash → fast-skip candidate
         size: Some(size),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
@@ -4550,7 +2587,6 @@ async fn a_mismatched_entry_is_not_refetched_on_rerun() {
             hash: format_hash(hash),
             size,
             mtime: SavedMtime::of(&meta).expect("mtime"),
-            chunks: None,
             source: test_source(),
         },
     );
@@ -4561,7 +2597,6 @@ async fn a_mismatched_entry_is_not_refetched_on_rerun() {
         path: "a.bin".into(),
         hash,
         size: Some(size - 7),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
@@ -4597,7 +2632,6 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
             hash: format_hash(real),
             size,
             mtime: stale,
-            chunks: None,
             source: test_source(),
         },
     );
@@ -4608,7 +2642,6 @@ async fn resolve_disk_state_rehash_confirms_touched_but_identical_file() {
         path: "a.txt".into(),
         hash: real,
         size: Some(size),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &saved, tmp.path(), false).await;
@@ -4627,7 +2660,6 @@ async fn resolve_disk_state_fetches_changed_file() {
         path: "a.txt".into(),
         hash: new,
         size: Some(11),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
@@ -4642,7 +2674,6 @@ async fn resolve_disk_state_absent_file_fetches() {
         path: "missing.txt".into(),
         hash: [0x00; 32],
         size: Some(1),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
@@ -4660,7 +2691,6 @@ async fn resolve_disk_state_overwrite_skips_nothing() {
         path: "a.txt".into(),
         hash: h,
         size: Some(u64::try_from(body.len()).expect("len")),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), true).await;
@@ -4682,7 +2712,6 @@ async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
         path: "game1/lib/dup.dll".into(),
         hash: h,
         size: Some(4096),
-        chunks: None,
         landed_from: None,
     }];
     let updates = build_completed_updates(
@@ -4699,7 +2728,6 @@ async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
         path: "game2/lib/dup.dll".into(),
         hash: h,
         size: Some(4096),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
@@ -4713,9 +2741,7 @@ async fn resolve_disk_state_indexes_whole_file_donor_from_other_path() {
 /// WRITTEN this run (its content changed, so it is not in `state.skip`) is
 /// excluded from `whole_file`: another entry's group could atomically replace
 /// its bytes between the whole-file link's re-hash and its link/copy (TOCTOU),
-/// so it must never be indexed as a whole-file donor — even though its bytes
-/// are still a valid CHUNK donor (covered by the final whole-file
-/// re-verification) and stay seeded.
+/// so it must never be indexed as a whole-file donor.
 #[tokio::test]
 async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -4726,7 +2752,6 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
         path: "changed.bin".into(),
         hash: old_hash,
         size: Some(32),
-        chunks: None,
         landed_from: None,
     }];
     let updates = build_completed_updates(
@@ -4747,7 +2772,6 @@ async fn resolve_disk_state_excludes_will_write_path_from_whole_file_index() {
         path: "changed.bin".into(),
         hash: new_hash,
         size: Some(32),
-        chunks: None,
         landed_from: None,
     }];
 
@@ -4807,7 +2831,6 @@ async fn resolve_disk_state_overwrite_builds_no_whole_file_index() {
         path: "a.bin".into(),
         hash: h,
         size: Some(16),
-        chunks: None,
         landed_from: None,
     }];
     let updates = build_completed_updates(
@@ -4842,97 +2865,10 @@ async fn resolve_disk_state_does_not_skip_a_symlink() {
         path: "link.txt".into(),
         hash: h,
         size: Some(u64::try_from(body.len()).expect("len")),
-        chunks: None,
         landed_from: None,
     }];
     let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
     assert!(!st.skip.contains_key("link.txt"));
-    assert!(st.seed.is_empty());
-}
-
-/// A skipped (unchanged) path seeds the NEW manifest entry's chunks, sourced
-/// from its own output file — a donor future entries can splice from without
-/// paying, spanning cross-run and cross-bundle reuse.
-#[tokio::test]
-async fn resolve_disk_state_seeds_unchanged_and_old_chunks() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    // unchanged file present, matches new manifest, has chunks → seed NEW chunks
-    let body = vec![9u8; 20];
-    std::fs::write(tmp.path().join("u.bin"), &body).expect("write");
-    let uh = *blake3::hash(&body).as_bytes();
-    let ch = *blake3::hash(&body).as_bytes(); // single-chunk == whole file
-    let entries = [ManifestEntry {
-        path: "u.bin".into(),
-        hash: uh,
-        size: Some(20),
-        chunks: Some(vec![ManifestChunk { hash: ch, size: 20 }]),
-        landed_from: None,
-    }];
-    let st = resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), false).await;
-    assert!(st.skip.contains_key("u.bin"));
-    assert_eq!(st.seed.len(), 1);
-    assert_eq!(st.seed[0].offset, 0);
-    assert_eq!(st.seed[0].len, 20);
-}
-
-/// A changed path (present but hash-mismatched against the new manifest)
-/// with a prior saved record carrying chunks seeds the OLD chunks, sourced
-/// from the still-present old file — it survives on disk until this entry's
-/// own group atomically materializes.
-#[tokio::test]
-async fn resolve_disk_state_seeds_old_chunks_of_a_changed_file() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let old_body = vec![1u8; 20];
-    let path = tmp.path().join("c.bin");
-    std::fs::write(&path, &old_body).expect("write old");
-
-    // Build a saved record (as a prior run would have) carrying chunk hints
-    // for the OLD content, then persist and reload it via the real
-    // merge_and_write / load round trip.
-    let old_hash = *blake3::hash(&old_body).as_bytes();
-    let old_chunk_hash = old_hash; // single-chunk == whole file
-    let old_entries = [ManifestEntry {
-        path: "c.bin".into(),
-        hash: old_hash,
-        size: Some(20),
-        chunks: Some(vec![ManifestChunk {
-            hash: old_chunk_hash,
-            size: 20,
-        }]),
-        landed_from: None,
-    }];
-    let old_outcomes = vec![EntryOutcome::Fetched(20)];
-    let old_refs: Vec<&ManifestEntry> = old_entries.iter().collect();
-    let updates = build_completed_updates(&old_refs, &old_outcomes, TEST_BUNDLE, tmp.path());
-    skip_cache::merge_and_write(tmp.path(), SavedManifest::default(), updates)
-        .expect("write saved manifest");
-    let saved = skip_cache::load(tmp.path());
-
-    // The new manifest declares different content, but the OLD file is
-    // still on disk (not yet overwritten) — a fetch, not a skip, and the
-    // old bytes remain a valid donor until this entry's own materialize.
-    let new_hash = *blake3::hash(&[2u8; 20]).as_bytes();
-    let new_entries = vec![ManifestEntry {
-        path: "c.bin".into(),
-        hash: new_hash,
-        size: Some(20),
-        chunks: None,
-        landed_from: None,
-    }];
-
-    let st = resolve_disk_state(&new_entries, &saved, tmp.path(), false).await;
-    assert!(!st.skip.contains_key("c.bin"), "changed content must fetch");
-    // The per-entry "changed" branch and the whole-root records pass both
-    // seed this same donor (harmless duplication, see resolve_disk_state's
-    // doc comment) — assert every seed entry present matches, rather than
-    // pinning an exact count.
-    assert!(!st.seed.is_empty());
-    for donor in &st.seed {
-        assert_eq!(donor.hash, old_chunk_hash);
-        assert_eq!(donor.source, path);
-        assert_eq!(donor.offset, 0);
-        assert_eq!(donor.len, 20);
-    }
 }
 
 /// The headline #1306 invariant, testable without a live endpoint: two
@@ -5193,7 +3129,6 @@ fn settle_group_run_records_outcomes_and_passes_a_stop_through() {
             hash: format_hash([0x00; 32]),
             size: 3,
             mtime: SavedMtime { secs: 1, nanos: 0 },
-            chunks: None,
             source: test_source(),
         },
     );
@@ -5209,130 +3144,6 @@ fn settle_group_run_records_outcomes_and_passes_a_stop_through() {
         "the landed paid and resumed tallies are kept"
     );
     assert_eq!(rx.try_recv().expect("a flush batch").fetched_bytes, 3);
-}
-
-/// A deterministic `len`-byte blob.
-fn test_blob(len: usize) -> Vec<u8> {
-    (0..len)
-        .map(|i| u8::try_from(i % 251).unwrap_or(0))
-        .collect()
-}
-
-/// One scripted holder of `blob`, paying provider `provider`. A holder
-/// given a `blip` flag resets its first stream once, 256 KiB in, sets the
-/// flag as it does, and then serves.
-fn scripted_holder(
-    blob: &[u8],
-    provider: u8,
-    blip: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> anyhow::Result<crate::StreamCandidate<crate::source::ScriptedSource>> {
-    let ledger = Arc::new(crate::PoolLedger::new(crate::Cumulative::default()));
-    let mut source = crate::source::ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
-    if let Some(fired) = blip {
-        source = source.fault_once_after(256 * 1024, move || {
-            fired.store(true, std::sync::atomic::Ordering::SeqCst);
-            anyhow!("connection reset")
-        });
-    }
-    Ok(crate::StreamCandidate::new(
-        source,
-        Arc::new(std::sync::Mutex::new(crate::PoolContext {
-            pool_id: alloy::primitives::B256::ZERO,
-            provider: Address::repeat_byte(provider),
-            deposit: alloy::primitives::U256::from(u128::MAX),
-            client_signer: Arc::new(PrivateKeySigner::random()),
-            voucher_domain: decdn_incentive::capacity_bond_domain(1, Address::ZERO),
-            prior_bytes_delivered: alloy::primitives::U256::ZERO,
-            prior_amount: alloy::primitives::U256::ZERO,
-            client_binding: None,
-            capability: None,
-        })),
-        ledger,
-    ))
-}
-
-/// Two scripted holders of `blob`; the first (0xA1) blips once and sets
-/// `first_blip` when given one.
-fn two_scripted_holders(
-    blob: &[u8],
-    first_blip: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> anyhow::Result<(
-    crate::StaticSources<crate::source::ScriptedSource>,
-    Vec<crate::Holder>,
-)> {
-    let sources = crate::StaticSources::new(vec![
-        scripted_holder(blob, 0xA1, first_blip)?,
-        scripted_holder(blob, 0xB2, None)?,
-    ])?;
-    let holders = sources.holders();
-    Ok((sources, holders))
-}
-
-/// A funder that is never asked: every scripted deposit is huge.
-fn no_topups() -> crate::source::FakeFunder {
-    crate::source::FakeFunder::new(crate::Recovery::Unavailable)
-}
-
-/// `blob`'s BLAKE3 root, the hash a scripted holder serves it under.
-fn root(blob: &[u8]) -> [u8; 32] {
-    *blake3::hash(blob).as_bytes()
-}
-
-/// `len` bytes at `offset` of the entry's `.partial` beside `dest`: a
-/// range entry that fetched only some ranges stays unpromoted.
-fn read_range(dest: &Path, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
-    use std::io::{Read as _, Seek as _};
-    let mut f = std::fs::File::open(partial_path(dest))?;
-    f.seek(std::io::SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; usize::try_from(len)?];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
-}
-
-/// A range-dedup entry fetches only the ranges no donor supplies, through
-/// the acquire loop. Its one blipping holder cools while the other holder
-/// carries the range, and the entry stays a `.partial` for the splice.
-#[tokio::test(start_paused = true)]
-async fn a_range_entry_survives_a_holder_blip() -> anyhow::Result<()> {
-    let blob = test_blob(6 * 1024 * 1024);
-    let ranges = vec![(1024 * 1024, 2 * 1024 * 1024)];
-    let blipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (provider, holders) = two_scripted_holders(&blob, Some(Arc::clone(&blipped)))?;
-    let staging = tempfile::tempdir()?;
-    let dest = staging.path().join("entry");
-    let downloader = Downloader::new(&provider, no_topups())
-        .holders(holders)
-        .max_lanes(2);
-    let stop = StopPolicy::new(
-        false,
-        Some(std::time::Duration::from_mins(1)),
-        Arc::default(),
-    );
-    downloader
-        .fetch_to_paths_until(
-            &[DownloadTarget {
-                hash: root(&blob),
-                total_bytes: ProvenSize::assume_for_tests(u64::try_from(blob.len())?),
-                dest: &dest,
-                ranges: Some(&ranges),
-            }],
-            None,
-            &stop,
-        )
-        .await?;
-    assert!(
-        blipped.load(std::sync::atomic::Ordering::SeqCst),
-        "holder 0xA1 reset a stream mid-range"
-    );
-    assert_eq!(
-        read_range(&dest, 1024 * 1024, 2 * 1024 * 1024)?,
-        blob[1024 * 1024..3 * 1024 * 1024]
-    );
-    assert!(
-        !dest.exists(),
-        "an entry with donor bytes left is not promoted"
-    );
-    Ok(())
 }
 
 /// An entry whose blob differs in size from its manifest lands, and the run
@@ -5374,11 +3185,7 @@ fn the_report_tallies_every_outcome() {
         reconstructed: 20,
         resumed: 6,
     };
-    let dedup = DedupSummary {
-        spliced_bytes: 3,
-        hints_ignored: 1,
-    };
-    let report = bundle_report(&outcomes, transfer, dedup, vec!["w".into()]);
+    let report = bundle_report(&outcomes, transfer, vec!["w".into()]);
     assert_eq!(
         (report.fetched, report.linked, report.skipped, report.failed),
         (1, 1, 1, 1)
@@ -5388,11 +3195,9 @@ fn the_report_tallies_every_outcome() {
         (
             report.downloaded,
             report.reconstructed,
-            report.resumed_bytes,
-            report.spliced_bytes,
-            report.hints_ignored
+            report.resumed_bytes
         ),
-        (4, 20, 6, 3, 1)
+        (4, 20, 6)
     );
     assert_eq!(
         report.failures,
@@ -5402,19 +3207,6 @@ fn the_report_tallies_every_outcome() {
         }]
     );
     assert_eq!(report.warnings, vec!["w".to_string()]);
-}
-
-/// Each pull reports only its own range-dedup counters: reading them for one
-/// pull's report resets them for the next pull of the same puller.
-#[test]
-fn dedup_counters_are_per_pull() {
-    let stats = DedupStats::default();
-    stats.spliced_bytes.fetch_add(10, Ordering::Relaxed);
-    stats.hints_ignored.fetch_add(2, Ordering::Relaxed);
-    let first = stats.take();
-    assert_eq!((first.spliced_bytes, first.hints_ignored), (10, 2));
-    let second = stats.take();
-    assert_eq!((second.spliced_bytes, second.hints_ignored), (0, 0));
 }
 
 /// A group's share of the run's outstanding work goes as its bytes land,
@@ -5496,15 +3288,7 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
     disk.skip.insert("present.bin".to_string(), [2; 32]);
     disk.whole_file
         .insert([3; 32], tmp.path().join("elsewhere.bin"));
-    let plan = build_fetch_plan(&entries);
-    let work = planned_work(
-        &entries,
-        &Landing::open(tmp.path()).unwrap(),
-        false,
-        &plan,
-        &disk,
-    )
-    .await;
+    let work = planned_work(&entries, &Landing::open(tmp.path()).unwrap(), false, &disk).await;
     assert_eq!(
         work.get(&[1; 32]),
         Some(&PlannedWork {
@@ -5518,7 +3302,6 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
         &entries,
         &Landing::open(tmp.path()).unwrap(),
         true,
-        &plan,
         &DiskState::default(),
     )
     .await;
@@ -5535,12 +3318,11 @@ async fn planned_work_leaves_out_colliding_entries() {
         ManifestEntry::new("P", [2; 32], Some(200)),
         ManifestEntry::new("q", [3; 32], Some(300)),
     ];
-    let plan = build_fetch_plan(&entries);
     let landing = Landing::open(tmp.path()).unwrap();
     for overwrite in [false, true] {
         let disk =
             resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), overwrite).await;
-        let work = planned_work(&entries, &landing, overwrite, &plan, &disk).await;
+        let work = planned_work(&entries, &landing, overwrite, &disk).await;
         assert_eq!(
             work.keys().collect::<Vec<_>>(),
             vec![&[3; 32]],
@@ -5559,26 +3341,4 @@ fn a_manifest_fetch_runs_under_the_manifest_cap() {
     assert_eq!(manifest_cap_bytes(1 << 40), manifest_cap);
     assert_eq!(manifest_cap_bytes(0), manifest_cap);
     assert_eq!(manifest_cap_bytes(1 << 20), 1 << 20);
-}
-
-/// Dedup ranges planned from a manifest's declared size drive the entry only
-/// when the size is the proven one: a declared size above or below it, or
-/// none, fetches the whole blob.
-#[test]
-fn dedup_ranges_hold_only_at_the_proven_size() {
-    let ranges: &[(u64, u64)] = &[(0, 1024), (8192, 4096)];
-    let size = 16_384;
-    let proven = ProvenSize::assume_for_tests(size);
-    assert_eq!(
-        ranges_at_proven_size(Some(ranges), Some(size), proven),
-        Some(ranges)
-    );
-    for declared in [Some(1 << 60), Some(size - 1), Some(0), None] {
-        assert_eq!(
-            ranges_at_proven_size(Some(ranges), declared, proven),
-            None,
-            "{declared:?}"
-        );
-    }
-    assert_eq!(ranges_at_proven_size(None, Some(size), proven), None);
 }
