@@ -117,6 +117,13 @@ impl UdpPortClaim {
     /// Claim a free UDP port below the kernel's ephemeral range.
     pub fn new() -> anyhow::Result<Self> {
         let (low, high) = claim_range(ephemeral_low()?)?;
+        Self::claim_in(low, high)
+    }
+
+    /// Claim a free UDP port in `low..high`, trying [`UDP_CLAIM_ATTEMPTS`]
+    /// random picks.
+    fn claim_in(low: u16, high: u16) -> anyhow::Result<Self> {
+        anyhow::ensure!(low < high, "empty UDP claim range {low}..{high}");
         let span = u64::from(high - low);
         for _ in 0..UDP_CLAIM_ATTEMPTS {
             let offset = std::hash::RandomState::new().build_hasher().finish() % span;
@@ -161,18 +168,36 @@ fn claim_range(ephemeral_low: u16) -> anyhow::Result<(u16, u16)> {
 }
 
 /// The first port of the kernel's ephemeral range. Linux reads it from
-/// `/proc/sys/net/ipv4/ip_local_port_range`. Other platforms use the IANA
-/// dynamic range, which starts at 49152.
+/// `/proc/sys/net/ipv4/ip_local_port_range`. macOS reads it from the
+/// `net.inet.ip.portrange.first` sysctl. Other platforms use the IANA dynamic
+/// range, which starts at 49152.
 fn ephemeral_low() -> anyhow::Result<u16> {
-    const RANGE: &str = "/proc/sys/net/ipv4/ip_local_port_range";
-    if !cfg!(target_os = "linux") {
-        return Ok(49152);
+    if cfg!(target_os = "linux") {
+        const RANGE: &str = "/proc/sys/net/ipv4/ip_local_port_range";
+        let text = std::fs::read_to_string(RANGE).with_context(|| format!("read {RANGE}"))?;
+        return parse_ephemeral_low(&text).with_context(|| format!("parse {RANGE}: {text:?}"));
     }
-    let text = std::fs::read_to_string(RANGE).with_context(|| format!("read {RANGE}"))?;
-    parse_ephemeral_low(&text).with_context(|| format!("parse {RANGE}: {text:?}"))
+    if cfg!(target_os = "macos") {
+        const SYSCTL: &str = "/usr/sbin/sysctl";
+        const KEY: &str = "net.inet.ip.portrange.first";
+        let output = std::process::Command::new(SYSCTL)
+            .args(["-n", KEY])
+            .output()
+            .with_context(|| format!("run {SYSCTL} -n {KEY}"))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{SYSCTL} -n {KEY} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        return parse_ephemeral_low(&text).with_context(|| format!("parse {KEY}: {text:?}"));
+    }
+    Ok(49152)
 }
 
-/// The first number in an `ip_local_port_range` line (`"32768\t60999\n"`).
+/// The first number in an `ip_local_port_range` line (`"32768\t60999\n"`)
+/// or a `net.inet.ip.portrange.first` value (`"49152\n"`).
 fn parse_ephemeral_low(text: &str) -> anyhow::Result<u16> {
     text.split_whitespace()
         .next()

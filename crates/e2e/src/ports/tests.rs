@@ -17,10 +17,11 @@ const EPHEMERAL_PICKS: usize = 5000;
 /// How many UDP `bind(…:0)` calls
 /// [`udp_bind_to_port_zero_never_lands_below_ephemeral_low`] makes. A
 /// [`UdpPortClaim`] picks a port below `ephemeral_low()` because the kernel
-/// hands out no UDP port there. Off Linux `ephemeral_low()` is a fixed 49152:
-/// on a host whose range starts 100 ports lower, a run this size lands below it
-/// about six times. On Linux `ephemeral_low()` reads the range the kernel uses,
-/// so the test checks that read.
+/// hands out no UDP port there. On Linux and macOS `ephemeral_low()` reads the
+/// range the kernel uses, so the test checks that read: had it returned a
+/// value 100 ports above the start of the default macOS range (49152..65535),
+/// a run this size would land below it about six times. Other platforms use a
+/// fixed 49152, so there the test checks that constant.
 const ZERO_BINDS: usize = 1000;
 
 /// The bind `decdn-node`'s `net::bind_reuseaddr` makes for its admin and
@@ -125,6 +126,22 @@ fn udp_claim_is_exclusive_and_leaves_the_udp_port_free() {
 }
 
 #[test]
+fn udp_claim_fails_when_every_pick_is_held() {
+    // `std` sets `SO_REUSEADDR`, but the claim's lock does not, so the lock's
+    // bind on a listening port fails.
+    let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    let Some(high) = port.checked_add(1) else {
+        return;
+    };
+    let err = UdpPortClaim::claim_in(port, high).unwrap_err();
+    assert!(
+        err.to_string().contains("no free UDP port"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
 fn claim_range_sits_below_the_ephemeral_range() {
     assert_eq!(claim_range(32768).unwrap(), (16384, 32768));
     assert_eq!(claim_range(49152).unwrap(), (24576, 49152));
@@ -136,6 +153,7 @@ fn claim_range_sits_below_the_ephemeral_range() {
 #[test]
 fn parse_ephemeral_low_reads_the_range_start() {
     assert_eq!(parse_ephemeral_low("32768\t60999\n").unwrap(), 32768);
+    assert_eq!(parse_ephemeral_low("49152\n").unwrap(), 49152);
     assert!(parse_ephemeral_low("").is_err());
     assert!(parse_ephemeral_low("high 60999").is_err());
 }
