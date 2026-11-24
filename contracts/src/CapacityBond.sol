@@ -1092,10 +1092,6 @@ contract CapacityBond is
     // Views — bond / governor surface
     // -----------------------------------------------------------------
 
-    function bondOf(address operator) external view returns (uint256) {
-        return activeBond[operator];
-    }
-
     function isActive(address operator) public view returns (bool) {
         // Ongoing active status tests the grandfathered `bondFloorAtActivation`,
         // not the live `minBond`: a `minBond` raise never de-activates an
@@ -1124,6 +1120,9 @@ contract CapacityBond is
     // Views — node registry
     // -----------------------------------------------------------------
 
+    /// @notice The operator's bound NodeId (`bytes32(0)` when it holds no
+    ///         binding) and its `isActive` status, in one read. No contract
+    ///         calls it; off-chain readers use it.
     function nodeIdOf(address operator) external view returns (bytes32 nodeId, bool active) {
         nodeId = addressToNodeId[operator];
         active = isActive(operator);

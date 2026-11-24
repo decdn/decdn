@@ -1426,11 +1426,10 @@ pub enum VoucherRejectReason {
     /// Signature well-formed but recovers to the wrong signer.
     /// `VoucherError::WrongSigner`.
     WrongSigner,
-    /// `voucher.pool_id` mismatch (also: unknown pool). `PoolError::WrongPool`.
+    /// `voucher.pool_id` mismatch (also: unknown pool).
     WrongPool,
     /// The voucher names a provider node other than the one receiving it —
     /// a capability voucher scoped to one node redeemed against another.
-    /// `PoolError::WrongProvider`.
     WrongProvider,
     /// Cumulative amount regressed. `PoolError::AmountRegression`.
     AmountRegression,

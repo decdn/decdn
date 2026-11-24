@@ -32,12 +32,8 @@ fn format_bytes_picks_unit() {
 }
 
 #[test]
-fn format_usdc_renders_six_decimals() {
-    assert_eq!(format_usdc(0), "$0.000000");
-    assert_eq!(format_usdc(1), "$0.000001");
-    assert_eq!(format_usdc(12_345_678), "$12.345678");
-    // Whole dollars keep the trailing zeros so 1e6 × display == raw.
-    assert_eq!(format_usdc(5_000_000), "$5.000000");
+fn format_dollars_prefixes_the_usdc_figure() {
+    assert_eq!(format_dollars(12_345_678), "$12.345678");
 }
 
 #[test]

@@ -27,7 +27,7 @@ use alloy::primitives::{Address, B256, Signature, U256};
 use decdn_protocol::client::{Voucher as WireVoucher, VoucherRejectReason};
 
 use crate::lane::PoolError;
-use crate::voucher::{SignedVoucher, Voucher, VoucherError};
+use crate::voucher::{SignedVoucher, Voucher};
 
 /// Reconstruct a [`SignedVoucher`] from a wire voucher plus lane context.
 ///
@@ -96,7 +96,7 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> Result<WireVoucher, Wir
 }
 
 /// Map an off-chain [`PoolError`] to the wire [`VoucherRejectReason`] a node
-/// returns mid-stream, or [`RetrySignal`] when the failure is transient.
+/// returns mid-stream. Every variant is a permanent rejection.
 ///
 /// **Exhaustive, no wildcard (ADR 005 §Mirror obligation).** A new `PoolError`
 /// variant breaks this match at compile time, forcing a coordinated update of
@@ -108,33 +108,16 @@ pub fn signed_to_wire_voucher(signed: &SignedVoucher) -> Result<WireVoucher, Wir
 /// `ChainIndexZero` and `UnanchoredPreimage` are decided against the
 /// *per-stream* anchor, and `ChunkPriceMismatch` against the node's own quoted
 /// rate — none of which the lane-scoped validation enum can see, so the
-/// `cdn/client/v1` handler raises those directly.
-///
-/// [`PoolError::Store`] is the only transient failure: in-memory state did not
-/// advance, so it returns [`RetrySignal`] rather than a permanent reason. The
-/// `cdn/client/v1` handler surfaces that signal by aborting the stream (no
-/// in-band wire reason), so the client resends the **same** voucher on a
-/// fresh stream (ADR 003 §Off-chain voucher state persistence). Every other
-/// variant is a permanent rejection.
-pub const fn voucher_reject_reason(err: &PoolError) -> Result<VoucherRejectReason, RetrySignal> {
+/// `cdn/client/v1` handler raises those directly. The handler also raises the
+/// identity and signature reasons (`WrongPool`, `WrongProvider`,
+/// `BadSignature`, `WrongSigner`) itself, before it touches the lane.
+pub const fn voucher_reject_reason(err: &PoolError) -> VoucherRejectReason {
     match err {
-        PoolError::WrongPool { .. } => Ok(VoucherRejectReason::WrongPool),
-        PoolError::WrongProvider { .. } => Ok(VoucherRejectReason::WrongProvider),
-        PoolError::AmountRegression { .. } => Ok(VoucherRejectReason::AmountRegression),
-        PoolError::UnderFold { .. } => Ok(VoucherRejectReason::UnderFold),
-        PoolError::BytesRegression { .. } => Ok(VoucherRejectReason::BytesRegression),
-        PoolError::CapExceeded { .. } => Ok(VoucherRejectReason::SpendingCapExhausted),
-        PoolError::BadPreimage { .. } => Ok(VoucherRejectReason::BadPreimage),
-        PoolError::Signature(VoucherError::InvalidSignature) => {
-            Ok(VoucherRejectReason::BadSignature)
-        }
-        PoolError::Signature(VoucherError::WrongSigner { .. }) => {
-            Ok(VoucherRejectReason::WrongSigner)
-        }
-        // Transient — in-memory state unchanged. The handler aborts the stream
-        // rather than emitting an in-band wire reason; the client resends the
-        // same voucher (ADR 003 §Off-chain voucher state persistence).
-        PoolError::Store(_) => Err(RetrySignal),
+        PoolError::AmountRegression { .. } => VoucherRejectReason::AmountRegression,
+        PoolError::UnderFold { .. } => VoucherRejectReason::UnderFold,
+        PoolError::BytesRegression { .. } => VoucherRejectReason::BytesRegression,
+        PoolError::CapExceeded { .. } => VoucherRejectReason::SpendingCapExhausted,
+        PoolError::BadPreimage { .. } => VoucherRejectReason::BadPreimage,
     }
 }
 
@@ -150,13 +133,6 @@ pub enum WireVoucherError {
     #[error("voucher amount or bytes_delivered exceeds the u64 wire width")]
     ValueExceedsWireWidth,
 }
-
-/// Signals that a [`PoolError`] was transient ([`PoolError::Store`]): in-memory
-/// state did not advance, so the caller aborts the stream (no in-band wire
-/// reason) and the client resends the **same** voucher on a fresh stream (ADR
-/// 003) — distinguishable from a permanent rejection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetrySignal;
 
 #[cfg(test)]
 #[allow(clippy::similar_names)] // signer/signed pair up clearly here

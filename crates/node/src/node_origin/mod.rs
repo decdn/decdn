@@ -3691,6 +3691,11 @@ fn wedged_lane(
 /// deposit outlives any single lane.
 const WEDGED_PROVIDER_SUPPRESSION_SECS: u64 = 3600;
 
+// The provider-wide window outlives the per-`(peer, hash)` negative-cache entry
+// the same wedge writes. At or below it, `wedged_providers` buys nothing the
+// negative cache does not already give for the blob that wedged it.
+const _: () = assert!(WEDGED_PROVIDER_SUPPRESSION_SECS > REFUSAL_SUPPRESSION_TTL.as_secs());
+
 /// What a voucher rejection tells us, and therefore what to do about it.
 ///
 /// Exhaustive on purpose, like [`classify_refusal`]: a new `VoucherRejectReason` must break

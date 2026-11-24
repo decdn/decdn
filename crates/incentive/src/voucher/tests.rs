@@ -238,44 +238,10 @@ fn voucher_type_hash_matches_adr_003() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Lock the domain separator to the canonical EIP-712 form. If the
-/// alloy `Eip712Domain` ever changes its separator computation, this
-/// surfaces it before signatures stop being recoverable on-chain.
-#[test]
-fn domain_separator_matches_eip712_canonical() -> anyhow::Result<()> {
-    use alloy::primitives::keccak256;
-    use alloy::sol_types::SolValue;
-
-    let domain_typehash = keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    );
-    let chain_id: u64 = 421_614;
-    let verifying = address!("0000000000000000000000000000000000001234");
-
-    let domain = voucher_domain(chain_id, verifying);
-    let actual = domain.separator();
-
-    // separator = keccak256(abi.encode(typehash, hash(name), hash(version), chainId, addr))
-    let expected = keccak256(
-        (
-            domain_typehash,
-            keccak256(DOMAIN_NAME.as_bytes()),
-            keccak256(DOMAIN_VERSION.as_bytes()),
-            U256::from(chain_id),
-            verifying,
-        )
-            .abi_encode(),
-    );
-    anyhow::ensure!(
-        actual == expected,
-        "domain separator drift: actual={actual} expected={expected}"
-    );
-    Ok(())
-}
-
-/// Fixed-vector regression: a deterministic key + voucher must produce a
-/// specific recovered address. If the digest computation drifts, this
-/// catches it before the contract does.
+/// Fixed-vector regression: a fixed voucher under a fixed domain has a known
+/// EIP-712 digest, and a deterministic key signs it to a signature that
+/// recovers that key. A drift in the digest computation fails the pinned
+/// digest before the contract rejects the signature.
 #[test]
 fn fixed_vector_recovers_expected_signer() -> anyhow::Result<()> {
     // Test key — never used for anything but this fixture.
@@ -299,6 +265,10 @@ fn fixed_vector_recovers_expected_signer() -> anyhow::Result<()> {
         address!("00000000000000000000000000000000deadbeef"),
     );
 
+    assert_eq!(
+        voucher.signing_hash(&domain),
+        b256!("6938812b524d31ba801b47009f0fc86dd1dd805b3f96a945825afce593b6198c")
+    );
     let signed = voucher.sign(&signer, &domain)?;
     let recovered = signed.recover_signer(&domain)?;
     anyhow::ensure!(

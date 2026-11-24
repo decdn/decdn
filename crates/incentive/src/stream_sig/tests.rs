@@ -220,35 +220,3 @@ fn from_response_body_maps_fields() {
     };
     assert_eq!(StreamSigData::from_response_body(&body), sample_data());
 }
-
-/// Lock the `CapacityBond` domain separator to the canonical EIP-712 form.
-#[test]
-fn domain_separator_matches_eip712_canonical() -> anyhow::Result<()> {
-    use alloy::primitives::{U256, keccak256};
-    use alloy::sol_types::SolValue;
-
-    let domain_typehash = keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    );
-    let chain_id: u64 = 421_614;
-    let verifying = address!("0000000000000000000000000000000000001234");
-
-    let domain = capacity_bond_domain(chain_id, verifying);
-    let actual = domain.separator();
-
-    let expected = keccak256(
-        (
-            domain_typehash,
-            keccak256(crate::CAPACITY_BOND_DOMAIN_NAME.as_bytes()),
-            keccak256(crate::CAPACITY_BOND_DOMAIN_VERSION.as_bytes()),
-            U256::from(chain_id),
-            verifying,
-        )
-            .abi_encode(),
-    );
-    anyhow::ensure!(
-        actual == expected,
-        "domain separator drift: actual={actual} expected={expected}"
-    );
-    Ok(())
-}

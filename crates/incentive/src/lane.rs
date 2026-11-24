@@ -9,18 +9,16 @@
 //!
 //! In-memory state alone is insufficient: without persistence a node restart
 //! resets `last_amount` to zero and a client can resubmit a previously-accepted
-//! voucher (issue #527). [`LaneState::apply_voucher`] therefore requires a
-//! [`PoolStateStore`] and records the post-acceptance state to it before
-//! advancing in-memory fields or returning `Ok`; the store makes that record
+//! voucher (issue #527). The advance methods ([`LaneState::advance_presigned`],
+//! [`LaneState::advance_preimage_verified`]) return the advanced lane and touch
+//! no store; the node records it to a [`crate::PoolStateStore`], which makes it
 //! durable on its own flush cadence — see
 //! [ADR 003 §Off-chain voucher state persistence](https://github.com/decdn/decdn/blob/main/adr/003-payments.md)
 //! and [`crate::store`].
 
-use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, U256};
 
-use crate::store::{PoolStateStore, StoreError};
-use crate::voucher::{SignedVoucher, VoucherError};
+use crate::voucher::SignedVoucher;
 
 /// An opaque 32-byte pool identifier — the on-chain `PaymentPool` deposit id
 /// (`keccak256(owner, ownerPoolNonce)`). The buyer modules key their
@@ -43,15 +41,15 @@ pub struct LaneKey {
 /// Mutable per-lane state held by the delivering node.
 ///
 /// Tracks the latest accepted voucher (`last_*` fields) so subsequent
-/// [`LaneState::apply_voucher`] calls can enforce monotonicity. `cap` is the
+/// [`LaneState::advance_presigned`] calls can enforce monotonicity. `cap` is the
 /// capability's spending cap — vouchers exceeding it are invalid because
 /// `PaymentPool.redeem` would itself revert (ADR 003 §Capability delegation).
 ///
 /// **Field invariant (#527):** the `last_*` fields MUST only be advanced through
-/// this type's validated advance methods ([`LaneState::apply_voucher`], or a
-/// pure successor from [`LaneState::stage_voucher`] /
-/// [`LaneState::advance_presigned`] that the caller records and swaps in) or
-/// hydrated from a [`PoolStateStore`] (the trusted on-disk path). Direct field
+/// this type's validated advance methods (a pure successor from
+/// [`LaneState::advance_presigned`] / [`LaneState::advance_preimage_verified`]
+/// that the caller records and swaps in) or hydrated from a
+/// [`crate::PoolStateStore`] (the trusted on-disk path). Direct field
 /// assignment from outside this crate would bypass the voucher-replay guard from
 /// ADR 003 §Off-chain voucher state persistence, so the three replay-critical
 /// fields are **private** and reachable only through the getters
@@ -262,7 +260,7 @@ impl LaneState {
     /// voucher yet and otherwise the exact 65-byte `r‖s‖v` signature.
     ///
     /// **Trust boundary.** This is the one constructor that bypasses
-    /// `apply_voucher`'s validation, and several arguments share a type
+    /// `advance_presigned`'s validation, and several arguments share a type
     /// (`cap`/`last_amount`/`last_bytes_delivered` are all `U256`;
     /// `signer`/`provider` are both `Address`), so a transposition compiles. Do
     /// not add callers without round-trip coverage that pins a signer distinct
@@ -514,55 +512,6 @@ impl LaneState {
         Some(next)
     }
 
-    /// Fold a verified preimage into the lane, returning the advanced successor
-    /// and what it added (ADR 003 §Concurrent Streams, Rule 2 — deepest wins).
-    ///
-    /// `root` names the epoch the reveal belongs to; the caller learns it from
-    /// the receiving stream's own anchor, which is what makes an unanchored
-    /// reveal decidable per stream rather than ambiguously lane-wide (Rule 1).
-    /// A `root` this lane no longer tracks folds nothing: the reveal is real but
-    /// worthless, since the epoch it extends has been superseded by a signature
-    /// that already folded a frontier at least as deep.
-    ///
-    /// Placement is by index, not arrival order, so a reveal at or below the
-    /// tracked frontier is **already covered**: it advances nothing and — this
-    /// is the load-bearing part — hashes nothing. That is what keeps a
-    /// duplicate or out-of-order reveal free rather than a wasted walk.
-    ///
-    /// Verification hashes forward from the *submitted* value to the tracked
-    /// tip, never from a stored intermediate, so the walk is `index − verified`
-    /// keccaks and the lane keeps no chain state beyond the tip itself.
-    ///
-    /// # Errors
-    ///
-    /// [`PoolError::BadPreimage`] when the value does not reach the tracked tip
-    /// in `index − verified` steps; [`PoolError::CapExceeded`] when the reveal
-    /// would push the claim past the capability's cap (both raised by
-    /// [`Self::advance_preimage_verified`], which this delegates to).
-    pub fn advance_preimage(
-        &self,
-        root: B256,
-        index: u8,
-        preimage: B256,
-    ) -> Result<(Self, PreimageApplied), PoolError> {
-        // The single-lock convenience form: snapshot the frontier, hash forward,
-        // and apply, all against the same `self`. The node's serve path instead
-        // splits these so the keccak walk runs OUTSIDE the per-lane lock (issue
-        // #1792 item 5, [`Self::preimage_frontier`] /
-        // [`Self::advance_preimage_verified`]); this is what the incentive-crate
-        // tests exercise and what any caller without a lock to shed still uses.
-        let walked = self.preimage_frontier(root, index);
-        let walked_ok = match walked {
-            Some((verified_index, tip)) => {
-                crate::chain::verify_forward(preimage, index - verified_index, tip)
-            }
-            // No walk is needed (folds nothing); `advance_preimage_verified`
-            // returns the covered outcome before it consults `walked_ok`.
-            None => false,
-        };
-        self.advance_preimage_verified(root, index, preimage, walked, walked_ok)
-    }
-
     /// The frontier a reveal at `index` on epoch `root` must hash forward to, or
     /// `None` when the reveal folds nothing — the root is not the one this lane
     /// meters against, or `index` sits at or below the tracked frontier.
@@ -581,7 +530,24 @@ impl LaneState {
     }
 
     /// Fold a preimage whose forward walk the caller ALREADY ran (off the lane
-    /// lock) into the lane, returning the advanced successor and what it added.
+    /// lock) into the lane, returning the advanced successor and what it added
+    /// (ADR 003 §Concurrent Streams, Rule 2 — deepest wins).
+    ///
+    /// `root` names the epoch the reveal belongs to; the caller learns it from
+    /// the receiving stream's own anchor, which is what makes an unanchored
+    /// reveal decidable per stream rather than ambiguously lane-wide (Rule 1).
+    /// A `root` this lane no longer tracks folds nothing: the reveal is real but
+    /// worthless, since the epoch it extends has been superseded by a signature
+    /// that already folded a frontier at least as deep.
+    ///
+    /// Placement is by index, not arrival order, so a reveal at or below the
+    /// tracked frontier is **already covered**: it advances nothing and hashes
+    /// nothing. That is what keeps a duplicate or out-of-order reveal free
+    /// rather than a wasted walk.
+    ///
+    /// Verification hashes forward from the *submitted* value to the tracked
+    /// tip, never from a stored intermediate, so the walk is `index − verified`
+    /// keccaks and the lane keeps no chain state beyond the tip itself.
     ///
     /// `walked` is the `(verified_index, tip)` the caller hashed against —
     /// [`Self::preimage_frontier`]'s return — and `walked_ok` is what
@@ -589,8 +555,8 @@ impl LaneState {
     /// trusted ONLY while the lane's live frontier still equals `walked`: a
     /// concurrent same-lane sibling that advanced the chain in the gap moved the
     /// frontier, so this re-hashes against the live tip under the lock (the rare
-    /// race). A reveal a sibling already covered folds nothing, exactly as
-    /// [`Self::advance_preimage`]'s at-or-below-frontier case does. Every other
+    /// race), and `walked: None` always re-hashes. A reveal a sibling already
+    /// covered folds nothing. Every other
     /// check — the tracked-root gate and the spending-cap gate — is O(1) and
     /// stays under the lock.
     ///
@@ -674,125 +640,42 @@ impl LaneState {
         (!root.is_zero() && root == self.chain.chain_root).then_some(self.chain)
     }
 
-    /// Validate `signed` against this lane's invariants and, on success, record
-    /// the post-acceptance state to `store` before advancing the in-memory
-    /// `last_*` fields.
+    /// Advance this lane by `signed`, a voucher whose signature the caller
+    /// ALREADY verified against `self.signer`, and return the successor plus its
+    /// [`VoucherApplied`]. Pure: `self` never changes, so a rejection leaves the
+    /// live lane untouched.
     ///
-    /// Mirrors the on-chain `PaymentPool.redeem` checks:
-    /// - `voucher.pool_id == self.pool_id`
-    /// - `voucher.provider == self.provider`
-    /// - signature recovers to `self.signer`
+    /// Mirrors the watermark-dependent on-chain `PaymentPool.redeem` checks:
     /// - `voucher.amount > self.last_amount`
     /// - `voucher.bytes_delivered >= self.last_bytes_delivered`
     /// - `voucher.amount <= self.cap`, and on a voucher that repeats the live
     ///   root, `voucher.amount + verified_index × voucher.chunk_price <= self.cap`
+    /// - a voucher under a new root folds the live chain's frontier
     ///
-    /// Expiry (`now < self.expiry`) is checked by the node handler, which holds
-    /// the clock; this method is time-agnostic.
+    /// The serve loop recovers the (watermark-independent) signature OUTSIDE the
+    /// per-lane lock so concurrent same-lane streams do not serialize on the
+    /// `ecrecover` (#1735), then calls this under the lock to check the
+    /// monotonicity guards against the LIVE watermark and advance atomically. The
+    /// check and the advance MUST stay under one lock hold: two streams reading
+    /// the same watermark and both advancing would lose one voucher. Expiry is
+    /// the handler's to check, since it holds the clock.
     ///
-    /// Ordering of side effects: every check above runs first; if all pass, the
-    /// candidate state is sent to `store.record` and only on `Ok` is in-memory
-    /// state advanced. On any failure — including store failure — `self` is left
-    /// unchanged. This makes `Ok(_)` the protocol-level commit point: further
-    /// bytes are delivered **only after** this method returns `Ok` (ADR 003
-    /// §Off-chain voucher state persistence, issue #527).
-    ///
-    /// # Errors
-    ///
-    /// See [`PoolError`] for the full taxonomy. A persistent-store failure
-    /// surfaces as [`PoolError::Store`].
-    pub fn apply_voucher(
-        &mut self,
-        signed: &SignedVoucher,
-        domain: &Eip712Domain,
-        store: &dyn PoolStateStore,
-    ) -> Result<VoucherApplied, PoolError> {
-        // INVARIANT (#527): validate + advance on a CLONE, record the clone,
-        // swap on `Ok` only. `stage_voucher` produces the advanced successor
-        // without recording; the record-then-swap here is the commit point — the
-        // store takes the row into its working set and flushes it on its own
-        // cadence. Do NOT swap before the `?` on `record`: that's the literal
-        // #527 replay window in code form.
-        let (next, applied) = self.stage_voucher(signed, domain)?;
-        store.record(&next)?;
-        *self = next;
-        Ok(applied)
-    }
-
-    /// Validate `signed` against this state's invariants and return the advanced
-    /// successor state plus its [`VoucherApplied`] — the pure, in-memory half of
-    /// [`Self::apply_voucher`], persisting nothing.
-    ///
-    /// The per-voucher serve loop calls this to verify and advance one voucher
-    /// with no side effect; the caller then records the successor to the buffered
-    /// lane store and swaps it into the live lane. Because vouchers are cumulative
-    /// — each carries the running `amount` / `bytes_delivered` — a later voucher
-    /// supersedes every earlier one.
+    /// `pool_id` / `provider` are the lane's own identity and are not re-checked:
+    /// the caller reconstructs `signed` from this lane's pinned identity, so they
+    /// match by construction.
     ///
     /// **Durability.** The caller records the returned state to the lane store,
     /// which buffers it in memory and makes it durable on a background flush (ADR
     /// 003 §Off-chain voucher state persistence). A crash loses at most the
-    /// frontier advanced since the last flush, which is safe — an honest client
-    /// resumes forward and an un-redeemed replay stays on-chain-payable — so the
-    /// serve loop advances and delivers without waiting for the fsync; the
+    /// frontier advanced since the last flush, which is safe: an honest client
+    /// resumes forward and an un-redeemed replay stays on-chain-payable. The
     /// redeemed watermark is floored separately by a flush before every on-chain
-    /// redeem. `stage_voucher` takes `&self` (never mutates the caller's state) so
-    /// an un-recorded candidate is discarded on a rejection without touching the
-    /// live lane.
-    ///
-    /// # Errors
-    ///
-    /// The same validation taxonomy as [`Self::apply_voucher`] **minus**
-    /// [`PoolError::Store`] — no store is touched here.
-    pub fn stage_voucher(
-        &self,
-        signed: &SignedVoucher,
-        domain: &Eip712Domain,
-    ) -> Result<(Self, VoucherApplied), PoolError> {
-        if signed.voucher.pool_id != self.pool_id {
-            return Err(PoolError::WrongPool {
-                expected: self.pool_id,
-                got: signed.voucher.pool_id,
-            });
-        }
-        if signed.voucher.provider != self.provider {
-            return Err(PoolError::WrongProvider {
-                expected: self.provider,
-                got: signed.voucher.provider,
-            });
-        }
-        // Signature check before the amount/bytes monotonicity guards: an
-        // unauthenticated voucher is rejected as `Signature(WrongSigner)`
-        // regardless of the amounts it claims. `verify_signer` recovers a
-        // 65-byte EOA signature via `ecrecover` and rejects non-canonical
-        // high-`s` up front, matching the on-chain verifiable-set (#836).
-        signed
-            .verify_signer(self.signer, domain)
-            .map_err(PoolError::Signature)?;
-        self.advance_presigned(signed)
-    }
-
-    /// The amount/bytes monotonicity + cap half of [`Self::stage_voucher`], for a
-    /// voucher whose signature the caller ALREADY verified against `self.signer`.
-    ///
-    /// The serve loop recovers the (watermark-independent) signature OUTSIDE the
-    /// per-lane lock so concurrent same-lane streams do not serialize on the
-    /// `ecrecover` (#1735), then calls this under the lock to re-check the
-    /// (watermark-dependent) monotonicity guards against the LIVE watermark and
-    /// advance atomically. The monotonicity check and the advance MUST stay under
-    /// one lock hold: two streams reading the same watermark and both advancing
-    /// would lose one voucher.
-    ///
-    /// `pool_id` / `provider` are the lane's own identity and are not re-checked:
-    /// the caller reconstructs `signed` from this lane's pinned identity, so they
-    /// match by construction. Every other check mirrors [`Self::stage_voucher`].
+    /// redeem.
     ///
     /// # Errors
     ///
     /// [`PoolError::AmountRegression`], [`PoolError::BytesRegression`],
-    /// [`PoolError::CapExceeded`], or [`PoolError::UnderFold`] — the same
-    /// watermark-dependent taxonomy as [`Self::stage_voucher`], minus the
-    /// signature and pool/provider checks.
+    /// [`PoolError::CapExceeded`], or [`PoolError::UnderFold`].
     pub fn advance_presigned(
         &self,
         signed: &SignedVoucher,
@@ -885,7 +768,7 @@ impl LaneState {
             next.chain.chunk_price = signed.voucher.chunk_price;
             // The kept frontier still counts toward the claim, so the cap binds
             // `amount` plus the frontier at the adopted price, exactly as it
-            // binds a reveal ([`Self::advance_preimage`]). Checking `amount`
+            // binds a reveal ([`Self::advance_preimage_verified`]). Checking `amount`
             // alone would credit up to a whole chain past the cap.
             let claimed = signed.voucher.amount.saturating_add(next.chain.accrued());
             if claimed > self.cap {
@@ -935,7 +818,7 @@ impl LaneState {
     }
 }
 
-/// Outcome of a successful [`LaneState::apply_voucher`].
+/// Outcome of a successful [`LaneState::advance_presigned`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoucherApplied {
     /// Incremental amount this voucher added over the prior watermark
@@ -961,7 +844,7 @@ impl VoucherApplied {
     }
 }
 
-/// Outcome of a [`LaneState::advance_preimage`] fold.
+/// Outcome of a [`LaneState::advance_preimage_verified`] fold.
 ///
 /// Both deltas are zero for a reveal that advanced nothing — one at or below
 /// the tracked frontier, or one naming a superseded epoch. Neither is an error:
@@ -1025,38 +908,16 @@ impl std::fmt::Display for FoldAxis {
     }
 }
 
-/// Failure modes for [`LaneState::apply_voucher`].
+/// Failure modes for [`LaneState::advance_presigned`] and
+/// [`LaneState::advance_preimage_verified`].
 ///
-/// Most in-memory variants map to an on-chain `PaymentPool.redeem` revert;
-/// off-chain we surface them before they cost gas. The ordering and fold
-/// guards ([`PoolError::AmountRegression`], [`PoolError::BytesRegression`],
-/// [`PoolError::UnderFold`]) have no revert — redemption is cumulative — and
-/// keep the node's own ledger consistent. [`PoolError::Store`] is the
-/// off-chain-only variant for persistent-store failures (issue #527).
-///
-/// `PartialEq`/`Eq` are intentionally not derived: [`StoreError::Io`] wraps
-/// `std::io::Error`, which is not `PartialEq`. Tests pattern-match on variants
-/// via the `matches!` macro instead of comparing for equality.
-#[derive(Debug, thiserror::Error)]
+/// [`PoolError::CapExceeded`] and [`PoolError::BadPreimage`] map to an
+/// on-chain `PaymentPool.redeem` revert; off-chain we surface them before they
+/// cost gas. The ordering and fold guards ([`PoolError::AmountRegression`],
+/// [`PoolError::BytesRegression`], [`PoolError::UnderFold`]) have no revert —
+/// redemption is cumulative — and keep the node's own ledger consistent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PoolError {
-    /// `voucher.pool_id` does not match the pool this lane draws from — also
-    /// the "unknown pool" case surfaced by the caller.
-    #[error("voucher pool_id {got} does not match expected {expected}")]
-    WrongPool {
-        /// The pool this lane draws from.
-        expected: B256,
-        /// The pool the voucher named.
-        got: B256,
-    },
-    /// `voucher.provider` names a node other than this one — a capability
-    /// voucher scoped to one provider redeemed against another.
-    #[error("voucher provider {got} does not match expected {expected}")]
-    WrongProvider {
-        /// This node's provider address.
-        expected: Address,
-        /// The provider the voucher named.
-        got: Address,
-    },
     /// Cumulative amount is at or below the lane's signed watermark — a stale
     /// or replayed voucher, or one a concurrent same-lane sibling already
     /// settled. `amount` is the sole ordering key (there is no nonce).
@@ -1118,20 +979,6 @@ pub enum PoolError {
         /// Index of the tip the lane has verified to.
         verified: u8,
     },
-    /// Signature is malformed or signed by the wrong address.
-    #[error(transparent)]
-    Signature(#[from] VoucherError),
-    /// Lane-store write failed; in-memory state is unchanged. See [`StoreError`]
-    /// for the underlying cause. This is surfaced to the caller so the client
-    /// resends the same voucher instead of proceeding on state the store never
-    /// took (#527, ADR 003 §Off-chain voucher state persistence).
-    ///
-    /// PROTOCOL NOTE: this is the only `PoolError` variant for which the client
-    /// SHOULD retry the same voucher unchanged. The validation variants mean the
-    /// voucher is permanently invalid for this lane state and retrying is a
-    /// client bug.
-    #[error("pool state store failed: {0}")]
-    Store(#[from] StoreError),
 }
 
 #[cfg(test)]

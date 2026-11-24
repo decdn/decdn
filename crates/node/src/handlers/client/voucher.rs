@@ -19,8 +19,8 @@ use super::proof_wait::ChunkProofs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, DEFAULT_TOLERANCE_BPS,
     Hash, LaneDeliveryState, LaneId, LaneKey, LaneState, Mutex, Ordering, Proof, RateError,
-    RecvStream, RetrySignal, SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop,
-    WatermarkBundle, verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    RecvStream, SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop, WatermarkBundle,
+    verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
 
@@ -592,12 +592,7 @@ impl ClientHandler {
         {
             Ok(advanced) => advanced,
             Err(e) => {
-                let Ok(reason) = voucher_reject_reason(&e) else {
-                    drop(guard);
-                    return Err(anyhow::anyhow!(
-                        "advance_preimage_verified touches no store; unexpected RetrySignal"
-                    ));
-                };
+                let reason = voucher_reject_reason(&e);
                 // A hash-chain mismatch is terminal and carries no watermark
                 // bundle: a preimage has no signature of its own, and a payment
                 // watermark cannot repair a wrong seed or a wrong chain. But this
@@ -737,8 +732,7 @@ impl ClientHandler {
 
         // `advance_presigned` re-checks the amount/bytes monotonicity guards
         // against the LIVE watermark and returns the advanced candidate. It skips
-        // the signature (already verified by the caller) and touches no store, so
-        // it can never surface `RetrySignal` here.
+        // the signature (already verified by the caller) and touches no store.
         match state.advance_presigned(signed) {
             Ok((next_state, applied)) => {
                 // ADVANCE: this voucher raises the lane watermark. Rate-check the
@@ -827,21 +821,7 @@ impl ClientHandler {
                 })
             }
             Err(e) => {
-                // Map to the wire reject reason. `Err(RetrySignal)` (a transient
-                // store failure) cannot occur here — `advance_presigned` touches no
-                // store — so this is defensive: abort the stream rather than
-                // inventing a wire reason for a fault this path cannot produce.
-                let reason = match voucher_reject_reason(&e) {
-                    Ok(reason) => reason,
-                    Err(RetrySignal) => {
-                        // Unmarked: a `RetrySignal` from a path that touches no
-                        // store is a broken node invariant, so it belongs at
-                        // `error!` in the dispatch sink.
-                        return Err(VerifyStop::Bail(anyhow::anyhow!(
-                            "advance_presigned touches no store; unexpected RetrySignal"
-                        )));
-                    }
-                };
+                let reason = voucher_reject_reason(&e);
                 // The wire reason drops the lane's detail (for an `UnderFold`, the
                 // axis and the shortfall), so record it here.
                 tracing::debug!(error = %e, ?reason, "voucher fails lane validation");

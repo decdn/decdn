@@ -3485,6 +3485,7 @@ impl CacheEngine {
     /// The origin read budget as `(head_start, min_bps)`, or `None` when
     /// [`Self::set_origin_read_budget`] left the reads unbounded. For the
     /// runtime's wiring tests.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn origin_read_budget_parts(&self) -> Option<(Duration, u64)> {
         self.origin_read_budget().map(|b| (b.head_start, b.min_bps))
@@ -3590,6 +3591,7 @@ impl CacheEngine {
     /// consumer that needs a heat signal — `tinylfu` eviction/admission and the
     /// `margin` serve-economics policy — so this only reports whether *some*
     /// consumer requested one, not which.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn has_frequency_estimator(&self) -> bool {
         self.inner.frequency.load().is_some()
@@ -3659,7 +3661,8 @@ impl CacheEngine {
 
     /// Sum the sizes of the members of `seg`, using `sizes` for per-hash bytes.
     /// For `Main` (the untracked default) this sums every hash in `sizes` not
-    /// present in the segment map.
+    /// present in the segment map. A test hook.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn segment_bytes(&self, seg: crate::policy::Segment, sizes: &HashMap<Hash, u64>) -> u64 {
         let guard = self
@@ -4042,7 +4045,8 @@ impl CacheEngine {
     }
 
     /// The proof the engine keeps for `hash` and the size it proves, with no
-    /// I/O.
+    /// I/O. A test hook.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn kept_size_proof(&self, hash: Hash) -> Option<(u64, Bytes)> {
         self.inner

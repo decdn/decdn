@@ -61,11 +61,11 @@ impl ContentDenylist {
         }
     }
 
-    /// An empty deny-set, for tests and for wiring paths with no `[content]`
-    /// section resolved yet.
+    /// An empty deny-set, for tests.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn empty() -> Self {
-        Self::new(&ResolvedContent::default())
+        Self::default()
     }
 
     /// Is this address denied as a pool funder, by either source?
@@ -106,7 +106,7 @@ impl ContentDenylist {
 
 impl Default for ContentDenylist {
     fn default() -> Self {
-        Self::empty()
+        Self::new(&ResolvedContent::default())
     }
 }
 

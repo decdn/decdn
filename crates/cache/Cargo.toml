@@ -71,7 +71,10 @@ default = ["s3"]
 # `CacheEngine::insert_blob` / `read_blob`: seed a store with whole blobs and
 # read them back, for tests in this crate and its dependents.
 # `CacheEngine::origin_fetch_outboard_bytes`: read an origin's outboard
-# through the outboard cache without a range draw.
+# through the outboard cache without a range draw. Plus read-only hooks the
+# engine's dependents assert on (`kept_size_proof`, `segment_bytes`,
+# `has_frequency_estimator`, `origin_read_budget_parts`,
+# `FillSession::observer_count`).
 test-util = []
 # `S3Origin`. Off, the crate links no AWS SDK and no `aws-lc`, for a binary
 # that stores and serves blobs without an S3 origin.

@@ -225,6 +225,7 @@ impl DownloadReceipt {
     }
 
     /// Node wall-clock Unix time (seconds) at voucher acceptance.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub const fn timestamp_secs(&self) -> u64 {
         self.timestamp_secs
@@ -403,7 +404,7 @@ impl JsonlReceiptLog {
     /// log that is already near the cap rotates on the next append rather than
     /// only after a full cap's worth of fresh writes.
     ///
-    /// Unlike [`crate::pool_store::PersistentPoolStateStore::open`], a
+    /// Unlike [`crate::pool_store::PoolStoreFiles::open`], a
     /// failure here is **not** required to abort node bring-up: the receipt log
     /// is an audit artifact, not the #527 replay guard. The runtime decides the
     /// fatality (it currently logs and continues without the audit log).
