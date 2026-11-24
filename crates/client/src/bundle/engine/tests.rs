@@ -2,7 +2,8 @@ use super::super::{
     BundleManifest, MAX_MANIFEST_BYTES, MalformedManifest, ManifestChunk, NotAManifest,
 };
 use super::*;
-use crate::{ClientRangedStore, ProvenSize};
+use crate::ProvenSize;
+use crate::ranged_store::store_dir_for;
 use alloy::signers::local::PrivateKeySigner;
 use iroh::PublicKey;
 use std::assert_matches;
@@ -1903,6 +1904,11 @@ async fn reassemble_dedup_succeeds_when_the_first_drive_finalizes_the_blob() {
         fn staging(&self) -> &Path {
             &self.staging
         }
+        fn store(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+            Box::pin(async { None })
+        }
         fn drive<'a>(
             &'a self,
             _ranges: &'a [(u64, u64)],
@@ -2264,17 +2270,54 @@ fn planned_downloads_match_the_run_total() {
     );
 }
 
-/// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive` opens
-/// the entry's store the way the real drive does (`<staging>.decdn`) and
-/// admits each requested range's bao-verified bytes into it, so the store
-/// holds them present. It never finalizes `<hex>` itself, so
-/// `reassemble_dedup` exercises its splice + whole-file verify + promote path.
-/// Records every driven range.
+/// The store a test entry at `staging` fetches into: `store` beside it.
+fn test_store_path(staging: &Path) -> PathBuf {
+    staging.with_file_name("store")
+}
+
+/// Seed the store beside `staging` with the verified prefix
+/// `[0, prefix_len)` of `content`, as an earlier interrupted run would leave
+/// it, and return the spans the store then holds of it.
+async fn seed_prefix(staging: &Path, content: &[u8], prefix_len: u64) -> Vec<(u64, u64)> {
+    let hash = *blake3::hash(content).as_bytes();
+    let total = u64::try_from(content.len()).expect("content len fits u64");
+    let dir = BlobDir::open(&test_store_path(staging))
+        .await
+        .expect("open store");
+    dir.blob(hash, total, None)
+        .await
+        .expect("open entry")
+        .admit_prefix(content, prefix_len)
+        .await
+        .expect("seed the store");
+    let spans = resumed_spans(Some(&dir), hash).await;
+    dir.shutdown().await.expect("shut down store");
+    spans
+}
+
+/// A fake [`RangeDriver`] over an in-memory `content` blob: each `drive`
+/// admits each requested range's bao-verified bytes into the store beside
+/// `staging` ([`test_store_path`]), so the store holds them present. It
+/// never finalizes `<hex>` itself, so `reassemble_dedup` exercises its
+/// splice + whole-file verify + promote path. Records every driven range.
 struct RecordingDriver {
     hash: [u8; 32],
     staging: PathBuf,
     content: Vec<u8>,
     driven: std::sync::Mutex<Vec<(u64, u64)>>,
+    store: tokio::sync::OnceCell<BlobDir>,
+}
+impl RecordingDriver {
+    /// The store the drives fill, opened on first use.
+    async fn opened(&self) -> &BlobDir {
+        self.store
+            .get_or_init(|| async {
+                BlobDir::open(&test_store_path(&self.staging))
+                    .await
+                    .expect("open store")
+            })
+            .await
+    }
 }
 impl RangeDriver for RecordingDriver {
     fn hash(&self) -> [u8; 32] {
@@ -2283,6 +2326,9 @@ impl RangeDriver for RecordingDriver {
     fn staging(&self) -> &Path {
         &self.staging
     }
+    fn store(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+        Box::pin(async move { Some(self.opened().await.clone()) })
+    }
     fn drive<'a>(
         &'a self,
         ranges: &'a [(u64, u64)],
@@ -2290,10 +2336,12 @@ impl RangeDriver for RecordingDriver {
         Box::pin(async move {
             use decdn_bao_range::RangedStore as _;
             let total = u64::try_from(self.content.len()).expect("content len fits u64");
-            let dir = BlobDir::open(&store_dir_for(&self.staging).expect("store dir"))
+            let store = self
+                .opened()
                 .await
-                .expect("open store");
-            let store = dir.blob(self.hash, total, None).await.expect("open entry");
+                .blob(self.hash, total, None)
+                .await
+                .expect("open entry");
             let outboard = bao_tree::io::outboard::PreOrderMemOutboard::create(
                 &self.content,
                 decdn_bao_range::IROH_BLOCK_SIZE,
@@ -2313,13 +2361,13 @@ impl RangeDriver for RecordingDriver {
                 .expect("encode range");
                 store.admit(aligned, bao).await.expect("admit range");
             }
-            dir.shutdown().await.expect("shut down store");
             Ok(())
         })
     }
 }
 
 /// A [`RangeDriver`] whose every drive fails, as an interrupted run's would.
+/// It opens no store.
 struct FailingDriver {
     hash: [u8; 32],
     staging: PathBuf,
@@ -2330,6 +2378,9 @@ impl RangeDriver for FailingDriver {
     }
     fn staging(&self) -> &Path {
         &self.staging
+    }
+    fn store(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+        Box::pin(async { None })
     }
     fn drive<'a>(
         &'a self,
@@ -2399,8 +2450,8 @@ async fn spliced_bytes_never_enter_the_store() {
     assert!(res.is_err(), "the fallback drive fails: {res:?}");
     assert!(!staging.exists(), "nothing is promoted");
     assert!(
-        resumed_spans(&staging, whole).await.is_empty(),
-        "the store holds no spliced byte"
+        !test_store_path(&staging).exists(),
+        "no splice opened a store"
     );
 }
 
@@ -2423,10 +2474,7 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
 
     // An earlier run fetched `[0, GROUP)` into the store.
     let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_download_prefix(&staging, &content, GROUP)
-        .await
-        .expect("seed the store");
-    let resumed = resumed_spans(&staging, whole).await;
+    let resumed = seed_prefix(&staging, &content, GROUP).await;
     assert_eq!(resumed, vec![(0, GROUP)]);
 
     // The donor's chunk verifies against its own hint, but its first group
@@ -2444,6 +2492,7 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: vec![DonorRange {
@@ -2483,10 +2532,6 @@ async fn verified_store_bytes_win_over_a_spliced_byte() {
         !assembly_path(&staging).exists(),
         "the assembly file is promoted"
     );
-    assert!(
-        !store_dir_for(&staging).expect("store dir").exists(),
-        "the store is removed once the entry is promoted"
-    );
 }
 
 /// An entry resumed from an earlier run's store whose splice then covers part
@@ -2504,10 +2549,7 @@ async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
 
     // An earlier, interrupted run fetched `[0, 3*GROUP)` into the store.
     let staging = tmp.path().join("blob");
-    ClientRangedStore::seed_download_prefix(&staging, &content, 3 * GROUP)
-        .await
-        .expect("seed the store");
-    let resumed = resumed_spans(&staging, whole).await;
+    let resumed = seed_prefix(&staging, &content, 3 * GROUP).await;
     assert_eq!(resumed, vec![(0, 3 * GROUP)]);
 
     // This run splices `[0, 2*GROUP)` from a donor and pays for the deferred
@@ -2521,6 +2563,7 @@ async fn a_splice_over_a_resumed_prefix_counts_the_overlap_as_spliced() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: vec![DonorRange {
@@ -2585,9 +2628,8 @@ fn a_self_heal_outcome_counts_the_whole_resumed_prefix() {
     assert_eq!(EntryBytes::dedup(4 * GROUP, outcome).paid, GROUP);
 }
 
-/// The whole-blob path reads what an earlier run fetched from the entry's
-/// store and pays only for the rest (#2236). A fresh entry and an unreadable
-/// store resume nothing.
+/// The whole-blob path reads what an earlier run fetched from the run's
+/// store and pays only for the rest (#2236). No store resumes nothing.
 #[tokio::test]
 async fn resumed_spans_read_the_store_an_earlier_run_left() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -2599,14 +2641,11 @@ async fn resumed_spans_read_the_store_an_earlier_run_left() {
     let staging = tmp.path().join("blob");
 
     assert!(
-        resumed_spans(&staging, hash).await.is_empty(),
+        resumed_spans(None, hash).await.is_empty(),
         "no store, no spans"
     );
 
-    ClientRangedStore::seed_download_prefix(&staging, &content, GROUP)
-        .await
-        .expect("seed the store");
-    let resumed = resumed_spans(&staging, hash).await;
+    let resumed = seed_prefix(&staging, &content, GROUP).await;
     assert_eq!(resumed, vec![(0, GROUP)]);
     assert_eq!(
         EntryBytes::whole_blob(len, span_bytes(&resumed)),
@@ -2619,14 +2658,6 @@ async fn resumed_spans_read_the_store_an_earlier_run_left() {
     // A resumed count never exceeds the blob.
     assert_eq!(EntryBytes::whole_blob(10, 20).paid, 0);
     assert_eq!(EntryBytes::whole_blob(10, 20).resumed, 10);
-
-    let store = store_dir_for(&staging).expect("store dir");
-    std::fs::remove_dir_all(&store).expect("drop the store");
-    std::fs::write(&store, b"not a store").expect("corrupt");
-    assert!(
-        resumed_spans(&staging, hash).await.is_empty(),
-        "an unreadable store resumes nothing"
-    );
 }
 
 /// Two donor chunks of a blob, `[0, cut)` and `[cut, 4*GROUP)`, each written
@@ -2800,6 +2831,7 @@ async fn reassemble_dedup_splices_a_boundary_group_from_two_donors() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -2843,6 +2875,7 @@ async fn reassemble_dedup_refetches_the_outward_group_span_of_a_failed_donor() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -2899,6 +2932,7 @@ async fn reconcile_deferred_falls_back_to_the_outward_group_span() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -2955,6 +2989,7 @@ async fn spliced_bytes_exclude_a_first_splice_refetch_under_a_tail_splice() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
 
     let outcome = reassemble_dedup(
@@ -3046,6 +3081,7 @@ async fn reconcile_deferred_splices_a_late_registered_donor() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: Vec::new(),
@@ -3126,6 +3162,7 @@ async fn reconcile_deferred_pays_when_the_assigned_fetcher_never_produces_it() {
         staging: staging.clone(),
         content: content.clone(),
         driven: std::sync::Mutex::new(Vec::new()),
+        store: tokio::sync::OnceCell::new(),
     };
     let plan = ReassemblePlan {
         donor: Vec::new(),
@@ -3187,6 +3224,9 @@ impl RangeDriver for SlotDriver<'_, '_> {
     fn staging(&self) -> &Path {
         self.inner.staging()
     }
+    fn store(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<BlobDir>> + '_>> {
+        self.inner.store()
+    }
     fn drive<'a>(
         &'a self,
         ranges: &'a [(u64, u64)],
@@ -3236,6 +3276,7 @@ async fn a_donor_waiter_gives_its_slot_to_a_queued_entry_and_retakes_it_to_drive
             staging: staging.clone(),
             content: content.clone(),
             driven: std::sync::Mutex::new(Vec::new()),
+            store: tokio::sync::OnceCell::new(),
         },
         slot: &slot,
         held_on_drive: std::sync::Mutex::new(Vec::new()),
@@ -3320,6 +3361,7 @@ async fn a_waiter_whose_donor_arrives_holds_its_slot_again_for_the_splice() {
             staging: staging.clone(),
             content: content.clone(),
             driven: std::sync::Mutex::new(Vec::new()),
+            store: tokio::sync::OnceCell::new(),
         },
         slot: &slot,
         held_on_drive: std::sync::Mutex::new(Vec::new()),
@@ -5509,6 +5551,7 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
         false,
         &plan,
         &disk,
+        None,
     )
     .await;
     assert_eq!(
@@ -5526,6 +5569,7 @@ async fn planned_work_leaves_out_skipped_and_donor_groups() {
         true,
         &plan,
         &DiskState::default(),
+        None,
     )
     .await;
     assert_eq!(all.len(), 3, "an overwriting pull fetches every group");
@@ -5546,7 +5590,7 @@ async fn planned_work_leaves_out_colliding_entries() {
     for overwrite in [false, true] {
         let disk =
             resolve_disk_state(&entries, &SavedManifest::default(), tmp.path(), overwrite).await;
-        let work = planned_work(&entries, &landing, overwrite, &plan, &disk).await;
+        let work = planned_work(&entries, &landing, overwrite, &plan, &disk, None).await;
         assert_eq!(
             work.keys().collect::<Vec<_>>(),
             vec![&[3; 32]],

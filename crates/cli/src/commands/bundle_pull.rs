@@ -1148,7 +1148,8 @@ async fn pull_manifest(
     let Kept { manifest, excluded } = match selected.inspect_err(|_| warn_shortfall(puller))? {
         Planned::Pull(kept) => kept,
         Planned::Nothing { reason, excluded } => {
-            let reported = observer.nothing_to_fetch(reason, excluded, out, uri.hash);
+            let stored = puller.partial_downloads(out).await;
+            let reported = observer.nothing_to_fetch(reason, excluded, out, (uri.hash, &stored));
             warn_shortfall(puller);
             return reported;
         }
@@ -1175,7 +1176,8 @@ async fn pull_manifest(
     };
     observer.finish();
     observer.record_counts(&outcome.report, excluded);
-    warn_leftover_partials(out, &manifest.entries, uri.hash);
+    let stored = puller.partial_downloads(out).await;
+    warn_leftover_partials(out, &manifest.entries, uri.hash, &stored);
     let reported = report(&outcome.report, excluded, out, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
     // its exit code (75 for a give-up with no `openPool` or `topUp` in
@@ -1285,19 +1287,20 @@ impl PullObserver {
     }
 
     /// End a run that has nothing to fetch, for `reason`: say so, warn of
-    /// the partial downloads earlier runs left under `out`, and record the
-    /// `excluded` entries, so the run's record shows how many it dropped.
-    /// Under `--json`, the run says so with its [`PullReport`], the same
-    /// object every real run prints: no entry fetched, the `excluded` count,
-    /// and no byte paid by the pull, which leaves out the manifest fetch as
-    /// every run's report does. Otherwise it prints one prose line for
-    /// `reason`.
+    /// the partial downloads earlier runs left under `out` (the manifest blob
+    /// `bundle_hash` aside, with `stored` what the download store holds only
+    /// part of), and record the `excluded` entries, so the run's record shows
+    /// how many it dropped. Under `--json`, the run says so with its
+    /// [`PullReport`], the same object every real run prints: no entry
+    /// fetched, the `excluded` count, and no byte paid by the pull, which
+    /// leaves out the manifest fetch as every run's report does. Otherwise it
+    /// prints one prose line for `reason`.
     fn nothing_to_fetch(
         &self,
         reason: NothingReason,
         excluded: u64,
         out: &Path,
-        bundle_hash: [u8; 32],
+        (bundle_hash, stored): ([u8; 32], &[([u8; 32], u64)]),
     ) -> anyhow::Result<()> {
         let empty = BundleReport::default();
         let reported = if self.json {
@@ -1306,7 +1309,7 @@ impl PullObserver {
             report_nothing_to_fetch(reason);
             Ok(())
         };
-        warn_leftover_partials(out, &[], bundle_hash);
+        warn_leftover_partials(out, &[], bundle_hash, stored);
         self.record_counts(&empty, excluded);
         reported
     }
@@ -1767,26 +1770,35 @@ fn counts_line(rep: &PullReport) -> String {
     )
 }
 
-/// Scan `<out_root>/.decdn-partial` for leftover per-hash staging entries —
-/// the `<hex>` blob, its `<hex>.assembly` file and its `<hex>.decdn` store
-/// directory — whose hash is not in `keep`, and total the disk space they take
-/// ([`allocated_bytes`], every file under a store directory included). Other
-/// names are not counted. A missing or unreadable directory holds nothing.
-fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
-    let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
-        return Leftovers::default();
-    };
+/// The leftover partial downloads under `<out_root>/.decdn-partial` whose hash
+/// is not in `keep`, and the disk space they take: the per-hash staging files
+/// (the `<hex>` blob and its `<hex>.assembly` file, by [`allocated_bytes`]),
+/// and the blobs the run's download store holds only part of (`stored`, from
+/// [`BundlePuller::partial_downloads`], by the verified bytes it holds of
+/// each). Other names are not counted. A missing or unreadable directory
+/// holds no staging files.
+fn leftover_partials(
+    out_root: &Path,
+    keep: &HashSet<[u8; 32]>,
+    stored: &[([u8; 32], u64)],
+) -> Leftovers {
     let mut blobs: HashSet<[u8; 32]> = HashSet::new();
     let mut bytes = 0u64;
+    for &(hash, held) in stored {
+        if !keep.contains(&hash) {
+            blobs.insert(hash);
+            bytes = bytes.saturating_add(held);
+        }
+    }
+    let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
+        return Leftovers::of(&blobs, bytes);
+    };
     for entry in dir.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
         };
-        let stem = name
-            .strip_suffix(".decdn")
-            .or_else(|| name.strip_suffix(".assembly"))
-            .unwrap_or(name);
+        let stem = name.strip_suffix(".assembly").unwrap_or(name);
         let Ok(hash) = blake3::Hash::from_hex(stem) else {
             continue;
         };
@@ -1794,37 +1806,14 @@ fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
         if keep.contains(&hash) {
             continue;
         }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_file() {
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
             blobs.insert(hash);
             bytes = bytes.saturating_add(allocated_bytes(&meta));
-        } else if meta.is_dir() {
-            blobs.insert(hash);
-            bytes = bytes.saturating_add(tree_bytes(&entry.path()));
         }
     }
-    Leftovers {
-        blobs: u64::try_from(blobs.len()).unwrap_or(u64::MAX),
-        bytes,
-    }
-}
-
-/// The disk space every file under `dir` takes ([`allocated_bytes`]). An
-/// unreadable entry counts nothing.
-fn tree_bytes(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries.flatten().fold(0u64, |sum, entry| {
-        let size = match entry.metadata() {
-            Ok(meta) if meta.is_dir() => tree_bytes(&entry.path()),
-            Ok(meta) => allocated_bytes(&meta),
-            Err(_) => 0,
-        };
-        sum.saturating_add(size)
-    })
+    Leftovers::of(&blobs, bytes)
 }
 
 /// The disk space a file takes. A range-dedup `.assembly` is sized to the whole
@@ -1851,6 +1840,16 @@ struct Leftovers {
     bytes: u64,
 }
 
+impl Leftovers {
+    /// The leftovers of `blobs`, taking `bytes` on disk.
+    fn of(blobs: &HashSet<[u8; 32]>, bytes: u64) -> Self {
+        Self {
+            blobs: u64::try_from(blobs.len()).unwrap_or(u64::MAX),
+            bytes,
+        }
+    }
+}
+
 /// The warning line for `leftovers` in `dir`, without the `warning: ` prefix,
 /// or `None` when there are none.
 fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
@@ -1869,21 +1868,27 @@ fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
     }
 }
 
-/// Warn on stderr about leftover staging files of blobs this run did not use
-/// ([`leftover_partials`]): a partial of an entry an earlier run started,
+/// Warn on stderr about leftover partial downloads of blobs this run did not
+/// use ([`leftover_partials`]): a partial of an entry an earlier run started,
 /// which this run's filter or selection left out, or one another bundle
 /// pulled into the same output directory left. They stay for a later run that
 /// selects the entry again, so the warning only names them and never deletes
 /// them. `entries` are the run's selected entries (none when the filter or
-/// `--select` emptied the run), and `bundle_hash` is the manifest blob, which
-/// is also this run's own.
-fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: [u8; 32]) {
+/// `--select` emptied the run), `bundle_hash` is the manifest blob, which is
+/// also this run's own, and `stored` is what the run's download store holds
+/// only part of.
+fn warn_leftover_partials(
+    out_root: &Path,
+    entries: &[ManifestEntry],
+    bundle_hash: [u8; 32],
+    stored: &[([u8; 32], u64)],
+) {
     let keep: HashSet<[u8; 32]> = entries
         .iter()
         .map(|e| e.hash)
         .chain([bundle_hash])
         .collect();
-    let leftovers = leftover_partials(out_root, &keep);
+    let leftovers = leftover_partials(out_root, &keep, stored);
     if let Some(line) = leftover_warning(&out_root.join(STAGING_DIR), &leftovers) {
         eprintln!("warning: {line}");
     }

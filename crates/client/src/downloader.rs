@@ -29,7 +29,7 @@ use crate::credential::{CredentialSlot, RunDemand};
 use crate::health::PeerHealth;
 use crate::ledgers::LaneLedgers;
 use crate::pacer::BudgetPacer;
-use crate::ranged_store::{BlobDir, store_dir_for};
+use crate::ranged_store::{BlobDir, StaleStoreEntry, store_dir_for};
 use crate::recovery::RecoveryGate;
 use crate::scheduler::{AcquireEnv, AcquireTarget, acquire};
 use crate::source::Funder;
@@ -122,6 +122,9 @@ pub struct Downloader<P, F> {
     max_blob_bytes: u64,
     /// What the caller's run still needs ([`Self::run_demand`]).
     run: Option<Arc<RunDemand>>,
+    /// The store every target fetches into, which the caller owns
+    /// ([`Self::store`]); `None` keeps a store beside each `dest`.
+    shared: Option<BlobDir>,
 }
 
 impl<P, F> std::fmt::Debug for Downloader<P, F> {
@@ -152,7 +155,17 @@ impl<P, F> Downloader<P, F> {
             max_lanes: usize::MAX,
             max_blob_bytes: 0,
             run: None,
+            shared: None,
         }
+    }
+
+    /// Fetch every target into `store`, which the caller opened and removes:
+    /// a bundle run keeps one store for all its entries. The downloader
+    /// neither stops nor removes it.
+    #[must_use]
+    pub(crate) fn store(mut self, store: BlobDir) -> Self {
+        self.shared = Some(store);
+        self
     }
 
     /// Start every target from `holders`, in preference order, instead of
@@ -295,6 +308,8 @@ where
     /// already holds the blob (an earlier run exported it) is not fetched
     /// again. A target with explicit [`DownloadTarget::ranges`] that leave
     /// bytes missing is not exported: its landed ranges stay in its store.
+    /// A downloader given a caller's store fetches every target into that one
+    /// instead, and leaves it in place.
     /// Writes land at their absolute offsets, so out-of-order and
     /// multi-source fills assemble correctly. The whole blob is fetched at full
     /// throughput, with no read-ahead bound.
@@ -304,7 +319,9 @@ where
     /// byte is verified against: a wrong hash surfaces as a verification
     /// failure, never as silent corruption. The exported file is hashed once
     /// more: one whose bytes changed on disk after they verified is removed,
-    /// and the target is fetched again.
+    /// and the target is fetched again from an empty store. A caller's store
+    /// then holds a lost export, so the target ends with a stale-store error
+    /// instead.
     ///
     /// `stop` decides when a target that makes no verified progress gives up.
     /// A target that gives up or fails keeps its landed bytes in its store for
@@ -367,14 +384,16 @@ where
         Ok(written)
     }
 
-    /// Fetch one target to its `dest` through a store beside it. Returns
-    /// whether `dest` holds the blob.
+    /// Fetch one target to its `dest` through its store: the caller's, or one
+    /// beside `dest`. Returns whether `dest` holds the blob.
     ///
     /// An exported file that does not hash to the blob holds bytes that
-    /// changed on disk after they verified. The store went with the export,
-    /// so one more pass fetches the blob again from an empty store; a second
-    /// mismatch is a local fault and ends the target. Both passes share one
-    /// [`SourceSet`], so the second continues each lane's voucher sequence.
+    /// changed on disk after they verified. A store beside `dest` went with
+    /// the export, so one more pass fetches the blob again from an empty
+    /// store; a second mismatch is a local fault and ends the target. Both
+    /// passes share one [`SourceSet`], so the second continues each lane's
+    /// voucher sequence. A caller's store keeps a lost export of the blob, so
+    /// the target ends with [`StaleStoreEntry`] instead.
     async fn fetch_one(
         &self,
         target: &DownloadTarget<'_>,
@@ -383,14 +402,19 @@ where
         on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync + '_)>,
         stop: &StopPolicy,
     ) -> anyhow::Result<bool> {
-        let store_dir = store_dir_for(target.dest)?;
+        let own_dir = match self.shared {
+            Some(_) => None,
+            None => Some(store_dir_for(target.dest)?),
+        };
         if let Some(parent) = target.dest.parent().filter(|p| !p.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| anyhow::anyhow!("create download dir {}: {e}", parent.display()))?;
         }
         if dest_holds(target.dest, target.hash).await {
-            remove_leftover_store(&store_dir).await;
+            if let Some(dir) = &own_dir {
+                remove_leftover_store(dir).await;
+            }
             return Ok(true);
         }
         let mut sources = SourceSet::new(
@@ -407,11 +431,14 @@ where
         };
         for pass in 0..2u8 {
             match self
-                .fetch_pass(&store_dir, target, &mut sources, &run)
+                .fetch_pass(own_dir.as_deref(), target, &mut sources, &run)
                 .await?
             {
                 Pass::Exported => return Ok(true),
                 Pass::Kept => return Ok(false),
+                Pass::Drifted if own_dir.is_none() => {
+                    return Err(anyhow::Error::new(StaleStoreEntry));
+                }
                 Pass::Drifted if pass == 0 => tracing::warn!(
                     hash = %blake3::Hash::from_bytes(target.hash).to_hex(),
                     dest = %target.dest.display(),
@@ -423,14 +450,27 @@ where
         Err(anyhow::Error::new(crate::HashMismatch))
     }
 
-    /// One pass of [`Self::fetch_one`] through the store in `store_dir`.
+    /// One pass of [`Self::fetch_one`]: through the store in `own_dir`, which
+    /// the pass opens and removes once the blob is exported, or through the
+    /// caller's store when `own_dir` is `None`.
     async fn fetch_pass(
         &self,
-        store_dir: &Path,
+        own_dir: Option<&Path>,
         target: &DownloadTarget<'_>,
         sources: &mut SourceSet<'_, P>,
         run: &Run<'_>,
     ) -> anyhow::Result<Pass> {
+        let Some(store_dir) = own_dir else {
+            let dir = self
+                .shared
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("a download with no store"))?;
+            return Ok(if self.fetch_target(dir, target, sources, run).await? {
+                checked_export(target).await
+            } else {
+                Pass::Kept
+            });
+        };
         let dir = BlobDir::open(store_dir).await?;
         let exported = match self.fetch_target(&dir, target, sources, run).await {
             Ok(exported) => exported,
@@ -446,13 +486,7 @@ where
             return Ok(Pass::Kept);
         }
         dir.remove().await?;
-        if dest_holds(target.dest, target.hash).await {
-            return Ok(Pass::Exported);
-        }
-        if let Err(e) = tokio::fs::remove_file(target.dest).await {
-            tracing::warn!(error = %e, "removing a file that failed its hash");
-        }
-        Ok(Pass::Drifted)
+        Ok(checked_export(target).await)
     }
 
     /// Fill one target's ranges into its store in `dir` and export it once
@@ -474,6 +508,11 @@ where
                 Some(target.dest.to_path_buf()),
             )
             .await?;
+        // `dest` does not hold the blob, so a complete entry whose bytes
+        // cannot be read is the export that `dest` lost.
+        if store.is_lost_export().await {
+            return Err(anyhow::Error::new(StaleStoreEntry));
+        }
         let env = AcquireEnv {
             pacer: run.pacer,
             funder: &self.funder,
@@ -541,6 +580,18 @@ enum Pass {
     Kept,
     /// The exported file failed its hash and was removed, with the store.
     Drifted,
+}
+
+/// How a pass that exported `target` ends: its `dest` hashes to the blob, or
+/// it does not and is removed.
+async fn checked_export(target: &DownloadTarget<'_>) -> Pass {
+    if dest_holds(target.dest, target.hash).await {
+        return Pass::Exported;
+    }
+    if let Err(e) = tokio::fs::remove_file(target.dest).await {
+        tracing::warn!(error = %e, "removing a file that failed its hash");
+    }
+    Pass::Drifted
 }
 
 /// The bytes [`dest_holds`] reads at once: large enough that hashing each

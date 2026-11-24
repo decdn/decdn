@@ -1,5 +1,8 @@
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::ranged_store::{BlobDir, StaleStoreEntry};
 
 use super::DownloadTarget;
 use super::Downloader;
@@ -639,6 +642,93 @@ async fn a_finished_download_removes_its_store() -> anyhow::Result<()> {
         "the store is removed"
     );
     Ok(())
+}
+
+/// Fetch the whole `blob` to `dest` through the caller's `store`.
+async fn fetch_into(store: &BlobDir, blob: &[u8], dest: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let total = u64::try_from(blob.len())?;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    let source = ScriptedSource::new(blob.to_vec())?.paying(Arc::clone(&ledger));
+    let target = DownloadTarget {
+        hash: source.root(),
+        total_bytes: ProvenSize::assume_for_tests(total),
+        dest,
+        ranges: None,
+    };
+    downloader(vec![candidate(source, ledger, 0xA1)])?
+        .store(store.clone())
+        .fetch_to_paths(&[target], None)
+        .await
+}
+
+/// A download through a caller's store exports its blob and leaves the store
+/// in place. Once the exported file is gone, the store holds a lost export,
+/// and a fetch of that blob through it ends with `StaleStoreEntry`.
+#[tokio::test]
+async fn a_callers_store_stays_and_a_lost_export_is_stale() -> anyhow::Result<()> {
+    let blob = payload(2 * 1024 * 1024);
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("model.bin");
+    let store = BlobDir::open(&dir.path().join("store")).await?;
+
+    let paths = fetch_into(&store, &blob, &dest).await?;
+    anyhow::ensure!(paths == vec![dest.clone()], "the fetch exports");
+    anyhow::ensure!(std::fs::read(&dest)? == blob, "the file is the blob");
+    anyhow::ensure!(store.path().exists(), "the caller's store stays");
+    anyhow::ensure!(
+        !crate::ranged_store::store_dir_for(&dest)?.exists(),
+        "no store beside dest"
+    );
+
+    std::fs::remove_file(&dest)?;
+    let err = fetch_into(&store, &blob, &dest)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a lost export must not fetch"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<StaleStoreEntry>().is_some(),
+        "a lost export is stale: {err:#}"
+    );
+    store.shutdown().await
+}
+
+/// An export through a caller's store that fails its hash cannot fetch
+/// again into that store: the target ends with `StaleStoreEntry`.
+#[tokio::test]
+async fn a_drifted_export_in_a_callers_store_is_stale() -> anyhow::Result<()> {
+    let blob = payload(2 * 1024 * 1024);
+    let total = u64::try_from(blob.len())?;
+    let dir = tempfile::tempdir()?;
+    let dest = dir.path().join("model.bin");
+    let store = BlobDir::open(&dir.path().join("store")).await?;
+    let root = *blake3::hash(&blob).as_bytes();
+    store
+        .blob(root, total, None)
+        .await?
+        .admit_prefix(&blob, total)
+        .await?;
+    let data_dir = store.path().join("data");
+    let data_file = std::fs::read_dir(&data_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "data"))
+        .ok_or_else(|| anyhow::anyhow!("no data file in {}", data_dir.display()))?;
+    let mut drifted = std::fs::read(&data_file)?;
+    if let Some(b) = drifted.get_mut(1000) {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&data_file, &drifted)?;
+
+    let err = fetch_into(&store, &blob, &dest)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a drifted export must not land"))?;
+    anyhow::ensure!(
+        err.downcast_ref::<StaleStoreEntry>().is_some(),
+        "a drifted export is stale: {err:#}"
+    );
+    anyhow::ensure!(!dest.exists(), "the drifted file is removed");
+    store.shutdown().await
 }
 
 /// A lone source that stalls mid-blob trips the lane watchdog, cools, and

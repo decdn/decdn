@@ -62,6 +62,7 @@ use crate::{
 mod engine;
 mod landing;
 mod manifest_cache;
+mod run_store;
 mod skip_cache;
 #[cfg(test)]
 mod tests;
@@ -70,9 +71,9 @@ mod tests;
 pub use crate::lane_sources::FaultContext;
 
 /// The directory under the output root where a pull stages the blobs it
-/// fetches: the `<hex>.decdn` store (and a dedup entry's `<hex>.assembly`)
-/// while a blob is in flight, and `<hex>` once it is verified and before it
-/// lands at its paths.
+/// fetches: the run's download store (`store/`, one for every entry) and a
+/// dedup entry's `<hex>.assembly` while a blob is in flight, and `<hex>` once
+/// it is verified and before it lands at its paths.
 pub const STAGING_DIR: &str = ".decdn-partial";
 
 /// The largest bundle manifest a pull fetches, in bytes. A manifest fetch
@@ -1106,11 +1107,21 @@ impl BundlePuller {
         self.ctx.rate_hints()
     }
 
-    /// Wait for every queued peer-record and watermark write to land. Call it
-    /// before the process exits, after a cancelled pull too, so the next run
-    /// resumes each lane from what it paid.
+    /// Every blob this puller's download store in `out_dir` holds only part
+    /// of, with the verified bytes it holds of each: the partial downloads a
+    /// later pull resumes from. A directory with no store holds none.
+    pub async fn partial_downloads(&self, out_dir: &Path) -> Vec<([u8; 32], u64)> {
+        self.ctx.run_store.partials(out_dir).await
+    }
+
+    /// Wait for every queued peer-record and watermark write to land, and close
+    /// the run's download store: it is removed once it holds nothing a later
+    /// pull needs. Call it before the process exits, after a cancelled pull
+    /// too, so the next run resumes each lane from what it paid and each
+    /// entry from what it fetched.
     pub async fn finish(self) {
         self.ctx.writes.settle().await;
+        self.ctx.run_store.close().await;
     }
 }
 
@@ -1306,6 +1317,7 @@ impl BundlePullerBuilder {
             hints: self.hints,
             evidence: self.evidence,
             rate_samples: std::sync::Mutex::default(),
+            run_store: run_store::RunStore::default(),
         };
         Ok(BundlePuller { ctx })
     }

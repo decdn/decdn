@@ -452,8 +452,11 @@ The rules below apply to every pull:
   entry, so a stuck entry waits while other entries make progress. A pull in
   a terminal has no limit. A pull in a script stops after 10 minutes with no
   verified byte. `--give-up-after-secs` overrides both limits. When the limit
-  expires, the pull stops all entries and exits with code 75. Each entry
-  keeps its store, so a rerun pays for no byte twice.
+  expires, the pull stops all entries and exits with code 75. The pull
+  keeps one download store for all its entries
+  (`.decdn-partial/store/`), and the store keeps what each entry fetched, so
+  a rerun pays for no byte twice. The pull removes the store when no entry
+  needs it.
 - **Output** files are written under the output directory at each entry's
   relative path, resolved with the § Path-safety rules above (`..`,
   absolute, and escaping paths rejected). The pull holds the output
@@ -602,7 +605,7 @@ When `wire_bytes` is more than `paid_bytes`, the report adds the line
 `paid_bytes`.
 
 A pull can resume the bytes that an earlier, interrupted pull fetched into
-an entry's store. The earlier pull paid for those bytes, so they are not in
+its download store. The earlier pull paid for those bytes, so they are not in
 `downloaded`. The report states them separately, as `resumed_bytes`. A
 byte that the pull also splices counts only in `spliced_bytes`.
 `downloaded` is a sum of content lengths. It is not an exact count of

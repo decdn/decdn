@@ -8,7 +8,7 @@ use decdn_bao_range::{
     AlignedRange, CHUNK_GROUP_BYTES, IROH_BLOCK_SIZE, RangedStore, RangedStoreError,
 };
 
-use super::{ClientRangedStore, last_group, store_dir_for, whole};
+use super::{BlobDir, ClientRangedStore, last_group, store_dir_for, whole};
 use crate::ProvenSize;
 use crate::source::IngestEnd;
 
@@ -481,4 +481,61 @@ async fn finalize_exports_to_a_relative_destination() -> anyhow::Result<()> {
     store.finalize().await?;
     assert_eq!(std::fs::read(&dest)?, plaintext);
     Ok(())
+}
+
+/// An exported blob whose file then moves away is a lost export: the entry
+/// still reads complete, and its bytes cannot be read. One whose file stays
+/// is not.
+#[tokio::test]
+async fn an_export_whose_file_moves_is_a_lost_export() -> anyhow::Result<()> {
+    let total = 4 * GROUP;
+    let (root, plaintext, outboard) = synth_blob(usize::try_from(total)?);
+    let tmp = tempfile::tempdir()?;
+    let dest = tmp.path().join("out.bin");
+    let dir = BlobDir::open(&tmp.path().join("store")).await?;
+    let store = dir.blob(root, total, Some(dest.clone())).await?;
+    let whole = decdn_bao_range::align_range(0, total, total)?;
+    store
+        .admit(whole.clone(), bao_for(root, &plaintext, outboard, &whole))
+        .await?;
+    store.finalize().await?;
+    assert!(!dir.blob(root, total, None).await?.is_lost_export().await);
+
+    std::fs::rename(&dest, tmp.path().join("moved.bin"))?;
+    let reopened = dir.blob(root, total, None).await?;
+    assert!(
+        reopened.is_complete().await?,
+        "the entry still reads complete"
+    );
+    assert!(reopened.is_lost_export().await);
+    dir.shutdown().await
+}
+
+/// `partial_hashes` lists the blobs the store holds only part of, and no
+/// complete one.
+#[tokio::test]
+async fn partial_hashes_lists_only_partial_blobs() -> anyhow::Result<()> {
+    let total = 2 * GROUP;
+    let (whole_root, whole_data, whole_ob) = synth_blob(usize::try_from(total)?);
+    // A longer blob, so another root.
+    let (part_root, part_data, part_ob) = synth_blob(usize::try_from(total + GROUP)?);
+    let tmp = tempfile::tempdir()?;
+    let dir = BlobDir::open(tmp.path()).await?;
+
+    let whole = decdn_bao_range::align_range(0, total, total)?;
+    dir.blob(whole_root, total, None)
+        .await?
+        .admit(
+            whole.clone(),
+            bao_for(whole_root, &whole_data, whole_ob, &whole),
+        )
+        .await?;
+    let head = decdn_bao_range::align_range(0, GROUP, total + GROUP)?;
+    dir.blob(part_root, total + GROUP, None)
+        .await?
+        .admit(head.clone(), bao_for(part_root, &part_data, part_ob, &head))
+        .await?;
+
+    assert_eq!(dir.partial_hashes().await?, vec![part_root]);
+    dir.shutdown().await
 }

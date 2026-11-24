@@ -1,14 +1,21 @@
 //! [`ClientRangedStore`]: the client-side [`RangedStore`](decdn_bao_range::RangedStore)
 //! backend over an iroh-blobs store (ADR 038, #2881).
 //!
-//! A download keeps its store in a directory of its own, `<dest>.decdn`
-//! beside its destination (`store_dir_for`), opened as a `BlobDir`. The
-//! store holds the verified bytes, their outboard and the present ranges, so a
-//! resumed download reads what an earlier run fetched from the store alone.
-//! Once the blob is complete, `finalize` exports it to the destination, and
-//! the caller removes the directory. Each run proves the blob's size again
-//! before it plans, so the store keeps no size of its own beyond what the
-//! store's entry proves.
+//! A store lives in a directory of its own, opened as a `BlobDir`: a single
+//! download keeps one at `<dest>.decdn` beside its destination
+//! (`store_dir_for`), and a bundle pull keeps one for every entry of the run.
+//! The store holds the verified bytes, their outboard and the present ranges,
+//! so a resumed download reads what an earlier run fetched from the store
+//! alone. Once a blob is complete, `finalize` exports it to its destination.
+//! Each run proves the blob's size again before it plans, so the store keeps
+//! no size of its own beyond what the store's entry proves.
+//!
+//! An export moves the blob's data file to its destination, and the store's
+//! entry then refers to that file. A store that outlives the export holds a
+//! lost export once the file moves on: the entry reads complete, its bytes
+//! cannot be read, and a fresh import into it is ignored. A fetch that meets
+//! one ends with `StaleStoreEntry`, and only a new store fetches that blob
+//! again.
 //!
 //! The store is keyed by offset. It holds the size `bound` the planner works
 //! to and the `proven` size: a size proof sets both
@@ -63,10 +70,28 @@ pub(crate) fn store_dir_for(dest: &Path) -> anyhow::Result<PathBuf> {
     Ok(dest.with_file_name(dir))
 }
 
-/// An iroh-blobs file store opened in one directory. One download holds one,
-/// so no two processes open the same directory. The store runs with no
-/// garbage collection: the caller removes the whole directory once the
-/// download no longer needs it ([`Self::remove`]).
+/// The store holds a lost export of the blob a fetch needs: the entry reads
+/// complete, but the file the blob was exported to is gone, so its bytes
+/// cannot be read and a fresh import into the entry is ignored. Only a new
+/// store fetches the blob again.
+#[derive(Debug)]
+pub(crate) struct StaleStoreEntry;
+
+impl std::fmt::Display for StaleStoreEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the download store holds a lost export of this file; the store is removed \
+             when the run ends, and the next run fetches the file again",
+        )
+    }
+}
+
+impl std::error::Error for StaleStoreEntry {}
+
+/// An iroh-blobs file store opened in one directory. One download, or one
+/// bundle run, holds one, so no two processes open the same directory. The
+/// store runs with no garbage collection: the caller removes the whole
+/// directory once nothing in it is needed ([`Self::remove`]).
 #[derive(Debug, Clone)]
 pub(crate) struct BlobDir {
     fs: FsStore,
@@ -107,6 +132,38 @@ impl BlobDir {
         export_to: Option<PathBuf>,
     ) -> anyhow::Result<ClientRangedStore> {
         ClientRangedStore::open_in(Store::from(self.fs.clone()), root, bound_hint, export_to).await
+    }
+
+    /// The directory the store lives in.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The hashes of every blob the store holds only part of.
+    ///
+    /// # Errors
+    ///
+    /// The store cannot list its blobs or answer for one.
+    pub(crate) async fn partial_hashes(&self) -> anyhow::Result<Vec<[u8; 32]>> {
+        let store = Store::from(self.fs.clone());
+        let hashes = store
+            .blobs()
+            .list()
+            .hashes()
+            .await
+            .map_err(|e| anyhow::anyhow!("list store {}: {e}", self.path.display()))?;
+        let mut partial = Vec::new();
+        for hash in hashes {
+            let status = store
+                .blobs()
+                .status(hash)
+                .await
+                .map_err(|e| anyhow::anyhow!("store status of {hash}: {e}"))?;
+            if matches!(status, BlobStatus::Partial { .. }) {
+                partial.push(*hash.as_bytes());
+            }
+        }
+        Ok(partial)
     }
 
     /// Commit everything the store holds and stop it. A store that is dropped
@@ -323,6 +380,26 @@ impl ClientRangedStore {
             export_to,
             exported: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the store holds a lost export of the blob ([`StaleStoreEntry`]):
+    /// its entry reads complete, but its first byte cannot be read.
+    pub(crate) async fn is_lost_export(&self) -> bool {
+        if self.root == decdn_protocol::EMPTY_ROOT {
+            return false;
+        }
+        let complete = matches!(
+            self.store.blobs().status(self.hash).await,
+            Ok(BlobStatus::Complete { .. })
+        );
+        complete
+            && self
+                .store
+                .blobs()
+                .export_ranges(self.hash, 0..1)
+                .concatenate()
+                .await
+                .is_err()
     }
 
     /// A fresh in-memory store for `root`, sized to `bound_hint` until a size

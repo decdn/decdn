@@ -465,7 +465,7 @@ fn a_plan_with_no_entry_is_nothing() {
     ));
 }
 
-/// The run-end scan counts the staging files of blobs the run did not
+/// The run-end scan counts the partial downloads of blobs the run did not
 /// use, once per blob, totals the disk space they take, and ignores the
 /// run's own blobs, the manifest blob, and names that are not a blob's
 /// staging file (#2190).
@@ -473,7 +473,7 @@ fn a_plan_with_no_entry_is_nothing() {
 fn leftover_partials_counts_only_unselected_blobs() {
     let tmp = tempfile::tempdir().expect("tmp");
     assert_eq!(
-        leftover_partials(tmp.path(), &HashSet::new()),
+        leftover_partials(tmp.path(), &HashSet::new(), &[]),
         Leftovers::default(),
         "no staging dir, nothing left over"
     );
@@ -484,20 +484,10 @@ fn leftover_partials_counts_only_unselected_blobs() {
     let write = |name: String, len: usize| {
         std::fs::write(dir.join(name), vec![0u8; len]).expect("write");
     };
-    // A store directory holding `files` of the given lengths, nested as a
-    // file store nests its data.
-    let store = |name: String, files: &[usize]| {
-        let data = dir.join(name).join("data");
-        std::fs::create_dir_all(&data).expect("store dir");
-        for (i, len) in files.iter().enumerate() {
-            std::fs::write(data.join(format!("f{i}")), vec![0u8; *len]).expect("write");
-        }
-    };
-    // The run's selected entry and the manifest blob: kept for this run.
-    store(format!("{}.decdn", hex(1)), &[500, 5]);
-    store(format!("{}.decdn", hex(2)), &[300]);
-    // An orphan store and assembly, and a finalized orphan blob.
-    store(format!("{}.decdn", hex(3)), &[1000, 10]);
+    // What the download store holds only part of: the run's selected entry
+    // and the manifest blob, kept for this run, and an orphan.
+    let stored = [([1; 32], 505), ([2; 32], 300), ([3; 32], 1010)];
+    // The orphan's assembly, and a finalized orphan blob.
     write(format!("{}.assembly", hex(3)), 700);
     write(hex(4), 200);
     // A stray name.
@@ -507,12 +497,8 @@ fn leftover_partials_counts_only_unselected_blobs() {
     let on_disk = |path: std::path::PathBuf| {
         allocated_bytes(&std::fs::metadata(dir.join(path)).expect("metadata"))
     };
-    let orphan_data = std::path::PathBuf::from(format!("{}.decdn", hex(3))).join("data");
-    let expected = on_disk(orphan_data.join("f0"))
-        + on_disk(orphan_data.join("f1"))
-        + on_disk(format!("{}.assembly", hex(3)).into())
-        + on_disk(hex(4).into());
-    let leftovers = leftover_partials(tmp.path(), &keep);
+    let expected = 1010 + on_disk(format!("{}.assembly", hex(3)).into()) + on_disk(hex(4).into());
+    let leftovers = leftover_partials(tmp.path(), &keep, &stored);
     assert_eq!(
         leftovers,
         Leftovers {
@@ -565,7 +551,7 @@ fn leftover_partials_count_a_sparse_assembly_by_its_allocated_space() {
     let hex = blake3::Hash::from_bytes([9; 32]).to_hex().to_string();
     let file = std::fs::File::create(dir.join(format!("{hex}.assembly"))).expect("create");
     file.set_len(64 * 1024 * 1024).expect("size the assembly");
-    let leftovers = leftover_partials(tmp.path(), &HashSet::new());
+    let leftovers = leftover_partials(tmp.path(), &HashSet::new(), &[]);
     assert_eq!(leftovers.blobs, 1);
     assert!(
         leftovers.bytes < 1024 * 1024,
@@ -1691,7 +1677,7 @@ async fn a_run_with_nothing_to_fetch_records_its_excluded_entries() {
         ActivityRecorder::start_in(records.path(), &uri, &text, out.path(), &evidence).unwrap();
     let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
     observer
-        .nothing_to_fetch(NothingReason::Filtered, 9, out.path(), uri.hash)
+        .nothing_to_fetch(NothingReason::Filtered, 9, out.path(), (uri.hash, &[]))
         .unwrap();
     activity.finish(&Ok(()), None).await;
 

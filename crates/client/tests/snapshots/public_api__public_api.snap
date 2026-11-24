@@ -45,6 +45,7 @@ pub fn decdn_client::bundle::BundlePuller::builder(decdn_client::session::ChainC
 pub async fn decdn_client::bundle::BundlePuller::fetch_manifest(&mut self, [u8; 32], &std::path::Path, bool) -> anyhow::Result<decdn_client::bundle::BundleManifest>
 pub async fn decdn_client::bundle::BundlePuller::finish(self)
 pub fn decdn_client::bundle::BundlePuller::funding_shortfall(&self) -> core::option::Option<alloc::string::String>
+pub async fn decdn_client::bundle::BundlePuller::partial_downloads(&self, &std::path::Path) -> alloc::vec::Vec<([u8; 32], u64)>
 pub async fn decdn_client::bundle::BundlePuller::pull(&mut self, &decdn_client::bundle::BundleManifest, &std::path::Path, bool, &tokio_util::sync::cancellation_token::CancellationToken) -> decdn_client::bundle::BundleOutcome
 pub fn decdn_client::bundle::BundlePuller::replacements(&self) -> alloc::vec::Vec<decdn_client::source::PoolReplaced>
 pub const fn decdn_client::bundle::BundlePuller::unconfirmed_escrows(&self) -> &decdn_client::buyer_pool::UnconfirmedEscrows
