@@ -47,7 +47,7 @@ fn render_config_emits_parseable_toml() {
     );
     assert_eq!(
         doc["blockchain"]["redeem_threshold_micro_usdc"].as_integer(),
-        Some(10)
+        i64::try_from(REDEEM_THRESHOLD_MICRO_USDC).ok()
     );
     assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
     assert!(doc["cache"]["origin"].get("path").is_some());
