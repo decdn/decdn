@@ -518,8 +518,8 @@ pub struct DecdnMetrics {
     /// no direct IP path at accept time. Expected on a node behind NAT; on a
     /// node with a public address it means dialers did not find or reach that
     /// address. On a node with `network.external_addrs` set, also check that
-    /// the port forward or load balancer delivers UDP to this host. The node
-    /// does not probe a configured address. Operator-visible name:
+    /// the port forward or load balancer delivers UDP to this host.
+    /// Operator-visible name:
     /// `decdn_inbound_connections_relayed_total`.
     pub inbound_connections_relayed: Counter,
     /// `1` when `network.external_addrs` configures an address, or else when

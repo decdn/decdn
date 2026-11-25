@@ -191,6 +191,19 @@ pub fn public_quic_addrs(
     out
 }
 
+/// Where [`public_quic_addrs`] takes its addresses from: `"route"` (the host's
+/// route-public IPs) when `external` (the configured `network.external_addrs`)
+/// is empty, else `"configured"`. The node does not probe a configured
+/// address, so the port forward or load balancer in front of it is unverified.
+#[must_use]
+pub const fn addr_source(external: &[SocketAddr]) -> &'static str {
+    if external.is_empty() {
+        "route"
+    } else {
+        "configured"
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;

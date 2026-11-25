@@ -7,10 +7,8 @@ fn reachability_passes_both_ways_and_guides_the_nat_case() {
     assert_eq!(public.severity, Severity::Pass);
     assert!(public.title.contains("/ip4/8.8.8.8/udp/4433/quic-v1"));
     assert!(public.remediation.is_none());
-    assert!(
-        public.detail.is_none(),
-        "a route address carries no source detail"
-    );
+    assert_eq!(public.detail.as_deref(), Some("source=route probed=false"));
+    assert!(!public.title.contains("load balancer"), "{}", public.title);
 
     let nat = classify_reachability(&[], 4433, &[]);
     assert_eq!(nat.severity, Severity::Pass, "behind NAT is supported");
@@ -35,10 +33,11 @@ fn reachability_counts_a_configured_external_addr() {
     );
     assert!(!finding.title.contains("8.8.8.8"), "{}", finding.title);
     assert!(finding.remediation.is_none());
-    let detail = finding.detail.unwrap();
-    assert!(detail.contains("source=configured"), "{detail}");
-    assert!(detail.contains("network.external_addrs"), "{detail}");
-    assert!(detail.contains("not probed"), "{detail}");
+    assert!(finding.title.contains("load balancer"), "{}", finding.title);
+    assert_eq!(
+        finding.detail.as_deref(),
+        Some("source=configured probed=false")
+    );
 }
 
 #[test]

@@ -7,7 +7,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 
 use decdn_common::config::ResolvedConfig;
-use decdn_common::net::{public_quic_addrs, quic_multiaddr, route_public_ips};
+use decdn_common::net::{addr_source, public_quic_addrs, quic_multiaddr, route_public_ips};
 
 use super::{Finding, Report, Severity};
 
@@ -73,17 +73,15 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 /// (`network.external_addrs`) address on its own port when there are any, else
 /// each of `route_public` (the host's route-public IPs) on `bind_port`. Both
 /// outcomes pass: a host behind NAT is a supported setup whose inbound runs
-/// through the relay and hole-punching. The doctor does not probe a configured
-/// address, so a public finding from `external_addrs` carries a
-/// `source=configured` detail that says the forward or load balancer is
-/// unverified.
+/// through the relay and hole-punching. A public finding carries a
+/// `source=<route|configured> probed=false` detail from [`addr_source`].
 pub(crate) fn classify_reachability(
     route_public: &[IpAddr],
     bind_port: u16,
     external_addrs: &[SocketAddr],
 ) -> Finding {
     let public = public_quic_addrs(route_public, bind_port, external_addrs);
-    let configured = !external_addrs.is_empty();
+    let source = addr_source(external_addrs);
     if public.is_empty() {
         Finding {
             group: "Ports",
@@ -104,16 +102,16 @@ pub(crate) fn classify_reachability(
             .iter()
             .map(|a| quic_multiaddr(a.ip(), a.port()))
             .collect();
+        let mut title = format!("public address: peers dial {} directly", addrs.join(", "));
+        if source == "configured" {
+            title.push_str(" (verify the forward or load balancer delivers UDP to this host)");
+        }
         Finding {
             group: "Ports",
             id: "port.reachability",
             severity: Severity::Pass,
-            title: format!("public address: peers dial {} directly", addrs.join(", ")),
-            detail: configured.then(|| {
-                "source=configured (network.external_addrs, not probed; verify the forward \
-                 or load balancer delivers UDP to this host)"
-                    .to_string()
-            }),
+            title,
+            detail: Some(format!("source={source} probed=false")),
             remediation: None,
         }
     }

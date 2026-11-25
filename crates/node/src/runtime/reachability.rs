@@ -10,12 +10,11 @@
 //! registered address first. When `network.external_addrs` is set, its
 //! addresses are the public ones and the host's own addresses do not count.
 //! When the node has a public address, the report names its source (`route`
-//! or `configured`); the node trusts a configured address from config and
-//! does not probe it.
+//! or `configured`, from [`addr_source`]).
 
 use std::net::SocketAddr;
 
-use decdn_common::net::{public_quic_addrs, quic_multiaddr, route_public_ips};
+use decdn_common::net::{addr_source, public_quic_addrs, quic_multiaddr, route_public_ips};
 
 use crate::metrics::Metrics;
 
@@ -45,19 +44,6 @@ fn classify(public: &[SocketAddr], registered: &[SocketAddr]) -> Reachability {
         Reachability::PublicRegistered
     } else {
         Reachability::PublicUnregistered { missing }
-    }
-}
-
-/// Where the public addresses come from: `"configured"` when
-/// `network.external_addrs` is set (the node does not probe these), else
-/// `"route"` (the host's route-public IPs). This matches
-/// [`public_quic_addrs`], which uses exactly the configured list whenever it is
-/// non-empty.
-const fn addr_source(external_addrs: &[SocketAddr]) -> &'static str {
-    if external_addrs.is_empty() {
-        "route"
-    } else {
-        "configured"
     }
 }
 
