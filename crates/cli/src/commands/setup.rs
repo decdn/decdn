@@ -229,9 +229,15 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let cb_addr = resolved.capacity_bond_address;
     let json = args.chain.common.json;
     let dry_run = args.chain.common.dry_run;
-
     // ---- Keys (idempotent — generate only on a clean slate). ----
     let key_path = identity::key_path(&resolved.data_dir);
+    // The register step reads `network.external_addrs` after `bond::execute`.
+    // On a clean slate a registration is certain, so a bad entry fails here,
+    // before any key generation or prompt. A node with a key checks it once
+    // its registration state is known, before any transaction.
+    if args.multiaddrs.is_empty() && !key_path.exists() {
+        file.external_addrs()?;
+    }
     let default_keystore = eth_identity::keystore_path(&resolved.data_dir);
     let mut keys_generated = false;
     match precheck_keys(
@@ -373,7 +379,14 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 .context("failed to write dry-run bond plan")?;
         }
         let readiness = read_readiness(&bond_contract, operator).await?;
-        let multiaddr_count = register::registration_multiaddrs(&args.multiaddrs, &file).len();
+        // Only a registration that is due reads the multiaddrs.
+        let multiaddr_count =
+            match registration_status(readiness.node_id, readiness.active, local_node_id) {
+                RegistrationStatus::Due => {
+                    register::registration_multiaddrs(&args.multiaddrs, &file)?.len()
+                }
+                RegistrationStatus::AlreadyRegistered | RegistrationStatus::Divergent => 0,
+            };
         emit_readiness(json, &readiness, &args.region, multiaddr_count);
         if json {
             println!(
@@ -425,6 +438,11 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         RegistrationStatus::AlreadyRegistered => true,
         RegistrationStatus::Due => false,
     };
+    // A registration is due: a bad `network.external_addrs` entry fails here,
+    // before the terms prompt and any transaction.
+    if !already_registered && args.multiaddrs.is_empty() {
+        file.external_addrs()?;
+    }
 
     // ---- ADR 019 § Terms Acceptance — accept the current operator terms
     //      *before* any transaction, so a refusal / stale-client abort happens
@@ -499,7 +517,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             if !json {
                 println!("register:");
             }
-            let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file);
+            let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file)?;
             let outcome = register::submit_registration(
                 &provider,
                 &signer,

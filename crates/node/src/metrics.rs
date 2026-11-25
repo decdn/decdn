@@ -520,9 +520,10 @@ pub struct DecdnMetrics {
     /// address. Operator-visible name:
     /// `decdn_inbound_connections_relayed_total`.
     pub inbound_connections_relayed: Counter,
-    /// `1` when the host's default route has a public source address (ADR 001
-    /// § Node Discovery), `0` when the node is behind NAT. Sampled at
-    /// bring-up. Operator-visible name: `decdn_node_public_address`.
+    /// `1` when `network.external_addrs` configures an address, or else when
+    /// the host's default route has a public source address (ADR 001 § Node
+    /// Discovery); `0` when the node is behind NAT. Sampled at bring-up.
+    /// Operator-visible name: `decdn_node_public_address`.
     pub node_public_address: Gauge,
     /// `cdn/dht/v1` requests rejected by the per-peer (`NodeId`) token
     /// bucket (ADR 022 §DHT Rate Limiting). One Counter per layer to match
@@ -3232,7 +3233,8 @@ recorders! {
     /// Record an inbound connection that arrived over the relay only.
     inbound_connection_relayed => inbound_connections_relayed.inc();
 
-    /// Set whether the host has a public address on its default route.
+    /// Set whether the node has a public address: a configured
+    /// `network.external_addrs` address, or one on the host's default route.
     node_public_address(public: bool) => node_public_address.set(i64::from(public));
 
     /// Record a `cdn/dht/v1` request rejected at the per-peer layer.

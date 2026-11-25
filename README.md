@@ -282,7 +282,9 @@ bonds, registers the node, and prints a go/no-go summary
 - **Keystore password.** Set `DECDN_KEYSTORE_PASSWORD` or pass `--keystore-password-file`
   ([runbook](docs/runbook.md#keystore-will-not-unlock)).
 - **Network.** The node listens on UDP 4433 over IPv4 and IPv6, so a dual-stack host also
-  passes `--multiaddr /ip6/<addr>/udp/4433/quic-v1`. `--region` is an ISO 3166-1 alpha-2
+  passes `--multiaddr /ip6/<addr>/udp/4433/quic-v1`. Behind a port forward or a load balancer,
+  set `[network] external_addrs = ["<public-ip>:<port>"]`: `decdn setup` registers it when no
+  `--multiaddr` is given, and the node advertises it to peers. `--region` is an ISO 3166-1 alpha-2
   country code ([ADR 030](adr/030-node-region-self-attestation.md)).
 - **Your own content.** Import it into a local origin store with
   `decdn origin import --input <path> --to <dir>`, then write the node config with

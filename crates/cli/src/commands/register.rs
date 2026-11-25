@@ -38,6 +38,9 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     let file = chain_ctx::load_optional_config(config_path)?;
     let resolved = chain_ctx::resolve(&args.chain, &file)?;
     let cb_addr = resolved.capacity_bond_address;
+    // Chosen before the signer loads, so a bad `network.external_addrs` entry
+    // fails before any password prompt.
+    let multiaddrs = registration_multiaddrs(&args.multiaddrs, &file)?;
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
@@ -59,7 +62,6 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     // `decdn node register` submits a single transaction and has no partial
     // report to print, so the slot is only consulted through the error message.
     let mut tx_slot = None;
-    let multiaddrs = registration_multiaddrs(&args.multiaddrs, &file);
     let outcome = submit_registration(
         &provider,
         &signer,
@@ -84,18 +86,44 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     Ok(())
 }
 
-/// The multiaddrs to register (ADR 001 § Node Discovery): `explicit` when the
-/// operator passed any, else one `/ip{4,6}/<ip>/udp/<bind_port>/quic-v1` per
-/// public address on the host's default route. A host behind NAT gets none,
-/// since its route source is not dialable; its operator passes the forwarded
-/// address with `--multiaddr` instead. The chosen default is reported on
-/// stderr, so `--json` stdout stays machine-readable.
+/// The multiaddrs to register (ADR 001 § Node Discovery), first match wins:
+///
+/// 1. `explicit`, when the operator passed any. `network.external_addrs` is
+///    then neither read nor checked.
+/// 2. Each `network.external_addrs` address, on its own port, when that list
+///    holds any address. An empty list counts as unset. The configured
+///    addresses replace the host's own, as in the daemon's reachability check
+///    (see [`decdn_common::net::public_quic_addrs`]).
+/// 3. One `/ip{4,6}/<ip>/udp/<bind_port>/quic-v1` per public address on the
+///    host's default route. A host behind NAT gets none, since its route
+///    source is not dialable; its operator sets `network.external_addrs` or
+///    passes the forwarded address with `--multiaddr` instead.
+///
+/// The chosen default is reported on stderr, so `--json` stdout stays
+/// machine-readable.
+///
+/// # Errors
+///
+/// Returns an error when a `network.external_addrs` entry is invalid and no
+/// `explicit` multiaddr is given.
 pub(crate) fn registration_multiaddrs(
     explicit: &[String],
     file: &chain_ctx::FileConfig,
-) -> Vec<String> {
+) -> anyhow::Result<Vec<String>> {
     if !explicit.is_empty() {
-        return explicit.to_vec();
+        return Ok(explicit.to_vec());
+    }
+    let external = file.external_addrs()?;
+    if !external.is_empty() {
+        let chosen: Vec<String> = external
+            .iter()
+            .map(|a| decdn_common::net::quic_multiaddr(a.ip(), a.port()))
+            .collect();
+        eprintln!(
+            "note: no --multiaddr given; registering network.external_addrs: {}",
+            chosen.join(", ")
+        );
+        return Ok(chosen);
     }
     let bind_port = file.bind_port();
     let chosen = default_multiaddrs(&decdn_common::net::route_public_ips(), bind_port);
@@ -103,8 +131,8 @@ pub(crate) fn registration_multiaddrs(
         eprintln!(
             "note: no --multiaddr given and no public address on the default route (behind \
              NAT); registering none. Peers reach the node through the relay and its pkarr \
-             record. If UDP {bind_port} is forwarded to this host, pass the forwarded address \
-             with --multiaddr."
+             record. If UDP {bind_port} is forwarded to this host, set the forwarded address \
+             in network.external_addrs or pass it with --multiaddr."
         );
     } else {
         eprintln!(
@@ -112,7 +140,7 @@ pub(crate) fn registration_multiaddrs(
             chosen.join(", ")
         );
     }
-    chosen
+    Ok(chosen)
 }
 
 fn default_multiaddrs(public: &[std::net::IpAddr], bind_port: u16) -> Vec<String> {

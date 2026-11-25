@@ -349,6 +349,7 @@ fn build_config(
             // Ephemeral iroh QUIC bind port — nothing dials this node.
             bind_port: 0,
             relay_urls: Vec::new(),
+            external_addrs: Vec::new(),
             discovery: ResolvedDiscovery::default(),
         },
         blockchain: ResolvedBlockchain {

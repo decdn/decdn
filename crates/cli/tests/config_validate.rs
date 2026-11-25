@@ -101,6 +101,26 @@ fn validate_fails_for_malformed_relay_url() -> anyhow::Result<()> {
 }
 
 #[test]
+fn validate_fails_for_private_external_addr() -> anyhow::Result<()> {
+    let body = format!(
+        "{VALID_CONFIG}\n[network]\nexternal_addrs = [\"10.0.0.5:4433\", \"8.8.8.8:30443\"]\n"
+    );
+    let dir = TempDir::new()?;
+    let path = write_config(&dir, &body)?;
+    fs::write(dir.path().join("keystore.json"), "")?;
+    let err = commands::config_validate(Some(&path), &args(dir.path())?)
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected validation to fail"))?;
+    let msg = format!("{err:#}");
+    anyhow::ensure!(
+        msg.contains("network.external_addrs[0]") && msg.contains("10.0.0.5"),
+        "error should name the private external address: {msg}"
+    );
+    anyhow::ensure!(!msg.contains("network.external_addrs[1]"), "{msg}");
+    Ok(())
+}
+
+#[test]
 fn validate_fails_for_malformed_discovery_peer_addr() -> anyhow::Result<()> {
     // #818 scope 1: a malformed `[network.discovery]` peer socket address must
     // fail `config validate` up front and name the offending indexed field.
@@ -322,6 +342,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_urls: Vec::new(),
+            external_addrs: Vec::new(),
             discovery: decdn_common::config::ResolvedDiscovery::default(),
         },
         blockchain: ResolvedBlockchain {
@@ -635,6 +656,31 @@ fn summary_prints_one_line_per_relay() -> anyhow::Result<()> {
         out.contains("relay_url:                https://relay-b.example"),
         "{out}"
     );
+    Ok(())
+}
+
+#[test]
+fn validate_summary_lists_external_addrs() -> anyhow::Result<()> {
+    let cfg = sample_resolved(|c| {
+        c.network.external_addrs = vec![
+            std::net::SocketAddr::from(([8, 8, 8, 8], 30443)),
+            std::net::SocketAddr::from((
+                std::net::Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111),
+                4433,
+            )),
+        ];
+    });
+    let out = render(None, &cfg)?;
+    anyhow::ensure!(
+        out.contains("external_addr:            8.8.8.8:30443"),
+        "{out}"
+    );
+    anyhow::ensure!(
+        out.contains("external_addr:            [2606:4700::1111]:4433"),
+        "{out}"
+    );
+    let unset = render(None, &sample_resolved(|_| {}))?;
+    anyhow::ensure!(!unset.contains("external_addr:"), "{unset}");
     Ok(())
 }
 

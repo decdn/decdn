@@ -100,6 +100,10 @@ pub fn write_validate_summary<W: std::io::Write>(
             decdn_common::redact::redact_userinfo(relay)
         )?;
     }
+    // One line per configured external address; nothing when unset.
+    for addr in &resolved.network.external_addrs {
+        writeln!(w, "  external_addr:            {addr}")?;
+    }
     // Operator-configurable discovery (#818); nothing printed when unset (the
     // node then uses the n0 pkarr/DNS default). A pkarr_url is an infra relay
     // endpoint — pkarr authenticates by the Ed25519-signed packet, not a URL
@@ -984,6 +988,10 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # Multiple relays give redundancy/failover; the node logs whether a relay connected
 # after bring-up but never fails on it (iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
+# Public IP:port addresses where peers reach this node through a port forward or a
+# load balancer (IPv6 in brackets). The node publishes each one; `decdn setup` and
+# `decdn node register` register them when no --multiaddr is given. Restart to apply.
+# external_addrs = ["<public-ip>:4433"]
 # Operator-configurable address discovery (#818). Absent => n0-hosted pkarr/DNS.
 # Present => the node drops the n0 discovery leg and uses only what is set here.
 # [network.discovery]

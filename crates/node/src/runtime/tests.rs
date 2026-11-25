@@ -301,6 +301,7 @@ fn cfg_with_origins(origins: Vec<ResolvedOrigin>) -> (tempfile::TempDir, Resolve
         network: ResolvedNetwork {
             bind_port: 4433,
             relay_urls: Vec::new(),
+            external_addrs: Vec::new(),
             discovery: decdn_common::config::ResolvedDiscovery::default(),
         },
         blockchain: ResolvedBlockchain {
@@ -1033,9 +1034,16 @@ async fn report_home_relay_false_when_relay_never_connects() {
     let sk = SecretKey::generate();
     let transport = quic_transport_config().unwrap();
     let relays = vec![format!("http://127.0.0.1:{dead_port}")];
-    let ep = build_endpoint(&sk, 0, &relays, &ResolvedDiscovery::default(), transport)
-        .await
-        .expect("endpoint binds with an unreachable relay");
+    let ep = build_endpoint(
+        &sk,
+        0,
+        &relays,
+        &[],
+        &ResolvedDiscovery::default(),
+        transport,
+    )
+    .await
+    .expect("endpoint binds with an unreachable relay");
     assert!(!report_home_relay(ep.home_relay_status(), Duration::from_millis(500)).await);
     ep.close().await;
 }
@@ -1176,9 +1184,16 @@ async fn build_endpoint_binds_ipv6_on_bind_port() {
     let has_v6 = bind_v6_only_udp(0).is_some();
     let sk = SecretKey::generate();
     let transport = quic_transport_config().unwrap();
-    let ep = build_endpoint(&sk, port, &[], &ResolvedDiscovery::default(), transport)
-        .await
-        .expect("endpoint binds on both families");
+    let ep = build_endpoint(
+        &sk,
+        port,
+        &[],
+        &[],
+        &ResolvedDiscovery::default(),
+        transport,
+    )
+    .await
+    .expect("endpoint binds on both families");
     let bound = ep.bound_sockets();
     assert!(
         bound.iter().any(|a| a.is_ipv4() && a.port() == port),
@@ -1214,9 +1229,16 @@ async fn build_endpoint_falls_back_to_ipv4_when_ipv6_bind_fails() {
     };
     let sk = SecretKey::generate();
     let transport = quic_transport_config().unwrap();
-    let ep = build_endpoint(&sk, port, &[], &ResolvedDiscovery::default(), transport)
-        .await
-        .expect("an IPv6 bind failure does not stop the node");
+    let ep = build_endpoint(
+        &sk,
+        port,
+        &[],
+        &[],
+        &ResolvedDiscovery::default(),
+        transport,
+    )
+    .await
+    .expect("an IPv6 bind failure does not stop the node");
     let bound = ep.bound_sockets();
     assert!(bound.iter().all(SocketAddr::is_ipv4), "{bound:?}");
     assert!(
@@ -1246,9 +1268,50 @@ async fn build_endpoint_binds_with_portless_relay_url() {
     let sk = SecretKey::generate();
     let transport = quic_transport_config().unwrap();
     let relays = vec!["relay://portless-a".to_string()];
-    let ep = build_endpoint(&sk, 0, &relays, &ResolvedDiscovery::default(), transport)
+    let ep = build_endpoint(
+        &sk,
+        0,
+        &relays,
+        &[],
+        &ResolvedDiscovery::default(),
+        transport,
+    )
+    .await
+    .expect("portless relay URL binds");
+    ep.close().await;
+}
+
+#[tokio::test]
+async fn build_endpoint_advertises_configured_external_addrs() {
+    // iroh adds each configured address to the endpoint's own address set
+    // during bind, so it is present right after `bind()` returns. A static
+    // peer map keeps the build off the n0 pkarr publisher, so the test
+    // publishes no address record; the relay leg keeps the n0 default.
+    let sk = SecretKey::generate();
+    let transport = quic_transport_config().unwrap();
+    let external: Vec<SocketAddr> = vec![
+        "8.8.8.8:30443".parse().unwrap(),
+        "[2606:4700::1111]:4433".parse().unwrap(),
+    ];
+    let discovery = ResolvedDiscovery {
+        pkarr_url: None,
+        dns_origin: None,
+        peers: vec![decdn_common::config::ResolvedDiscoveryPeer {
+            node_id: SecretKey::generate().public().to_string(),
+            relay_url: None,
+            addrs: vec!["8.8.4.4:4433".to_string()],
+        }],
+    };
+    let ep = build_endpoint(&sk, 0, &[], &external, &discovery, transport)
         .await
-        .expect("portless relay URL binds");
+        .expect("endpoint with external addrs binds");
+    let advertised: Vec<SocketAddr> = ep.addr().ip_addrs().copied().collect();
+    for addr in &external {
+        assert!(
+            advertised.contains(addr),
+            "{addr} missing from {advertised:?}"
+        );
+    }
     ep.close().await;
 }
 
@@ -1271,7 +1334,7 @@ async fn build_endpoint_binds_with_custom_discovery() {
             addrs: vec!["203.0.113.4:4433".to_string()],
         }],
     };
-    let ep = build_endpoint(&sk, 0, &[], &discovery, transport)
+    let ep = build_endpoint(&sk, 0, &[], &[], &discovery, transport)
         .await
         .expect("custom-discovery endpoint binds");
     ep.close().await;
@@ -1291,7 +1354,7 @@ async fn build_endpoint_binds_with_discovery_and_custom_relay() {
         dns_origin: Some("discovery.example.".to_string()),
         peers: Vec::new(),
     };
-    let ep = build_endpoint(&sk, 0, &relays, &discovery, transport)
+    let ep = build_endpoint(&sk, 0, &relays, &[], &discovery, transport)
         .await
         .expect("discovery + custom relay endpoint binds");
     ep.close().await;

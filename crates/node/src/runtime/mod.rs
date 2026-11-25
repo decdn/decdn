@@ -697,6 +697,7 @@ async fn build_infra(
         &secret_key,
         cfg.network.bind_port,
         &cfg.network.relay_urls,
+        &cfg.network.external_addrs,
         &cfg.network.discovery,
         transport_config,
     )
@@ -1025,6 +1026,7 @@ async fn build_chain_and_handlers(
     reachability::report(
         &infra.node_metrics,
         cfg.network.bind_port,
+        &cfg.network.external_addrs,
         &registry.dial_addrs.get(&own_id).unwrap_or_default(),
     );
     // The registry refresh MUST stay live through drain (its staker set gates
@@ -2930,6 +2932,13 @@ async fn shutdown<P: Provider + Clone + 'static>(
 /// a container without a v6 stack) or with `[::]:bind_port` taken still starts
 /// on IPv4 only, and [`warn_if_no_ipv6_socket`] logs the degraded state.
 ///
+/// Each of `external_addrs` (`network.external_addrs`, a forwarded or
+/// load-balancer address) goes to iroh as a configured external address. iroh
+/// advertises it together with the addresses it discovers and uses it in NAT
+/// traversal. When a pkarr publisher runs (the n0 default, or
+/// `network.discovery.pkarr_url`), the record carries it too: resolution admits
+/// only public addresses, so `node_publish_filter` keeps each one.
+///
 /// No transient pre-bind probe: it would introduce a TOCTOU window
 /// between the probe and the real bind, and iroh's
 /// `Endpoint::builder().bind_addr(...).bind()` owns its UDP socket
@@ -2939,6 +2948,7 @@ async fn build_endpoint(
     secret_key: &SecretKey,
     bind_port: u16,
     relay_urls: &[String],
+    external_addrs: &[SocketAddr],
     discovery: &ResolvedDiscovery,
     transport_config: QuicTransportConfig,
 ) -> anyhow::Result<Endpoint> {
@@ -2968,6 +2978,9 @@ async fn build_endpoint(
     builder = builder
         .secret_key(secret_key.clone())
         .transport_config(transport_config);
+    for addr in external_addrs {
+        builder = builder.external_addr(*addr);
+    }
 
     // A configured `network.relay_urls` list swaps the n0 default relay map for
     // the operator's self-hosted relays (`RelayMode::Custom`). The relay leg is

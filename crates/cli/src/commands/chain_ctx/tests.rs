@@ -95,6 +95,52 @@ fn bind_port_reads_the_network_section() {
     assert_eq!(file.network.and_then(|n| n.bind_port), Some(5000));
 }
 
+#[test]
+fn external_addrs_read_the_network_section() {
+    let file: FileConfig = toml::from_str(
+        "[network]\nexternal_addrs = [\"8.8.8.8:30443\", \"8.8.8.8:30443\", \"1.1.1.1:4433\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        file.external_addrs().unwrap(),
+        vec![
+            "8.8.8.8:30443".parse::<std::net::SocketAddr>().unwrap(),
+            "1.1.1.1:4433".parse().unwrap(),
+        ]
+    );
+    assert!(FileConfig::default().external_addrs().unwrap().is_empty());
+}
+
+#[test]
+fn external_addrs_refuse_a_private_entry() {
+    let file: FileConfig =
+        toml::from_str("[network]\nexternal_addrs = [\"192.168.1.2:4433\"]\n").unwrap();
+    let msg = format!("{:#}", file.external_addrs().unwrap_err());
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(msg.contains("192.168.1.2"), "{msg}");
+}
+
+/// A misspelt `[network]` key stops the CLI before it registers the wrong
+/// addresses, as it stops the daemon.
+#[test]
+fn network_section_refuses_an_unknown_key() {
+    let err = toml::from_str::<FileConfig>("[network]\nexternal_addr = [\"8.8.8.8:4433\"]\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("external_addr"), "{err}");
+}
+
+/// Every key the daemon's `[network]` table accepts also parses here, so the
+/// strict reader refuses only what the daemon refuses.
+#[test]
+fn network_section_accepts_every_daemon_key() {
+    let toml = "[network]\nbind_port = 4433\nrelay_urls = [\"https://relay.example\"]\n\
+                external_addrs = [\"8.8.8.8:4433\"]\n\
+                [network.discovery]\ndns_origin = \"dns.example\"\n";
+    toml::from_str::<decdn_common::config::FileConfig>(toml).unwrap();
+    toml::from_str::<FileConfig>(toml).unwrap();
+}
+
 /// Pull-through resolves by the daemon's role rule: on with no origin, off with
 /// one, and an explicit value wins either way. Both origin forms count.
 #[test]
