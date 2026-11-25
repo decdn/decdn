@@ -21,7 +21,7 @@ use decdn_client::PoolReplaced;
 use decdn_client::bundle::{
     BundleEnd, BundleManifest, BundleObserver, BundlePuller, BundleReport, EntryLanded,
     FaultContext, FaultHints, FileObserver, ForeignReason, Funding, MalformedManifest,
-    ManifestEntry, NotAManifest, STAGING_DIR, format_hash, planned_downloads, select_nodes,
+    ManifestEntry, NotAManifest, format_hash, planned_downloads, select_nodes,
 };
 use decdn_client::buyer_pool::UnconfirmedEscrows;
 use decdn_client::endpoint as client_endpoint;
@@ -1135,7 +1135,7 @@ async fn pull_manifest(
     let Kept { manifest, excluded } = match selected.inspect_err(|_| warn_shortfall(puller))? {
         Planned::Pull(kept) => kept,
         Planned::Nothing { reason, excluded } => {
-            let reported = observer.nothing_to_fetch(reason, excluded, out, uri.hash);
+            let reported = observer.nothing_to_fetch(reason, excluded, out);
             warn_shortfall(puller);
             return reported;
         }
@@ -1162,7 +1162,6 @@ async fn pull_manifest(
     };
     observer.finish();
     observer.record_counts(&outcome.report, excluded);
-    warn_leftover_partials(out, &manifest.entries, uri.hash);
     let reported = report(&outcome.report, excluded, out, args.json);
     // A fault that ended the whole pull is its result, so `main` maps it to
     // its exit code (75 for a give-up with no `openPool` or `topUp` in
@@ -1271,9 +1270,8 @@ impl PullObserver {
         }
     }
 
-    /// End a run that has nothing to fetch, for `reason`: say so, warn of
-    /// the partial downloads earlier runs left under `out`, and record the
-    /// `excluded` entries, so the run's record shows how many it dropped.
+    /// End a run that has nothing to fetch, for `reason`: say so, and record
+    /// the `excluded` entries, so the run's record shows how many it dropped.
     /// Under `--json`, the run says so with its [`PullReport`], the same
     /// object every real run prints: no entry fetched, the `excluded` count,
     /// and no byte paid by the pull, which leaves out the manifest fetch as
@@ -1284,7 +1282,6 @@ impl PullObserver {
         reason: NothingReason,
         excluded: u64,
         out: &Path,
-        bundle_hash: [u8; 32],
     ) -> anyhow::Result<()> {
         let empty = BundleReport::default();
         let reported = if self.json {
@@ -1293,7 +1290,6 @@ impl PullObserver {
             report_nothing_to_fetch(reason);
             Ok(())
         };
-        warn_leftover_partials(out, &[], bundle_hash);
         self.record_counts(&empty, excluded);
         reported
     }
@@ -1492,8 +1488,7 @@ fn json_plan(out: &str, entries: &[ManifestEntry]) -> serde_json::Value {
 /// entry selection `filter` applies to those entries, so the plan is the
 /// entry set a real run starts from and the unmatched-pattern warnings are
 /// the ones it prints. A real run then skips files already present in the
-/// output root (unless `--overwrite`) and warns on leftover partials; the dry
-/// run does neither, and its quote prices a fresh pull. It does refuse a
+/// output root (unless `--overwrite`); the dry run does not, and its quote prices a fresh pull. It does refuse a
 /// hidden entry path into a default destination ([`refuse_hidden`]) and a
 /// default destination that holds a file the pull may replace
 /// ([`refuse_foreign`]), as a real run does. A bundle with no cached manifest
@@ -1713,103 +1708,6 @@ fn counts_line(rep: &PullReport) -> String {
          failed{not_run})",
         rep.output, rep.fetched, rep.linked, rep.skipped, rep.reused, rep.excluded, rep.failed
     )
-}
-
-/// Scan `<out_root>/.decdn-partial` for leftover per-hash staging files
-/// (`<hex>`) whose hash is not in `keep`, and total the disk space they take
-/// ([`allocated_bytes`]). Other names (the run's download store among them)
-/// are not counted. A missing or unreadable directory holds nothing.
-fn leftover_partials(out_root: &Path, keep: &HashSet<[u8; 32]>) -> Leftovers {
-    let Ok(dir) = std::fs::read_dir(out_root.join(STAGING_DIR)) else {
-        return Leftovers::default();
-    };
-    let mut blobs: HashSet<[u8; 32]> = HashSet::new();
-    let mut bytes = 0u64;
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Ok(hash) = blake3::Hash::from_hex(name) else {
-            continue;
-        };
-        let hash = *hash.as_bytes();
-        if keep.contains(&hash) {
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.is_file() {
-            blobs.insert(hash);
-            bytes = bytes.saturating_add(allocated_bytes(&meta));
-        }
-    }
-    Leftovers {
-        blobs: u64::try_from(blobs.len()).unwrap_or(u64::MAX),
-        bytes,
-    }
-}
-
-/// The disk space a file takes. A sparse file's length can be far above the
-/// space that deleting it frees. On Unix the allocated blocks give that space;
-/// elsewhere the length is the best figure.
-fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        meta.blocks().saturating_mul(512)
-    }
-    #[cfg(not(unix))]
-    {
-        meta.len()
-    }
-}
-
-/// Staging files in the staging directory that a run did not use: how many
-/// distinct blobs, and the disk space their files take.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Leftovers {
-    blobs: u64,
-    bytes: u64,
-}
-
-/// The warning line for `leftovers` in `dir`, without the `warning: ` prefix,
-/// or `None` when there are none.
-fn leftover_warning(dir: &Path, leftovers: &Leftovers) -> Option<String> {
-    let size = human_bytes(leftovers.bytes);
-    let dir = dir.display();
-    match leftovers.blobs {
-        0 => None,
-        1 => Some(format!(
-            "1 partial download ({size} on disk) that this run did not use remains in \
-             {dir}; delete it to reclaim the space"
-        )),
-        n => Some(format!(
-            "{n} partial downloads ({size} on disk) that this run did not use remain in \
-             {dir}; delete them to reclaim the space"
-        )),
-    }
-}
-
-/// Warn on stderr about leftover staging files of blobs this run did not use
-/// ([`leftover_partials`]): a partial of an entry an earlier run started,
-/// which this run's filter or selection left out, or one another bundle
-/// pulled into the same output directory left. They stay for a later run that
-/// selects the entry again, so the warning only names them and never deletes
-/// them. `entries` are the run's selected entries (none when the filter or
-/// `--select` emptied the run), and `bundle_hash` is the manifest blob, which
-/// is also this run's own.
-fn warn_leftover_partials(out_root: &Path, entries: &[ManifestEntry], bundle_hash: [u8; 32]) {
-    let keep: HashSet<[u8; 32]> = entries
-        .iter()
-        .map(|e| e.hash)
-        .chain([bundle_hash])
-        .collect();
-    let leftovers = leftover_partials(out_root, &keep);
-    if let Some(line) = leftover_warning(&out_root.join(STAGING_DIR), &leftovers) {
-        eprintln!("warning: {line}");
-    }
 }
 
 /// Format a byte count as a short decimal-unit label (`13.8 GB`). SI (1000-based)
