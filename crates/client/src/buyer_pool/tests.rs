@@ -1,10 +1,10 @@
 use super::{
-    AllowanceShortfall, EscrowUnconfirmed, EscrowUntracked, LOW_WATER_DIVISOR, OpenUnconfirmed,
-    OwnedPayer, PaymentPool, TopUpUnconfirmed, UnconfirmedEscrows, approval_floor,
-    approve_decision, approve_if_short, ensure_allowance, escrowed_but_untracked, floored_nonce,
-    grade_deposit_credit, issue_self_capability, open_pool, open_pool_above, pool_accepts_funds,
-    refill_amount, self_owned_lane_ctx, send_open_pool, send_top_up_at, top_up,
-    top_up_unless_ended, topped_up_from_receipt,
+    AllowanceShortfall, EscrowUnconfirmed, EscrowUntracked, LOW_WATER_DIVISOR, NonceFloor,
+    OpenUnconfirmed, OwnedPayer, PaymentPool, TopUpUnconfirmed, UnconfirmedEscrows, approval_floor,
+    approve_decision, ensure_allowance, escrowed_but_untracked, floored_nonce,
+    grade_deposit_credit, issue_self_capability, open_pool, pool_accepts_funds, refill_amount,
+    self_owned_lane_ctx, send_open_pool, send_top_up_at, top_up, top_up_unless_ended,
+    topped_up_from_receipt,
 };
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
@@ -67,6 +67,7 @@ async fn a_top_up_whose_reads_fail_before_the_send_is_not_unconfirmed() {
         U256::from(1_000u64),
         Some(&escrows),
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -94,6 +95,7 @@ async fn a_transport_failed_top_up_submit_is_unconfirmed_with_its_nonce() {
         U256::from(1_000u64),
         Some(&escrows),
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -115,6 +117,7 @@ async fn top_up_mocked(
         B256::repeat_byte(0x33),
         U256::from(1_000u64),
         Some(escrows),
+        None,
         None,
     )
     .await
@@ -207,6 +210,7 @@ async fn open_tracked(
         U256::from(1_000u64),
         Some(opens),
         receipt_timeout,
+        None,
     )
     .await
 }
@@ -333,6 +337,7 @@ async fn top_up_parked(
             U256::from(1_000u64),
             None,
             receipt_timeout,
+            None,
         ),
     )
     .await
@@ -378,6 +383,7 @@ async fn top_up_tracked(
         B256::repeat_byte(0x33),
         U256::from(1_000u64),
         Some(escrows),
+        None,
         None,
     )
     .await
@@ -895,6 +901,7 @@ async fn a_rejected_top_up_submit_is_not_unconfirmed() {
         U256::from(1_000u64),
         Some(&escrows),
         None,
+        None,
     )
     .await
     .unwrap_err();
@@ -1163,6 +1170,23 @@ async fn an_already_known_approve_submit_says_it_may_be_pending() {
     assert!(msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
 }
 
+/// An `approve` whose pending-nonce read fails sends nothing, so the error
+/// does not say it may be pending.
+#[tokio::test]
+async fn an_approve_whose_nonce_read_fails_sends_nothing() {
+    let asserter = alloy::providers::mock::Asserter::new();
+    // An ABI-encoded zero allowance, so an `approve` is due; the pending-nonce
+    // read then finds no reply.
+    asserter.push_success(&B256::ZERO);
+    let msg = format!("{:#}", approve_on(asserter).await);
+    assert!(
+        msg.contains("read the pending nonce for the USDC approve"),
+        "{msg}"
+    );
+    assert!(!msg.contains(APPROVE_MAYBE_BROADCAST), "{msg}");
+    assert!(!msg.contains("eth_sendTransaction"), "{msg}");
+}
+
 /// The USDC token the nonce-floor tests approve on.
 const FLOOR_TOKEN: Address = Address::repeat_byte(0x44);
 
@@ -1174,10 +1198,10 @@ fn stale_rpc_after(allowance: U256) -> ScriptedRpc {
         .answering_calls([Bytes::from(allowance.to_be_bytes::<32>().to_vec())])
 }
 
-/// Run [`approve_if_short`] on `rpc` for the owner and pool the floor tests
+/// Run [`ensure_allowance`] on `rpc` for the owner and pool the floor tests
 /// use, and return the floor it sets.
-async fn approve_on_scripted(rpc: &ScriptedRpc) -> Option<u64> {
-    approve_if_short(
+async fn approve_on_scripted(rpc: &ScriptedRpc) -> Option<NonceFloor> {
+    ensure_allowance(
         &rpc.clone().provider(),
         FLOOR_TOKEN,
         Address::repeat_byte(0x22),
@@ -1194,14 +1218,14 @@ async fn approve_on_scripted(rpc: &ScriptedRpc) -> Option<u64> {
 async fn a_mined_approve_floors_the_next_open_pool_nonce() {
     let rpc = stale_rpc_after(U256::ZERO);
     let floor = approve_on_scripted(&rpc).await;
-    assert_eq!(floor, Some(SCRIPTED_NONCE + 1));
+    assert_eq!(floor.map(NonceFloor::get), Some(SCRIPTED_NONCE + 1));
     let contract = scripted_pool(rpc.clone());
     let deployment = decdn_incentive::Deployment {
         chain_id: CHAIN_ID,
         payment_pool: *contract.address(),
     };
     let opens = UnconfirmedEscrows::default();
-    let err = open_pool_above(
+    let err = open_pool(
         &contract,
         deployment,
         FLOOR_TOKEN,
@@ -1257,9 +1281,9 @@ async fn a_sufficient_allowance_sets_no_nonce_floor() {
         payment_pool: *contract.address(),
     };
     let opens = UnconfirmedEscrows::default();
-    // The open's receipt holds no `PoolOpened`; only the nonce it pinned
-    // matters here.
-    let _ = open_pool_above(
+    // The first receipt the transport mines holds no `PoolOpened`, so the
+    // open is held untracked; the nonce it pinned is what this test reads.
+    let err = open_pool(
         &contract,
         deployment,
         FLOOR_TOKEN,
@@ -1269,16 +1293,20 @@ async fn a_sufficient_allowance_sets_no_nonce_floor() {
         None,
         floor,
     )
-    .await;
+    .await
+    .unwrap_err();
+    assert!(err.downcast_ref::<EscrowUntracked>().is_some(), "{err:#}");
     assert_eq!(rpc.sent_nonces(), vec![SCRIPTED_NONCE]);
 }
 
 /// A pending count above the floor wins: the floor only raises a nonce.
 #[test]
 fn a_pending_count_above_the_floor_wins() {
-    assert_eq!(floored_nonce(9, Some(6)), 9);
-    assert_eq!(floored_nonce(5, Some(6)), 6);
+    let floor = NonceFloor::after_mined(5);
+    assert_eq!(floored_nonce(9, floor), 9);
+    assert_eq!(floored_nonce(5, floor), 6);
     assert_eq!(floored_nonce(5, None), 5);
+    assert_eq!(NonceFloor::after_mined(u64::MAX), None);
 }
 
 #[test]

@@ -48,10 +48,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::Metrics;
 use decdn_client::buyer_pool::{
-    LOW_WATER_DIVISOR, OpenUnconfirmed, OpenedPool, OwnedPayer, PoolNotOpen, ProgressWrite,
-    TopUpUnconfirmed, WatermarkRow, ensure_allowance, grade_deposit_credit, open_pool,
-    opened_from_receipt, pool_accepts_funds, refill_amount, self_owned_lane_ctx, send_open_pool,
-    send_top_up_at, top_up as pool_top_up, topped_up_effect, topped_up_from_receipt,
+    LOW_WATER_DIVISOR, NonceFloor, OpenUnconfirmed, OpenedPool, OwnedPayer, PoolNotOpen,
+    ProgressWrite, TopUpUnconfirmed, WatermarkRow, ensure_allowance, grade_deposit_credit,
+    open_pool, opened_from_receipt, pool_accepts_funds, refill_amount, self_owned_lane_ctx,
+    send_open_pool, send_top_up_at, top_up as pool_top_up, topped_up_effect,
+    topped_up_from_receipt,
 };
 use decdn_client::{LocalPullFault, PoolContext, PoolReplaced, Recovery};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
@@ -570,17 +571,22 @@ struct FundingHandles<P: Provider + Clone + 'static> {
 /// `T` is whatever the top-up returns, carried through untouched — from the
 /// retry on a recovered allowance, so it describes the second transaction.
 /// `attempt` may run twice, so producing a `T` must be safe to repeat.
+///
+/// `attempt` takes the nonce floor its `topUp` pins no nonce below. The first
+/// attempt gets `None`. The retry gets the [`NonceFloor`] the recovery's
+/// `approve` set, so a lagging RPC backend cannot make it reuse the spent
+/// nonce.
 async fn top_up_recovering_allowance<T, A, AFut, R, RFut>(
     attempt: A,
     recover_allowance: R,
 ) -> Result<T>
 where
-    A: Fn() -> AFut,
+    A: Fn(Option<NonceFloor>) -> AFut,
     AFut: std::future::Future<Output = Result<T>>,
     R: FnOnce() -> RFut,
-    RFut: std::future::Future<Output = Result<()>>,
+    RFut: std::future::Future<Output = Result<Option<NonceFloor>>>,
 {
-    match attempt().await {
+    match attempt(None).await {
         Ok(out) => Ok(out),
         Err(err)
             if err
@@ -589,8 +595,8 @@ where
         {
             // The standing approval was revoked or never granted; do the
             // just-in-time `approve`, then retry the transfer exactly once.
-            recover_allowance().await?;
-            attempt().await
+            let nonce_floor = recover_allowance().await?;
+            attempt(nonce_floor).await
         }
         Err(err) => Err(err),
     }
@@ -681,7 +687,7 @@ async fn top_up_and_settle<P: Provider + Clone + 'static>(
         // `settle_unconfirmed_top_up` takes over and keeps the top-up slot
         // until the chain resolves the `topUp`. That is also how a `topUp`
         // dropped from the mempool reaches the settle loop's re-send.
-        || {
+        |nonce_floor| {
             pool_top_up(
                 &handles.contract,
                 handles.owner,
@@ -691,6 +697,7 @@ async fn top_up_and_settle<P: Provider + Clone + 'static>(
                 // until `settle_unconfirmed_top_up` resolves it.
                 None,
                 Some(RECEIPT_TIMEOUT),
+                nonce_floor,
             )
         },
         || {
@@ -3231,6 +3238,9 @@ async fn run_open<P: Provider + Clone>(
         // chain resolves the open. That is also how an `openPool` dropped from
         // the mempool reaches the settle loop's re-send.
         Some(RECEIPT_TIMEOUT),
+        // No `approve` runs just before the open: the bootstrap grants the
+        // standing allowance.
+        None,
     )
     .await
     {

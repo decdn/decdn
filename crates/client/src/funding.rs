@@ -25,9 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::{
     LOW_WATER_DIVISOR, OpenedPool, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool,
-    UnconfirmedEscrows, UnrecordedEscrow, WalletShortfall, approve_if_short,
-    escrowed_but_untracked, grade_deposit_credit, open_pool_above, pool_accepts_funds,
-    refill_amount, self_owned_lane_ctx, top_up_unless_ended, topped_up_effect,
+    UnconfirmedEscrows, UnrecordedEscrow, WalletShortfall, ensure_allowance,
+    escrowed_but_untracked, grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount,
+    self_owned_lane_ctx, top_up_unless_ended, topped_up_effect,
 };
 use crate::fault::PoolOpenRefused;
 use crate::lanes::LaneDeps;
@@ -820,7 +820,7 @@ where
         self.funding.refuse_after_untracked()?;
         let deposit = self.working_deposit;
         refuse_open(self.open, deposit)?;
-        let nonce_floor = approve_if_short(
+        let nonce_floor = ensure_allowance(
             self.rpc,
             self.token,
             self.owner,
@@ -832,7 +832,7 @@ where
             },
         )
         .await?;
-        let (opened, unrecorded) = open_pool_above(
+        let (opened, unrecorded) = open_pool(
             self.contract,
             self.deployment,
             self.token,
@@ -1527,7 +1527,7 @@ where
             .context("refusing a second topUp while an earlier one is unconfirmed"));
     }
     funding.refuse_after_untracked()?;
-    let nonce_floor = approve_if_short(
+    let nonce_floor = ensure_allowance(
         contract.provider(),
         token,
         owner,
@@ -1822,9 +1822,9 @@ where
     // exactly the deposit being escrowed.
     let approve_amount = if max_approve { None } else { Some(deposit) };
     let nonce_floor =
-        approve_if_short(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
+        ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
     refuse_after_end(Some(ended))?;
-    let (opened, unrecorded) = open_pool_above(
+    let (opened, unrecorded) = open_pool(
         contract,
         deployment,
         token,

@@ -2696,13 +2696,13 @@ async fn happy_path_attempts_topup_once_and_never_reads_allowance() {
     let attempts = AtomicUsize::new(0);
     let recovers = AtomicUsize::new(0);
     let out = top_up_recovering_allowance(
-        || {
+        |_| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Ok(U256::from(500u64)) }
         },
         || {
             recovers.fetch_add(1, Ordering::SeqCst);
-            async { Ok(()) }
+            async { Ok(None) }
         },
     )
     .await;
@@ -2720,7 +2720,7 @@ async fn bad_path_approves_then_retries_topup_once() {
     let attempts = AtomicUsize::new(0);
     let recovers = AtomicUsize::new(0);
     let out = top_up_recovering_allowance(
-        || {
+        |_| {
             let n = attempts.fetch_add(1, Ordering::SeqCst);
             async move {
                 if n == 0 {
@@ -2734,7 +2734,7 @@ async fn bad_path_approves_then_retries_topup_once() {
         },
         || {
             recovers.fetch_add(1, Ordering::SeqCst);
-            async { Ok(()) }
+            async { Ok(None) }
         },
     )
     .await;
@@ -2747,18 +2747,46 @@ async fn bad_path_approves_then_retries_topup_once() {
     assert_eq!(recovers.load(Ordering::SeqCst), 1, "exactly one approve");
 }
 
+/// #2863: the retry after a just-in-time `approve` pins no nonce below the
+/// floor that `approve` set; the first attempt has none.
+#[tokio::test]
+async fn the_retry_after_an_approve_gets_its_nonce_floor() {
+    let floors = std::sync::Mutex::new(Vec::new());
+    let floor = NonceFloor::after_mined(5);
+    let out = top_up_recovering_allowance(
+        |nonce_floor| {
+            floors.lock().unwrap().push(nonce_floor);
+            let first = floors.lock().unwrap().len() == 1;
+            async move {
+                if first {
+                    Err(anyhow::Error::new(
+                        decdn_client::buyer_pool::AllowanceShortfall,
+                    ))
+                } else {
+                    Ok(U256::from(700u64))
+                }
+            }
+        },
+        || async move { Ok(floor) },
+    )
+    .await;
+    assert_eq!(out.unwrap(), U256::from(700u64));
+    assert_eq!(*floors.lock().unwrap(), vec![None, floor]);
+    assert_eq!(floor.map(NonceFloor::get), Some(6));
+}
+
 #[tokio::test]
 async fn terminal_non_allowance_revert_is_not_retried() {
     let attempts = AtomicUsize::new(0);
     let recovers = AtomicUsize::new(0);
     let out: Result<U256> = top_up_recovering_allowance(
-        || {
+        |_| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Err(anyhow::anyhow!("topUp reverted for pool: paused")) }
         },
         || {
             recovers.fetch_add(1, Ordering::SeqCst);
-            async { Ok(()) }
+            async { Ok(None) }
         },
     )
     .await;
@@ -2779,7 +2807,7 @@ async fn terminal_non_allowance_revert_is_not_retried() {
 async fn retry_still_shortfall_stops_after_one_retry() {
     let attempts = AtomicUsize::new(0);
     let out: Result<U256> = top_up_recovering_allowance(
-        || {
+        |_| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async {
                 Err(anyhow::Error::new(
@@ -2787,7 +2815,7 @@ async fn retry_still_shortfall_stops_after_one_retry() {
                 ))
             }
         },
-        || async { Ok(()) },
+        || async { Ok(None) },
     )
     .await;
     assert!(out.is_err());

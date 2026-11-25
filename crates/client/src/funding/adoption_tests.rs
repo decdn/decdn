@@ -3027,6 +3027,66 @@ async fn a_refill_that_ends_during_its_allowance_leg_sends_no_top_up() {
     assert!(funding.escrows().pending().is_empty());
 }
 
+/// #2863: a lane build's first open approves, then opens at a nonce above the
+/// mined `approve`, though every pending-nonce read answers the stale count.
+#[tokio::test(start_paused = true)]
+async fn a_first_open_pins_its_nonce_above_the_mined_approve() {
+    use decdn_incentive::test_rpc::{SCRIPTED_NONCE, ScriptedRpc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    // `usdc()`, then an allowance read that finds none: the `approve` mines,
+    // then the `openPool`.
+    let rpc = ScriptedRpc::mined_in_order([
+        mined_with(Vec::new()),
+        mined_open(signer.address(), B256::repeat_byte(0xEE)),
+    ])
+    .answering_calls([
+        Bytes::from(TOKEN.abi_encode()),
+        Bytes::from(U256::ZERO.abi_encode()),
+    ]);
+    run_scripted(
+        &store,
+        &signer,
+        &rpc,
+        &RunFunding::default(),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("the lane build opens a pool");
+    assert_eq!(rpc.sent_nonces(), vec![SCRIPTED_NONCE, SCRIPTED_NONCE + 1]);
+}
+
+/// #2863: a refill approves, then tops up at a nonce above the mined
+/// `approve`, though every pending-nonce read answers the stale count.
+#[tokio::test(start_paused = true)]
+async fn a_refill_pins_its_top_up_nonce_above_the_mined_approve() {
+    use decdn_incentive::test_rpc::{SCRIPTED_NONCE, ScriptedRpc};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = client_store(&dir);
+    let signer = Arc::new(PrivateKeySigner::random());
+    a_spent_pool(&store, &signer);
+    // The pool still takes funds and the allowance is none: the `approve`
+    // mines, then the `topUp`.
+    let rpc = ScriptedRpc::mined_in_order([mined_with(Vec::new()), mined_top_up()])
+        .answering_calls([
+            still_open(signer.address()),
+            Bytes::from(U256::ZERO.abi_encode()),
+        ]);
+    run_scripted(
+        &store,
+        &signer,
+        &rpc,
+        &RunFunding::default(),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("the lane build refills the pool");
+    assert_eq!(rpc.sent_nonces(), vec![SCRIPTED_NONCE, SCRIPTED_NONCE + 1]);
+}
+
 /// #2513: a lane build whose fetch ends during its open's allowance leg
 /// opens no pool.
 #[tokio::test(start_paused = true)]
