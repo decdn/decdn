@@ -82,9 +82,6 @@ fn default_config_template_covers_every_wired_field() {
         cctp_iris_url,
         capacity_bond_address,
         origin_assignment_address,
-        origin_directory_positive_ttl_sec,
-        origin_directory_negative_ttl_sec,
-        origin_directory_cache_capacity,
         publisher_registry_address,
         content_blacklist_address,
         content_blacklist_poll_interval_sec,
@@ -122,18 +119,6 @@ fn default_config_template_covers_every_wired_field() {
         (
             "origin_assignment_address =",
             origin_assignment_address.is_none(),
-        ),
-        (
-            "origin_directory_positive_ttl_sec =",
-            origin_directory_positive_ttl_sec.is_none(),
-        ),
-        (
-            "origin_directory_negative_ttl_sec =",
-            origin_directory_negative_ttl_sec.is_none(),
-        ),
-        (
-            "origin_directory_cache_capacity =",
-            origin_directory_cache_capacity.is_none(),
         ),
         (
             "publisher_registry_address =",

@@ -5,7 +5,7 @@
 //! FIND\_VALUE Flow "Origin discovery", ADR 011 § Origin Assignment
 //! Authority) is:
 //!
-//!   `OriginAssignment.getOrigins(namespaceId)` → `[operator...]`
+//!   seated-origin set (`OriginAssignment.getOrigins(namespaceId)`) → `[operator...]`
 //!     → drop operators the local [`ContentDenylist`] denies (the origin ∪
 //!       operator blacklist union the watcher syncs from `ContentBlacklist`,
 //!       plus the operator's own `[content] denied_origins`)
@@ -19,99 +19,40 @@
 //!
 //! The bare hash carries no origin information (ADR 002 § Retrieval by
 //! namespace): the request supplies the namespace its content is published
-//! under. `namespaceId == 0` names no namespace, so it resolves to no origins
-//! here and is never fetched or cached.
+//! under. `namespaceId == 0` names no namespace, so it resolves to no origins.
 //!
-//! Namespace creation is permissionless and free, so this directory does not
-//! mirror the whole chain-side namespace set up front: it resolves each
-//! namespace lazily, on first request, and caches the result (positive or
-//! negative) behind a split TTL ([`crate::dht::lazy_origin_cache`]). A live
-//! cache hit — including a cached "no origins" — resolves with no RPC; a
-//! cold miss issues one `getOrigins(namespace)` call. Chain reads therefore
-//! scale with the namespaces this node is actually asked to serve, not the
-//! permissionless global namespace count.
+//! The operator set comes from the shared [`SeatedOrigins`] snapshot, which
+//! holds every seat in every namespace and is kept current by
+//! [`crate::origin_seat_watcher`]. A lookup makes no chain read: a namespace
+//! the snapshot does not list resolves to no origins and asks the snapshot for
+//! an early re-read, which the snapshot's refresh loop rate-limits.
 //!
-//! The cache stores only the raw operator address set; it never stores
-//! resolved `NodeId`s or liveness. Both the `operator → NodeId` binding (the
-//! shared capacity-bond reverse projection) and staker liveness (the shared
-//! [`StakerSet`]) are read live at resolution time, so a TTL-anchored cache
-//! entry never goes stale on the parts of the answer that can change without
-//! a new `getOrigins` call.
-//!
-//! A `getOrigins` RPC failure fails closed: the lookup resolves no origins
-//! for that request, and — because a transient RPC failure must not be frozen
-//! for a TTL — the result is not cached, so the next request retries.
+//! Every stage after the seat set reads live state: the deny-set, the
+//! `operator → NodeId` binding and staker liveness, so a blacklist or a
+//! liveness change takes effect on the next lookup.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
-use anyhow::{Context, Result};
-use tracing::warn;
 
-use crate::chain_events::timed;
 use crate::content_deny::ContentDenylist;
-use crate::dht::lazy_origin_cache::{LazyOriginCache, resolve_active};
 use crate::dht::origin::OriginDirectory;
 use crate::dht::routing::NodeId;
+use crate::dht::seated_origins::SeatedOrigins;
 use crate::dht::staker_set::StakerSet;
-use crate::metrics::Metrics;
-use decdn_common::redact::sanitize_err_chain;
-use decdn_incentive::origin_assignment::OriginAssignment;
 
-/// Contract handle(s) the directory needs. Bundled so production construction
-/// has one call site; tests inject [`OriginChainReads`] directly via
-/// `StubReads` instead of this type.
-struct Contracts<P: Provider + Clone> {
-    origin: OriginAssignment::OriginAssignmentInstance<P>,
-}
-
-/// The chain read this directory performs, behind a trait so lookup is
-/// unit-testable without a provider and so [`ChainOriginDirectory`] can hold
-/// it as `Arc<dyn OriginChainReads + Send + Sync>` (object-safe via
-/// `#[async_trait]`). The production implementation is [`Contracts`]; tests
-/// supply a scripted stub.
-#[async_trait::async_trait]
-trait OriginChainReads {
-    /// Authoritative current operator set for `namespace` (`getOrigins`).
-    async fn get_origins(&self, namespace: U256) -> Result<Vec<Address>>;
-}
-
-#[async_trait::async_trait]
-impl<P> OriginChainReads for Contracts<P>
-where
-    P: Provider + Clone + Send + Sync,
-{
-    async fn get_origins(&self, namespace: U256) -> Result<Vec<Address>> {
-        // Bounded here, in the production impl: a stalled provider must fail
-        // this single lookup rather than hang the caller's DHT-miss fallback
-        // path indefinitely. `StubReads` needs no timeout.
-        timed(None, "getOrigins", self.origin.getOrigins(namespace).call())
-            .await
-            .with_context(|| format!("getOrigins(namespace={namespace})"))
-    }
-}
-
-/// Chain-backed origin directory: a lazy TTL cache over `getOrigins`, resolving
-/// operators to active `NodeId`s against the shared capacity-bond reverse
-/// projection. No background watcher and no whole-directory mirror — a single
-/// `getOrigins(ns)` RPC fires only on a cold-namespace miss, and chain reads
-/// therefore scale with the namespaces this node is actually asked to serve,
-/// not the permissionless global namespace count.
+/// Chain-backed origin directory: resolves a namespace from the seated-origin
+/// snapshot to active `NodeId`s against the shared capacity-bond reverse
+/// projection.
 pub struct ChainOriginDirectory {
-    reads: Arc<dyn OriginChainReads + Send + Sync>,
-    cache: LazyOriginCache,
+    seated: Arc<dyn SeatedOrigins>,
     operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
     staker_set: Arc<dyn StakerSet>,
     /// The node's live origin deny-set — the same union the delivery gate
     /// consults. A blacklisted operator is dropped from every resolved origin
-    /// set, so this node never routes an origin-pull to one. Read live (never
-    /// cached), so a governance blacklist takes effect without waiting out the
-    /// `getOrigins` TTL.
+    /// set, so this node never routes an origin-pull to one.
     content_deny: Arc<ContentDenylist>,
-    metrics: Arc<Metrics>,
 }
 
 impl std::fmt::Debug for ChainOriginDirectory {
@@ -122,84 +63,57 @@ impl std::fmt::Debug for ChainOriginDirectory {
 }
 
 impl ChainOriginDirectory {
-    /// Build a directory over the given `OriginAssignment` contract. No RPC:
-    /// the cache is lazy and populates on the first lookup miss for each
-    /// namespace.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new<P>(
-        provider: P,
-        origin_assignment_addr: Address,
+    /// Build a directory over the shared seated-origin snapshot and chain
+    /// projections. No RPC.
+    #[must_use]
+    pub fn new(
+        seated: Arc<dyn SeatedOrigins>,
         operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
         staker_set: Arc<dyn StakerSet>,
         content_deny: Arc<ContentDenylist>,
-        cache_capacity: usize,
-        positive_ttl: Duration,
-        negative_ttl: Duration,
-        metrics: Arc<Metrics>,
-    ) -> Self
-    where
-        P: Provider + Clone + Send + Sync + 'static,
-    {
-        let reads = Arc::new(Contracts {
-            origin: OriginAssignment::new(origin_assignment_addr, provider),
-        });
+    ) -> Self {
         Self {
-            reads,
-            cache: LazyOriginCache::new(cache_capacity, positive_ttl, negative_ttl),
+            seated,
             operator_to_node,
             staker_set,
             content_deny,
-            metrics,
         }
     }
 
-    /// Resolve a cached/fetched operator address set to active origin
-    /// `NodeId`s, first dropping any operator the local deny-set blacklists.
-    /// Both the blacklist filter and liveness are applied live at read time, so
-    /// a TTL-anchored cache entry never keeps routing to an operator that has
-    /// since been blacklisted or gone inactive.
+    /// Resolve an operator address set to active origin `NodeId`s: drop any
+    /// operator the local deny-set blacklists, map each through the
+    /// capacity-bond reverse projection, keep only operators the `StakerSet`
+    /// reports active, and sort + dedup for a deterministic order. An operator
+    /// with no reverse binding is dropped: the registry has not observed its
+    /// node registration.
     fn resolve(&self, operators: &[Address]) -> Vec<NodeId> {
-        let allowed: Vec<Address> = operators
-            .iter()
-            .copied()
-            .filter(|op| !self.content_deny.is_origin_denied(op))
-            .collect();
-        resolve_active(&allowed, &self.operator_to_node, self.staker_set.as_ref())
+        let mut nodes: Vec<NodeId> = crate::dht::chain_projection::with_read(
+            &self.operator_to_node,
+            "chain operator reverse map",
+            |rev| {
+                operators
+                    .iter()
+                    .filter(|op| !self.content_deny.is_origin_denied(op))
+                    .filter_map(|op| rev.get(op).copied())
+                    .filter(|nid| self.staker_set.is_active(nid))
+                    .collect()
+            },
+        );
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
     }
 }
 
 #[async_trait::async_trait]
 impl OriginDirectory for ChainOriginDirectory {
     async fn lookup_origins(&self, namespace_id: U256) -> Vec<NodeId> {
-        // Namespace 0 (NO_NAMESPACE) authorizes nothing by construction — never
-        // fetch or cache it (ADR 002 §Namespace 0).
+        // Namespace 0 (NO_NAMESPACE) authorizes nothing by construction
+        // (ADR 002 §Namespace 0).
         if namespace_id == U256::ZERO {
             return Vec::new();
         }
-        // Live TTL hit (positive OR negative) → resolve from the cached operator
-        // set with no RPC.
-        if let Some(operators) = self.cache.get(&namespace_id) {
-            return self.resolve(&operators);
-        }
-        // Cold miss: one on-demand getOrigins. On RPC error, fail closed
-        // (resolve nothing) and DO NOT cache — a transient failure must not be
-        // frozen for a TTL, and the next request retries.
-        let operators = match self.reads.get_origins(namespace_id).await {
-            Ok(ops) => ops,
-            Err(err) => {
-                self.metrics.origin_directory_get_origins_failure();
-                warn!(
-                    error = %sanitize_err_chain(&err),
-                    %namespace_id,
-                    "getOrigins lookup failed; resolving no origins for this request"
-                );
-                return Vec::new();
-            }
-        };
-        // Cache the authoritative set (empty → negative entry, short TTL).
-        self.cache.insert(namespace_id, operators.clone());
-        self.metrics.origin_directory_cache_size(self.cache.len());
-        self.resolve(&operators)
+        self.resolve(&self.seated.origins_in(namespace_id))
     }
 
     fn origin_nodes(&self, operators: &[Address]) -> Vec<NodeId> {

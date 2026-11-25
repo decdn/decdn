@@ -28,11 +28,10 @@
 //! - [`crate::dht::ChainOriginDirectory`] — the production path, and the only
 //!   one that can resolve anything. It yields the same candidate set the chain
 //!   above specifies, but does not perform that literal call sequence: the
-//!   `namespace → operators` view is fetched lazily on a cold-namespace miss
-//!   and cached with a split TTL, and the `active` filter is applied from the
-//!   shared `StakerSet` at lookup time rather than taken from the `nodeIdOf`
-//!   tuple. A live cache hit resolves with no RPC; a miss issues one
-//!   on-demand `getOrigins` call.
+//!   `namespace → operators` view comes from the seated-origin snapshot
+//!   ([`crate::dht::seated_origins`]), and the `active` filter is applied from
+//!   the shared `StakerSet` at lookup time rather than taken from the
+//!   `nodeIdOf` tuple. A lookup makes no RPC.
 //! - [`EmptyOriginDirectory`] (this module) — resolves nothing. What the
 //!   runtime installs when the chain contracts aren't configured.
 //! - `StaticOriginDirectory` (this module, `test-support` only) — a fixed in-memory map, for tests

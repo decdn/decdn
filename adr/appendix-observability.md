@@ -313,7 +313,7 @@ A failed refresh keeps the projection the node already has and retries on the ne
 | `decdn_blacklist_enforcement_failures_total` | Counter | M | live | — | Distinct hashes a batched re-scope could not re-verify or evict in one pass (`Recheck::Failed` — a disk error or a scope `eth_call` failure). An increase means that a pass did not fully enforce the deny-set. A blacklisted blob can then be servable past its compliance window. This can occur while `decdn_blacklist_watcher_last_tick_timestamp_seconds` is fresh: the two metrics answer different questions (deny-set enforced vs chain readable). The counter pairs with the aggregate `warn!` (`"blacklist re-scope could not enforce every entry"`). A boot that retries its enforcement pass also adds to it. The node serves only after a clean pass, so that increase does not mean a served blob. |
 | `decdn_blacklist_ledger_poll_failures_total` | Counter | M | live | — | `ContentBlacklist` ledger polls that could not read chain state and kept the deny-set the node already had. The next poll retries from the same cursor, so no record is lost. Enforcement of local expiry and region ripening still runs on every tick. Pairs with the `warn!` in `blacklist_watcher`. |
 
-The origin directory is a lazy, on-demand TTL cache with no refresh loop, so it carries none of the refresh metrics above. It exposes its own pair instead: `decdn_origin_directory_get_origins_failures_total` (Counter) counts `getOrigins` lookups that failed on a cold-namespace cache miss, and `decdn_origin_directory_cache_size` (Gauge) reports the current namespace count held in the cache (positive and negative entries, bounded by the configured capacity).
+The origin directory reads the seated-origin projection. It makes no chain read of its own, so it has no metrics of its own.
 
 **Recommended alerts:**
 
@@ -324,7 +324,6 @@ The origin directory is a lazy, on-demand TTL cache with no refresh loop, so it 
 | `decdn_blacklist_enforcement_failures_total` (rate) | > 0 | > 0 sustained | The blacklist deny-set is not fully enforced — a blacklisted blob may be servable past its compliance window. Check disk health and the `ContentBlacklist` RPC; correlate with the `unenforced` `warn!`. |
 | `increase(decdn_blacklist_ledger_poll_failures_total[1h])` | > 0 | > 0 sustained | Blacklist ledger polls are failing, so new takedowns wait. Check the RPC provider's `eth_call` path and its support for the `safe` block tag. |
 | `increase(decdn_capacity_bond_registry_resync_failures_total[1h])` | > 0 | > 0 sustained | Registry refreshes are failing. Check the RPC provider's `eth_call` path. |
-| `decdn_origin_directory_get_origins_failures_total` (rate) | > 0 | sustained | `getOrigins` reads are failing on cache misses — requests are silently losing their origin fallback. Check the RPC provider. |
 
 ### Health
 
