@@ -171,9 +171,9 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         global scope. `addedAt == 0` means "not blacklisted".
     /// @dev    Every field is statically sized: `getHashEntry` returns this
     ///         struct, and off-chain readers decode it as a fixed tuple. The
-    ///         audit-trail `reason` string (ADR 011 § Reason field) is stored
-    ///         out-of-band in `hashReason` so it cannot perturb that tuple's
-    ///         shape. Packs into one slot (8 + 8 + 1 + 1 = 18 bytes).
+    ///         audit-trail `reason` string (ADR 011 § Reason field) lives on
+    ///         the `HashBlacklisted` event, not in storage. Packs into one slot
+    ///         (8 + 8 + 1 + 1 = 18 bytes).
     /// @dev    `effectiveAt` is STAMPED at add time from the window then in
     ///         force, never computed live from the current `complianceWindow`:
     ///         a live computation would let a governance window change
@@ -187,15 +187,6 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     }
 
     mapping(bytes32 region => mapping(bytes32 hash => HashEntry)) internal _hashEntries;
-
-    /// @notice Free-form audit-trail reason per (region, hash) — legal notice
-    ///         identifiers (DMCA case numbers, DSA notice IDs) or short category
-    ///         labels (ADR 011 § Reason field). Persisted on-chain so takedowns
-    ///         carry a DMCA/DSA-defensible provenance record. Kept out of
-    ///         `HashEntry` to preserve that struct's static ABI shape (see its
-    ///         doc). Public auto-getter `hashReason(region, hash)`; cleared on
-    ///         `removeHash*`. Set to `""` when an entry carries no reason.
-    mapping(bytes32 region => mapping(bytes32 hash => string)) public hashReason;
 
     /// @notice Operator-level blacklist (ADR 011 § Decision — operator-level
     ///         blacklist evicts the operator from `CapacityBond` via
@@ -401,7 +392,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
 
     /// @notice Add `hash` to the global blacklist. `GOVERNANCE_ROLE` only.
     /// @param  reason Free-form audit-trail note (DMCA/DSA notice id or label);
-    ///         persisted on the entry per ADR 011 § Reason field.
+    ///         emitted on `HashBlacklisted` per ADR 011 § Reason field.
     /// @dev Also the ratification path for an emergency entry: re-adding under
     ///      governance rewrites `emergency` to false, so the auto-expiry in
     ///      `_isLive` stops applying and the entry becomes permanent.
@@ -415,7 +406,7 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
     ///         a body's authority is its own jurisdiction, so the role alone
     ///         cannot reach another region's entries.
     /// @param  reason Free-form audit-trail note (DMCA/DSA notice id or label);
-    ///         persisted on the entry per ADR 011 § Reason field.
+    ///         emitted on `HashBlacklisted` per ADR 011 § Reason field.
     function addHashRegional(bytes32 region, bytes32 hash, string calldata reason)
         external
         onlyRole(REGIONAL_BODY_ROLE)
@@ -905,8 +896,6 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         // Every add carries a new notice (its reason), so every add appends a
         // record carrying the entry's resulting expiry.
         _logHash(kind, region, hash, e.emergency ? e.addedAt + _expiryFor(e.category) : 0);
-        // The audit-trail reason always takes the current notice's.
-        hashReason[region][hash] = reason;
         // Idempotent: a re-add leaves the index alone.
         // slither-disable-next-line unused-return
         _regionHashes[region].add(hash);
@@ -917,7 +906,6 @@ contract ContentBlacklist is AccessControl, ReentrancyGuard {
         HashEntry storage e = _hashEntries[region][hash];
         if (e.addedAt == 0) revert EntryNotBlacklisted(region, hash);
         delete _hashEntries[region][hash];
-        delete hashReason[region][hash];
         // slither-disable-next-line unused-return
         _regionHashes[region].remove(hash);
         _logHash(kind, region, hash, 0);

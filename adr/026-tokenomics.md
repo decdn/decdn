@@ -315,12 +315,6 @@ Parameter setters on `FeeRouter` and `CapacityBond` are role-gated via `AccessCo
 - **[ADR 009 — Governance Model](009-governance.md#adr-009-governance-model):** Voting-weight source is served-bytes weight from the governance-chain `FeeRouter` bytes ledger, fed by sweeps, per [ADR 036](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight). Non-operator holders carry zero weight. The multisig bootstrap phase ends with a manual one-shot transition the multisig executes.
 - **[ADR 036 — Served-Bytes Voting Weight](036-served-bytes-voting-weight.md#adr-036-served-bytes-voting-weight):** Defines the canonical DAO voting-weight formula the §Governance "Voting weight" section above points to. Vote weight is `FeeRouter.bytesInWindow × age_ramp`, each epoch's bytes capped at what `CapacityBond.declaredMbpsAtEpoch` could physically deliver over that epoch, capped per-operator at `voteCapBps` against the bytes-weighted total. `windowEpochs` (default 13) is a governable parameter. Vote weight derives from proven delivered bytes, capped by declared capacity rather than granted by it, so the design has no capacity-shortfall penalty, no `min_delivery_ratio`, and no registration gate on discovery; discovery opens on `cdn/client/v1` serve operator latency and availability discovery, not declared-capacity enforcement.
 - **[ADR 016 — Smart Contract Interaction Model](016-contract-interactions.md#adr-016-smart-contract-interaction-model):** `CapacityBond` is the operator registry and capacity-curve bond. `FeeRouter` is the governance-chain sweep receiver and split. Class diagrams reflect this surface.
-- **`ADR 014` — On-Chain Verification for Slashing Evidence:** RETIRED. The protocol has no on-chain evidence path. The `StreamResponse` signature is specified in [ADR 005 § Signer binding](005-protocol.md#signer-binding).
-- **`ADR 028` — Slashing Appeals:** RETIRED. With no slashing, there is nothing to appeal.
-- **`ADR 032` — SafetyReserve Appeal-Surface Contract Surface:** RETIRED. No appeal contract exists.
-- **`ADR 033` — Safety and Insurance Reserve:** RETIRED. There is no `SafetyReserve` contract and no safety bucket in the FeeRouter split.
-- **`ADR 034` — Gauge Boost and Voting Escrow:** RETIRED. The gauge-boost mechanism, `VotingEscrow` contract, and per-operator gauge-share cap are replaced by the capacity-bond curve.
-- **`ADR 035` — Delegator Pool:** RETIRED. The 7% delegator bucket and `DelegatorBuyer` pipeline do not exist; the router split has an operator rebate and a treasury leg.
 
 ## Deferred & Open
 
