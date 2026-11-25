@@ -9,8 +9,9 @@
 //! `multiaddrs` do not carry one of its public addresses, since peers dial the
 //! registered address first. When `network.external_addrs` is set, its
 //! addresses are the public ones and the host's own addresses do not count.
-//! The report names the address source (`route` or `configured`); the node
-//! trusts a configured address from config and does not probe it.
+//! When the node has a public address, the report names its source (`route`
+//! or `configured`); the node trusts a configured address from config and
+//! does not probe it.
 
 use std::net::SocketAddr;
 
