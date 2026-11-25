@@ -19,7 +19,9 @@ use decdn_cache::{
     CacheEngine, FilesystemOrigin, HttpOrigin, Origin, S3Credentials, S3Origin, S3OriginConfig,
 };
 use decdn_client::Connections;
-use decdn_common::config::{ResolvedDiscovery, ResolvedOrigin, ResolvedS3Credentials};
+use decdn_common::config::{
+    ResolvedDiscovery, ResolvedNetwork, ResolvedOrigin, ResolvedS3Credentials,
+};
 use iroh::address_lookup::{DnsAddressLookup, MemoryLookup, PkarrPublisher};
 use iroh::endpoint::{BindOpts, IdleTimeout, QuicTransportConfig, VarInt, presets};
 use iroh::protocol::Router;
@@ -649,16 +651,9 @@ async fn build_infra(
 
     let transport_config =
         quic_transport_config().context("failed to build QUIC transport config")?;
-    let ep = build_endpoint(
-        &secret_key,
-        cfg.network.bind_port,
-        &cfg.network.relay_urls,
-        &cfg.network.external_addrs,
-        &cfg.network.discovery,
-        transport_config,
-    )
-    .await
-    .context("failed to build iroh endpoint")?;
+    let ep = build_endpoint(&secret_key, &cfg.network, transport_config)
+        .await
+        .context("failed to build iroh endpoint")?;
 
     node_metrics
         .register_iroh_endpoint(&ep)
@@ -979,8 +974,7 @@ async fn build_chain_and_handlers(
     let own_id = crate::dht::routing::NodeId::from_bytes(*infra.ep.id().as_bytes());
     reachability::report(
         &infra.node_metrics,
-        cfg.network.bind_port,
-        &cfg.network.external_addrs,
+        &cfg.network,
         &registry.dial_addrs.get(&own_id).unwrap_or_default(),
     );
     // The registry refresh MUST stay live through drain (its staker set gates
@@ -2831,12 +2825,12 @@ async fn shutdown<P: Provider + Clone + 'static>(
     }
 }
 
-/// Build an iroh `Endpoint` bound to `bind_port` on both address families:
-/// `0.0.0.0:bind_port` and `[::]:bind_port`. ALPNs are set by the `Router`
-/// when it spawns. The bind addresses are included in the error message so a
-/// port collision surfaces as a config-level diagnostic (matching
-/// `metrics::bind` and `admin::bind`), rather than an opaque "endpoint bind
-/// failed".
+/// Build an iroh `Endpoint` from `network` (the resolved `[network]` section),
+/// bound to `network.bind_port` on both address families: `0.0.0.0:bind_port`
+/// and `[::]:bind_port`. ALPNs are set by the `Router` when it spawns. The
+/// bind addresses are included in the error message so a port collision
+/// surfaces as a config-level diagnostic (matching `metrics::bind` and
+/// `admin::bind`), rather than an opaque "endpoint bind failed".
 ///
 /// The IPv6 bind replaces iroh's default `[::]:0` socket, so a dual-stack node
 /// listens on one stable port per family and an operator can register an
@@ -2846,10 +2840,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
 /// a container without a v6 stack) or with `[::]:bind_port` taken still starts
 /// on IPv4 only, and [`warn_if_no_ipv6_socket`] logs the degraded state.
 ///
-/// Each of `external_addrs` (`network.external_addrs`, a forwarded or
-/// load-balancer address) goes to iroh as a configured external address. iroh
-/// advertises it together with the addresses it discovers and uses it in NAT
-/// traversal. When a pkarr publisher runs (the n0 default, or
+/// Each of `network.external_addrs` (a forwarded or load-balancer address)
+/// goes to iroh as a configured external address. iroh advertises it together
+/// with the addresses it discovers and uses it in NAT traversal. When a pkarr publisher runs (the n0 default, or
 /// `network.discovery.pkarr_url`), the record carries it too: resolution admits
 /// only public addresses, so `node_publish_filter` keeps each one.
 ///
@@ -2860,12 +2853,16 @@ async fn shutdown<P: Provider + Clone + 'static>(
 /// existing TCP listeners.
 async fn build_endpoint(
     secret_key: &SecretKey,
-    bind_port: u16,
-    relay_urls: &[String],
-    external_addrs: &[SocketAddr],
-    discovery: &ResolvedDiscovery,
+    network: &ResolvedNetwork,
     transport_config: QuicTransportConfig,
 ) -> anyhow::Result<Endpoint> {
+    let ResolvedNetwork {
+        bind_port,
+        relay_urls,
+        external_addrs,
+        discovery,
+    } = network;
+    let bind_port = *bind_port;
     let bind_v4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
     let bind_v6 = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, bind_port, 0, 0);
 

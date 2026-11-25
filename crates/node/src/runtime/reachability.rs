@@ -12,8 +12,9 @@
 //! When the node has a public address, the report names its source (`route`
 //! or `configured`, from [`addr_source`]).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
+use decdn_common::config::ResolvedNetwork;
 use decdn_common::net::{addr_source, public_quic_addrs, quic_multiaddr, route_public_ips};
 
 use crate::metrics::Metrics;
@@ -47,20 +48,28 @@ fn classify(public: &[SocketAddr], registered: &[SocketAddr]) -> Reachability {
     }
 }
 
+/// Log the node's reachability once and set `decdn_node_public_address`,
+/// with the host's route-public IPs read from the default route. See
+/// [`report_with`].
+pub(super) fn report(metrics: &Metrics, network: &ResolvedNetwork, registered: &[SocketAddr]) {
+    report_with(&route_public_ips(), metrics, network, registered);
+}
+
 /// Log the node's reachability once and set `decdn_node_public_address`.
-/// The public addresses are each of `external_addrs` (`network.external_addrs`)
-/// on its own port when there are any, else the host's route-public IPs on
-/// `bind_port`.
+/// The public addresses are each of `network.external_addrs` on its own port
+/// when there are any, else each of `route_public` (the host's route-public
+/// IPs) on `network.bind_port`.
 /// `registered` is this node's own decoded registry `multiaddrs`.
-pub(super) fn report(
+pub(super) fn report_with(
+    route_public: &[IpAddr],
     metrics: &Metrics,
-    bind_port: u16,
-    external_addrs: &[SocketAddr],
+    network: &ResolvedNetwork,
     registered: &[SocketAddr],
 ) {
-    let public = public_quic_addrs(&route_public_ips(), bind_port, external_addrs);
+    let bind_port = network.bind_port;
+    let public = public_quic_addrs(route_public, bind_port, &network.external_addrs);
     metrics.node_public_address(!public.is_empty());
-    let source = addr_source(external_addrs);
+    let source = addr_source(&network.external_addrs);
     match classify(&public, registered) {
         Reachability::BehindNat => tracing::info!(
             bind_port,

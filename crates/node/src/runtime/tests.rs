@@ -1029,16 +1029,28 @@ async fn report_home_relay_false_when_relay_never_connects() {
     let relays = vec![format!("http://127.0.0.1:{dead_port}")];
     let ep = build_endpoint(
         &sk,
-        0,
-        &relays,
-        &[],
-        &ResolvedDiscovery::default(),
+        &network(0, relays, vec![], ResolvedDiscovery::default()),
         transport,
     )
     .await
     .expect("endpoint binds with an unreachable relay");
     assert!(!report_home_relay(ep.home_relay_status(), Duration::from_millis(500)).await);
     ep.close().await;
+}
+
+/// A resolved `[network]` section for a `build_endpoint` test.
+fn network(
+    bind_port: u16,
+    relay_urls: Vec<String>,
+    external_addrs: Vec<SocketAddr>,
+    discovery: ResolvedDiscovery,
+) -> ResolvedNetwork {
+    ResolvedNetwork {
+        bind_port,
+        relay_urls,
+        external_addrs,
+        discovery,
+    }
 }
 
 /// Bind an `IPV6_V6ONLY` UDP socket on `[::]:port`, or return `None` when
@@ -1179,10 +1191,7 @@ async fn build_endpoint_binds_ipv6_on_bind_port() {
     let transport = quic_transport_config().unwrap();
     let ep = build_endpoint(
         &sk,
-        port,
-        &[],
-        &[],
-        &ResolvedDiscovery::default(),
+        &network(port, vec![], vec![], ResolvedDiscovery::default()),
         transport,
     )
     .await
@@ -1224,10 +1233,7 @@ async fn build_endpoint_falls_back_to_ipv4_when_ipv6_bind_fails() {
     let transport = quic_transport_config().unwrap();
     let ep = build_endpoint(
         &sk,
-        port,
-        &[],
-        &[],
-        &ResolvedDiscovery::default(),
+        &network(port, vec![], vec![], ResolvedDiscovery::default()),
         transport,
     )
     .await
@@ -1263,10 +1269,7 @@ async fn build_endpoint_binds_with_portless_relay_url() {
     let relays = vec!["relay://portless-a".to_string()];
     let ep = build_endpoint(
         &sk,
-        0,
-        &relays,
-        &[],
-        &ResolvedDiscovery::default(),
+        &network(0, relays, vec![], ResolvedDiscovery::default()),
         transport,
     )
     .await
@@ -1295,9 +1298,13 @@ async fn build_endpoint_advertises_configured_external_addrs() {
             addrs: vec!["8.8.4.4:4433".to_string()],
         }],
     };
-    let ep = build_endpoint(&sk, 0, &[], &external, &discovery, transport)
-        .await
-        .expect("endpoint with external addrs binds");
+    let ep = build_endpoint(
+        &sk,
+        &network(0, vec![], external.clone(), discovery),
+        transport,
+    )
+    .await
+    .expect("endpoint with external addrs binds");
     let advertised: Vec<SocketAddr> = ep.addr().ip_addrs().copied().collect();
     for addr in &external {
         assert!(
@@ -1327,7 +1334,7 @@ async fn build_endpoint_binds_with_custom_discovery() {
             addrs: vec!["203.0.113.4:4433".to_string()],
         }],
     };
-    let ep = build_endpoint(&sk, 0, &[], &[], &discovery, transport)
+    let ep = build_endpoint(&sk, &network(0, vec![], vec![], discovery), transport)
         .await
         .expect("custom-discovery endpoint binds");
     ep.close().await;
@@ -1347,7 +1354,7 @@ async fn build_endpoint_binds_with_discovery_and_custom_relay() {
         dns_origin: Some("discovery.example.".to_string()),
         peers: Vec::new(),
     };
-    let ep = build_endpoint(&sk, 0, &relays, &[], &discovery, transport)
+    let ep = build_endpoint(&sk, &network(0, relays, vec![], discovery), transport)
         .await
         .expect("discovery + custom relay endpoint binds");
     ep.close().await;

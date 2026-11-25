@@ -4,9 +4,9 @@
 //! use while this node's daemon is running is expected, not a fault.
 
 use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 
-use decdn_common::config::ResolvedConfig;
+use decdn_common::config::{ResolvedConfig, ResolvedNetwork};
 use decdn_common::net::{addr_source, public_quic_addrs, quic_multiaddr, route_public_ips};
 
 use super::{Finding, Report, Severity};
@@ -69,19 +69,16 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 
 /// Report whether the host takes direct inbound connections (ADR 001 § Node
 /// Discovery). The QUIC addresses a remote peer can dial come from
-/// [`public_quic_addrs`], as the daemon counts them: each `external_addrs`
-/// (`network.external_addrs`) address on its own port when there are any, else
-/// each of `route_public` (the host's route-public IPs) on `bind_port`. Both
-/// outcomes pass: a host behind NAT is a supported setup whose inbound runs
-/// through the relay and hole-punching. A public finding carries a
+/// [`public_quic_addrs`], as the daemon counts them: each
+/// `network.external_addrs` address on its own port when there are any, else
+/// each of `route_public` (the host's route-public IPs) on `network.bind_port`.
+/// Both outcomes pass: a host behind NAT is a supported setup whose inbound
+/// runs through the relay and hole-punching. A public finding carries a
 /// `source=<route|configured> probed=false` detail from [`addr_source`].
-pub(crate) fn classify_reachability(
-    route_public: &[IpAddr],
-    bind_port: u16,
-    external_addrs: &[SocketAddr],
-) -> Finding {
-    let public = public_quic_addrs(route_public, bind_port, external_addrs);
-    let source = addr_source(external_addrs);
+pub(crate) fn classify_reachability(route_public: &[IpAddr], network: &ResolvedNetwork) -> Finding {
+    let bind_port = network.bind_port;
+    let public = public_quic_addrs(route_public, bind_port, &network.external_addrs);
+    let source = addr_source(&network.external_addrs);
     if public.is_empty() {
         Finding {
             group: "Ports",
@@ -120,11 +117,7 @@ pub(crate) fn classify_reachability(
 /// Push bindability findings for the QUIC, metrics, and (if configured)
 /// admin ports, and the host's reachability.
 pub(crate) fn check_ports(report: &mut Report, cfg: &ResolvedConfig, daemon_running: bool) {
-    report.push(classify_reachability(
-        &route_public_ips(),
-        cfg.network.bind_port,
-        &cfg.network.external_addrs,
-    ));
+    report.push(classify_reachability(&route_public_ips(), &cfg.network));
     report.push(classify_bind(
         "quic bind",
         cfg.network.bind_port,
