@@ -2827,11 +2827,10 @@ async fn shutdown<P: Provider + Clone + 'static>(
 
 /// Build an iroh `Endpoint` from `network` (the resolved `[network]` section),
 /// bound to `network.bind_port` on both address families: `0.0.0.0:bind_port`
-/// and `[::]:bind_port`. ALPNs are set by the `Router`
-/// when it spawns. The bind addresses are included in the error message so a
-/// port collision surfaces as a config-level diagnostic (matching
-/// `metrics::bind` and `admin::bind`), rather than an opaque "endpoint bind
-/// failed".
+/// and `[::]:bind_port`. ALPNs are set by the `Router` when it spawns. The
+/// bind addresses are included in the error message so a port collision
+/// surfaces as a config-level diagnostic (matching `metrics::bind` and
+/// `admin::bind`), rather than an opaque "endpoint bind failed".
 ///
 /// The IPv6 bind replaces iroh's default `[::]:0` socket, so a dual-stack node
 /// listens on one stable port per family and an operator can register an
@@ -2841,10 +2840,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
 /// a container without a v6 stack) or with `[::]:bind_port` taken still starts
 /// on IPv4 only, and [`warn_if_no_ipv6_socket`] logs the degraded state.
 ///
-/// Each of `network.external_addrs` (a forwarded or
-/// load-balancer address) goes to iroh as a configured external address. iroh
-/// advertises it together with the addresses it discovers and uses it in NAT
-/// traversal. When a pkarr publisher runs (the n0 default, or
+/// Each of `network.external_addrs` (a forwarded or load-balancer address)
+/// goes to iroh as a configured external address. iroh advertises it together
+/// with the addresses it discovers and uses it in NAT traversal. When a pkarr publisher runs (the n0 default, or
 /// `network.discovery.pkarr_url`), the record carries it too: resolution admits
 /// only public addresses, so `node_publish_filter` keeps each one.
 ///

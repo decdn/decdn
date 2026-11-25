@@ -71,9 +71,9 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 /// Discovery). The QUIC addresses a remote peer can dial come from
 /// [`public_quic_addrs`], as the daemon counts them: each
 /// `network.external_addrs` address on its own port when there are any, else
-/// each of `route_public` (the host's route-public IPs) on `network.bind_port`. Both
-/// outcomes pass: a host behind NAT is a supported setup whose inbound runs
-/// through the relay and hole-punching. A public finding carries a
+/// each of `route_public` (the host's route-public IPs) on `network.bind_port`.
+/// Both outcomes pass: a host behind NAT is a supported setup whose inbound
+/// runs through the relay and hole-punching. A public finding carries a
 /// `source=<route|configured> probed=false` detail from [`addr_source`].
 pub(crate) fn classify_reachability(route_public: &[IpAddr], network: &ResolvedNetwork) -> Finding {
     let bind_port = network.bind_port;
