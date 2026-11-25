@@ -572,7 +572,7 @@ pub fn resolve_config(
 /// inside either single-section resolver.
 ///
 /// Scope: this is a *static local-config* check only. The on-chain governance
-/// deny-set (fed at runtime through `CacheEngine::set_chain_denied`) can still
+/// deny-set (fed at runtime through `CacheEngine::set_chain_denied_one`) can still
 /// collide with a pinned hash after startup; no static check can catch that.
 // Single-section shim preserving the `anyhow::Result` API for the unit tests;
 // `resolve_config` uses the `*_into` worker with the shared bag instead.

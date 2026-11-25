@@ -213,17 +213,8 @@ These give early warning that a node serves a blacklisted hash after its complia
 | `decdn_buyer_pool_adoption_failures_total` | Counter | M | live | Bootstraps that could not determine whether this node already owns a payment pool on chain, so the first cache miss opens one. Every increment is a chance the node escrows a second deposit beside one it already holds. Adoption runs once per process, so this does not self-correct before the next restart. |
 | `decdn_unredeemed_usdc` | Gauge | M | live | Raw USDC in accepted vouchers this node has not redeemed on-chain. The value sums `owed − paid` over the lanes the redeemer plans to collect. The redeemer refreshes it once per sweep (each self-tick and each serve-cutoff sweep), so it lags live accrual by up to one `redeem_interval_secs`. |
 | `decdn_buyer_pool_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
-| `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers this node signed as the payer (node-to-node pulls). |
 | `decdn_vouchers_received_total` | Counter | R | live | Signed vouchers this node accepted as the payee on an inbound stream. `PayWord` preimage reveals are not vouchers and do not count. A `PayWord` stream counts its anchor voucher. |
 | `decdn_preimage_reveals_received_total` | Counter | R | live | `PayWord` hash-chain preimage reveals this node accepted as the payee on an inbound stream. A reveal counts when it advances its lane's chain frontier. A reveal at or below the frontier does not count. Each counted reveal hints the redeemer, so the sum of this rate and the `decdn_vouchers_received_total` rate is the redeemer's hint rate. |
-
-#### Reputation Metrics
-
-Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-system) — no cross-node propagation, so the only reputation metric is the local score gauge.
-
-| Metric | Type | Tier | Status | Description |
-|--------|------|------|--------|-------------|
-| `decdn_reputation_score` | Gauge | R | planned | This node's current local reputation score (0.0–1.0) for a peer, computed from its own delivery observations per [ADR 008](008-reputation.md#adr-008-reputation-system). |
 
 #### Node / Process Metrics
 
@@ -465,7 +456,6 @@ Each metric series has one canonical `decdn_`-prefixed name; informal short name
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |
-| `vouchers_signed` | `decdn_vouchers_signed_total` | architecture.md |
 | `vouchers_received` | `decdn_vouchers_received_total` | architecture.md |
 | `channels_open` | `decdn_lanes_open` | architecture.md |
 | `channels_settled` | `decdn_pool_redemptions_total` | architecture.md |

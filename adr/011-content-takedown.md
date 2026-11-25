@@ -172,7 +172,7 @@ Emergency auto-expiry is the one set change that is not caused by a transaction.
 
 ### Reason field
 
-Free-form string, stored on-chain for auditability. Operators can reference legal notice identifiers (e.g., DMCA case numbers, DSA notice IDs) or use short category labels.
+Free-form string, emitted on-chain in the `HashBlacklisted` event for auditability. The contract does not store it. Operators can reference legal notice identifiers (e.g., DMCA case numbers, DSA notice IDs) or use short category labels.
 
 ### `region` field
 
