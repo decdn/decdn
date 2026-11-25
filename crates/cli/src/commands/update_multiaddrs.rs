@@ -213,14 +213,11 @@ pub(crate) fn ensure_submittable(plan: &Plan) -> anyhow::Result<()> {
          operator cannot register (it would revert too) and instead exits the bond with \
          `decdn node unbond --all`."
     );
-    anyhow::ensure!(
-        plan.packed_size <= plan.max_multiaddr_size,
-        "packed multiaddrs are {} bytes, over the maxMultiaddrSize ceiling of {} bytes — \
-         `updateMultiaddrs` would revert MultiaddrsTooLarge. Publish fewer or shorter \
-         addresses.",
+    ensure_packed_within(
         plan.packed_size,
         plan.max_multiaddr_size,
-    );
+        "updateMultiaddrs",
+    )?;
     if plan.head_timestamp < plan.ready_at {
         let wait = plan.ready_at.saturating_sub(plan.head_timestamp);
         anyhow::bail!(
@@ -233,6 +230,25 @@ pub(crate) fn ensure_submittable(plan: &Plan) -> anyhow::Result<()> {
             plan.head_timestamp,
         );
     }
+    Ok(())
+}
+
+/// Refuse a packed multiaddr set the contract would revert `MultiaddrsTooLarge`
+/// on, naming `contract_fn` (the call that would revert) and both byte counts.
+/// The contract's check is `packed > maxMultiaddrSize`, so a set exactly at the
+/// ceiling passes. Pure, so `registerNode` and `updateMultiaddrs` share one
+/// testable bound.
+pub(crate) fn ensure_packed_within(
+    packed_size: u64,
+    max_multiaddr_size: u64,
+    contract_fn: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        packed_size <= max_multiaddr_size,
+        "packed multiaddrs are {packed_size} bytes, over the maxMultiaddrSize ceiling of \
+         {max_multiaddr_size} bytes — `{contract_fn}` would revert MultiaddrsTooLarge. Publish \
+         fewer or shorter addresses.",
+    );
     Ok(())
 }
 

@@ -183,3 +183,35 @@ fn json_null_tx_on_a_dry_run() {
         Some(true)
     );
 }
+
+#[test]
+fn packed_size_under_ceiling_passes() {
+    ensure_packed_within(36, 1_024, "registerNode").expect("under the ceiling is within bounds");
+}
+
+/// The contract's check is `packed > maxMultiaddrSize`, so equality passes.
+#[test]
+fn packed_size_at_ceiling_passes() {
+    ensure_packed_within(1_024, 1_024, "registerNode").expect("size == ceiling is within bounds");
+}
+
+#[test]
+fn packed_size_over_ceiling_names_the_call_and_both_sizes() {
+    let err = ensure_packed_within(1_025, 1_024, "registerNode")
+        .expect_err("over the ceiling must not proceed");
+    let msg = format!("{err}");
+    assert!(msg.contains("`registerNode`"), "names the call: {msg}");
+    assert!(
+        msg.contains("MultiaddrsTooLarge"),
+        "names the revert: {msg}"
+    );
+    assert!(msg.contains("1025 bytes"), "reports the packed size: {msg}");
+    assert!(msg.contains("1024 bytes"), "reports the ceiling: {msg}");
+}
+
+#[test]
+fn empty_set_packs_within_any_ceiling() {
+    let packed = decdn_incentive::node_register::pack_multiaddrs(&[]).expect("empty set packs");
+    let size = u64::try_from(packed.len()).expect("0 fits in u64");
+    ensure_packed_within(size, 0, "registerNode").expect("an empty set never exceeds the ceiling");
+}

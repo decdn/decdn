@@ -30,7 +30,7 @@ use decdn_common::identity;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::{bind_sig, node_register};
 
-use crate::commands::{chain_ctx, terms};
+use crate::commands::{chain_ctx, terms, update_multiaddrs};
 
 /// Entry point for `decdn node register`.
 pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
@@ -44,19 +44,20 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let bond = CapacityBond::new(cb_addr, &provider);
+
+    // An oversized set fails here, before the terms prompt, and on `--dry-run`
+    // too: the signatures a dry run prints would only revert on submission.
+    ensure_multiaddrs_fit(&bond, cb_addr, &multiaddrs).await?;
 
     // ADR 019 § Terms Acceptance — read the network's current terms hash, then
     // require the operator to accept the matching embedded terms before we sign.
     // Enforced on `--dry-run` too: a dry run still produces a real, submit-able
     // signature that commits to `termsHash`, so it must not be generated over
     // terms the operator hasn't seen / a stale client's hash.
-    let terms_hash = CapacityBond::new(cb_addr, &provider)
-        .currentTermsHash()
-        .call()
-        .await
-        .with_context(|| {
-            format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
-        })?;
+    let terms_hash = bond.currentTermsHash().call().await.with_context(|| {
+        format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
+    })?;
     terms::ensure_accepted_async(terms_hash, args.accept_terms).await?;
 
     // `decdn node register` submits a single transaction and has no partial
@@ -84,6 +85,35 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     };
     write_outcome(&mut out, &outcome, args.chain.common.json).context(label)?;
     Ok(())
+}
+
+/// Refuse a multiaddr set whose packed form exceeds `CapacityBond.maxMultiaddrSize`,
+/// so `registerNode` never reverts `MultiaddrsTooLarge` after a prompt or a
+/// transaction. Packs with [`node_register::pack_multiaddrs`], so a single entry
+/// past the `u16` length prefix also fails here. An empty set (a host behind
+/// NAT) packs to 0 bytes and always passes.
+///
+/// # Errors
+///
+/// Returns an error when an entry does not pack, the ceiling read fails, or the
+/// packed set is over the ceiling.
+pub(crate) async fn ensure_multiaddrs_fit<P: Provider + Clone>(
+    bond: &CapacityBond::CapacityBondInstance<P>,
+    cb_addr: Address,
+    multiaddrs: &[String],
+) -> anyhow::Result<()> {
+    let packed = node_register::pack_multiaddrs(multiaddrs)?;
+    let max_multiaddr_size = bond.maxMultiaddrSize().call().await.with_context(|| {
+        format!("failed to read maxMultiaddrSize from CapacityBond at {cb_addr}")
+    })?;
+    // Saturating rather than `try_into`: the ceiling is a governance parameter
+    // bounded far below `u64::MAX`, so a value past `u64` is unreachable — and
+    // failing the whole command on an unreachable read would be worse than clamping.
+    let max_multiaddr_size: u64 = max_multiaddr_size.saturating_to();
+    // Packed length is a handful of KB in practice; `u64::MAX` on the
+    // impossible overflow keeps the ceiling check erring toward "too large".
+    let packed_size = u64::try_from(packed.len()).unwrap_or(u64::MAX);
+    update_multiaddrs::ensure_packed_within(packed_size, max_multiaddr_size, "registerNode")
 }
 
 /// The multiaddrs to register (ADR 001 § Node Discovery), first match wins:
