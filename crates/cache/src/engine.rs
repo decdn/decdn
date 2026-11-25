@@ -2542,7 +2542,7 @@ impl CacheEngine {
     ///
     /// Wholesale replacement, not a merge: removing an entry from the denylist
     /// and reloading must un-deny it. Touches only the local slot — a reload
-    /// must not drop what the blacklist watcher put in [`Self::set_chain_denied`].
+    /// must not drop what the blacklist watcher put in the governance deny-set.
     pub fn set_denied(&self, new: &DeniedHashes) -> PinDiff {
         let new_arc = Arc::new(
             new.iter()
@@ -2568,19 +2568,16 @@ impl CacheEngine {
     ///
     /// The set records *why* a hash is refused — governance-sourced, which selects
     /// the wire refusal code — a fact `evicted.log` (which records only *that* a
-    /// hash was evicted) cannot express. The blacklist watcher rebuilds it each
-    /// boot by re-checking every enumerated hash through
-    /// `isHashBlacklistedForOperator` and writing survivors one at a time via
-    /// [`Self::set_chain_denied_one`]; this bulk setter is retained for tests and
-    /// any wholesale reseed.
+    /// hash was evicted) cannot express. The blacklist watcher writes it one hash
+    /// at a time through [`Self::set_chain_denied_one`]; this bulk setter serves
+    /// tests and a wholesale reseed.
     pub fn set_chain_denied(&self, hashes: HashSet<Hash>) {
         self.inner.chain_denied.store(Arc::new(hashes));
     }
 
     /// Add or drop one governance-denied hash, returning whether the set
-    /// actually changed so a caller can skip logging a no-op replay (the watcher
-    /// re-scans a block range after a restart and re-delivers events it has
-    /// already applied).
+    /// actually changed. The blacklist watcher re-denies every live in-scope
+    /// hash on each enforcement pass, so most calls change nothing.
     ///
     /// Read-modify-write rather than in-place mutation, because [`ArcSwap`] has
     /// no such thing. Blacklist events are governance actions and therefore
