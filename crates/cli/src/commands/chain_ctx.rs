@@ -134,10 +134,27 @@ impl FileConfig {
     }
 }
 
+/// The `[network]` table. Unlike the other sections it refuses an unknown
+/// key, as the daemon does: `external_addrs` decides what `decdn setup` and
+/// `decdn node register` put on chain, so a misspelt key must stop the command
+/// before a transaction rather than at the daemon's next start. It names every
+/// key of the daemon's `NetworkConfig`; the ones the CLI does not use are read
+/// for presence only.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileNetwork {
     bind_port: Option<u16>,
     external_addrs: Option<Vec<String>>,
+    #[expect(
+        dead_code,
+        reason = "named so the strict parse accepts the daemon's key"
+    )]
+    relay_urls: Option<serde::de::IgnoredAny>,
+    #[expect(
+        dead_code,
+        reason = "named so the strict parse accepts the daemon's key"
+    )]
+    discovery: Option<serde::de::IgnoredAny>,
 }
 
 /// The `[cache]` fields that decide pull-through. The origin tables are read

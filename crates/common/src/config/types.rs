@@ -107,9 +107,11 @@ pub struct NetworkConfig {
     /// a port forward or a load balancer. Each entry is `IP:port`, with an
     /// IPv6 address in brackets (`"[2606:4700::1111]:4433"`). A hostname or
     /// port 0 is refused, and the IP must be public. The port is the one peers dial,
-    /// which can differ from [`Self::bind_port`]. The node publishes each
-    /// address in its address record and counts it as a public address in its
-    /// reachability check, in place of the host's own addresses. When the list
+    /// which can differ from [`Self::bind_port`]. iroh advertises each address
+    /// to peers, and a running pkarr publisher (the n0 default, or
+    /// [`DiscoveryConfig::pkarr_url`]) puts it in the address record beside
+    /// the host's own addresses. The reachability check counts the configured
+    /// addresses as public in place of the host's own. When the list
     /// holds any address, `decdn setup` and `decdn node register` register
     /// these addresses if no `--multiaddr` is given; an empty list counts as
     /// unset. The daemon expands `${VAR}` in an entry; `decdn setup` and

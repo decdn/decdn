@@ -88,7 +88,8 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
 
 /// The multiaddrs to register (ADR 001 § Node Discovery), first match wins:
 ///
-/// 1. `explicit`, when the operator passed any. The file is not read.
+/// 1. `explicit`, when the operator passed any. `network.external_addrs` is
+///    then neither read nor checked.
 /// 2. Each `network.external_addrs` address, on its own port, when that list
 ///    holds any address. An empty list counts as unset. The configured
 ///    addresses replace the host's own, as in the daemon's reachability check

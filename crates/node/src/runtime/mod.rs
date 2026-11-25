@@ -2935,8 +2935,9 @@ async fn shutdown<P: Provider + Clone + 'static>(
 /// Each of `external_addrs` (`network.external_addrs`, a forwarded or
 /// load-balancer address) goes to iroh as a configured external address. iroh
 /// advertises it together with the addresses it discovers and uses it in NAT
-/// traversal. The pkarr record carries it too: resolution admits only public
-/// addresses, so `node_publish_filter` keeps each one.
+/// traversal. When a pkarr publisher runs (the n0 default, or
+/// `network.discovery.pkarr_url`), the record carries it too: resolution admits
+/// only public addresses, so `node_publish_filter` keeps each one.
 ///
 /// No transient pre-bind probe: it would introduce a TOCTOU window
 /// between the probe and the real bind, and iroh's

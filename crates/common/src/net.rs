@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 /// the unstable `IpAddr::is_global`. An IPv4-mapped IPv6 address is judged as
 /// its IPv4 address.
 #[must_use]
-pub fn is_publishable(ip: IpAddr) -> bool {
+pub const fn is_publishable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_publishable_v4(v4),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -48,17 +48,26 @@ const fn is_publishable_v4(ip: Ipv4Addr) -> bool {
         || a >= 240)
 }
 
-fn is_publishable_v6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments().first().copied().unwrap_or(0);
-    !(ip.is_unspecified()
-        || ip.is_loopback()
+const fn is_publishable_v6(ip: Ipv6Addr) -> bool {
+    let [first, second, third, fourth, ..] = ip.segments();
+    // 2002::/16: 6to4, judged as the IPv4 address it embeds.
+    if first == 0x2002 {
+        let [a, b] = second.to_be_bytes();
+        let [c, d] = third.to_be_bytes();
+        return is_publishable_v4(Ipv4Addr::new(a, b, c, d));
+    }
+    // ::/16 holds the unspecified and loopback addresses, the deprecated
+    // IPv4-compatible ::/96 form and other reserved space; none is dialable.
+    !(first == 0
         || ip.is_multicast()
+        // 100::/64: discard-only.
+        || (first == 0x0100 && second == 0 && third == 0 && fourth == 0)
         // fc00::/7: unique local.
         || (first & 0xFE00) == 0xFC00
         // fe80::/10: link-local unicast.
         || (first & 0xFFC0) == 0xFE80
         // 2001:db8::/32: documentation.
-        || (first == 0x2001 && ip.segments().get(1).copied() == Some(0x0DB8)))
+        || (first == 0x2001 && second == 0x0DB8))
 }
 
 /// The host's public IP addresses: for IPv4 and IPv6, the source address of
@@ -118,15 +127,25 @@ pub fn quic_multiaddr(ip: IpAddr, port: u16) -> String {
 /// refuses. The message names the value or the IP.
 pub fn parse_external_addr(raw: &str) -> anyhow::Result<SocketAddr> {
     let trimmed = raw.trim();
-    let addr: SocketAddr = trimmed.parse().map_err(|_| {
-        if trimmed.parse::<IpAddr>().is_ok() {
+    let addr: SocketAddr = trimmed.parse().map_err(|err| {
+        let unbracketed = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(trimmed);
+        if trimmed.starts_with('/') {
+            anyhow::anyhow!(
+                "invalid socket address {raw:?}: write IP:port, not a multiaddr \
+                 (8.8.8.8:4433 for /ip4/8.8.8.8/udp/4433/quic-v1)"
+            )
+        } else if unbracketed.parse::<IpAddr>().is_ok() {
             anyhow::anyhow!(
                 "invalid socket address {raw:?}: missing port; write IP:port, with IPv6 as \
                  [addr]:port"
             )
         } else {
             anyhow::anyhow!(
-                "invalid socket address {raw:?}: expected IP:port; a hostname is not accepted"
+                "invalid socket address {raw:?} ({err}): expected IP:port with a port up to \
+                 65535; a hostname is not accepted"
             )
         }
     })?;

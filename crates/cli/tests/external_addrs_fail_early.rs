@@ -1,6 +1,8 @@
-//! A bad `network.external_addrs` entry stops `decdn setup` and
-//! `decdn node register` before any key generation, password prompt or chain
-//! read (ADR 019 § Phase 2).
+//! A bad `network.external_addrs` entry stops `decdn node register` before the
+//! password prompt or any chain read, and stops `decdn setup` on a node with
+//! no key before key generation or any chain read (ADR 019 § Phase 2). Setup
+//! on a node with a key checks the entries after it reads the registration
+//! state; `crates/e2e/tests/cli_setup_external_addrs.rs` covers that.
 //!
 //! Drives the real `decdn` binary against a refused RPC port: a command that
 //! reached the chain would fail with an RPC error instead of naming the entry.
@@ -69,12 +71,16 @@ fn setup_refuses_a_private_external_addr_before_generating_keys() {
     assert!(stderr.contains("network.external_addrs[0]"), "{stderr}");
     assert!(stderr.contains("10.0.0.5"), "{stderr}");
     assert!(
-        !stderr.contains("rpc_url"),
+        !stderr.contains("RPC reachable?"),
         "no chain read happened: {stderr}"
     );
     assert!(
         !decdn_common::identity::key_path(data_dir.path()).exists(),
         "no node key is generated before the check"
+    );
+    assert!(
+        !decdn_incentive::eth_identity::keystore_path(data_dir.path()).exists(),
+        "no eth keystore is created before the check"
     );
 }
 
@@ -106,6 +112,10 @@ fn setup_with_explicit_multiaddr_skips_the_external_addrs_check() {
     assert!(
         !stderr.contains("network.external_addrs"),
         "--multiaddr skips the key: {stderr}"
+    );
+    assert!(
+        stderr.contains("RPC reachable?"),
+        "the run got past the check to the chain read: {stderr}"
     );
 }
 

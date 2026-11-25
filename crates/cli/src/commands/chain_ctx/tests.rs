@@ -120,6 +120,27 @@ fn external_addrs_refuse_a_private_entry() {
     assert!(msg.contains("192.168.1.2"), "{msg}");
 }
 
+/// A misspelt `[network]` key stops the CLI before it registers the wrong
+/// addresses, as it stops the daemon.
+#[test]
+fn network_section_refuses_an_unknown_key() {
+    let err = toml::from_str::<FileConfig>("[network]\nexternal_addr = [\"8.8.8.8:4433\"]\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("external_addr"), "{err}");
+}
+
+/// Every key the daemon's `[network]` table accepts also parses here, so the
+/// strict reader refuses only what the daemon refuses.
+#[test]
+fn network_section_accepts_every_daemon_key() {
+    let toml = "[network]\nbind_port = 4433\nrelay_urls = [\"https://relay.example\"]\n\
+                external_addrs = [\"8.8.8.8:4433\"]\n\
+                [network.discovery]\ndns_origin = \"dns.example\"\n";
+    toml::from_str::<decdn_common::config::FileConfig>(toml).unwrap();
+    toml::from_str::<FileConfig>(toml).unwrap();
+}
+
 /// Pull-through resolves by the daemon's role rule: on with no origin, off with
 /// one, and an explicit value wins either way. Both origin forms count.
 #[test]
