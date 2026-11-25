@@ -625,13 +625,22 @@ fn ensure_no_hash_pinned_and_denied_into(
     });
 }
 
+/// Single-section wrapper over [`validate_port_layout_into`] for tests.
+#[cfg(test)]
+fn validate_port_layout(
+    network: &ResolvedNetwork,
+    observability: &ResolvedObservability,
+) -> anyhow::Result<()> {
+    one_section(|bag| validate_port_layout_into(network, observability, bag))
+}
+
 /// Cross-section check on the running node's port assignments. Lives at the
 /// resolver boundary because `bind_port`, `metrics_port`, and `admin_port`
 /// come from different sections — the collision rules are inherently
 /// cross-section, and operators who set two of them equal almost certainly
-/// made a typo. Also emits a stderr warning for well-known ports (<1024),
+/// made a typo. Also records a warning notice for well-known ports (<1024),
 /// which bind on Unix only with elevated privilege and may collide with
-/// standardized services.
+/// standardized services. Callers pass their own bag.
 ///
 /// Collision rules:
 /// - `bind_port` vs. `metrics_port` — QUIC (UDP) and metrics (TCP) would
@@ -644,15 +653,7 @@ fn ensure_no_hash_pinned_and_denied_into(
 /// with nothing (the OS picks distinct values) and needs no elevated
 /// privilege, so every check skips it. Admin disabled (`None`) means we
 /// skip the pair checks that involve it.
-#[cfg(test)]
-fn validate_port_layout(
-    network: &ResolvedNetwork,
-    observability: &ResolvedObservability,
-) -> anyhow::Result<()> {
-    one_section(|bag| validate_port_layout_into(network, observability, bag))
-}
-
-fn validate_port_layout_into(
+pub fn validate_port_layout_into(
     network: &ResolvedNetwork,
     observability: &ResolvedObservability,
     bag: &mut ConfigDiagnostics,
@@ -798,9 +799,7 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// Resolve network fields, recording any malformed `relay_urls` (#818) or
 /// `external_addrs` entry into `bag`.
 ///
-/// Startup ([`resolve_config`]) resolves the table into the shared bag. The
-/// SIGHUP reload (`runtime::reload`) resolves it into a bag of its own, to
-/// report a bad or changed `[network]` that only the next restart applies.
+/// Callers pass their own bag.
 ///
 /// Each `external_addrs` entry must pass [`crate::net::parse_external_addr`]:
 /// a public `IP:port`. A bad entry is recorded under

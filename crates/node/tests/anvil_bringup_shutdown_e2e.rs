@@ -603,10 +603,7 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &cfg,
         Box::new(|_| Ok(decdn_node::runtime::LogLevelApply::Installed)) as LogLevelSetter,
     ));

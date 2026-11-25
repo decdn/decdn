@@ -258,10 +258,7 @@ async fn persistent_sighup_observes_both_signals() {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         setter,
     ));
@@ -338,10 +335,7 @@ async fn sighup_applies_security_changes() {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         setter,
     ));
@@ -458,10 +452,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         setter,
     ));
@@ -730,10 +721,7 @@ async fn sighup_routes_a_resolve_notice_into_the_log_stream() {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         setter,
     ));
@@ -829,10 +817,7 @@ async fn a_failed_commit_reports_no_notices() {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         failing_setter,
     ));
@@ -908,10 +893,7 @@ async fn observability_restart_notice_follows_cli_precedence() {
             admin_port: None,
             otlp_endpoint: Some("http://cli-collector:4317".to_string()),
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -963,10 +945,7 @@ async fn an_aborted_reload_reports_no_observability_notice() {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -993,8 +972,8 @@ async fn an_aborted_reload_reports_no_observability_notice() {
     );
 }
 
-/// A `[network]` table the next restart rejects warns once, on one line that
-/// names the bad key, while the reload still applies and counts no failure.
+/// A `[network]` table the next restart rejects warns once, naming the bad
+/// key, while the reload still applies and counts no failure.
 /// The warning is about the file on disk, so a reload that aborts on another
 /// section still reports it.
 #[tokio::test(flavor = "current_thread")]
@@ -1025,10 +1004,7 @@ async fn sighup_reports_an_invalid_network_table() {
             admin_port: None,
             otlp_endpoint: None,
         },
-        NetworkArgs {
-            bind_port: None,
-            relay_url: None,
-        },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -1038,9 +1014,7 @@ async fn sighup_reports_an_invalid_network_table() {
     let invalid_lines = |logs: &str| -> usize {
         logs.lines()
             .filter(|l| {
-                l.contains(" WARN ")
-                    && l.contains("[network] is invalid; the next restart fails")
-                    && l.contains("network.external_addrs[0]")
+                l.contains(" WARN ") && l.contains("[network] is invalid; the next restart fails")
             })
             .count()
     };
@@ -1067,6 +1041,7 @@ async fn sighup_reports_an_invalid_network_table() {
     assert_eq!(levels.lock().unwrap().clone(), vec![LogLevel::Debug]);
     let logs = captured_logs(&log_buf);
     assert_eq!(invalid_lines(&logs), 1, "got:\n{logs}");
+    assert!(logs.contains("network.external_addrs[0]"), "got:\n{logs}");
     assert!(
         !logs.contains("ignoring change to network."),
         "an invalid table reports no field change, got:\n{logs}"
@@ -1090,4 +1065,5 @@ async fn sighup_reports_an_invalid_network_table() {
         .expect_err("a bad cache.pinned_hashes must abort the reload");
     let logs = captured_logs(&log_buf);
     assert_eq!(invalid_lines(&logs), 1, "got:\n{logs}");
+    assert!(logs.contains("network.external_addrs[0]"), "got:\n{logs}");
 }

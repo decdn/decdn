@@ -71,12 +71,11 @@ use crate::dispatch::ConnectionLimiter;
 use anyhow::Context;
 use decdn_common::cli::common::{LogFormat, LogLevel};
 use decdn_common::cli::run::{NetworkArgs, ObservabilityArgs};
-use decdn_common::config::types::NetworkConfig;
 use decdn_common::config::{
     ConfigDiagnostics, ConfigNotice, ConfigNoticeLevel, FileConfig, ResolvedLoadShed,
     ResolvedNetwork, ResolvedObservability, ResolvedSecurity, load_file_config,
     parse_pinned_hashes, resolve_load_shed_into, resolve_network_into, resolve_observability_into,
-    resolve_security_into,
+    resolve_security_into, validate_port_layout_into,
 };
 
 /// Read-only snapshot of the reloadable fields, returned by
@@ -1091,10 +1090,7 @@ impl RuntimeReloadState {
                 admin_port: None,
                 otlp_endpoint: None,
             },
-            NetworkArgs {
-                bind_port: None,
-                relay_url: None,
-            },
+            NetworkArgs::default(),
             &cfg,
             log_level_setter,
         )
@@ -1181,15 +1177,15 @@ impl RuntimeReloadState {
             }
         };
 
-        // `[network]` is restart-required and reads only the file and two
+        // `[network]` is restart-required and reads only the file and
         // immutable fields, so it resolves outside the reload lock and never
         // touches the shared bag. A table the next restart rejects is a fact
         // about the file, true whether or not this reload aborts below, so it
         // warns before any gate.
-        let network = resolve_network_for_notice(&self.network_cli, file.network.as_ref());
-        if let Err(problems) = &network {
+        let network = resolve_network_for_notice(&self.network_cli, &self.log_level.cli, &file);
+        if let Err(err) = &network {
             tracing::warn!(
-                problems = %problems,
+                error = %err,
                 "config reload: [network] is invalid; the next restart fails"
             );
         }
@@ -1319,32 +1315,37 @@ impl RuntimeReloadState {
 }
 
 /// Resolve the reloaded `[network]` table with the startup rules, into a bag
-/// of its own. `[network]` is restart-required, so its problems never reach
-/// the shared reload bag and never abort the reload.
+/// of its own, and check the port layout of the reloaded `[network]` and
+/// `[observability]` tables as startup does. `[network]` is
+/// restart-required, so its problems never reach the shared reload bag and
+/// never abort the reload.
 ///
 /// `Ok` carries the resolved table and the notices startup would also emit
-/// for it (the `--relay-url` override of a `relay_urls` list). `Err` carries
-/// the problems on one line, `; `-separated, each naming its key (e.g.
+/// for it (the `--relay-url` override of a `relay_urls` list, a well-known
+/// port). `Err` carries the problems, each naming its key (e.g.
 /// `network.external_addrs[0]: …`). A rejected entry is echoed as startup
-/// echoes it, with relay and discovery URL userinfo redacted. This checks the
-/// `[network]` table's own keys only, not the port layout across tables.
+/// echoes it, with relay and discovery URL userinfo redacted.
+///
+/// An invalid `[observability]` table skips the port-layout check: the
+/// shared reload bag reports it and aborts the reload.
 fn resolve_network_for_notice(
-    cli: &NetworkArgs,
-    file: Option<&NetworkConfig>,
-) -> Result<(ResolvedNetwork, Vec<ConfigNotice>), String> {
+    network_cli: &NetworkArgs,
+    observability_cli: &ObservabilityArgs,
+    file: &FileConfig,
+) -> anyhow::Result<(ResolvedNetwork, Vec<ConfigNotice>)> {
     let mut bag = ConfigDiagnostics::new();
-    let resolved = resolve_network_into(cli, file, &mut bag);
+    let network = resolve_network_into(network_cli, file.network.as_ref(), &mut bag);
+    let mut observability_bag = ConfigDiagnostics::new();
+    let observability = resolve_observability_into(
+        observability_cli,
+        file.observability.as_ref(),
+        &mut observability_bag,
+    );
+    if observability_bag.problem_count() == 0 {
+        validate_port_layout_into(&network, &observability, &mut bag);
+    }
     let notices = bag.take_notices();
-    bag.into_result()
-        .map(|()| (resolved, notices))
-        .map_err(|err| {
-            format!("{err:#}")
-                .lines()
-                .skip(1) // the `configuration has N problem(s):` header
-                .map(|line| line.trim().trim_start_matches("- "))
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
+    bag.into_result().map(|()| (network, notices))
 }
 
 /// Names of the `[network]` fields, as the config spells them, whose reloaded
