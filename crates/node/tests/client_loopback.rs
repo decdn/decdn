@@ -11048,10 +11048,6 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
     let (target, server_eth_addr, server_ep, server_task, metrics) =
         spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
 
-    // Baseline AFTER setup, so the assertion below isolates origin reads caused
-    // by THIS request.
-    let baseline_bytes = cache_metrics.pull_through_bytes.get();
-
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
 
@@ -11069,12 +11065,9 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
     .await;
     assert_foreign_declined(res, &metrics)?;
     anyhow::ensure!(
-        cache_metrics.pull_through_bytes.get() == baseline_bytes
-            && cache_metrics.origin_fetches.get() == 0,
-        "the cache-hit gate must not read the origin, got {} bytes beyond baseline {} \
-         and {} origin fetches",
+        cache_metrics.pull_through_bytes.get() == 0 && cache_metrics.origin_fetches.get() == 0,
+        "a foreign decline must not pull through the origin, got {} bytes and {} fetches",
         cache_metrics.pull_through_bytes.get(),
-        baseline_bytes,
         cache_metrics.origin_fetches.get()
     );
 
