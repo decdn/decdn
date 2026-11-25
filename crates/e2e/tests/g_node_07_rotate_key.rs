@@ -447,10 +447,10 @@ async fn run_unbound() -> anyhow::Result<()> {
         "the repair must clear the flag"
     );
 
-    // ---- 4. A second `--bind-existing` is refused rather than burning a
-    // binding nonce on a no-op. The state is already correct, and a command that
+    // ---- 4. A second `--bind-existing` is refused rather than sending a
+    // no-op transaction. The state is already correct, and a command that
     // reported success here would teach an operator that re-running is a way to
-    // "make sure" — which on a nonce-consuming call it is not.
+    // "make sure".
     let noop = run_node_cli_raw(
         &node,
         &[

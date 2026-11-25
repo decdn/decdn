@@ -7,24 +7,21 @@
 //! Ethereum address, and uses it for voucher attribution for the connection's
 //! lifetime. The binding is not stored on-chain.
 //!
-//! The signed payload follows ADR 003 §Binding Message Format exactly so an
-//! off-chain Rust verification byte-matches what the on-chain `CapacityBond`
-//! contract accepts:
+//! The signed payload follows ADR 003 §Binding Message Format:
 //!
 //! ```text
 //! BindNodeId(bytes32 nodeId,uint64 nonce)
 //! ```
 //!
-//! Ephemeral client bindings always sign `nonce = 0` (the on-chain registration
-//! path uses the per-address `bindingNonce`, a distinct domain of values).
+//! Ephemeral client bindings always sign `nonce = 0`.
 //!
 //! # Domain
 //!
-//! The EIP-712 domain is the `CapacityBond` contract deployment
-//! (`EIP712("CapacityBond", "1")`, see `contracts/src/CapacityBond.sol`), so an
-//! ephemeral binding is bound to the same chain + contract as on-chain
-//! registration, preventing cross-chain / cross-contract replay (ADR 003
-//! §Binding Message Format).
+//! The EIP-712 domain names the `CapacityBond` deployment (name
+//! `"CapacityBond"`, version `"1"`, its chain id and address), so a binding is
+//! bound to one network deployment, preventing cross-chain replay (ADR 003
+//! §Binding Message Format). The domain is an off-chain namespace: no contract
+//! verifies these signatures.
 //!
 //! # Scope
 //!
@@ -39,23 +36,21 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, B256, Signature};
 use alloy::sol_types::{SolStruct, eip712_domain};
 
-/// EIP-712 domain `name` field for the `CapacityBond` deployment. Must match
-/// `EIP712("CapacityBond", "1")` in `contracts/src/CapacityBond.sol` — a
-/// mismatch produces a different digest and every binding fails to recover the
-/// expected address.
+/// EIP-712 domain `name` field for the `CapacityBond` deployment. Signer and
+/// verifier must agree on it: a mismatch produces a different digest and every
+/// signature fails to recover the expected address.
 pub const CAPACITY_BOND_DOMAIN_NAME: &str = "CapacityBond";
 
 /// EIP-712 domain `version` field.
 pub const CAPACITY_BOND_DOMAIN_VERSION: &str = "1";
 
 /// `nonce` value for ephemeral (off-chain) client bindings (ADR 003 §Off-Chain
-/// Ephemeral Binding). On-chain registration uses the per-address
-/// `bindingNonce` instead.
+/// Ephemeral Binding).
 pub const EPHEMERAL_BINDING_NONCE: u64 = 0;
 
 // Solidity struct mirroring ADR 003 §Binding Message Format. The `sol!` macro
-// uses the Rust struct name as the on-chain Solidity type name; the contract's
-// struct is `BindNodeId`, wrapped in a private module to keep the name local.
+// uses the Rust struct name as the Solidity type name, so it is wrapped in a
+// private module to keep the name local.
 mod sol_types {
     alloy::sol! {
         #[allow(non_snake_case, missing_debug_implementations)]
@@ -63,25 +58,14 @@ mod sol_types {
             bytes32 nodeId;
             uint64 nonce;
         }
-        // ADR 019 § Terms Acceptance — the registration binding signature
-        // additionally commits to the accepted `termsHash`. Distinct typehash
-        // from `BindNodeId`: rebinding (key rotation) stays on `BindNodeId` and
-        // does not re-accept terms.
-        #[allow(non_snake_case, missing_debug_implementations)]
-        struct RegisterNode {
-            bytes32 nodeId;
-            uint64 nonce;
-            bytes32 termsHash;
-        }
     }
 }
 
 use sol_types::BindNodeId as BindNodeIdSol;
-use sol_types::RegisterNode as RegisterNodeSol;
 
 /// Construct the `CapacityBond` EIP-712 domain for a given deployment.
 ///
-/// Every operator signature shares it: `BindNodeId` and `RegisterNode` here,
+/// Every off-chain operator and client signature shares it: `BindNodeId` here,
 /// the `StreamResponse` signature ([`crate::stream_sig`]) and the
 /// `OriginAttestation` ([`crate::origin_attestation`]). Each signs a distinct
 /// type name, so no signature verifies as another type.
@@ -95,35 +79,13 @@ pub fn capacity_bond_domain(chain_id: u64, verifying_contract: Address) -> Eip71
     }
 }
 
-/// EIP-712 signing hash for a `BindNodeId(nodeId, nonce)` under `domain`.
-///
-/// Used for the ephemeral client binding (ADR 003 §Off-Chain Ephemeral Binding)
-/// and on-chain rebinding (`bindNodeId`, key rotation). Initial node
-/// registration signs [`register_node_signing_hash`] instead.
+/// EIP-712 signing hash for a `BindNodeId(nodeId, nonce)` under `domain`: the
+/// ephemeral client binding (ADR 003 §Off-Chain Ephemeral Binding).
 #[must_use]
 pub fn binding_signing_hash(node_id: B256, nonce: u64, domain: &Eip712Domain) -> B256 {
     BindNodeIdSol {
         nodeId: node_id,
         nonce,
-    }
-    .eip712_signing_hash(domain)
-}
-
-/// EIP-712 signing hash for a `RegisterNode(nodeId, nonce, termsHash)` under
-/// `domain` — the initial on-chain node registration binding (ADR 019 § Terms
-/// Acceptance). `terms_hash` MUST equal the contract's `currentTermsHash`, and
-/// the signature cryptographically binds the operator's acceptance to it.
-#[must_use]
-pub fn register_node_signing_hash(
-    node_id: B256,
-    nonce: u64,
-    terms_hash: B256,
-    domain: &Eip712Domain,
-) -> B256 {
-    RegisterNodeSol {
-        nodeId: node_id,
-        nonce,
-        termsHash: terms_hash,
     }
     .eip712_signing_hash(domain)
 }
@@ -156,8 +118,8 @@ pub fn verify_binding(
         });
     }
     let sig = Signature::from_raw(signature).map_err(|_| BindError::Malformed)?;
-    // Reject non-canonical high-`s` so the off-chain accept-set matches the
-    // on-chain verifiable-set (#836).
+    // Reject non-canonical high-`s` so each binding has one canonical
+    // signature (#836).
     if crate::sig_canon::is_high_s(&sig) {
         return Err(BindError::Malformed);
     }

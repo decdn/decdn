@@ -671,10 +671,8 @@ fn build_summary_register_submitted() {
         chain_id: 42,
         capacity_bond: Address::repeat_byte(0x22),
         region: "DE".to_string(),
-        binding_nonce: 0,
         registration_nonce: 0,
         multiaddr_count: 1,
-        binding_sig: vec![0x11; 65],
         ed25519_sig: vec![0x22; 64],
         tx: Some(B256::repeat_byte(0x55)),
     };

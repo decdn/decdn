@@ -1,7 +1,9 @@
 //! Off-chain construction of the `CapacityBond.registerNode` signing inputs
 //! (ADR 019 § Step 2.3).
 //!
-//! Two byte-exact encodings the on-chain `CapacityBond` depends on:
+//! The Ethereum key authenticates registration as the transaction sender, so
+//! it signs nothing else. Two byte-exact encodings the on-chain `CapacityBond`
+//! depends on:
 //!
 //! - [`ownership_message_digest`] reproduces
 //!   `CapacityBond._verifyEd25519OwnershipSignature`'s message hash
@@ -17,10 +19,6 @@
 //!   is the authority for the format. [`unpack_multiaddrs`] is its inverse,
 //!   read back only by `decdn node rotate-key --key eth` when it re-registers
 //!   an operator's existing addresses from a new Ethereum address.
-//!
-//! The EIP-712 `BindNodeId` half of registration lives in [`crate::bind_sig`]
-//! and is reused as-is — `binding_signing_hash` produces the digest the
-//! operator signs with the Ethereum key.
 
 use alloy::primitives::{Address, B256, U256, keccak256};
 

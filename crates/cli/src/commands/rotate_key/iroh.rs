@@ -46,15 +46,14 @@ use std::path::{Path, PathBuf};
 
 use alloy::primitives::{Address, B256, Bytes};
 use alloy::providers::Provider;
-use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent as _;
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::identity::{self, StagedNodeKey};
 use decdn_incentive::capacity_bond::CapacityBond;
+use decdn_incentive::node_register;
 use decdn_incentive::tx::SendOutcome;
-use decdn_incentive::{bind_sig, node_register};
 
 use crate::commands::chain_ctx;
 use crate::commands::rotate_key::confirm_or_bail;
@@ -120,15 +119,12 @@ pub(crate) async fn run(
     // the hash rather than read as "nothing happened".
     let mut outcome = SendOutcome::NotSent;
     let sent = decdn_incentive::tx::send_for_receipt(
-        CapacityBond::new(cb_addr, &provider).bindNodeId(
-            plan.new_node_id,
-            Bytes::from(plan.binding_sig.clone()),
-            Bytes::from(plan.ed25519_sig.clone()),
-        ),
+        CapacityBond::new(cb_addr, &provider)
+            .bindNodeId(plan.new_node_id, Bytes::from(plan.ed25519_sig.clone())),
         "bindNodeId",
         Some(
-            "most likely the binding nonce advanced under a concurrent registration, the new \
-             nodeId is already bound to another address, or a signature digest was mis-built",
+            "most likely the new nodeId is already bound to another address, or the ownership \
+             digest was mis-built",
         ),
         &mut outcome,
     )
@@ -249,7 +245,7 @@ fn gate_and_install(
             // operator`, so this is the one post-send path where the chain
             // definitely names this key. Park it rather than destroy it: recovery
             // becomes a `mv` instead of a second
-            // `bindNodeId` and another binding nonce. That matters most in
+            // `bindNodeId`. That matters most in
             // `install_staged`'s worst branch, which can leave `node.secret`
             // MISSING — where `--bind-existing` would refuse for want of a key
             // on disk.
@@ -370,8 +366,8 @@ fn park_key(key: &mut NewKey, plan: &Plan) -> Option<PathBuf> {
 /// They are not merely inert here: `--mbps` and `--region` describe a
 /// re-registration this path never performs, so silently dropping them would
 /// let an operator believe a tier or region change was applied. `--accept-terms`
-/// is the sharpest — rebinding signs the terms-free `BindNodeId` payload, so
-/// passing it suggests an acceptance that never happens.
+/// is the sharpest — rebinding names no terms, so passing it suggests an
+/// acceptance that never happens.
 fn reject_eth_only_flags(args: &cli::RotateKeyArgs) -> anyhow::Result<()> {
     let mut offenders = Vec::new();
     if args.new_keystore.is_some() {
@@ -393,7 +389,7 @@ fn reject_eth_only_flags(args: &cli::RotateKeyArgs) -> anyhow::Result<()> {
         offenders.is_empty(),
         "{} apply to `--key eth` only. Rotating the iroh node key rebinds an existing \
          registration: it does not re-register, so it changes no tier, region, or multiaddr, and \
-         signs the terms-free `BindNodeId` payload rather than re-accepting terms.",
+         does not re-accept terms.",
         offenders.join(", "),
     );
     Ok(())
@@ -540,7 +536,7 @@ impl NewKey {
     }
 }
 
-/// Everything read from chain plus the two signatures, assembled before the
+/// Everything read from chain plus the ownership signature, assembled before the
 /// confirmation gate so the operator is shown the real transaction. Owned so
 /// [`write_plan`] and [`write_disclosure`] are testable without a chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -559,17 +555,15 @@ pub(crate) struct Plan {
     /// Whether this run generated the new key (and so will replace
     /// `node.secret`) or is binding one already on disk.
     pub(crate) generated: bool,
-    pub(crate) binding_nonce: u64,
     pub(crate) registration_nonce: u64,
-    pub(crate) binding_sig: Vec<u8>,
     pub(crate) ed25519_sig: Vec<u8>,
 }
 
 /// Read the binding state, refuse the runs the contract would revert or that
-/// would be a no-op, then build both signatures.
+/// would be a no-op, then build the ownership signature.
 ///
-/// Nonces are read even on a dry run: they are inputs to the digests, and a
-/// preview that signed over invented nonces would not be a preview of anything.
+/// The nonce is read even on a dry run: it is an input to the digest, and a
+/// preview that signed over an invented nonce would not be a preview of anything.
 async fn build_plan<P: Provider + Clone>(
     provider: &P,
     signer: &PrivateKeySigner,
@@ -597,8 +591,8 @@ async fn build_plan<P: Provider + Clone>(
     let new_node_id = new_key.node_id();
     anyhow::ensure!(
         new_node_id != old_node_id,
-        "the key {} is already the one bound on-chain, so binding it again would consume a \
-         binding nonce and change nothing.{}",
+        "the key {} is already the one bound on-chain, so binding it again would change \
+         nothing.{}",
         new_node_id,
         if bind_existing {
             " The local key and the on-chain binding already agree — this node is not in the \
@@ -633,11 +627,6 @@ async fn build_plan<P: Provider + Clone>(
         .call()
         .await
         .with_context(|| ctx("getNodeByAddress"))?;
-    let binding_nonce = bond
-        .bindingNonce(operator)
-        .call()
-        .await
-        .with_context(|| ctx("bindingNonce"))?;
     // Keyed on the NEW id. Usually 0 for a fresh key, but not necessarily — an
     // id that was bound and unbound before carries a bumped nonce, and signing
     // over 0 there reverts `InvalidEd25519Signature`.
@@ -646,14 +635,6 @@ async fn build_plan<P: Provider + Clone>(
         .call()
         .await
         .with_context(|| ctx("registrationNonce"))?;
-
-    // EIP-712 binding signature (Ethereum key) over the terms-free `BindNodeId`
-    // payload. NOT `register_node_signing_hash`: that typehash additionally
-    // commits to `termsHash`, and rebinding deliberately does not re-accept
-    // terms (ADR 019 § enforcement at registration only).
-    let domain = bind_sig::capacity_bond_domain(chain_id, cb_addr);
-    let bind_hash = bind_sig::binding_signing_hash(new_node_id, binding_nonce, &domain);
-    let binding_sig = signer.sign_hash_sync(&bind_hash)?.as_bytes().to_vec();
 
     // ed25519 ownership proof, signed by the key being bound over the contract's
     // digest. The operator address is inside the preimage, so the proof cannot
@@ -674,9 +655,7 @@ async fn build_plan<P: Provider + Clone>(
         active: info.active,
         new_node_id,
         generated: new_key.generated(),
-        binding_nonce,
         registration_nonce,
-        binding_sig,
         ed25519_sig,
     })
 }
@@ -833,7 +812,7 @@ pub(crate) fn write_plan(
     // for `MaybeBroadcast` — a send whose broadcast is unknown, which may still
     // have put the transaction in the mempool. Collapsing them told a `--json` wrapper
     // "nothing happened" on the one path that also parks a key, inviting a
-    // re-run that double-submits over the same binding nonce.
+    // re-run that double-submits the same rebinding.
     let in_flight_unknown = maybe_effected && tx.is_none();
     let tx_hex = tx.map(|v| format!("{v:#x}"));
     let archived_str = archived.map(|a| a.display().to_string());
@@ -853,9 +832,7 @@ pub(crate) fn write_plan(
             "generated_key": p.generated,
             "preview_key": preview_key,
             "active": p.active,
-            "binding_nonce": p.binding_nonce,
             "registration_nonce": p.registration_nonce,
-            "binding_sig": format!("0x{}", alloy::hex::encode(&p.binding_sig)),
             "ed25519_sig": format!("0x{}", alloy::hex::encode(&p.ed25519_sig)),
             "bind_tx": tx_hex,
             "archived_key": archived_str,
@@ -871,9 +848,7 @@ pub(crate) fn write_plan(
     writeln!(w, "generated_key={}", p.generated)?;
     writeln!(w, "preview_key={preview_key}")?;
     writeln!(w, "active={}", p.active)?;
-    writeln!(w, "binding_nonce={}", p.binding_nonce)?;
     writeln!(w, "registration_nonce={}", p.registration_nonce)?;
-    writeln!(w, "binding_sig=0x{}", alloy::hex::encode(&p.binding_sig))?;
     writeln!(w, "ed25519_sig=0x{}", alloy::hex::encode(&p.ed25519_sig))?;
     match tx_hex {
         Some(h) => writeln!(w, "bind_tx={h}")?,

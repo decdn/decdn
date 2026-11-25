@@ -132,8 +132,8 @@ pub enum NodeCommand {
     Top(TopArgs),
     /// Register this node on-chain via `CapacityBond.registerNode` (ADR 019
     /// § Step 2.3). Loads the local iroh node key and Ethereum keystore,
-    /// builds the EIP-712 `bindingSignature` and the ed25519 ownership
-    /// signature locally, and submits the registration transaction. This
+    /// builds the ed25519 ownership signature locally, and submits the
+    /// registration transaction. This
     /// is the only `node` subcommand that talks to the chain rather than a
     /// running node's admin RPC.
     ///
@@ -823,8 +823,7 @@ pub struct RotateKeyArgs {
     /// (`--key eth`) Accept the network's current operator terms
     /// non-interactively. Re-registration from a new address is a fresh
     /// registration, so it re-accepts terms (ADR 019 § Terms Acceptance);
-    /// `--key iroh` never does, because rebinding signs the terms-free
-    /// `BindNodeId` payload.
+    /// `--key iroh` never does, because rebinding names no terms.
     #[arg(long = "accept-terms")]
     pub accept_terms: bool,
 

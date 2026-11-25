@@ -64,10 +64,8 @@ fn sample_outcome(tx: Option<B256>) -> RegisterOutcome {
         chain_id: 31337,
         capacity_bond: Address::repeat_byte(0x01),
         region: "DE".to_string(),
-        binding_nonce: 0,
         registration_nonce: 0,
         multiaddr_count: 1,
-        binding_sig: vec![0x11; 65],
         ed25519_sig: vec![0x22; 64],
         tx,
     }

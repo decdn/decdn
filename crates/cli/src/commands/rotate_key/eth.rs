@@ -610,7 +610,7 @@ async fn reonboard(
 
     // ADR 019 § Terms Acceptance — re-registration from a new address is a
     // FRESH registration, so it re-accepts terms. (`--key iroh` never does: a
-    // rebind signs the terms-free `BindNodeId` payload.)
+    // rebind names no terms.)
     let terms_hash = bond_contract
         .currentTermsHash()
         .call()

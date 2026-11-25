@@ -983,7 +983,7 @@ function registerNode(
     bytes32 nodeId,
     bytes calldata multiaddrs,
     string calldata regionHint,
-    bytes calldata bindingSignature,
+    bytes32 termsHash,                // must equal currentTermsHash (ADR 019 § Terms Acceptance)
     bytes calldata ed25519Signature   // proves caller controls nodeId's ed25519 private key
 ) external;
 
@@ -1014,7 +1014,6 @@ event NodeRegistered(
     address indexed ethAddress,
     bytes multiaddrs,
     string regionHint,
-    uint64 bindingNonce,
     uint64 registrationNonce
 );
 event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
@@ -1064,7 +1063,7 @@ Three tiers, from simplest to most scalable:
 
 `registerNode` requires an ed25519 signature proving the caller controls the private key corresponding to `nodeId`. Without this proof, an attacker could front-run legitimate registrations by calling `registerNode` with someone else's NodeId — the attacker gains no traffic (cannot complete iroh QUIC handshakes with that identity), but under the one-to-one uniqueness constraint the legitimate owner is permanently blocked from registering. Even with the ed25519 verification overhead, the total `registerNode` cost (about 1M gas plus the recoverable entry-tier capacity bond) is low enough that squatting remains a cheap griefing/DoS vector without the ownership proof.
 
-**Note:** The `bindingSignature` parameter proves the caller's Ethereum key signed the NodeId binding — it does not prove ownership of the ed25519 NodeId itself. These are orthogonal concerns: `bindingSignature` prevents a binding that the Ethereum key holder did not sign, while ed25519 ownership verification prevents NodeId squatting.
+**Note:** The Ethereum key consents to the binding when it sends the transaction, because `registerNode` binds `msg.sender`. That consent does not prove ownership of the ed25519 NodeId. The ed25519 signature proves ownership and prevents NodeId squatting.
 
 ##### Signed message
 
@@ -1074,7 +1073,7 @@ The `ed25519Signature` parameter is an ed25519 signature over:
 ed25519_sign(private_key, keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId])))
 ```
 
-Where `registrationNonce` is a per-`nodeId` counter (distinct from the per-address `bindingNonce` used for EIP-712 binding), incremented by `deregisterNode` on each deregistration. The nonce prevents replay of old signatures after a node deregisters and a different address attempts to re-register the same `nodeId`. The `block.chainid` binding prevents cross-chain signature replay.
+Where `registrationNonce` is a per-`nodeId` counter, incremented by `deregisterNode` on each deregistration. The nonce prevents replay of old signatures after a node deregisters and a different address attempts to re-register the same `nodeId`. The `block.chainid` binding prevents cross-chain signature replay.
 
 ##### On-chain verification
 
@@ -1082,7 +1081,7 @@ EVM has no native ed25519 precompile, and no such precompile is deployed on the 
 
 ##### Reclaim flow
 
-If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, deactivates the current holder's node if the reclaimed NodeId was its bound id (clearing the active flag and removing it from the active set — the bond stays in place, as with `deregisterNode`; the holder exits the bond separately via `unbond`. Unlike `deregisterNode`, reclaim does **not** clear the holder's `declaredMbps`; the displaced holder is now inactive, so they clear it with `declareMbps(0)` — see [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), clears the NodeId↔address mappings (and zeroes the holder's now-stale `NodeInfo.nodeId` so the read views stay consistent with the cleared binding), increments `registrationNonce[nodeId]`, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have a bond — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 `StreamResponse` signature ([ADR 005 § Signer binding](005-protocol.md#signer-binding)) and EIP-712 NodeId↔Ethereum binding ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
+If a NodeId was squatted (e.g., during a transition period or via a contract bug), the legitimate ed25519 key holder calls `reclaimNodeId(nodeId, ed25519Signature)`. This verifies the ed25519 signature over `keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]))`, deactivates the current holder's node if the reclaimed NodeId was its bound id (clearing the active flag and removing it from the active set — the bond stays in place, as with `deregisterNode`; the holder exits the bond separately via `unbond`. Unlike `deregisterNode`, reclaim does **not** clear the holder's `declaredMbps`; the displaced holder is now inactive, so they clear it with `declareMbps(0)` — see [ADR 026 § Capacity-bond curve](026-tokenomics.md#capacity-bond-curve)), clears the NodeId↔address mappings (and zeroes the holder's now-stale `NodeInfo.nodeId` so the read views stay consistent with the cleared binding), increments `registrationNonce[nodeId]`, and emits `NodeIdReclaimed`. The caller can then call `registerNode` under their own address. Reclaim does not require the caller to have a bond — it only proves ed25519 key ownership and clears the squatter's binding. `reclaimNodeId` is the sole reclaim mechanism: there is no admin override. Reclaim authority is gated entirely by ed25519 wire-key ownership (the iroh NodeId private key), distinct from the secp256k1 `StreamResponse` signature ([ADR 005 § Signer binding](005-protocol.md#signer-binding)) and from the Ethereum key that sends a binding transaction ([§ NodeId-to-Ethereum Binding](#nodeid-to-ethereum-binding)).
 
 ## Admission and Priority
 
@@ -1093,33 +1092,28 @@ Node admission and queueing policy — how a node decides which requests to serv
 
 ## NodeId-to-Ethereum Binding
 
-The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for pool and lane association and to attribute signed responses to a node ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). Two orthogonal signature mechanisms protect this mapping: the EIP-712 `bindingSignature` (secp256k1) proves the Ethereum key holder consents to the association — preventing a binding that the key holder did not sign; the `ed25519Signature` ([§ NodeId Ownership Verification](#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the registration — preventing NodeId squatting.
+The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public keys) and Ethereum addresses (secp256k1-derived). This binding is used for pool and lane association and to attribute signed responses to a node ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). Two checks protect this mapping. The Ethereum key holder consents to the association by sending the binding transaction: the contract binds `msg.sender` and no other address. The `ed25519Signature` ([§ NodeId Ownership Verification](#nodeid-ownership-verification)) proves the NodeId's private key holder authorized the binding. This prevents NodeId squatting.
 
 ### Binding Message Format
 
-The binding uses EIP-712 typed structured data, signed by the Ethereum private key. Two typed structs share the per-address `nonce` counter: initial registration signs `RegisterNode`, which additionally binds the operator's acceptance of the current operator terms ([ADR 019 § Operator Safety Obligations](019-node-onboarding.md#operator-safety-obligations)); rebinding (key rotation) signs the narrower `BindNodeId`.
+The off-chain client binding ([§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients)) uses EIP-712 typed structured data, signed by the Ethereum private key:
 
-```solidity
-bytes32 constant REGISTER_NODE_TYPEHASH = keccak256(
-    "RegisterNode(bytes32 nodeId,uint64 nonce,bytes32 termsHash)"
-);
-
-bytes32 constant BIND_NODE_TYPEHASH = keccak256(
-    "BindNodeId(bytes32 nodeId,uint64 nonce)"
-);
+```
+BindNodeId(bytes32 nodeId,uint64 nonce)
 ```
 
 Where:
 
 - `nodeId`: the 32-byte ed25519 public key (iroh `NodeId`)
-- `nonce`: a monotonic counter per Ethereum address, preventing replay of revoked bindings
-- `termsHash`: the operator-terms hash the caller accepts, which must equal the governance-canonical `currentTermsHash` (registration only; see [ADR 019 § Operator Safety Obligations](019-node-onboarding.md#operator-safety-obligations))
+- `nonce`: always `0` for an ephemeral binding
 
-The EIP-712 domain separator is the same as the `CapacityBond` contract deployment (chain ID + contract address), preventing cross-chain and cross-contract replay. Terms acceptance is enforced at registration only, so rotating a NodeId through `bindNodeId` neither carries nor re-checks `termsHash`.
+The EIP-712 domain names the `CapacityBond` deployment (name `"CapacityBond"`, version `"1"`, chain ID, contract address). This prevents cross-chain replay. The domain is an off-chain namespace: no contract verifies this signature.
+
+On-chain binding takes no EIP-712 signature. `msg.sender` authenticates the Ethereum key.
 
 ### On-Chain Registration
 
-Node registration and NodeId binding are atomic. `CapacityBond.registerNode()` ([§ Node Registry](#node-registry)) accepts a `termsHash` parameter, a `bindingSignature` parameter — an EIP-712 signature over `RegisterNode(nodeId, bindingNonce[msg.sender], termsHash)` — and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [§ NodeId Ownership Verification](#nodeid-ownership-verification)). It requires `termsHash == currentTermsHash`, verifies both signatures, writes the `nodeIdToAddress`/`addressToNodeId` mappings, emits `TermsAccepted(nodeId, termsHash, timestamp)`, and increments `bindingNonce[msg.sender]` in the same transaction that adds the node to the mesh. The per-address nonce counter is shared with `bindNodeId`, giving replay protection across both paths; the distinct typehash keeps a registration signature from being replayed as a bare rebind. This eliminates the window in which a node could be active without a binding that attributes its signed responses.
+Node registration and NodeId binding are atomic. `CapacityBond.registerNode()` ([§ Node Registry](#node-registry)) accepts a `termsHash` parameter and an `ed25519Signature` parameter proving ownership of the NodeId's ed25519 private key (see [§ NodeId Ownership Verification](#nodeid-ownership-verification)). It requires `termsHash == currentTermsHash`, verifies the ed25519 signature, writes the `nodeIdToAddress`/`addressToNodeId` mappings, and emits `TermsAccepted(nodeId, termsHash, timestamp)` in the same transaction that adds the node to the mesh. This eliminates the window in which a node could be active without a binding that attributes its signed responses.
 
 The standalone `CapacityBond.bindNodeId()` function below remains available for **rebinding only** (key rotation after initial registration). It is not needed at initial registration time.
 
@@ -1131,7 +1125,6 @@ This creates an authoritative, publicly queryable mapping:
 // CapacityBond additions
 mapping(bytes32 => address) public nodeIdToAddress;
 mapping(address => bytes32) public addressToNodeId;
-mapping(address => uint64) public bindingNonce;
 
 // Bundled per-operator binding + activity view (off-chain origin discovery;
 // ADR 016 § Off-Chain Read API, ADR 022 § Origin discovery). `nodeId` is
@@ -1158,25 +1151,15 @@ function isActive(address operator) external view returns (bool);
 
 // Intended for rebinding (key rotation) only — initial binding is performed
 // atomically inside registerNode(). Like registerNode, bindNodeId requires
-// BOTH the EIP-712 binding signature (Ethereum-key consent) AND an ed25519
-// proof of the new NodeId's ownership. The ed25519 requirement is deliberate:
-// without it, an EIP-712-only rebinding would re-open the squatting vector
-// that registerNode's ed25519 check closes (an attacker could bind an unbound
-// NodeId they don't own, blocking the legitimate owner's registerNode). With
-// the proof required on every binding path, no NodeId can be bound without
-// proving ownership, so squatting is impossible and reclaimNodeId is a
-// defense-in-depth backstop (for legacy / buggy bindings) rather than a
-// routine remedy. Calling this before registerNode is permitted but only
-// records a binding without mesh membership or bond.
-function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calldata ed25519Signature) external {
-    uint64 nonce = bindingNonce[msg.sender];
-    bytes32 digest = keccak256(abi.encodePacked(
-        "\x19\x01",
-        DOMAIN_SEPARATOR,
-        keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce))
-    ));
-    require(SignatureChecker.isValidSignatureNow(msg.sender, digest, bindingSignature), "invalid binding signature");
-
+// an ed25519 proof of the new NodeId's ownership. Without it, a rebinding
+// would re-open the squatting vector that registerNode's ed25519 check closes
+// (an attacker could bind an unbound NodeId they don't own, blocking the
+// legitimate owner's registerNode). With the proof required on every binding
+// path, no NodeId can be bound without proving ownership, so squatting is
+// impossible and reclaimNodeId is a defense-in-depth backstop (for buggy
+// bindings) rather than a routine remedy. Calling this before registerNode is
+// permitted but only records a binding without mesh membership or bond.
+function bindNodeId(bytes32 nodeId, bytes calldata ed25519Signature) external {
     // Prove ownership of the new NodeId's ed25519 key (same message preimage
     // as registerNode; see § NodeId Ownership Verification).
     bytes32 ed25519Msg = keccak256(abi.encodePacked(nodeId, msg.sender, block.chainid, registrationNonce[nodeId]));
@@ -1198,22 +1181,19 @@ function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calld
 
     nodeIdToAddress[nodeId] = msg.sender;
     addressToNodeId[msg.sender] = nodeId;
-    bindingNonce[msg.sender] = nonce + 1;
 
     // Keep the registration record consistent for an already-active node.
     if (nodes[msg.sender].active) {
         nodes[msg.sender].nodeId = nodeId;
     }
 
-    emit NodeIdBound(msg.sender, nodeId, nonce);
+    emit NodeIdBound(msg.sender, nodeId);
 }
 
 function resolveNodeId(bytes32 nodeId) external view returns (address) {
     return nodeIdToAddress[nodeId];
 }
 ```
-
-> **Note on EIP-712 signature:** Redundant for direct on-chain calls (`msg.sender` already authenticates the caller) but retained for: (1) future meta-transaction/relayer patterns where a third party submits the binding on the operator's behalf; (2) atomic binding inside `registerNode`, where the signature supplies the explicit cryptographic consent to associate a specific NodeId with the calling address (`registerNode` writes the mapping on behalf of `msg.sender`).
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
@@ -1223,12 +1203,12 @@ Clients without on-chain registration MAY include a signed binding in their `Str
 
 | Role | On-chain binding required? | Rationale |
 | --- | --- | --- |
-| Node (bonded) | **Yes** — `registerNode` performs binding atomically via `bindingSignature` (EIP-712, proves Ethereum key consent) and `ed25519Signature` (proves NodeId ownership) | Signed responses are attributed through the on-chain NodeId→address mapping; atomic binding eliminates gap; ed25519 proof prevents NodeId squatting |
+| Node (bonded) | **Yes** — `registerNode` binds `msg.sender` atomically and checks `ed25519Signature` (proves NodeId ownership) | Signed responses are attributed through the on-chain NodeId→address mapping; atomic binding eliminates gap; ed25519 proof prevents NodeId squatting |
 | Client (opening a pool) | No — the pool `owner` and voucher `signer` fields are Ethereum addresses directly | Pool operations use Ethereum addresses, not NodeIds |
 
 ### Rebinding
 
-A node or client can rebind their Ethereum address to a new NodeId by calling `bindNodeId` (the nonce increments, invalidating the old binding). The old NodeId→address mapping is deleted. This supports key rotation scenarios (e.g., compromised iroh key). Initial binding is handled atomically by `registerNode` and does not require a separate `bindNodeId` call.
+A node or client can rebind their Ethereum address to a new NodeId by calling `bindNodeId`. The old NodeId→address mapping is deleted. This supports key rotation scenarios (e.g., compromised iroh key). Initial binding is handled atomically by `registerNode` and does not require a separate `bindNodeId` call.
 
 ## Decimal Handling
 

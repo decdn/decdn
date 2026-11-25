@@ -101,7 +101,7 @@ pub mod voucher;
 
 pub use bind_sig::{
     BindError, CAPACITY_BOND_DOMAIN_NAME, CAPACITY_BOND_DOMAIN_VERSION, EPHEMERAL_BINDING_NONCE,
-    binding_signing_hash, capacity_bond_domain, register_node_signing_hash, verify_binding,
+    binding_signing_hash, capacity_bond_domain, verify_binding,
 };
 pub use buyer_pool::{
     AdvanceOutcome, BuyerLaneProgress, BuyerLoad, BuyerPoolState, BuyerPoolStore,

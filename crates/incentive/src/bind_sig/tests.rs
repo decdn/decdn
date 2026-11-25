@@ -32,26 +32,11 @@ fn round_trip_recovers_signer() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Lock the `RegisterNode` EIP-712 type hash to the contract's
-/// `REGISTER_NODE_TYPEHASH` (ADR 019 § Terms Acceptance / ADR 003 § Binding
-/// Message Format). A drift here means the off-chain registration signature
-/// no longer verifies on-chain.
-#[test]
-fn register_node_type_hash_matches_contract() {
-    use alloy::primitives::keccak256;
-    let canonical: &[u8] = b"RegisterNode(bytes32 nodeId,uint64 nonce,bytes32 termsHash)";
-    assert_eq!(
-        keccak256(RegisterNodeSol::eip712_root_type().as_bytes()),
-        keccak256(canonical),
-        "RegisterNode type hash drifted from CapacityBond.REGISTER_NODE_TYPEHASH"
-    );
-}
-
 #[test]
 fn high_s_binding_signature_rejected() -> anyhow::Result<()> {
-    // The high-`s` twin of a valid binding recovers the same signer
-    // off-chain but reverts on-chain; reject it to keep the accept-set
-    // aligned with the on-chain verifiable-set (#836).
+    // The high-`s` twin of a valid binding recovers the same signer; reject
+    // it so each binding has one canonical signature, as every other EIP-712
+    // signature in the protocol does (#836).
     let signer = PrivateKeySigner::random();
     let domain = sample_domain();
     let node_id = B256::repeat_byte(0xAB);

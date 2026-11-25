@@ -35,7 +35,6 @@ fn bound_log(emitter: Address, operator: Address, node_id: B256) -> alloy::rpc::
     let event = CapacityBond::NodeIdBound {
         ethAddress: operator,
         nodeId: node_id,
-        bindingNonce: 3,
     };
     alloy::rpc::types::Log {
         inner: alloy::primitives::Log {
@@ -242,9 +241,7 @@ fn plan(generated: bool, active: bool) -> Plan {
         active,
         new_node_id: B256::repeat_byte(0x22),
         generated,
-        binding_nonce: 3,
         registration_nonce: 0,
-        binding_sig: vec![0xAA; 65],
         ed25519_sig: vec![0xBB; 64],
     }
 }

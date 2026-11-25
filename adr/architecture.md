@@ -161,7 +161,7 @@ Numeric per-ADR index.
 - A node cannot earn without delivering verifiable bytes — BLAKE3 hash mismatch voids payment
 - A node cannot join the peer mesh without bonding — prevents free-riders and ties each slot to a bond proportional to declared capacity
 - A node cannot register without bonding — `CapacityBond` enforces `bond >= bond_required(declared_capacity_Mbps)` via the `bond = k × Mbps^α` curve before accepting a `register` call
-- A node cannot register without binding — `registerNode` atomically writes the NodeId-to-address mapping via EIP-712 signature, so every signed response of an active node is attributable to its operator address
+- A node cannot register without binding — `registerNode` atomically writes the NodeId-to-address mapping for `msg.sender`, so every signed response of an active node is attributable to its operator address
 - A node cannot register a NodeId it does not control — `registerNode` verifies an ed25519 signature proving ownership of the NodeId's private key, preventing squatting ([ADR 003 § NodeId Ownership Verification](003-payments.md#nodeid-ownership-verification))
 - A payment pool amortizes on-chain costs across every node and signer it backs; per-MB payments are off-chain vouchers, redeemed per node
 - Safety bounds on all governable parameters are hardcoded — governance cannot set fees to 100% or stake to zero (see [ADR 009](009-governance.md#adr-009-governance-model))
