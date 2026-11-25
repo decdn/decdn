@@ -35,9 +35,9 @@ use decdn_cache::{
 use decdn_client::LocalPullFault;
 use decdn_client::{PoolContext, Recovery};
 use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    StreamSigData, Voucher, binding_signing_hash, capacity_bond_domain, min_payment,
-    signed_to_wire_voucher, voucher_domain,
+    LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, StreamSigData, Voucher,
+    binding_signing_hash, capacity_bond_domain, min_payment, signed_to_wire_voucher,
+    voucher_domain,
 };
 use decdn_node::buyer_pool::{OpenReported, PoolOpenPending, PoolOpener};
 use decdn_node::dht::attestation::test_support;
@@ -6528,7 +6528,7 @@ async fn leaf_ranged_paid_pull(
         .await
         .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
 
-    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(leaf_node_id, &binding_dom());
     let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
     let ext = StreamRequestExt {
         binding: Some(ClientBinding {
@@ -6822,7 +6822,7 @@ async fn leaf_paced_pull_mode(
         .await
         .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
 
-    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(leaf_node_id, &binding_dom());
     let binding_signature = leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec();
     let ext = StreamRequestExt {
         binding: Some(ClientBinding {
@@ -9484,7 +9484,7 @@ async fn leaf_opens_paid_stream(
         .await
         .map_err(|e| anyhow::anyhow!("leaf open_bi: {e}"))?;
 
-    let binding_hash = binding_signing_hash(leaf_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(leaf_node_id, &binding_dom());
     let binding_signature = {
         use alloy::signers::SignerSync;
         leaf_eth.sign_hash_sync(&binding_hash)?.as_bytes().to_vec()

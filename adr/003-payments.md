@@ -1099,13 +1099,10 @@ The protocol requires a verifiable mapping between iroh NodeIds (ed25519 public 
 The off-chain client binding ([§ Off-Chain (Ephemeral) Binding for Clients](#off-chain-ephemeral-binding-for-clients)) uses EIP-712 typed structured data, signed by the Ethereum private key:
 
 ```
-BindNodeId(bytes32 nodeId,uint64 nonce)
+BindNodeId(bytes32 nodeId)
 ```
 
-Where:
-
-- `nodeId`: the 32-byte ed25519 public key (iroh `NodeId`)
-- `nonce`: always `0` for an ephemeral binding
+Where `nodeId` is the 32-byte ed25519 public key (iroh `NodeId`). The binding carries no nonce: the node applies it only to the authenticated connection whose remote id is `nodeId` ([ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model)).
 
 The EIP-712 domain names the `CapacityBond` deployment (name `"CapacityBond"`, version `"1"`, chain ID, contract address). This prevents cross-chain replay. The domain is an off-chain namespace: no contract verifies this signature.
 
@@ -1197,7 +1194,7 @@ function resolveNodeId(bytes32 nodeId) external view returns (address) {
 
 ### Off-Chain (Ephemeral) Binding for Clients
 
-Clients without on-chain registration MAY include a signed binding in their `StreamRequest` to attest a NodeId↔Ethereum-address mapping for the connection's lifetime. The node verifies the EIP-712 signature over `BindNodeId(nodeId, nonce=0)` by recovering the signer from the fixed 65-byte form and comparing it against the claimed address. A smart-account binding is rejected fail-closed, so a client binds and signs with an EOA; a Safe funder is served through a capability-delegated EOA `signer` instead ([ADR 024 § Off-Chain Signature Verification — EOA Recovery Only](024-account-abstraction.md#off-chain-signature-verification--eoa-recovery-only)). The verified address is cached for the connection's lifetime and acts as a gate, not as an attribution source: the node refuses a request whose voucher `signer` is not the bound address, before any bytes are delivered, since that signer's vouchers would fail verification against the address it authenticated as. The address a voucher must recover to is the capability-authorized `signer` for the pool ([§ PaymentPool](#paymentpool)). This ephemeral binding is not stored on-chain and is valid only for the session. Wire-format details are in [ADR 005](005-protocol.md#client-identity-binding).
+Clients without on-chain registration MAY include a signed binding in their `StreamRequest` to attest a NodeId↔Ethereum-address mapping for the connection's lifetime. The node verifies the EIP-712 signature over `BindNodeId(nodeId)` by recovering the signer from the fixed 65-byte form and comparing it against the claimed address. A smart-account binding is rejected fail-closed, so a client binds and signs with an EOA; a Safe funder is served through a capability-delegated EOA `signer` instead ([ADR 024 § Off-Chain Signature Verification — EOA Recovery Only](024-account-abstraction.md#off-chain-signature-verification--eoa-recovery-only)). The verified address is cached for the connection's lifetime and acts as a gate, not as an attribution source: the node refuses a request whose voucher `signer` is not the bound address, before any bytes are delivered, since that signer's vouchers would fail verification against the address it authenticated as. The address a voucher must recover to is the capability-authorized `signer` for the pool ([§ PaymentPool](#paymentpool)). This ephemeral binding is not stored on-chain and is valid only for the session. Wire-format details are in [ADR 005](005-protocol.md#client-identity-binding).
 
 ### Binding Requirements by Role
 

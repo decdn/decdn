@@ -10,10 +10,11 @@
 //! The signed payload follows ADR 003 §Binding Message Format:
 //!
 //! ```text
-//! BindNodeId(bytes32 nodeId,uint64 nonce)
+//! BindNodeId(bytes32 nodeId)
 //! ```
 //!
-//! Ephemeral client bindings always sign `nonce = 0`.
+//! The binding needs no nonce: the node applies it only to the authenticated
+//! QUIC connection whose remote id is `nodeId`.
 //!
 //! # Domain
 //!
@@ -44,10 +45,6 @@ pub const CAPACITY_BOND_DOMAIN_NAME: &str = "CapacityBond";
 /// EIP-712 domain `version` field.
 pub const CAPACITY_BOND_DOMAIN_VERSION: &str = "1";
 
-/// `nonce` value for ephemeral (off-chain) client bindings (ADR 003 §Off-Chain
-/// Ephemeral Binding).
-pub const EPHEMERAL_BINDING_NONCE: u64 = 0;
-
 // Solidity struct mirroring ADR 003 §Binding Message Format. The `sol!` macro
 // uses the Rust struct name as the Solidity type name, so it is wrapped in a
 // private module to keep the name local.
@@ -56,7 +53,6 @@ mod sol_types {
         #[allow(non_snake_case, missing_debug_implementations)]
         struct BindNodeId {
             bytes32 nodeId;
-            uint64 nonce;
         }
     }
 }
@@ -79,25 +75,20 @@ pub fn capacity_bond_domain(chain_id: u64, verifying_contract: Address) -> Eip71
     }
 }
 
-/// EIP-712 signing hash for a `BindNodeId(nodeId, nonce)` under `domain`: the
+/// EIP-712 signing hash for a `BindNodeId(nodeId)` under `domain`: the
 /// ephemeral client binding (ADR 003 §Off-Chain Ephemeral Binding).
 #[must_use]
-pub fn binding_signing_hash(node_id: B256, nonce: u64, domain: &Eip712Domain) -> B256 {
-    BindNodeIdSol {
-        nodeId: node_id,
-        nonce,
-    }
-    .eip712_signing_hash(domain)
+pub fn binding_signing_hash(node_id: B256, domain: &Eip712Domain) -> B256 {
+    BindNodeIdSol { nodeId: node_id }.eip712_signing_hash(domain)
 }
 
 /// Verify an ephemeral client binding and recover the attesting Ethereum
 /// address (EOA `ecrecover`).
 ///
 /// `node_id` is the client's 32-byte iroh `NodeId` (the connection's
-/// authenticated remote id); `nonce` is [`EPHEMERAL_BINDING_NONCE`] for
-/// off-chain bindings. The recovered address is what the node uses for voucher
-/// attribution; the caller MUST further check it equals the lane's `signer`
-/// before accepting vouchers.
+/// authenticated remote id). The recovered address is what the node uses for
+/// voucher attribution; the caller MUST further check it equals the lane's
+/// `signer` before accepting vouchers.
 ///
 /// # Errors
 ///
@@ -106,7 +97,6 @@ pub fn binding_signing_hash(node_id: B256, nonce: u64, domain: &Eip712Domain) ->
 ///   invalid recovery id, so no address can be recovered.
 pub fn verify_binding(
     node_id: B256,
-    nonce: u64,
     signature: &[u8],
     domain: &Eip712Domain,
 ) -> Result<Address, BindError> {
@@ -123,7 +113,7 @@ pub fn verify_binding(
     if crate::sig_canon::is_high_s(&sig) {
         return Err(BindError::Malformed);
     }
-    let hash = binding_signing_hash(node_id, nonce, domain);
+    let hash = binding_signing_hash(node_id, domain);
     sig.recover_address_from_prehash(&hash)
         .map_err(|_| BindError::Malformed)
 }

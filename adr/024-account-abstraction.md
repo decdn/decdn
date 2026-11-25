@@ -79,7 +79,7 @@ deCDN recommends none of them. A 1-of-1 Safe carries the same trust posture as t
 
 ### Off-Chain Signature Verification — EOA Recovery Only
 
-[ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) specifies that nodes verify client ephemeral binding signatures (`BindNodeId` with `nonce=0`) off-chain, without an on-chain call.
+[ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) specifies that nodes verify client ephemeral binding signatures (`BindNodeId`) off-chain, without an on-chain call.
 
 Every signature deCDN produces or verifies off-chain — the node's `operator_sig`, client vouchers, and `BindNodeId` bindings — is the fixed 65-byte secp256k1 `r‖s‖v` form, verified by recovering the signer and comparing against the expected address. Verifiers reject any other length **fail-closed**. A smart-account signer is therefore un-servable off-chain even though the contracts accept it on-chain, and a party whose registered address is a smart account cannot be verified by recovery at all.
 
