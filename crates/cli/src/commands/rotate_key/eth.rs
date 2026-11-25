@@ -476,6 +476,11 @@ async fn select_phase<Q: Provider>(
     } else {
         args.multiaddrs.clone()
     };
+    // An oversized set (a long `--multiaddr` list, or a carried-forward set
+    // over a ceiling governance has since lowered) fails here, in the plan, so
+    // a dry run and the confirmation prompt both surface it before the terms
+    // prompt and the bond transactions.
+    register::ensure_multiaddrs_fit(bond_contract, *bond_contract.address(), &multiaddrs).await?;
 
     Ok(Phase::Reonboard {
         new_operator,
@@ -607,11 +612,6 @@ async fn reonboard(
     // swapped between the two reads would otherwise migrate the identity
     // somewhere the operator never saw.
     ensure_planned_operator(planned_operator, new_operator)?;
-
-    // An oversized set (a long `--multiaddr` list, or a carried-forward set
-    // over a ceiling governance has since lowered) fails here, before the terms
-    // prompt and the bond transactions, not as a `registerNode` revert after them.
-    register::ensure_multiaddrs_fit(&bond_contract, cb_addr, multiaddrs).await?;
 
     // ADR 019 § Terms Acceptance — re-registration from a new address is a
     // FRESH registration, so it re-accepts terms. (`--key iroh` never does: a

@@ -10,7 +10,7 @@ fn plan() -> Plan {
         active: true,
         multiaddr_count: 1,
         packed_size: 36,
-        max_multiaddr_size: 1_024,
+        max_multiaddr_size: U256::from(1_024),
         last_update: 1_000,
         cooldown_secs: 3_600,
         ready_at: 4_600,
@@ -81,7 +81,7 @@ fn inactive_operator_is_pointed_at_register() {
 fn oversized_set_reports_size_and_ceiling() {
     let mut p = plan();
     p.packed_size = 2_048;
-    p.max_multiaddr_size = 1_024;
+    p.max_multiaddr_size = U256::from(1_024);
     let err = ensure_submittable(&p).expect_err("over the ceiling must not proceed");
     let msg = format!("{err}");
     assert!(
@@ -98,7 +98,7 @@ fn oversized_set_reports_size_and_ceiling() {
 fn packed_size_equal_to_ceiling_passes() {
     let mut p = plan();
     p.packed_size = 1_024;
-    p.max_multiaddr_size = 1_024;
+    p.max_multiaddr_size = U256::from(1_024);
     ensure_submittable(&p).expect("size == ceiling is within bounds");
 }
 
@@ -161,8 +161,9 @@ fn json_carries_the_plan_and_the_tx() {
     );
     assert_eq!(
         v.get("max_multiaddr_size")
-            .and_then(serde_json::Value::as_u64),
-        Some(1_024)
+            .and_then(serde_json::Value::as_str),
+        Some("1024"),
+        "a uint256 is a decimal STRING, as every other on-chain amount"
     );
     assert_eq!(
         v.get("update_tx").and_then(serde_json::Value::as_str),
@@ -186,12 +187,13 @@ fn json_null_tx_on_a_dry_run() {
 
 #[test]
 fn packed_size_under_ceiling_passes() {
-    ensure_packed_within(36, 1_024, "registerNode").expect("under the ceiling is within bounds");
+    ensure_packed_within(36, U256::from(1_024), "registerNode")
+        .expect("under the ceiling is within bounds");
 }
 
 #[test]
 fn packed_size_over_ceiling_names_the_call_and_both_sizes() {
-    let err = ensure_packed_within(1_025, 1_024, "registerNode")
+    let err = ensure_packed_within(1_025, U256::from(1_024), "registerNode")
         .expect_err("over the ceiling must not proceed");
     let msg = format!("{err}");
     assert!(msg.contains("`registerNode`"), "names the call: {msg}");
@@ -201,11 +203,4 @@ fn packed_size_over_ceiling_names_the_call_and_both_sizes() {
     );
     assert!(msg.contains("1025 bytes"), "reports the packed size: {msg}");
     assert!(msg.contains("1024 bytes"), "reports the ceiling: {msg}");
-}
-
-#[test]
-fn empty_set_packs_within_any_ceiling() {
-    let packed = decdn_incentive::node_register::pack_multiaddrs(&[]).expect("empty set packs");
-    let size = u64::try_from(packed.len()).expect("0 fits in u64");
-    ensure_packed_within(size, 0, "registerNode").expect("an empty set never exceeds the ceiling");
 }

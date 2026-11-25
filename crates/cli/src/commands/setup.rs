@@ -450,29 +450,22 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         RegistrationStatus::AlreadyRegistered => true,
         RegistrationStatus::Due => false,
     };
-    // When a registration is due, choose the multiaddrs once, here, so a bad
-    // `network.external_addrs` entry or a set over the on-chain size ceiling
-    // fails before the terms prompt and any transaction. `multiaddrs` is `Some`
-    // exactly when `terms_hash` below is.
-    let multiaddrs = if already_registered {
+    // ---- A due registration: `Some((terms_hash, multiaddrs))`; `None` when
+    //      this key is already registered (acceptance was recorded at its own
+    //      registration). The multiaddrs are chosen once, here, so a bad
+    //      `network.external_addrs` entry or a set over the on-chain size
+    //      ceiling fails before the terms prompt and any transaction. ADR 019
+    //      § Terms Acceptance: the operator accepts the current terms *before*
+    //      any transaction, so a refusal / stale-client abort happens before
+    //      the bond is spent. ----
+    let registration = if already_registered {
         None
     } else {
         let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file)?;
         register::ensure_multiaddrs_fit(&bond_contract, cb_addr, &multiaddrs).await?;
-        Some(multiaddrs)
+        let terms_hash = accept_current_terms(&bond_contract, cb_addr, args.accept_terms).await?;
+        Some((terms_hash, multiaddrs))
     };
-
-    // ---- ADR 019 § Terms Acceptance — accept the current operator terms
-    //      *before* any transaction, so a refusal / stale-client abort happens
-    //      before the bond is spent. `Some(hash)` means "a fresh registration is
-    //      due and the operator accepted"; `None` means already registered. ----
-    let terms_hash = accept_terms_if_registering(
-        &bond_contract,
-        cb_addr,
-        already_registered,
-        args.accept_terms,
-    )
-    .await?;
 
     // ---- Confirm before submitting (unless --yes). ----
     if !args.yes
@@ -529,15 +522,12 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         }
 
         // ---- Register (skipped only when *this* key is already bound *and*
-        //      active; `terms_hash` is `Some` iff a fresh registration is due —
+        //      active; `registration` is `Some` iff a fresh registration is due —
         //      which includes a deregistered node whose binding still stands). ----
-        if let Some(terms_hash) = terms_hash {
+        if let Some((terms_hash, multiaddrs)) = &registration {
             if !json {
                 println!("register:");
             }
-            let multiaddrs = multiaddrs
-                .as_deref()
-                .context("internal: a due registration has no multiaddrs chosen")?;
             let outcome = register::submit_registration(
                 &provider,
                 &signer,
@@ -546,7 +536,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 resolved.chain_id,
                 &args.region,
                 multiaddrs,
-                terms_hash,
+                *terms_hash,
                 false,
                 &mut register_tx,
             )
@@ -573,7 +563,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     // failed before submitting, what it chose. 0 when no registration was due,
     // as on the dry-run path.
     let multiaddr_count = register_outcome.as_ref().map_or_else(
-        || multiaddrs.as_ref().map_or(0, Vec::len),
+        || registration.as_ref().map_or(0, |(_, m)| m.len()),
         |o| o.multiaddr_count,
     );
     let summary = |readiness: Option<&Readiness>| {
@@ -585,7 +575,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             register_outcome.as_ref(),
             false,
             readiness,
-            Some(terms_hash.is_some()),
+            Some(registration.is_some()),
             register_tx,
             &args.region,
             multiaddr_count,
@@ -738,21 +728,14 @@ fn registration_status(
     }
 }
 
-/// ADR 019 § Terms Acceptance for `setup`: when a fresh registration is due,
-/// read the network's current terms hash and require the operator to accept it
-/// *before* any transaction (so a refusal / stale-client abort happens before
-/// the bond is spent). Returns `Some(hash)` to feed registration, or `None` when
-/// this key is already registered (acceptance was recorded at its own
-/// registration).
-async fn accept_terms_if_registering<P: Provider + Clone>(
+/// ADR 019 § Terms Acceptance for `setup`: read the network's current terms
+/// hash and require the operator to accept it. Returns the hash to feed a due
+/// registration.
+async fn accept_current_terms<P: Provider + Clone>(
     bond_contract: &CapacityBond::CapacityBondInstance<P>,
     cb_addr: Address,
-    already_registered: bool,
     accept_flag: bool,
-) -> anyhow::Result<Option<B256>> {
-    if already_registered {
-        return Ok(None);
-    }
+) -> anyhow::Result<B256> {
     let hash = bond_contract
         .currentTermsHash()
         .call()
@@ -761,7 +744,7 @@ async fn accept_terms_if_registering<P: Provider + Clone>(
             format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
         })?;
     terms::ensure_accepted_async(hash, accept_flag).await?;
-    Ok(Some(hash))
+    Ok(hash)
 }
 
 /// On-chain registration state, read back for the readiness summary.

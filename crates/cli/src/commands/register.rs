@@ -99,7 +99,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
 ///
 /// Returns an error when an entry does not pack, the ceiling read fails, or the
 /// packed set is over the ceiling.
-pub(crate) async fn ensure_multiaddrs_fit<P: Provider + Clone>(
+pub(crate) async fn ensure_multiaddrs_fit<P: Provider>(
     bond: &CapacityBond::CapacityBondInstance<P>,
     cb_addr: Address,
     multiaddrs: &[String],
@@ -108,14 +108,7 @@ pub(crate) async fn ensure_multiaddrs_fit<P: Provider + Clone>(
     let max_multiaddr_size = bond.maxMultiaddrSize().call().await.with_context(|| {
         format!("failed to read maxMultiaddrSize from CapacityBond at {cb_addr}")
     })?;
-    // Saturating rather than `try_into`: the ceiling is a governance parameter
-    // bounded far below `u64::MAX`, so a value past `u64` is unreachable — and
-    // failing the whole command on an unreachable read would be worse than clamping.
-    let max_multiaddr_size: u64 = max_multiaddr_size.saturating_to();
-    // `usize` fits `u64` on every supported target; `u64::MAX` on the
-    // impossible overflow keeps the ceiling check erring toward "too large".
-    let packed_size = u64::try_from(packed.len()).unwrap_or(u64::MAX);
-    update_multiaddrs::ensure_packed_within(packed_size, max_multiaddr_size, "registerNode")
+    update_multiaddrs::ensure_packed_within(packed.len(), max_multiaddr_size, "registerNode")
 }
 
 /// The multiaddrs to register (ADR 001 § Node Discovery), first match wins:
