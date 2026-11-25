@@ -498,6 +498,8 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
         |logs: &str, field: &str| field_notice_count(logs, "observability", field);
     // `[network]` notices follow the same shape: one per changed field.
     let network_notice_count = |logs: &str, field: &str| field_notice_count(logs, "network", field);
+    // Any `[network]` field notice, whichever field it names.
+    let any_network_notice_count = |logs: &str| field_notice_count(logs, "network", "");
 
     // --- Reload #1: a mutable `log_level` + restart-required `[payment]`
     //     and `[network]` sections. The log_level change applies; `[payment]`
@@ -530,7 +532,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          notice, got:\n{after_first}"
     );
     assert_eq!(
-        network_notice_count(&after_first, ""),
+        any_network_notice_count(&after_first),
         1,
         "only the changed network field may warn, got:\n{after_first}"
     );
@@ -633,7 +635,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
 
     // `[network]` matches startup again, so it stays silent.
     assert_eq!(
-        network_notice_count(&logs, ""),
+        any_network_notice_count(&logs),
         0,
         "an unchanged [network] must not warn, got:\n{logs}"
     );
@@ -989,4 +991,103 @@ async fn an_aborted_reload_reports_no_observability_notice() {
         !logs.contains("collector:4317"),
         "the otlp_endpoint value must not be logged, got:\n{logs}"
     );
+}
+
+/// A `[network]` table the next restart rejects warns once, on one line that
+/// names the bad key, while the reload still applies and counts no failure.
+/// The warning is about the file on disk, so a reload that aborts on another
+/// section still reports it.
+#[tokio::test(flavor = "current_thread")]
+async fn sighup_reports_an_invalid_network_table() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = BufferWriter(Arc::clone(&log_buf));
+    let _log_guard = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(LevelFilter::INFO)
+        .finish()
+        .set_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    let initial = seed_resolved(10, LogLevel::Info);
+    let (setter, levels) = recording_setter();
+    let state = RuntimeReloadState::new(
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
+        },
+        &initial,
+        setter,
+    );
+    let metrics = Arc::new(Metrics::new());
+    state.attach_metrics(Arc::clone(&metrics));
+
+    let invalid_lines = |logs: &str| -> usize {
+        logs.lines()
+            .filter(|l| {
+                l.contains(" WARN ")
+                    && l.contains("[network] is invalid; the next restart fails")
+                    && l.contains("network.external_addrs[0]")
+            })
+            .count()
+    };
+    let failures = |metrics: &Metrics| -> String {
+        let text = metrics.encode().unwrap();
+        text.lines()
+            .find(|l| l.starts_with("decdn_config_reload_failures_total "))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // A bad `[network]` beside a reloadable change: the reload applies.
+    write_config(
+        &path,
+        "[observability]\n\
+         log_level = \"debug\"\n\n\
+         [network]\n\
+         external_addrs = [\"10.0.0.5:4433\"]\n",
+    );
+    state
+        .reload(&path)
+        .await
+        .expect("a bad [network] must not gate the reload");
+    assert_eq!(levels.lock().unwrap().clone(), vec![LogLevel::Debug]);
+    let logs = captured_logs(&log_buf);
+    assert_eq!(invalid_lines(&logs), 1, "got:\n{logs}");
+    assert!(
+        !logs.contains("ignoring change to network."),
+        "an invalid table reports no field change, got:\n{logs}"
+    );
+    assert_eq!(failures(&metrics), "decdn_config_reload_failures_total 0");
+
+    log_buf.lock().unwrap().clear();
+
+    // The same bad `[network]` beside a bad `cache.pinned_hashes`: the reload
+    // aborts, and the `[network]` warning still reaches the operator.
+    write_config(
+        &path,
+        "[cache]\n\
+         pinned_hashes = [\"zzz-not-hex\"]\n\n\
+         [network]\n\
+         external_addrs = [\"10.0.0.5:4433\"]\n",
+    );
+    state
+        .reload(&path)
+        .await
+        .expect_err("a bad cache.pinned_hashes must abort the reload");
+    let logs = captured_logs(&log_buf);
+    assert_eq!(invalid_lines(&logs), 1, "got:\n{logs}");
 }

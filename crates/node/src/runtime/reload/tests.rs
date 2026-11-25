@@ -1373,9 +1373,18 @@ async fn a_bad_network_edit_does_not_gate_the_reload() {
         &initial,
         setter,
     );
+    let metrics = Arc::new(crate::metrics::Metrics::new());
+    state.attach_metrics(Arc::clone(&metrics));
 
     state.reload(&path).await.expect("reload applies");
     assert_eq!(*captured.lock().unwrap(), Some(LogLevel::Debug));
+    // Not a reload failure.
+    let text = metrics.encode().unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l == "decdn_config_reload_failures_total 0"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -1388,7 +1397,9 @@ fn resolve_network_for_notice_names_the_bad_key() {
 #[test]
 fn resolve_network_for_notice_accepts_a_valid_table() {
     let file = network_file("bind_port = 5555\nexternal_addrs = [\"8.8.8.8:4433\"]\n");
-    let resolved = resolve_network_for_notice(&no_network_cli(), Some(&file)).unwrap();
+    let resolved = resolve_network_for_notice(&no_network_cli(), Some(&file))
+        .unwrap()
+        .0;
     assert_eq!(resolved.bind_port, 5555);
     assert_eq!(resolved.external_addrs.len(), 1);
 }
@@ -1402,7 +1413,7 @@ fn resolve_network_for_notice_keeps_cli_precedence() {
         relay_url: None,
     };
     let file = network_file("bind_port = 5555\n");
-    let resolved = resolve_network_for_notice(&cli, Some(&file)).unwrap();
+    let resolved = resolve_network_for_notice(&cli, Some(&file)).unwrap().0;
     assert_eq!(resolved.bind_port, 7777);
 }
 
@@ -1410,7 +1421,9 @@ fn resolve_network_for_notice_keeps_cli_precedence() {
 fn network_restart_required_changes_is_empty_when_unchanged() {
     let startup = seed_resolved(10, LogLevel::Info).network;
     let file = network_file("bind_port = 4433\n");
-    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file)).unwrap();
+    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file))
+        .unwrap()
+        .0;
     assert!(network_restart_required_changes(&startup, &reloaded).is_empty());
 }
 
@@ -1419,14 +1432,18 @@ fn network_restart_required_changes_names_each_changed_field() {
     let startup = seed_resolved(10, LogLevel::Info).network;
 
     let file = network_file("bind_port = 5555\n");
-    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file)).unwrap();
+    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file))
+        .unwrap()
+        .0;
     assert_eq!(
         network_restart_required_changes(&startup, &reloaded),
         vec!["bind_port"]
     );
 
     let file = network_file("external_addrs = [\"8.8.8.8:4433\"]\n");
-    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file)).unwrap();
+    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file))
+        .unwrap()
+        .0;
     assert_eq!(
         network_restart_required_changes(&startup, &reloaded),
         vec!["external_addrs"]
@@ -1436,9 +1453,76 @@ fn network_restart_required_changes_names_each_changed_field() {
         "bind_port = 5555\nrelay_urls = [\"https://relay.example\"]\n\
          external_addrs = [\"8.8.8.8:4433\"]\n",
     );
-    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file)).unwrap();
+    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file))
+        .unwrap()
+        .0;
     assert_eq!(
         network_restart_required_changes(&startup, &reloaded),
         vec!["bind_port", "relay_urls", "external_addrs"]
     );
+}
+
+/// A `[network]` table removed from the file resolves to the defaults, so it
+/// is a change against a startup that set non-default values.
+#[test]
+fn a_removed_network_table_diffs_against_the_defaults() {
+    let mut startup = seed_resolved(10, LogLevel::Info).network;
+    let reloaded = resolve_network_for_notice(&no_network_cli(), None)
+        .unwrap()
+        .0;
+    assert!(network_restart_required_changes(&startup, &reloaded).is_empty());
+
+    startup.bind_port = 5555;
+    assert_eq!(
+        network_restart_required_changes(&startup, &reloaded),
+        vec!["bind_port"]
+    );
+}
+
+#[test]
+fn network_restart_required_changes_names_a_discovery_change() {
+    let startup = seed_resolved(10, LogLevel::Info).network;
+    let file = network_file(
+        "[discovery]\npkarr_url = \"https://pkarr.example\"\ndns_origin = \"dns.example\"\n",
+    );
+    let reloaded = resolve_network_for_notice(&no_network_cli(), Some(&file))
+        .unwrap()
+        .0;
+    assert_eq!(
+        network_restart_required_changes(&startup, &reloaded),
+        vec!["discovery"]
+    );
+}
+
+/// `--relay-url` overrides a reloaded `relay_urls` list as at startup: the
+/// table is valid, nothing changes, and the override notice comes back for
+/// the reload to emit.
+#[test]
+fn resolve_network_for_notice_returns_the_relay_override_notice() {
+    let cli = NetworkArgs {
+        bind_port: None,
+        relay_url: Some("https://cli-relay.example".to_string()),
+    };
+    let mut startup = seed_resolved(10, LogLevel::Info).network;
+    startup.relay_urls = vec!["https://cli-relay.example".to_string()];
+    let file = network_file("relay_urls = [\"https://a.example\", \"https://b.example\"]\n");
+    let (reloaded, notices) = resolve_network_for_notice(&cli, Some(&file)).unwrap();
+    assert!(network_restart_required_changes(&startup, &reloaded).is_empty());
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices.first().unwrap().field, "network.relay_url");
+}
+
+/// The problems render on one line, each naming its key, and a relay URL's
+/// userinfo never reaches it.
+#[test]
+fn resolve_network_for_notice_renders_one_redacted_line() {
+    let file = network_file(
+        "relay_urls = [\"relay://user:hunter2@bad host\"]\n\
+         external_addrs = [\"10.0.0.5:4433\"]\n",
+    );
+    let err = resolve_network_for_notice(&no_network_cli(), Some(&file)).unwrap_err();
+    assert!(!err.contains('\n'), "{err}");
+    assert!(err.starts_with("network.relay_urls[0]: "), "{err}");
+    assert!(err.contains("; network.external_addrs[0]: "), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
 }

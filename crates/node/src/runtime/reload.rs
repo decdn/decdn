@@ -1181,6 +1181,19 @@ impl RuntimeReloadState {
             }
         };
 
+        // `[network]` is restart-required and reads only the file and two
+        // immutable fields, so it resolves outside the reload lock and never
+        // touches the shared bag. A table the next restart rejects is a fact
+        // about the file, true whether or not this reload aborts below, so it
+        // warns before any gate.
+        let network = resolve_network_for_notice(&self.network_cli, file.network.as_ref());
+        if let Err(problems) = &network {
+            tracing::warn!(
+                problems = %problems,
+                "config reload: [network] is invalid; the next restart fails"
+            );
+        }
+
         // Serialise concurrent reloads before *any* shared-state mutation.
         // `reload()` has no `.await` points, so on a multi-threaded runtime
         // two callers (a SIGHUP racing an `admin_v1_reload`) can execute in
@@ -1267,14 +1280,17 @@ impl RuntimeReloadState {
         // notice-bearing sections put their values.
         emit_config_notices(&notices);
         // The same holds for the "requires restart" notices: one for each
-        // non-reloadable section the file carries, one for each
+        // non-reloadable section the file carries, and one for each
         // restart-required observability or network field whose resolved
-        // value differs from startup, and one for a `[network]` table that the
-        // next restart rejects. `warn_restart_required_changes` reads the
-        // observability buffer, so it runs before phase 3 drains it.
+        // value differs from startup. An invalid `[network]` warned before the
+        // gates. `warn_restart_required_changes` reads the observability
+        // buffer, so it runs before phase 3 drains it.
         warn_restart_required_sections(&file);
         self.log_level.warn_restart_required_changes();
-        self.warn_network_restart_required(file.network.as_ref());
+        if let Ok((reloaded, network_notices)) = &network {
+            emit_config_notices(network_notices);
+            self.warn_network_changes(reloaded);
+        }
 
         // Phase 3: infallible swaps. None can fail.
         for section in &self.sections {
@@ -1288,45 +1304,47 @@ impl RuntimeReloadState {
         Ok(())
     }
 
-    /// Report the reloaded `[network]` table. `[network]` is restart-required,
-    /// so this applies nothing and never fails the reload. A table that the
-    /// next restart rejects warns once and names each bad key. A valid table
-    /// warns once for each field whose resolved value (CLI/env > file >
-    /// default) differs from startup. A valid, unchanged table is silent.
-    /// Names fields only, never values: a relay URL can carry credentials.
-    fn warn_network_restart_required(&self, file: Option<&NetworkConfig>) {
-        match resolve_network_for_notice(&self.network_cli, file) {
-            Err(problems) => tracing::warn!(
-                "config reload: [network] is invalid and the next restart fails: {problems}"
-            ),
-            Ok(reloaded) => {
-                for field in network_restart_required_changes(&self.startup_network, &reloaded) {
-                    tracing::warn!(
-                        field,
-                        "config reload: ignoring change to network.{field} (requires restart)"
-                    );
-                }
-            }
+    /// Warn once for each `[network]` field whose reloaded value (CLI/env >
+    /// file > default) differs from startup. `[network]` is restart-required,
+    /// so this applies nothing. An unchanged table is silent. Names fields
+    /// only, never values: a relay URL can carry credentials.
+    fn warn_network_changes(&self, reloaded: &ResolvedNetwork) {
+        for field in network_restart_required_changes(&self.startup_network, reloaded) {
+            tracing::warn!(
+                field,
+                "config reload: ignoring change to network.{field} (requires restart)"
+            );
         }
     }
 }
 
 /// Resolve the reloaded `[network]` table with the startup rules, into a bag
 /// of its own. `[network]` is restart-required, so its problems never reach
-/// the shared reload bag and never abort the reload. `Err` carries the
-/// rendered problems, one line per bad key (e.g. `network.external_addrs[0]`).
+/// the shared reload bag and never abort the reload.
+///
+/// `Ok` carries the resolved table and the notices startup would also emit
+/// for it (the `--relay-url` override of a `relay_urls` list). `Err` carries
+/// the problems on one line, `; `-separated, each naming its key (e.g.
+/// `network.external_addrs[0]: …`). A rejected entry is echoed as startup
+/// echoes it, with relay and discovery URL userinfo redacted. This checks the
+/// `[network]` table's own keys only, not the port layout across tables.
 fn resolve_network_for_notice(
     cli: &NetworkArgs,
     file: Option<&NetworkConfig>,
-) -> Result<ResolvedNetwork, String> {
+) -> Result<(ResolvedNetwork, Vec<ConfigNotice>), String> {
     let mut bag = ConfigDiagnostics::new();
     let resolved = resolve_network_into(cli, file, &mut bag);
-    // Startup already reported the CLI-over-file relay notice; a reload
-    // reports only what the next restart rejects.
-    let _notices = bag.take_notices();
+    let notices = bag.take_notices();
     bag.into_result()
-        .map(|()| resolved)
-        .map_err(|err| format!("{err:#}"))
+        .map(|()| (resolved, notices))
+        .map_err(|err| {
+            format!("{err:#}")
+                .lines()
+                .skip(1) // the `configuration has N problem(s):` header
+                .map(|line| line.trim().trim_start_matches("- "))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
 }
 
 /// Names of the `[network]` fields, as the config spells them, whose reloaded
@@ -1369,7 +1387,7 @@ fn warn_ignored(field: &'static str) {
 /// reloadable and never warns. `observability` and `network` are not handled
 /// here: their resolved values are diffed against startup by
 /// [`LogLevelSection::warn_restart_required_changes`] and
-/// [`RuntimeReloadState::warn_network_restart_required`]. Best-effort operator
+/// [`RuntimeReloadState::warn_network_changes`]. Best-effort operator
 /// guidance, not a correctness gate — this does not diff against the previous
 /// file, so a present-but-unchanged non-reloadable field still warns on every
 /// reload.
