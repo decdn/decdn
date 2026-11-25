@@ -56,8 +56,8 @@ pub fn ownership_message_digest(
 ///
 /// Returns an error if any single multiaddr exceeds `u16::MAX` bytes (it could
 /// not be length-prefixed). The contract separately enforces a total-size
-/// ceiling (`maxMultiaddrSize`, default 1,024 bytes); that bound is reported by
-/// the on-chain revert rather than re-checked here.
+/// ceiling (`maxMultiaddrSize`, at most 1,024 bytes on-chain); callers check the
+/// packed length against the chain before sending.
 pub fn pack_multiaddrs(addrs: &[String]) -> anyhow::Result<Vec<u8>> {
     // Each entry is a 2-byte length prefix + its bytes; pre-size to avoid
     // reallocating as entries are appended.

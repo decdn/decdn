@@ -231,10 +231,11 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let dry_run = args.chain.common.dry_run;
     // ---- Keys (idempotent — generate only on a clean slate). ----
     let key_path = identity::key_path(&resolved.data_dir);
-    // The register step reads `network.external_addrs` after `bond::execute`.
-    // On a clean slate a registration is certain, so a bad entry fails here,
-    // before any key generation or prompt. A node with a key checks it once
-    // its registration state is known, before any transaction.
+    // On a clean slate a registration is certain, so a bad
+    // `network.external_addrs` entry fails here, before any key generation or
+    // prompt. Once its registration state is known, a node with a registration
+    // due chooses the multiaddrs and checks them against the on-chain size
+    // ceiling, before the terms prompt and any transaction.
     if args.multiaddrs.is_empty() && !key_path.exists() {
         file.external_addrs()?;
     }
@@ -253,7 +254,15 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     json,
                     "keys: would generate (node key + eth keystore absent)",
                 );
-                return dry_run_without_keys(&resolved, &file, cb_addr, args.mbps, json).await;
+                return dry_run_without_keys(
+                    &resolved,
+                    &file,
+                    cb_addr,
+                    args.mbps,
+                    &args.multiaddrs,
+                    json,
+                )
+                .await;
             }
             hline(json, "keys: generating (node key + eth keystore absent)");
             let kg = cli::KeyGenArgs {
@@ -379,11 +388,14 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 .context("failed to write dry-run bond plan")?;
         }
         let readiness = read_readiness(&bond_contract, operator).await?;
-        // Only a registration that is due reads the multiaddrs.
+        // Only a registration that is due reads the multiaddrs, and checks them
+        // against the on-chain size ceiling as the live run does.
         let multiaddr_count =
             match registration_status(readiness.node_id, readiness.active, local_node_id) {
                 RegistrationStatus::Due => {
-                    register::registration_multiaddrs(&args.multiaddrs, &file)?.len()
+                    let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file)?;
+                    register::ensure_multiaddrs_fit(&bond_contract, cb_addr, &multiaddrs).await?;
+                    multiaddrs.len()
                 }
                 RegistrationStatus::AlreadyRegistered | RegistrationStatus::Divergent => 0,
             };
@@ -438,23 +450,22 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         RegistrationStatus::AlreadyRegistered => true,
         RegistrationStatus::Due => false,
     };
-    // A registration is due: a bad `network.external_addrs` entry fails here,
-    // before the terms prompt and any transaction.
-    if !already_registered && args.multiaddrs.is_empty() {
-        file.external_addrs()?;
-    }
-
-    // ---- ADR 019 § Terms Acceptance — accept the current operator terms
-    //      *before* any transaction, so a refusal / stale-client abort happens
-    //      before the bond is spent. `Some(hash)` means "a fresh registration is
-    //      due and the operator accepted"; `None` means already registered. ----
-    let terms_hash = accept_terms_if_registering(
-        &bond_contract,
-        cb_addr,
-        already_registered,
-        args.accept_terms,
-    )
-    .await?;
+    // ---- A due registration: `Some((terms_hash, multiaddrs))`; `None` when
+    //      this key is already registered (acceptance was recorded at its own
+    //      registration). The multiaddrs are chosen once, here, so a bad
+    //      `network.external_addrs` entry or a set over the on-chain size
+    //      ceiling fails before the terms prompt and any transaction. ADR 019
+    //      § Terms Acceptance: the operator accepts the current terms *before*
+    //      any transaction, so a refusal / stale-client abort happens before
+    //      the bond is spent. ----
+    let registration = if already_registered {
+        None
+    } else {
+        let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file)?;
+        register::ensure_multiaddrs_fit(&bond_contract, cb_addr, &multiaddrs).await?;
+        let terms_hash = accept_current_terms(&bond_contract, cb_addr, args.accept_terms).await?;
+        Some((terms_hash, multiaddrs))
+    };
 
     // ---- Confirm before submitting (unless --yes). ----
     if !args.yes
@@ -511,13 +522,12 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         }
 
         // ---- Register (skipped only when *this* key is already bound *and*
-        //      active; `terms_hash` is `Some` iff a fresh registration is due —
+        //      active; `registration` is `Some` iff a fresh registration is due —
         //      which includes a deregistered node whose binding still stands). ----
-        if let Some(terms_hash) = terms_hash {
+        if let Some((terms_hash, multiaddrs)) = &registration {
             if !json {
                 println!("register:");
             }
-            let multiaddrs = register::registration_multiaddrs(&args.multiaddrs, &file)?;
             let outcome = register::submit_registration(
                 &provider,
                 &signer,
@@ -525,8 +535,8 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                 cb_addr,
                 resolved.chain_id,
                 &args.region,
-                &multiaddrs,
-                terms_hash,
+                multiaddrs,
+                *terms_hash,
                 false,
                 &mut register_tx,
             )
@@ -549,10 +559,13 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     }
     .await;
 
-    // What registration actually submitted, defaulted multiaddrs included.
-    let multiaddr_count = register_outcome
-        .as_ref()
-        .map_or(args.multiaddrs.len(), |o| o.multiaddr_count);
+    // What registration submitted, defaulted multiaddrs included; on a run that
+    // failed before submitting, what it chose. 0 when no registration was due,
+    // as on the dry-run path.
+    let multiaddr_count = register_outcome.as_ref().map_or_else(
+        || registration.as_ref().map_or(0, |(_, m)| m.len()),
+        |o| o.multiaddr_count,
+    );
     let summary = |readiness: Option<&Readiness>| {
         build_summary(
             &pf,
@@ -562,7 +575,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             register_outcome.as_ref(),
             false,
             readiness,
-            Some(terms_hash.is_some()),
+            Some(registration.is_some()),
             register_tx,
             &args.region,
             multiaddr_count,
@@ -715,21 +728,14 @@ fn registration_status(
     }
 }
 
-/// ADR 019 § Terms Acceptance for `setup`: when a fresh registration is due,
-/// read the network's current terms hash and require the operator to accept it
-/// *before* any transaction (so a refusal / stale-client abort happens before
-/// the bond is spent). Returns `Some(hash)` to feed registration, or `None` when
-/// this key is already registered (acceptance was recorded at its own
-/// registration).
-async fn accept_terms_if_registering<P: Provider + Clone>(
+/// ADR 019 § Terms Acceptance for `setup`: read the network's current terms
+/// hash and require the operator to accept it. Returns the hash to feed a due
+/// registration.
+async fn accept_current_terms<P: Provider + Clone>(
     bond_contract: &CapacityBond::CapacityBondInstance<P>,
     cb_addr: Address,
-    already_registered: bool,
     accept_flag: bool,
-) -> anyhow::Result<Option<B256>> {
-    if already_registered {
-        return Ok(None);
-    }
+) -> anyhow::Result<B256> {
     let hash = bond_contract
         .currentTermsHash()
         .call()
@@ -738,7 +744,7 @@ async fn accept_terms_if_registering<P: Provider + Clone>(
             format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
         })?;
     terms::ensure_accepted_async(hash, accept_flag).await?;
-    Ok(Some(hash))
+    Ok(hash)
 }
 
 /// On-chain registration state, read back for the readiness summary.
@@ -787,6 +793,8 @@ async fn read_readiness<P: Provider + Clone>(
 /// reads only the operator-independent curve through a read-only provider and
 /// reports what *would* run. It still validates the tier band so an out-of-band
 /// `--mbps` is flagged here exactly as `build_plan` would on the keyed path.
+/// A clean slate always registers, so it also checks the registration
+/// multiaddrs against the on-chain size ceiling, as the live run does.
 /// On a pull-through node it also prints the buyer-USDC row: the keys do not
 /// exist yet, so the row reports a wallet that holds nothing, without a chain
 /// read.
@@ -795,6 +803,7 @@ async fn dry_run_without_keys(
     file: &chain_ctx::FileConfig,
     cb_addr: Address,
     mbps: u64,
+    explicit_multiaddrs: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     let provider =
@@ -835,6 +844,8 @@ async fn dry_run_without_keys(
         .await
         .context("failed to read minBond")?;
     let target = min_bond.max(required);
+    let multiaddrs = register::registration_multiaddrs(explicit_multiaddrs, file)?;
+    register::ensure_multiaddrs_fit(&bond_contract, cb_addr, &multiaddrs).await?;
     let buyer_usdc = keyless_buyer_usdc(buyer_usdc_plan(file));
     if json {
         let value = serde_json::json!({

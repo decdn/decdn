@@ -516,6 +516,59 @@ async fn phase_for(active: bool, active_bond: u64, declared_mbps: u64) -> Phase 
     .expect("the phase is decidable from the registry reads alone")
 }
 
+/// A carried-forward multiaddr set over the on-chain ceiling fails while the
+/// reonboard phase is planned, so a dry run and the confirmation prompt see
+/// it, not only the bond transactions that follow confirmation.
+#[tokio::test]
+async fn an_oversized_carried_forward_set_fails_the_reonboard_plan() {
+    use alloy::primitives::Bytes;
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+    use decdn_incentive::eth_identity::generate_and_persist;
+
+    let dir = tempfile::tempdir().unwrap();
+    // The keystore's data dir must be private to its owner.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    generate_and_persist(dir.path(), "hunter2", false).unwrap();
+    let password_file = dir.path().join("password");
+    std::fs::write(&password_file, "hunter2\n").unwrap();
+    let mut args = eth_args();
+    args.new_keystore = Some(decdn_incentive::eth_identity::keystore_path(dir.path()));
+    args.chain.common.keystore_password_file = Some(password_file);
+
+    // `Asserter` serves FIFO: `isActive(new_operator)` is false, then the
+    // ceiling is 64 bytes.
+    let asserter = Asserter::new();
+    asserter.push_success(&Bytes::from(U256::ZERO.to_be_bytes::<32>().to_vec()));
+    asserter.push_success(&Bytes::from(U256::from(64).to_be_bytes::<32>().to_vec()));
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+    let bond_contract = CapacityBond::new(Address::repeat_byte(0xCB), provider);
+    let packed_multiaddrs = node_register::pack_multiaddrs(&["a".repeat(100)]).unwrap();
+
+    let err = select_phase(
+        &bond_contract,
+        PhaseInputs {
+            old_operator: Address::repeat_byte(0x0E),
+            active: false,
+            active_bond: U256::ZERO,
+            declared_mbps: 5_000,
+            region_hint: "DE".to_string(),
+            packed_multiaddrs,
+        },
+        &args,
+    )
+    .await
+    .expect_err("an oversized set must not plan a reonboard");
+    let msg = format!("{err}");
+    assert!(msg.contains("`registerNode`"), "names the call: {msg}");
+    assert!(msg.contains("102 bytes"), "reports the packed size: {msg}");
+    assert!(msg.contains("64 bytes"), "reports the ceiling: {msg}");
+}
+
 /// An operator out of the active set without `deregisterNode` (ejected, or
 /// displaced by `reclaimNodeId`) still has a declared tier, and `unbond` of
 /// the whole bond reverts `BondBelowCurve` against it. The unbond phase must

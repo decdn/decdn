@@ -90,3 +90,45 @@ fn submitted_output_has_tx() {
     let s = String::from_utf8(buf).unwrap();
     assert!(s.contains("submitted=true tx=0x5555"), "{s}");
 }
+
+/// `ensure_multiaddrs_fit` against a mocked provider that serves no
+/// responses, so every chain read fails. The size bound itself is
+/// `update_multiaddrs::ensure_packed_within`, tested there.
+mod fit {
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+
+    use super::*;
+
+    /// Run the check for `multiaddrs` against a chain that answers nothing.
+    async fn fit(multiaddrs: &[String]) -> anyhow::Result<()> {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let addr = Address::repeat_byte(0xCB);
+        let bond = CapacityBond::new(addr, provider);
+        ensure_multiaddrs_fit(&bond, addr, multiaddrs).await
+    }
+
+    /// Packing runs before the chain read: a read would fail with an
+    /// empty-queue error instead of the length-prefix one.
+    #[tokio::test]
+    async fn an_unpackable_entry_fails_before_the_chain_read() {
+        let err = fit(&["a".repeat(usize::from(u16::MAX) + 1)])
+            .await
+            .expect_err("an entry past the u16 prefix must not proceed");
+        assert!(
+            format!("{err}").contains("uint16 length prefix"),
+            "reports the packing error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_names_the_ceiling() {
+        let err = fit(&["/ip4/203.0.113.10/udp/4433/quic-v1".to_string()])
+            .await
+            .expect_err("an unreadable ceiling must not pass");
+        assert!(
+            format!("{err:#}").contains("failed to read maxMultiaddrSize"),
+            "names the failed read: {err:#}"
+        );
+    }
+}

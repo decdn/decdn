@@ -10,8 +10,9 @@
 //! Bonding (`approve` + `bond` + `declareMbps`) is a precondition:
 //! the contract reverts `BondBelowMinimum` / `BondBelowCurve` if the bond
 //! is not already posted (run `decdn node bond` first). `--dry-run` builds
-//! and prints everything (it still reads the chain for the nonce the
-//! signature depends on) but does not submit.
+//! and prints everything but does not submit. It still reads the chain: the
+//! `maxMultiaddrSize` ceiling, so an oversized multiaddr set fails a dry run as
+//! it would a live one, and the nonce the signature depends on.
 //!
 //! The signing + submit path is factored into `submit_registration` so
 //! `decdn setup` (#933) can drive registration with the same already-loaded
@@ -29,7 +30,7 @@ use decdn_common::identity;
 use decdn_incentive::capacity_bond::CapacityBond;
 use decdn_incentive::node_register;
 
-use crate::commands::{chain_ctx, terms};
+use crate::commands::{chain_ctx, terms, update_multiaddrs};
 
 /// Entry point for `decdn node register`.
 pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
@@ -43,18 +44,19 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
+    let bond = CapacityBond::new(cb_addr, &provider);
+
+    // An oversized set fails here, before the terms prompt, and on `--dry-run`
+    // too: the signatures a dry run prints would only revert on submission.
+    ensure_multiaddrs_fit(&bond, cb_addr, &multiaddrs).await?;
 
     // ADR 019 § Terms Acceptance — read the network's current terms hash, then
     // require the operator to accept the matching embedded terms before
     // registering. Enforced on `--dry-run` too, so a dry run never shows a
     // registration over terms the operator hasn't seen.
-    let terms_hash = CapacityBond::new(cb_addr, &provider)
-        .currentTermsHash()
-        .call()
-        .await
-        .with_context(|| {
-            format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
-        })?;
+    let terms_hash = bond.currentTermsHash().call().await.with_context(|| {
+        format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
+    })?;
     terms::ensure_accepted_async(terms_hash, args.accept_terms).await?;
 
     // `decdn node register` submits a single transaction and has no partial
@@ -82,6 +84,29 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     };
     write_outcome(&mut out, &outcome, args.chain.common.json).context(label)?;
     Ok(())
+}
+
+/// Refuse a multiaddr set whose packed form exceeds `CapacityBond.maxMultiaddrSize`,
+/// so an oversized set fails as a named error before the terms prompt and any
+/// transaction, not as a `registerNode` revert. Packs with
+/// [`node_register::pack_multiaddrs`] before the chain read, so a single entry
+/// past the `u16` length prefix also fails here. An empty set (a host behind
+/// NAT) packs to 0 bytes and is always within the ceiling.
+///
+/// # Errors
+///
+/// Returns an error when an entry does not pack, the ceiling read fails, or the
+/// packed set is over the ceiling.
+pub(crate) async fn ensure_multiaddrs_fit<P: Provider>(
+    bond: &CapacityBond::CapacityBondInstance<P>,
+    cb_addr: Address,
+    multiaddrs: &[String],
+) -> anyhow::Result<()> {
+    let packed = node_register::pack_multiaddrs(multiaddrs)?;
+    let max_multiaddr_size = bond.maxMultiaddrSize().call().await.with_context(|| {
+        format!("failed to read maxMultiaddrSize from CapacityBond at {cb_addr}")
+    })?;
+    update_multiaddrs::ensure_packed_within(packed.len(), max_multiaddr_size, "registerNode")
 }
 
 /// The multiaddrs to register (ADR 001 § Node Discovery), first match wins:
@@ -165,8 +190,10 @@ pub(crate) struct RegisterOutcome {
 
 /// Build the ownership signature and submit `registerNode` (ADR 019) against
 /// an already-built `provider` and `signer`. `dry_run` reads the chain for the
-/// nonce the signature depends on but does not submit. Shared by `run` and `decdn setup` so the keystore is decrypted
-/// once across bond + register.
+/// nonce the signature depends on but does not submit. Shared by `run` and
+/// `decdn setup` so the keystore is decrypted once across bond + register.
+/// Callers check `multiaddrs` with [`ensure_multiaddrs_fit`] before any
+/// prompt; this function does not re-check the ceiling.
 ///
 /// `tx_slot` is caller-owned for the same reason `bond::execute`'s `Outcome` is
 /// (#1355): on an unreadable receipt the transaction is broadcast and may take
