@@ -10884,27 +10884,25 @@ async fn origin_only_node_fault_is_internal_error_not_signed_not_found() -> anyh
     Ok(())
 }
 
-/// Build a cache holding a blob that the local STORE has already accepted (a
-/// past import) but whose backing filesystem origin is deleted — the backend
-/// does not hold it, so a fresh `CacheEngine::origin_presence` finds no
-/// blob there (a fault against the deleted origin directory) even though
-/// `cache.has` is `true`. Used
-/// to prove the origin-only gate (#1759) sits ABOVE the cache-hit branch: a
-/// foreign hash already sitting in the store is still declined.
+/// Build a cache whose local STORE holds a blob (a past import) that its
+/// filesystem origin does not hold. The origin directory exists and is empty,
+/// so `CacheEngine::origin_presence` reads the hash `Absent` while `cache.has`
+/// is `true`. Used to prove the origin-only gate (#1759) sits ABOVE the
+/// cache-hit branch: a foreign hash already sitting in the store is still
+/// declined. Returns the origin and cache directories, in that order, as
+/// guards the caller holds.
 async fn cache_with_foreign_blob_imported(
     payload: &[u8],
 ) -> anyhow::Result<(
     CacheEngine,
     decdn_cache::Hash,
-    Arc<CacheMetrics>,
+    tempfile::TempDir,
     tempfile::TempDir,
 )> {
     let origin_dir = tempfile::tempdir()?;
-    let hash = support::seed_origin_object(origin_dir.path(), payload)?;
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache_metrics = Arc::new(CacheMetrics::default());
     let cache = CacheEngine::open_full(
         cache_dir.path(),
         vec![origin as Arc<dyn decdn_cache::Origin>],
@@ -10912,19 +10910,16 @@ async fn cache_with_foreign_blob_imported(
         PinnedHashes::empty(),
         RetryPolicy::default(),
         CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cache_metrics)),
+        None,
         Duration::ZERO,
     )
     .await?;
-    cache.insert_blob(payload.to_vec()).await?;
+    let hash = cache.insert_blob(payload.to_vec()).await?;
     anyhow::ensure!(
         cache.has(hash).await?,
         "precondition: the blob must be in the local store"
     );
-    // Drop the fs origin directory: the backend no longer holds the object,
-    // even though the store already imported it.
-    drop(origin_dir);
-    Ok((cache, hash, cache_metrics, cache_dir))
+    Ok((cache, hash, origin_dir, cache_dir))
 }
 
 /// Assert an origin-only node refused a fetch as a policy decline: the client
@@ -11041,19 +11036,15 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
 
 /// #1759: the gate is categorical — it sits ABOVE the cache-hit branch, so a
 /// foreign hash already sitting in the store (imported by an earlier relay,
-/// say) is still declined once the backend no longer holds it.
+/// say) is still declined when the node's own backend does not hold it.
 #[tokio::test(flavor = "multi_thread")]
 async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::Result<()> {
     let payload = vec![0x33u8; 32 * 1024];
-    let (cache, foreign_hash, cache_metrics, _cache_tmp) =
+    let (cache, foreign_hash, _origin_tmp, _cache_tmp) =
         cache_with_foreign_blob_imported(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
-    let (target, server_eth_addr, server_ep, server_task, _metrics) =
+    let (target, server_eth_addr, server_ep, server_task, metrics) =
         spawn_origin_only_server_with_metrics(cache, Arc::clone(&store)).await?;
-
-    // Baseline AFTER setup, so the assertion below isolates origin reads caused
-    // by THIS request.
-    let baseline_bytes = cache_metrics.pull_through_bytes.get();
 
     let (client_ep, _) = local_endpoint(fresh_key(), vec![]).await?;
     let ctx = pool_context(&client_ep, Arc::clone(&signer), deposit);
@@ -11070,16 +11061,7 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
         Duration::from_secs(20),
     )
     .await;
-    anyhow::ensure!(
-        res.is_err(),
-        "origin-only node must decline a foreign hash even when it is already cached"
-    );
-    anyhow::ensure!(
-        cache_metrics.pull_through_bytes.get() == baseline_bytes,
-        "the cache-hit gate must not read the origin, got {} bytes beyond baseline {}",
-        cache_metrics.pull_through_bytes.get(),
-        baseline_bytes
-    );
+    assert_foreign_declined(res, &metrics)?;
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
