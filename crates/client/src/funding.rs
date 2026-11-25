@@ -25,9 +25,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buyer_pool::{
     LOW_WATER_DIVISOR, OpenedPool, OwnedPayer, PoolNotOpen, TopUpUnconfirmed, ToppedUpPool,
-    UnconfirmedEscrows, UnrecordedEscrow, WalletShortfall, ensure_allowance,
-    escrowed_but_untracked, grade_deposit_credit, open_pool, pool_accepts_funds, refill_amount,
-    self_owned_lane_ctx, top_up_unless_ended, topped_up_effect,
+    UnconfirmedEscrows, UnrecordedEscrow, WalletShortfall, approve_if_short,
+    escrowed_but_untracked, grade_deposit_credit, open_pool_above, pool_accepts_funds,
+    refill_amount, self_owned_lane_ctx, top_up_unless_ended, topped_up_effect,
 };
 use crate::fault::PoolOpenRefused;
 use crate::lanes::LaneDeps;
@@ -820,7 +820,7 @@ where
         self.funding.refuse_after_untracked()?;
         let deposit = self.working_deposit;
         refuse_open(self.open, deposit)?;
-        ensure_allowance(
+        let nonce_floor = approve_if_short(
             self.rpc,
             self.token,
             self.owner,
@@ -832,7 +832,7 @@ where
             },
         )
         .await?;
-        let (opened, unrecorded) = open_pool(
+        let (opened, unrecorded) = open_pool_above(
             self.contract,
             self.deployment,
             self.token,
@@ -840,6 +840,7 @@ where
             deposit,
             Some(self.funding.escrows()),
             Some(RECEIPT_TIMEOUT),
+            nonce_floor,
         )
         .await?;
         record_opened(self.store, &opened, unrecorded)?;
@@ -1526,7 +1527,7 @@ where
             .context("refusing a second topUp while an earlier one is unconfirmed"));
     }
     funding.refuse_after_untracked()?;
-    ensure_allowance(
+    let nonce_floor = approve_if_short(
         contract.provider(),
         token,
         owner,
@@ -1542,6 +1543,7 @@ where
         Some(&funding.escrows),
         Some(RECEIPT_TIMEOUT),
         ended,
+        nonce_floor,
     )
     .await
 }
@@ -1819,9 +1821,10 @@ where
     // `max_approve` opts into an unlimited standing allowance; otherwise approve
     // exactly the deposit being escrowed.
     let approve_amount = if max_approve { None } else { Some(deposit) };
-    ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
+    let nonce_floor =
+        approve_if_short(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
     refuse_after_end(Some(ended))?;
-    let (opened, unrecorded) = open_pool(
+    let (opened, unrecorded) = open_pool_above(
         contract,
         deployment,
         token,
@@ -1829,6 +1832,7 @@ where
         deposit,
         Some(funding.escrows()),
         Some(RECEIPT_TIMEOUT),
+        nonce_floor,
     )
     .await?;
     record_opened(store, &opened, unrecorded)?;

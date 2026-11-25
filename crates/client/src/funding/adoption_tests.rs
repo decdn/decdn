@@ -3018,7 +3018,11 @@ async fn a_refill_that_ends_during_its_allowance_leg_sends_no_top_up() {
         .expect_err("the topUp is refused");
     ended_before_send(&err);
     assert!(rpc.calls_drained(), "the refill read its allowance");
-    assert!(rpc.sent_nonces().is_empty(), "no topUp was sent");
+    assert!(
+        !rpc.sent_inputs().iter().any(|input| input
+            .starts_with(&<PaymentPool::topUpCall as alloy::sol_types::SolCall>::SELECTOR)),
+        "no topUp was sent"
+    );
     assert!(funding.shortfall().is_none(), "no wallet read explains it");
     assert!(funding.escrows().pending().is_empty());
 }
