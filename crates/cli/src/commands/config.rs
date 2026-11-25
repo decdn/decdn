@@ -359,31 +359,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         "  serve.global_rate_per_sec: {}",
         resolved.serve.global_rate_per_sec
     )?;
-    // Download-receipt audit log (#802). The log lives at a fixed filename
-    // inside data_dir; surface the resolved path so an operator can confirm
-    // where receipts land without reading the daemon source, alongside the
-    // rotation cap and retained-backup count that bound its disk use. The path
-    // is derived (not a configurable field) — the daemon writes it to this
-    // canonical name under data_dir.
-    writeln!(
-        w,
-        "  receipts.log_path:        {}",
-        resolved
-            .identity
-            .data_dir
-            .join(config::RECEIPT_LOG_FILE)
-            .display()
-    )?;
-    writeln!(
-        w,
-        "  receipts.max_file_bytes:  {}",
-        resolved.receipts.max_file_bytes
-    )?;
-    writeln!(
-        w,
-        "  receipts.retained_files:  {}",
-        resolved.receipts.retained_files
-    )?;
     // Counts, not contents. An operator running `config validate` after adding a
     // takedown wants confirmation the entries were accepted — and a zero here is
     // the tell that a `[content]` section landed in the wrong file. Printing the
@@ -1150,10 +1125,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # global_rate_per_sec = 2000.0              # global inbound request sustained rate; 0.0 disables
 # global_burst = 5000                       # global inbound request burst capacity
 # max_tracked_per_peer = 4096               # cap on the per-peer keyed-limiter map; 0 = unbounded
-
-[receipts]
-# max_file_bytes = 134217728                # rotate the download-receipt log at this size (#802); default 128 MiB
-# retained_files = 4                        # rotated backup receipt files retained (#802); 0 keeps none
 
 [content]
 # ADR 011 local denylist — this operator's own removal lever, independent of

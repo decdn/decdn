@@ -69,8 +69,7 @@ use decdn_common::admin::{AdminRpcClient, DrainRequest, HealthResponse};
 use decdn_common::cli::run::{NetworkArgs, ObservabilityArgs};
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
-    ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedReceipts,
-    ResolvedSecurity,
+    ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedSecurity,
 };
 use decdn_incentive::eth_identity;
 use decdn_node::runtime::{LogLevelSetter, RuntimeReloadState};
@@ -453,7 +452,6 @@ fn build_config(
         content: decdn_common::config::ResolvedContent::default(),
         dht: ResolvedDht::default(),
         serve: decdn_common::config::ResolvedServe::default(),
-        receipts: ResolvedReceipts::default(),
     }
 }
 

@@ -179,9 +179,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
     # REQUIRED gate. `cargo llvm-cov nextest` in the `test` job does NOT execute
-    # doctests, so the `compile_fail` guard at crates/node/src/receipt_log.rs
-    # (and any future runnable doctest) would never run (#864). This job runs
-    # them so a doctest regression blocks the PR.
+    # doctests, so a runnable doctest (an example or a `compile_fail` guard)
+    # would never run (#864). This job runs them so a doctest regression blocks
+    # the PR.
     #
     # It lives in its own job — not appended to `test` — on purpose. A bare
     # `cargo test --doc` cannot reuse the coverage-instrumented artifacts the

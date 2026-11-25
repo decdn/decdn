@@ -13,8 +13,8 @@ use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::StreamAnchor;
 use super::wire::{FrameAccountingFault, FrameChunks, FrameQueue};
 use super::{
-    B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection, Hash,
-    RecvStream, SendStream,
+    BufferedProofReader, CHUNK_BYTES, ClientHandler, ClientMessage, Connection, Hash, RecvStream,
+    SendStream,
 };
 use crate::metrics::FirstByteClock;
 
@@ -208,7 +208,6 @@ impl ClientHandler {
         byte_len: u64,
         total_bytes: u64,
         admission: Admission,
-        client_node_id: B256,
         rate_per_mb: u64,
         first_byte: FirstByteClock,
     ) -> anyhow::Result<ServeEnd> {
@@ -231,7 +230,6 @@ impl ClientHandler {
             total_bytes,
             admission,
             &mut reader,
-            client_node_id,
             rate_per_mb,
             first_byte,
             &mut paid,
@@ -256,7 +254,6 @@ impl ClientHandler {
         total_bytes: u64,
         admission: Admission,
         reader: &mut BufferedProofReader,
-        client_node_id: B256,
         rate_per_mb: u64,
         mut first_byte: FirstByteClock,
         paid: &mut u64,
@@ -401,7 +398,6 @@ impl ClientHandler {
                     hash,
                     lane_key,
                     lane,
-                    client_node_id,
                     rate_per_mb,
                     len,
                     delivered,

@@ -153,7 +153,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
         serve: decdn_common::config::ResolvedServe::default(),
-        receipts: decdn_common::config::ResolvedReceipts::default(),
         content: decdn_common::config::ResolvedContent::default(),
     }
 }
@@ -560,14 +559,14 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
 
     // --- Reload #2: the mutable `log_level` change applies, bundled with
     //     restart-required ones. payment/blockchain/identity/
-    //     dht/serve/receipts warn on presence; `[network]` is back at its
+    //     dht/serve warn on presence; `[network]` is back at its
     //     startup `bind_port`, so it stays silent; `[cache]`
     //     warns because it sets the non-reloadable `cache_dir` (a
     //     pinned_hashes-only edit would not); `[observability]` warns once for
     //     each of `metrics_port` and `otlp_endpoint`, which differ from
     //     startup, and not for the reloadable `log_level`; `[security]` is
     //     fully reloadable, so it stays silent. Empty `[dht]`/`[serve]`/
-    //     `[receipts]`/`[security]` tables are "present" so they exercise
+    //     `[security]` tables are "present" so they exercise
     //     those emitter branches.
     write_config(
         &path,
@@ -587,7 +586,6 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          region = \"US\"\n\n\
          [dht]\n\n\
          [serve]\n\n\
-         [receipts]\n\n\
          [security]\n",
     );
     raise_sighup_soon();
@@ -607,15 +605,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     // Every section carrying a non-reloadable field emits exactly one
     // notice — including `[payment]`, present again (the notice fires on field
     // presence, not on a change vs the previous reload).
-    for section in [
-        "payment",
-        "blockchain",
-        "cache",
-        "identity",
-        "dht",
-        "serve",
-        "receipts",
-    ] {
+    for section in ["payment", "blockchain", "cache", "identity", "dht", "serve"] {
         assert_eq!(
             notice_count(&logs, section),
             1,

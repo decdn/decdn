@@ -119,10 +119,3 @@ published receipt shows that proof to everyone.
 
 `decdn get` writes a receipt only to the local file that `--receipt` names.
 To publish a receipt is the user's decision.
-
-## Relation to the Node's Download Receipts
-
-A node writes `download_receipts.jsonl` in its data directory. That file is
-the operator's audit log of what the node served and was paid for. A pull
-receipt is the client's record of one pull. The two files have different
-formats, and neither one reads the other.

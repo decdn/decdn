@@ -23,7 +23,7 @@ pub use resolved::{
     LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
     ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
     ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPaymentChain,
-    ResolvedReceipts, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServe,
+    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServe,
     ResolvedServeEconomics, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
@@ -457,27 +457,6 @@ pub const DEFAULT_FRAME_TARGET_BYTES: u64 = decdn_protocol::CHUNK_BYTES;
 /// Node-local policy, not a wire or governance parameter.
 pub const DEFAULT_VOUCHER_COMMIT_INTERVAL_MS: u64 = 5_000;
 
-/// Default size at which the download-receipt log rotates (#802): 128 MiB.
-/// With the default `retained_files` this bounds the audit log to ~640 MiB
-/// of `data_dir` while still keeping a multi-hundred-MiB delivery history.
-pub const DEFAULT_RECEIPT_MAX_FILE_BYTES: u64 = 128 << 20;
-/// Floor for `receipts.max_file_bytes` (#802): 1 MiB. Below this, rotation
-/// would churn near-constantly at the ~1-line-per-MiB-delivered write rate.
-pub const MIN_RECEIPT_MAX_FILE_BYTES: u64 = 1 << 20;
-/// Ceiling for `receipts.max_file_bytes` (#802): 1 GiB. A single live file
-/// larger than this defeats the point of bounding `data_dir` growth.
-pub const MAX_RECEIPT_MAX_FILE_BYTES: u64 = 1 << 30;
-/// Default number of rotated receipt-log backups retained (#802).
-pub const DEFAULT_RECEIPT_RETAINED_FILES: u32 = 4;
-/// Ceiling for `receipts.retained_files` (#802). Generous; the total disk
-/// bound is `(retained_files + 1) * max_file_bytes`.
-pub const MAX_RECEIPT_RETAINED_FILES: u32 = 100;
-/// Canonical filename of the download-receipt audit log within `data_dir`
-/// (#802). The path is derived (`data_dir`/this), not a configurable field;
-/// the daemon writer and the `config validate` summary both reference this so
-/// the surfaced path can't drift from where the log actually lands.
-pub const RECEIPT_LOG_FILE: &str = "download_receipts.jsonl";
-
 /// Load config from file (if present) and merge with CLI args.
 ///
 /// CLI args take precedence over file values; defaults fill gaps.
@@ -542,7 +521,6 @@ pub fn resolve_config(
     let load_shed = resolve_load_shed_into(file.load_shed.as_ref(), &mut bag);
     let dht = resolve_dht_into(file.dht.as_ref(), &mut bag);
     let serve = resolve_serve_into(file.serve.as_ref(), &mut bag);
-    let receipts = resolve_receipts_into(file.receipts.as_ref(), &mut bag);
     let content = resolve_content_into(file.content.as_ref(), &mut bag);
 
     validate_port_layout_into(&network, &observability, &mut bag);
@@ -566,7 +544,6 @@ pub fn resolve_config(
             load_shed,
             dht,
             serve,
-            receipts,
             content,
         },
         notices,
@@ -3007,60 +2984,6 @@ fn validate_otlp_endpoint(endpoint: &str) -> anyhow::Result<()> {
         "observability.otlp_endpoint must name the collector port (e.g. http://localhost:4317)"
     );
     Ok(())
-}
-
-/// Resolve download-receipt audit-log retention fields (#802).
-///
-/// `max_file_bytes` is clamped to `[MIN_RECEIPT_MAX_FILE_BYTES,
-/// MAX_RECEIPT_MAX_FILE_BYTES]` (rejected, not silently clamped) so a typo
-/// can neither rotate on every line nor defeat rotation. `retained_files`
-/// accepts `0` (truncate-in-place, no backups) up to
-/// `MAX_RECEIPT_RETAINED_FILES`.
-#[cfg(test)]
-fn resolve_receipts(file: Option<&types::ReceiptsConfig>) -> anyhow::Result<ResolvedReceipts> {
-    one_section(|bag| resolve_receipts_into(file, bag))
-}
-
-/// Bag-threading worker for the `[receipts]` section. Shares a bag with the
-/// other sections during startup ([`resolve_config`]); see
-/// [`resolve_payment_into`] for the rationale. The `#[cfg(test)]`
-/// `resolve_receipts` shim wraps this for direct unit tests.
-fn resolve_receipts_into(
-    file: Option<&types::ReceiptsConfig>,
-    bag: &mut ConfigDiagnostics,
-) -> ResolvedReceipts {
-    let max_file_bytes = file
-        .and_then(|r| r.max_file_bytes)
-        .unwrap_or(DEFAULT_RECEIPT_MAX_FILE_BYTES);
-    bag.check_with(
-        (MIN_RECEIPT_MAX_FILE_BYTES..=MAX_RECEIPT_MAX_FILE_BYTES).contains(&max_file_bytes),
-        "receipts.max_file_bytes",
-        || {
-            format!(
-                "receipts.max_file_bytes ({max_file_bytes}) must be within \
-                 [{MIN_RECEIPT_MAX_FILE_BYTES}, {MAX_RECEIPT_MAX_FILE_BYTES}] bytes"
-            )
-        },
-    );
-
-    let retained_files = file
-        .and_then(|r| r.retained_files)
-        .unwrap_or(DEFAULT_RECEIPT_RETAINED_FILES);
-    bag.check_with(
-        retained_files <= MAX_RECEIPT_RETAINED_FILES,
-        "receipts.retained_files",
-        || {
-            format!(
-                "receipts.retained_files ({retained_files}) must be <= \
-                 {MAX_RECEIPT_RETAINED_FILES}"
-            )
-        },
-    );
-
-    ResolvedReceipts {
-        max_file_bytes,
-        retained_files,
-    }
 }
 
 /// Resolve the connection concurrency cap.

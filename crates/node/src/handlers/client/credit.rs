@@ -15,9 +15,8 @@ use super::proof_wait::ChunkProofs;
 use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::StreamAnchor;
 use super::{
-    Address, Arc, B256, BufferedProofReader, ClientHandler, Connection, Hash, LaneDeliveryState,
-    LaneId, MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, VoucherRejectReason,
-    VoucherStop,
+    Address, Arc, BufferedProofReader, ClientHandler, Connection, Hash, LaneDeliveryState, LaneId,
+    MAX_PROOFS_PER_CHUNK, Mutex, RecvStream, SendStream, U256, VoucherRejectReason, VoucherStop,
 };
 
 /// What a stream holds for the checks that run before each send: the pool funder
@@ -159,7 +158,6 @@ impl ClientHandler {
         hash: Hash,
         lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
-        client_node_id: B256,
         rate_per_mb: u64,
         len: u64,
         delivered: u64,
@@ -196,10 +194,8 @@ impl ClientHandler {
                     recv,
                     reader,
                     anchor,
-                    hash,
                     lane_key,
                     Some(lane),
-                    client_node_id,
                     rate_per_mb,
                     &proofs,
                 )

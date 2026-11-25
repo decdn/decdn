@@ -22,9 +22,8 @@
 //! # Seam
 //!
 //! [`WarmingAllowance`] is the ledger; [`WarmingCreditSink`] is the serve-path
-//! boundary in front of it, mirroring [`crate::receipt_log::ReceiptSink`]. A
-//! stream task ends its serve with a non-blocking
-//! [`WarmingCreditSink::credit`], and the single background task from
+//! boundary in front of it, so ledger work never blocks delivery. A stream task
+//! ends its serve with a non-blocking [`WarmingCreditSink::credit`], and the single background task from
 //! [`spawn_warming_creditor`] applies the credit to the ledger. Tests use the
 //! inline `DirectWarmingCreditSink` (a `test-support` type) to keep the credit
 //! observable synchronously.

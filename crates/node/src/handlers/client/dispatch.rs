@@ -873,7 +873,6 @@ impl ClientHandler {
                         recv,
                         &req,
                         hash,
-                        client_node_id,
                         adm,
                         total,
                         rate_per_mb,
@@ -1303,7 +1302,6 @@ impl ClientHandler {
             req.byte_len,
             total_bytes,
             admission,
-            client_node_id,
             rate_per_mb,
             first_byte,
         ))

@@ -723,15 +723,6 @@ pub struct DecdnMetrics {
     /// `decdn_redemption_reconcile_failures_total`. Operator-visible name:
     /// `decdn_redeem_hints_parked_total`.
     pub redeem_hints_parked: Counter,
-    /// Download-receipt audit writes dropped because the bounded writer queue
-    /// was full (`try_send` → `Full`, #803), counted once per dropped receipt.
-    /// The receipt log is audit-only and the payment already advanced the lane
-    /// watermark, so a drop never affects settlement — but a sustained non-zero
-    /// rate means the receipt writer cannot keep up with disk I/O (a slow or full
-    /// `data_dir`, the end-state of #802) and audit/dispute records are being
-    /// lost. Operator-visible name:
-    /// `decdn_receipt_writes_dropped_total`.
-    pub receipt_writes_dropped: Counter,
     /// ADR 041 warming serve credits dropped before they reached the ledger,
     /// counted once per dropped credit. Either the bounded aggregator queue was
     /// full (`try_send` → `Full`) or the aggregator was gone (`Closed`). A drop
@@ -2147,10 +2138,6 @@ pub struct DecdnMetrics {
     /// failed. Sections committed before the failure stay applied; the rest keep
     /// their previous values.
     pub config_reload_failures: Counter,
-    /// `decdn_receipt_write_failures_total`: download-receipt audit records the
-    /// writer failed to persist (an I/O error or a panicked write task). Audit
-    /// only; settlement is unaffected.
-    pub receipt_write_failures: Counter,
     /// `decdn_serve_stream_midstream_pool_exhausted_total`: paying streams this
     /// node stopped mid-delivery because the pool's remaining deposit, minus
     /// the refundable floor `M`, can no longer fund the next chunk. The
@@ -2695,12 +2682,6 @@ recorders! {
     /// A redeem hint was dropped because its lane is parked after a chain
     /// fault on the hint path (#2340). The next sweep retries the lane.
     redeem_hint_parked => redeem_hints_parked.inc();
-
-    /// A download-receipt audit write was dropped because the bounded writer
-    /// queue was full (`try_send` → `Full`, #803). Audit-only, so a drop never
-    /// affects settlement; a sustained rate means the writer is not keeping up
-    /// with disk I/O and audit records are being lost.
-    receipt_write_dropped => receipt_writes_dropped.inc();
 
     /// An ADR 041 warming serve credit was dropped before it reached the ledger
     /// — the bounded aggregator queue was full, or the aggregator was gone. The
@@ -3392,8 +3373,6 @@ recorders! {
 
     /// A config reload failed and kept the previous values.
     config_reload_failure => config_reload_failures.inc();
-    /// The receipt writer failed to persist one audit record.
-    receipt_write_failure => receipt_write_failures.inc();
     /// A paying stream stopped mid-delivery on `PoolExhausted`.
     serve_stream_midstream_pool_exhausted => serve_stream_midstream_pool_exhausted.inc();
     /// A paying stream stopped mid-delivery because its pool closed, or closes

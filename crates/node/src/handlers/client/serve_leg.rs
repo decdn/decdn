@@ -62,7 +62,7 @@ use super::serve_waits::{ServeWaits, Wait};
 use super::voucher::StreamAnchor;
 use super::wire::chunk_frame_bufs;
 use super::{
-    Arc, B256, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
+    Arc, BufferedProofReader, CHUNK_BYTES, CHUNK_GROUP_BYTES, ClientHandler, ClientMessage,
     Connection, Hash, LaneDeliveryState, LaneId, Mutex, RecvStream, SendStream, ServeRejectReason,
 };
 
@@ -154,7 +154,6 @@ impl ClientHandler {
         lane: &Arc<Mutex<LaneDeliveryState>>,
         hash: Hash,
         lane_key: LaneId,
-        client_node_id: B256,
         rate_per_mb: u64,
         offset: u64,
         len: u64,
@@ -182,7 +181,6 @@ impl ClientHandler {
             lane,
             hash,
             lane_key,
-            client_node_id,
             rate_per_mb,
             offset,
             len,
@@ -319,7 +317,6 @@ impl ClientHandler {
         hash: Hash,
         lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
-        client_node_id: B256,
         rate_per_mb: u64,
         len: u64,
         delivered: u64,
@@ -337,7 +334,6 @@ impl ClientHandler {
                 hash,
                 lane_key,
                 lane,
-                client_node_id,
                 rate_per_mb,
                 len,
                 delivered,
@@ -381,7 +377,6 @@ impl ClientHandler {
         lane: &Arc<Mutex<LaneDeliveryState>>,
         hash: Hash,
         lane_key: LaneId,
-        client_node_id: B256,
         rate_per_mb: u64,
         offset: u64,
         len: u64,
@@ -475,7 +470,6 @@ impl ClientHandler {
                         hash,
                         lane_key,
                         lane,
-                        client_node_id,
                         rate_per_mb,
                         1,
                         delivered,
@@ -540,7 +534,6 @@ impl ClientHandler {
                     hash,
                     lane_key,
                     lane,
-                    client_node_id,
                     rate_per_mb,
                     clen,
                     delivered,

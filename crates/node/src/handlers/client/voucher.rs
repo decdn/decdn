@@ -18,8 +18,8 @@
 use super::proof_wait::ChunkProofs;
 use super::{
     Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, DEFAULT_TOLERANCE_BPS,
-    Hash, LaneDeliveryState, LaneId, LaneKey, LaneState, Mutex, Ordering, Proof, RateError,
-    RecvStream, SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop, WatermarkBundle,
+    LaneDeliveryState, LaneId, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream,
+    SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop, WatermarkBundle,
     verify_rate, voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
@@ -64,14 +64,11 @@ impl StreamAnchor {
 }
 
 /// A voucher that passed the node-side verify half, carrying the advanced
-/// candidate state, its cumulative byte watermark, and the receipt amount.
+/// candidate state and its cumulative byte watermark.
 #[derive(Debug)]
 struct VerifiedVoucher {
     next_state: LaneState,
     new_bytes: U256,
-    /// The voucher's cumulative amount, for the audit receipt (#248/#803).
-    /// Amount is the pool voucher's sole ordering key — there is no nonce.
-    amount: u64,
 }
 
 /// Why the node-side verify half rejected or bailed on a voucher. The optional
@@ -119,13 +116,6 @@ fn chunk_price_matches_quote(wire: &decdn_protocol::client::Voucher, rate_per_mb
         rate_per_mb
     };
     wire.chunk_price == expected
-}
-
-/// The bytes a proof added to a lane's paid frontier: the lane's paid bytes after
-/// the proof minus the paid bytes before it. A proof that folds nothing adds zero.
-fn paid_gain(before: U256, after: U256) -> anyhow::Result<u64> {
-    u64::try_from(after.saturating_sub(before))
-        .map_err(|_| anyhow::anyhow!("a proof added more than u64 bytes to a lane"))
 }
 
 /// Log one rejected payment proof at `info!`: the proof kind (`voucher` or
@@ -194,10 +184,8 @@ impl ClientHandler {
         recv: &mut RecvStream,
         reader: &mut BufferedProofReader,
         anchor: &mut StreamAnchor,
-        hash: Hash,
         lane_key: LaneId,
         lane: Option<&Arc<Mutex<LaneDeliveryState>>>,
-        client_node_id: B256,
         rate_per_mb: u64,
         proofs: &ChunkProofs,
     ) -> anyhow::Result<VoucherStop> {
@@ -231,10 +219,8 @@ impl ClientHandler {
             send,
             conn.stable_id(),
             anchor,
-            hash,
             lane_key,
             lane,
-            client_node_id,
             rate_per_mb,
             proof,
         )
@@ -243,8 +229,8 @@ impl ClientHandler {
 
     /// Verify one proof already read off the stream and commit it to the lane:
     /// the price check, the signature recovery, the watermark-gated re-checks
-    /// and the advance under the per-lane lock, then the record and the
-    /// receipt. [`Self::commit_one_proof`] calls this for the proof it waits
+    /// and the advance under the per-lane lock, then the record.
+    /// [`Self::commit_one_proof`] calls this for the proof it waits
     /// for; the serve loop's pre-frame drain calls it for the proofs the payer
     /// already delivered on the stream.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -253,10 +239,8 @@ impl ClientHandler {
         send: &mut SendStream,
         conn_id: usize,
         anchor: &mut StreamAnchor,
-        hash: Hash,
         lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
-        client_node_id: B256,
         rate_per_mb: u64,
         proof: Proof,
     ) -> anyhow::Result<VoucherStop> {
@@ -264,16 +248,7 @@ impl ClientHandler {
             Proof::Voucher(wire) => wire,
             Proof::Preimage(preimage) => {
                 return self
-                    .commit_one_preimage(
-                        send,
-                        conn_id,
-                        anchor,
-                        hash,
-                        lane_key,
-                        lane,
-                        client_node_id,
-                        preimage,
-                    )
+                    .commit_one_preimage(send, conn_id, anchor, lane_key, lane, preimage)
                     .await;
             }
         };
@@ -404,17 +379,14 @@ impl ClientHandler {
                 .await;
         }
 
-        // What the voucher added to the lane's paid bytes, for the receipt.
-        let gain = paid_gain(guard.paid_bytes, verified.new_bytes)?;
-
         // Advance in-memory, then record to the buffered store (a cheap map write;
         // durability is the background flush's job). A poisoned store mutex is the
         // only failure path and is treated as a serve fault. The candidate state
         // MOVES into the lane and `record` borrows it from there, so this proof
         // clones `LaneState` once (inside the store) rather than twice — the
         // remaining clone is the store's own and is the buffer resharding's to
-        // remove (issue #1792 item 3; `verified.{new_bytes,amount}` are `Copy`, so
-        // the partial move leaves them readable below).
+        // remove (issue #1792 item 3; `verified.new_bytes` is `Copy`, so the
+        // partial move leaves it readable below).
         let trailing = U256::from(wire.amount) < guard.state.last_amount();
         guard.state = verified.next_state;
         guard.paid_bytes = verified.new_bytes;
@@ -447,15 +419,6 @@ impl ClientHandler {
         self.metrics.voucher_received();
 
         // (3) Post-acceptance bookkeeping (best-effort, off the durability path).
-        //
-        // Only a proof that added to the lane's paid bytes gets a receipt. Under
-        // `PayWord` a stream sends an anchor voucher before its first reveal of
-        // an epoch. That voucher adds nothing to the lane's paid frontier, and
-        // logging it would put a payment in the audit log that this stream never
-        // took.
-        if gain > 0 {
-            self.record_receipt(hash, gain, client_node_id, verified.amount);
-        }
         self.hint_redeem(lane_key);
         Ok(VoucherStop::Continue { credited_bytes })
     }
@@ -504,10 +467,8 @@ impl ClientHandler {
         send: &mut SendStream,
         conn_id: usize,
         anchor: &mut StreamAnchor,
-        hash: Hash,
         lane_key: LaneId,
         lane: &Arc<Mutex<LaneDeliveryState>>,
-        client_node_id: B256,
         preimage: decdn_protocol::client::ChunkPreimage,
     ) -> anyhow::Result<VoucherStop> {
         // Index 0 names the root and resolves to the voucher's own `amount`, so
@@ -643,13 +604,8 @@ impl ClientHandler {
         }
 
         let owed_bytes = next_state.owed_bytes();
-        // Compute the receipt amount (an O(1) read) BEFORE moving the candidate
-        // into the lane, so the move can avoid a second full `LaneState` clone
-        // this reveal (issue #1792 item 3). The store's own clone inside `record`
-        // remains, to be removed with the buffer resharding.
-        let amount = u64::try_from(next_state.owed()).unwrap_or(u64::MAX);
-        // What the reveal added to the lane's paid bytes, for the receipt.
-        let gain = paid_gain(guard.paid_bytes, owed_bytes)?;
+        // The candidate MOVES into the lane, so this reveal clones `LaneState`
+        // only inside the store's `record` (issue #1792 item 3).
         guard.state = next_state;
         guard.paid_bytes = owed_bytes;
         if let Err(e) = self.record_lane(lane_key.deployment, &guard.state) {
@@ -669,20 +625,7 @@ impl ClientHandler {
         drop(guard);
         self.metrics.preimage_reveal_received();
 
-        // Post-acceptance bookkeeping, off the durability path. The receipt
-        // amount is the lane's new total claim — the same number a voucher's
-        // receipt carries, so the audit log reads uniformly across both proof
-        // kinds.
-        //
-        // The byte figure is `gain`: what the reveal added to the lane's paid
-        // frontier. A reveal walks from the LANE's frontier, so one arriving
-        // ahead of a sibling's covers every index between and pays for more than
-        // one chunk. That is what an audit log must say (#248/#803). A reveal that
-        // advanced nothing logs no payment. `amount` is the lane's new total claim,
-        // computed above before the candidate moved into the lane.
-        if gain > 0 {
-            self.record_receipt(hash, gain, client_node_id, amount);
-        }
+        // Post-acceptance bookkeeping, off the durability path.
         self.hint_redeem(lane_key);
         Ok(VoucherStop::Continue { credited_bytes })
     }
@@ -783,7 +726,6 @@ impl ClientHandler {
                 Ok(VerifiedVoucher {
                     next_state,
                     new_bytes,
-                    amount: wire.amount,
                 })
             }
             Err(PoolError::AmountRegression { last, .. }) => {
@@ -817,7 +759,6 @@ impl ClientHandler {
                 Ok(VerifiedVoucher {
                     next_state,
                     new_bytes: cumulative_bytes,
-                    amount: wire.amount,
                 })
             }
             Err(e) => {

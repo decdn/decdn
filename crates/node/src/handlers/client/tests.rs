@@ -308,9 +308,6 @@ async fn handler_for_tests_with(
             Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
                 as Arc<dyn PoolStateStore>,
         ),
-        Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
-            crate::receipt_log::NoopReceiptLog,
-        ))) as Arc<dyn ReceiptSink>,
         1,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
@@ -857,9 +854,6 @@ async fn handler_with_capability_intake(
             Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
                 as Arc<dyn PoolStateStore>,
         ),
-        Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
-            crate::receipt_log::NoopReceiptLog,
-        ))) as Arc<dyn ReceiptSink>,
         1,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),
@@ -941,9 +935,6 @@ async fn handler_with_deps(
             Arc::new(decdn_incentive::store::MemoryPoolStateStore::new())
                 as Arc<dyn PoolStateStore>,
         ),
-        Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
-            crate::receipt_log::NoopReceiptLog,
-        ))) as Arc<dyn ReceiptSink>,
         1,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),

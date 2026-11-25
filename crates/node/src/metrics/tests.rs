@@ -887,7 +887,6 @@ fn observability_counters_export_at_zero() {
         "decdn_dht_bucket_refresh_failures_total",
         "decdn_dht_bootstrap_find_node_failures_total",
         "decdn_config_reload_failures_total",
-        "decdn_receipt_write_failures_total",
         "decdn_serve_stream_midstream_pool_exhausted_total",
         "decdn_serve_stream_midstream_pool_closed_total",
         "decdn_serve_pool_recheck_stale_total",

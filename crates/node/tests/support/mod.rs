@@ -26,7 +26,6 @@ use decdn_incentive::{LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore};
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps, ClientProtocol};
 use decdn_node::metrics::Metrics;
-use decdn_node::receipt_log::{DirectReceiptSink, DownloadReceipt, ReceiptLog, ReceiptSink};
 use decdn_protocol::client::ClientMessage;
 use decdn_protocol::{decode_message, encode_message, read_frame, write_frame};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -552,111 +551,8 @@ pub(crate) struct HandlerDomains {
     pub binding: Eip712Domain,
 }
 
-/// In-memory [`ReceiptLog`] fake for tests: collects appended receipts so a
-/// suite can assert what was recorded on the voucher-accept path (issue #248).
-#[derive(Debug, Default)]
-pub(crate) struct VecReceiptLog {
-    inner: std::sync::Mutex<Vec<DownloadReceipt>>,
-}
-
-impl VecReceiptLog {
-    /// Snapshot the receipts appended so far.
-    ///
-    /// Recovers the inner `Vec` even if the mutex was poisoned by a panic on
-    /// another thread (`PoisonError::into_inner`), so a failing assertion still
-    /// sees the receipts actually collected rather than a misleading empty list.
-    /// The anti-panic policy rules out `unwrap`/`expect` here, and silently
-    /// defaulting to empty (the prior `unwrap_or_default`) would mask the real
-    /// failure cause in a test double.
-    #[must_use]
-    pub(crate) fn snapshot(&self) -> Vec<DownloadReceipt> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
-
-impl ReceiptLog for VecReceiptLog {
-    fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()> {
-        self.inner
-            .lock()
-            .map_err(|_| std::io::Error::other("VecReceiptLog mutex poisoned"))?
-            .push(receipt.clone());
-        Ok(())
-    }
-}
-
-/// A [`ReceiptLog`] whose `append` always errors. Proves the voucher-accept
-/// path treats a receipt-log write failure as non-fatal (issue #248): the
-/// payment already committed to the pool-state store, so delivery must still
-/// succeed.
-#[derive(Debug, Default)]
-pub(crate) struct FailingReceiptLog;
-
-impl ReceiptLog for FailingReceiptLog {
-    fn append(&self, _receipt: &DownloadReceipt) -> std::io::Result<()> {
-        Err(std::io::Error::other("simulated receipt-log write failure"))
-    }
-}
-
-/// A [`ReceiptLog`] whose `append` blocks until [`release`](Self::release) is
-/// called, recording what it eventually appends. Lets a test prove the
-/// paid-delivery hot path never waits on receipt-log I/O (#803): wired behind
-/// the real background-writer sink, delivery must complete even while every
-/// `append` is stalled here (an implementation that awaits the append inline hangs).
-#[derive(Default)]
-pub(crate) struct BlockingReceiptLog {
-    state: std::sync::Mutex<BlockingReceiptState>,
-    released: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct BlockingReceiptState {
-    released: bool,
-    seen: Vec<DownloadReceipt>,
-}
-
-impl BlockingReceiptLog {
-    /// Unblock all current and future `append` calls.
-    pub(crate) fn release(&self) {
-        if let Ok(mut g) = self.state.lock() {
-            g.released = true;
-        }
-        self.released.notify_all();
-    }
-
-    /// Snapshot the receipts appended so far.
-    #[must_use]
-    pub(crate) fn snapshot(&self) -> Vec<DownloadReceipt> {
-        self.state
-            .lock()
-            .map(|g| g.seen.clone())
-            .unwrap_or_default()
-    }
-}
-
-impl ReceiptLog for BlockingReceiptLog {
-    fn append(&self, receipt: &DownloadReceipt) -> std::io::Result<()> {
-        let mut g = self
-            .state
-            .lock()
-            .map_err(|_| std::io::Error::other("BlockingReceiptLog mutex poisoned"))?;
-        while !g.released {
-            g = self
-                .released
-                .wait(g)
-                .map_err(|_| std::io::Error::other("BlockingReceiptLog mutex poisoned"))?;
-        }
-        g.seen.push(receipt.clone());
-        Ok(())
-    }
-}
-
 /// Build a [`ClientHandler`] over `cache`/`store` with explicit domains and the
 /// `max_concurrent_streams` knob.
-/// Uses a throwaway in-memory receipt log; tests asserting receipt contents use
-/// [`build_handler_full_with_receipts`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_handler_full(
     server_id: iroh::PublicKey,
@@ -669,69 +565,6 @@ pub(crate) fn build_handler_full(
     domains: &HandlerDomains,
     max_concurrent_streams: usize,
 ) -> anyhow::Result<Arc<ClientHandler>> {
-    build_handler_full_with_receipts(
-        server_id,
-        server_eth,
-        metrics,
-        limiter,
-        cache,
-        store,
-        Arc::new(VecReceiptLog::default()),
-        rate,
-        domains,
-        max_concurrent_streams,
-    )
-}
-
-/// Like [`build_handler_full`] but takes an explicit [`ReceiptLog`] so a test
-/// can hold a handle ([`VecReceiptLog`]) and assert the appended receipts.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_handler_full_with_receipts(
-    server_id: iroh::PublicKey,
-    server_eth: &Arc<PrivateKeySigner>,
-    metrics: &Arc<Metrics>,
-    limiter: Arc<ConnectionLimiter>,
-    cache: CacheEngine,
-    store: Arc<dyn PoolStateStore>,
-    receipt_log: Arc<dyn ReceiptLog>,
-    rate: u64,
-    domains: &HandlerDomains,
-    max_concurrent_streams: usize,
-) -> anyhow::Result<Arc<ClientHandler>> {
-    // The handler enqueues through a `ReceiptSink`; wrap the test's synchronous
-    // `ReceiptLog` fake so receipts are appended inline and the test can assert
-    // them deterministically without standing up the background writer.
-    build_handler_full_with_sink(
-        server_id,
-        server_eth,
-        metrics,
-        limiter,
-        cache,
-        store,
-        Arc::new(DirectReceiptSink::new(receipt_log)),
-        rate,
-        domains,
-        max_concurrent_streams,
-    )
-}
-
-/// Like [`build_handler_full_with_receipts`] but wires an explicit
-/// [`ReceiptSink`] — e.g. the real background-writer sink from
-/// [`decdn_node::receipt_log::spawn_receipt_writer`] — so a test can exercise
-/// the production enqueue path instead of the synchronous [`DirectReceiptSink`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_handler_full_with_sink(
-    server_id: iroh::PublicKey,
-    server_eth: &Arc<PrivateKeySigner>,
-    metrics: &Arc<Metrics>,
-    limiter: Arc<ConnectionLimiter>,
-    cache: CacheEngine,
-    store: Arc<dyn PoolStateStore>,
-    receipt_sink: Arc<dyn ReceiptSink>,
-    rate: u64,
-    domains: &HandlerDomains,
-    max_concurrent_streams: usize,
-) -> anyhow::Result<Arc<ClientHandler>> {
     Ok(Arc::new(ClientHandler::new(client_handler_deps(
         server_id,
         server_eth,
@@ -739,7 +572,6 @@ pub(crate) fn build_handler_full_with_sink(
         limiter,
         cache,
         store,
-        receipt_sink,
         rate,
         domains,
         max_concurrent_streams,
@@ -789,7 +621,6 @@ fn client_handler_deps(
     limiter: Arc<ConnectionLimiter>,
     cache: CacheEngine,
     store: Arc<dyn PoolStateStore>,
-    receipt_sink: Arc<dyn ReceiptSink>,
     rate: u64,
     domains: &HandlerDomains,
     max_concurrent_streams: usize,
@@ -803,7 +634,6 @@ fn client_handler_deps(
         domains.stream_dom.clone(),
         domains.binding.clone(),
         decdn_node::handlers::client::PoolRoute::new(deployment_of(&domains.voucher), store),
-        receipt_sink,
         rate,
         max_concurrent_streams,
         // Empty by default; a test needing a populated deny-set overwrites the
@@ -830,8 +660,7 @@ fn client_handler_deps(
 /// `configure` before construction — the construction-time replacement for the
 /// removed `attach_*` setters (#1254). A test enables the optional wiring it
 /// exercises (pull-through deadline, window origin, leech governor, idle timeout,
-/// …) by setting the matching `deps` fields. Uses the throwaway in-memory receipt
-/// log, like [`build_handler_full`].
+/// …) by setting the matching `deps` fields.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_handler_full_configured(
     server_id: iroh::PublicKey,
@@ -852,7 +681,6 @@ pub(crate) fn build_handler_full_configured(
         limiter,
         cache,
         store,
-        Arc::new(DirectReceiptSink::new(Arc::new(VecReceiptLog::default()))),
         rate,
         domains,
         max_concurrent_streams,
