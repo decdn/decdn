@@ -9,6 +9,12 @@
 //! entry fails at the register step, after `approve`, `bond` and `declareMbps`
 //! are mined. The other direction matters too: a registered node registers no
 //! address, so a bad entry must not stop it.
+//!
+//! `decdn setup` and `decdn node register` also refuse a multiaddr set whose
+//! packed form exceeds `CapacityBond.maxMultiaddrSize` before any prompt or
+//! transaction. `registerNode` reverts `MultiaddrsTooLarge` above the ceiling,
+//! and the ceiling is a chain read, so only a deployed contract shows where
+//! the check runs.
 
 #![cfg(feature = "anvil-e2e")]
 #![allow(
@@ -52,6 +58,13 @@ async fn setup_ignores_a_bad_entry_on_a_registered_node() -> anyhow::Result<()> 
     tokio::time::timeout(OVERALL_TIMEOUT, ignores_when_registered())
         .await
         .context("cli_setup_external_addrs (registered) timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_multiaddr_set_fails_before_any_prompt_or_transaction() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, refuses_an_oversized_set())
+        .await
+        .context("cli_setup_external_addrs (oversized) timed out")?
 }
 
 fn init_tracing() {
@@ -143,6 +156,100 @@ async fn ignores_when_registered() -> anyhow::Result<()> {
     assert_eq!(chain.declared_mbps(operator).await?, TARGET_MBPS);
     assert!(chain.is_active(operator).await?, "the node stays active");
     Ok(())
+}
+
+async fn refuses_an_oversized_set() -> anyhow::Result<()> {
+    init_tracing();
+    let chain = ChainFixture::launch().await?;
+    // Keys and a keystore, nothing on chain.
+    let (node, _hash) = NodeFixture::launch_bare(&chain, "US", b"multiaddr size").await?;
+    let operator = node.operator_addr();
+
+    // Fund the whole target, so the pre-flight passes and setup reaches the
+    // registration-state read.
+    let target = chain
+        .min_bond()
+        .await?
+        .max(chain.bond_required(TARGET_MBPS).await?);
+    chain.transfer_token(operator, target).await?;
+    let token_before = chain.token_balance(operator).await?;
+    let bond_before = chain.active_bond(operator).await?;
+
+    // One address whose packed form exceeds any ceiling the contract accepts
+    // (`maxMultiaddrSize` is at most 1,024 bytes).
+    let too_large = format!("/dns4/{}.example/udp/4433/quic-v1", "a".repeat(1_100));
+    let mbps = TARGET_MBPS.to_string();
+    let setup = ["setup", "--mbps", &mbps, "--region", "US"];
+
+    // `node register` without `--accept-terms` and without a terminal aborts at
+    // the terms prompt. A size error instead shows the check runs first.
+    let register = run_with_multiaddr(
+        &node,
+        &["node", "register", "--region", "US"],
+        &too_large,
+        &[],
+    )
+    .await?;
+    assert_size_refused(&register, "node register");
+
+    let dry = run_with_multiaddr(&node, &setup, &too_large, &["--dry-run", "--json"]).await?;
+    assert_size_refused(&dry, "setup --dry-run");
+
+    let live = run_with_multiaddr(
+        &node,
+        &setup,
+        &too_large,
+        &["--yes", "--accept-terms", "--json"],
+    )
+    .await?;
+    assert_size_refused(&live, "setup");
+
+    assert_eq!(
+        chain.token_balance(operator).await?,
+        token_before,
+        "no TOKEN moved"
+    );
+    assert_eq!(
+        chain.active_bond(operator).await?,
+        bond_before,
+        "no bond was posted"
+    );
+    assert!(!chain.is_active(operator).await?, "the node is not active");
+    Ok(())
+}
+
+/// The command must fail with the size pre-check's error, which names the
+/// call it guards and the revert it prevents.
+fn assert_size_refused(out: &Output, what: &str) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "{what} must refuse an oversized set.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("`registerNode` would revert MultiaddrsTooLarge"),
+        "{what} fails at the size pre-check, not later.\nstderr: {stderr}"
+    );
+}
+
+/// `decdn <args> --multiaddr <multiaddr> <extra>` against the node's own
+/// config, asserting nothing.
+async fn run_with_multiaddr(
+    node: &NodeFixture,
+    args: &[&str],
+    multiaddr: &str,
+    extra: &[&str],
+) -> anyhow::Result<Output> {
+    Command::from(decdn_command(node.data_dir(), KEYSTORE_PASSWORD)?)
+        .args(args)
+        .args(["--multiaddr", multiaddr])
+        .args(extra)
+        .arg("--config")
+        .arg(node.config_path())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("spawn decdn {}", args.join(" ")))
 }
 
 /// A copy of the node's config whose existing `[network]` table gains a bad

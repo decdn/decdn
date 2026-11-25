@@ -25,7 +25,7 @@
 use std::io;
 use std::path::Path;
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
 use anyhow::Context;
 use decdn_common::cli;
@@ -114,10 +114,10 @@ pub(crate) struct Plan {
     /// Number of multiaddr strings being published.
     pub(crate) multiaddr_count: usize,
     /// Packed byte length of the `multiaddrs` field the transaction carries.
-    pub(crate) packed_size: u64,
+    pub(crate) packed_size: usize,
     /// Governable `maxMultiaddrSize` ceiling (bytes) the packed size must not
     /// exceed.
-    pub(crate) max_multiaddr_size: u64,
+    pub(crate) max_multiaddr_size: U256,
     /// `lastMultiaddrUpdate` timestamp (unix seconds); `0` when never updated.
     pub(crate) last_update: u64,
     /// Governable `multiaddrUpdateCooldown` (seconds) between updates.
@@ -158,15 +158,12 @@ async fn build_plan<P: Provider + Clone>(
         .with_context(|| ctx("multiaddrUpdateCooldown"))?;
     let head_timestamp = chain_ctx::head_timestamp(bond.provider()).await?;
 
-    // Saturating rather than `try_into`: both are governance parameters bounded
-    // far below `u64::MAX`, so a value past `u64` is unreachable — and failing
-    // the whole command on an unreachable read would be worse than clamping.
-    let max_multiaddr_size: u64 = max_multiaddr_size.saturating_to();
+    // Saturating rather than `try_into`: the cooldown is a governance parameter
+    // bounded far below `u64::MAX`, so a value past `u64` is unreachable — and
+    // failing the whole command on an unreachable read would be worse than clamping.
     let cooldown_secs: u64 = cooldown.saturating_to();
     let ready_at = info.lastMultiaddrUpdate.saturating_add(cooldown_secs);
-    // Packed length is a handful of KB in practice; `u64::MAX` on the
-    // impossible overflow keeps the ceiling check erring toward "too large".
-    let packed_size = u64::try_from(packed.len()).unwrap_or(u64::MAX);
+    let packed_size = packed.len();
 
     Ok(Plan {
         capacity_bond,
@@ -213,14 +210,11 @@ pub(crate) fn ensure_submittable(plan: &Plan) -> anyhow::Result<()> {
          operator cannot register (it would revert too) and instead exits the bond with \
          `decdn node unbond --all`."
     );
-    anyhow::ensure!(
-        plan.packed_size <= plan.max_multiaddr_size,
-        "packed multiaddrs are {} bytes, over the maxMultiaddrSize ceiling of {} bytes — \
-         `updateMultiaddrs` would revert MultiaddrsTooLarge. Publish fewer or shorter \
-         addresses.",
+    ensure_packed_within(
         plan.packed_size,
         plan.max_multiaddr_size,
-    );
+        "updateMultiaddrs",
+    )?;
     if plan.head_timestamp < plan.ready_at {
         let wait = plan.ready_at.saturating_sub(plan.head_timestamp);
         anyhow::bail!(
@@ -233,6 +227,25 @@ pub(crate) fn ensure_submittable(plan: &Plan) -> anyhow::Result<()> {
             plan.head_timestamp,
         );
     }
+    Ok(())
+}
+
+/// Refuse a packed multiaddr set the contract would revert `MultiaddrsTooLarge`
+/// on, naming `contract_fn` (the call that would revert) and both byte counts.
+/// The contract's check is `packed > maxMultiaddrSize`, so a set exactly at the
+/// ceiling passes. Pure, so `registerNode` and `updateMultiaddrs` share one
+/// testable bound.
+pub(crate) fn ensure_packed_within(
+    packed_size: usize,
+    max_multiaddr_size: U256,
+    contract_fn: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        U256::from(packed_size) <= max_multiaddr_size,
+        "packed multiaddrs are {packed_size} bytes, over the maxMultiaddrSize ceiling of \
+         {max_multiaddr_size} bytes — `{contract_fn}` would revert MultiaddrsTooLarge. Publish \
+         fewer or shorter addresses.",
+    );
     Ok(())
 }
 
@@ -260,7 +273,7 @@ pub(crate) fn write_plan(
             "active": p.active,
             "multiaddrs": p.multiaddr_count,
             "packed_bytes": p.packed_size,
-            "max_multiaddr_size": p.max_multiaddr_size,
+            "max_multiaddr_size": p.max_multiaddr_size.to_string(),
             "last_update": p.last_update,
             "cooldown_secs": p.cooldown_secs,
             "ready_at": p.ready_at,

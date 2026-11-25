@@ -192,9 +192,10 @@ mod sol_types {
             function unbond(uint256 amount) external;
 
             /// Governable ceiling (bytes) on the packed `multiaddrs` field an
-            /// operator may publish. `updateMultiaddrs` reverts
-            /// `MultiaddrsTooLarge` above it; `decdn node update-multiaddrs`
-            /// pre-checks against it so the cap surfaces before the send.
+            /// operator may publish. `registerNode` and `updateMultiaddrs` revert
+            /// `MultiaddrsTooLarge` above it; `decdn node register`, `decdn setup`,
+            /// `decdn node rotate-key --key eth` and `decdn node update-multiaddrs`
+            /// pre-check against it so the cap surfaces before the send.
             function maxMultiaddrSize() external view returns (uint256);
 
             /// Governable minimum interval (seconds) between an operator's
