@@ -15,7 +15,7 @@ Three independent design pressures bear on wallet choice and signature verificat
 
 deCDN resolves these as follows:
 
-- **On-chain (problems 2 and 3):** every contract verifies call-time signatures through OpenZeppelin's `SignatureChecker`, so a Safe — or any ERC-1271 account — works as `msg.sender`, a pool `owner`, or a voucher `signer` on every on-chain path with no further feature work. This is the one piece whose omission would force a coordinated retrofit of every deployed contract later.
+- **On-chain (problems 2 and 3):** every contract verifies call-time signatures through OpenZeppelin's `SignatureChecker`, so a Safe — or any ERC-1271 account — works as `msg.sender` or a pool `owner` on every on-chain path with no further feature work. This is the one piece whose omission would force a coordinated retrofit of every deployed contract later. The redemption voucher is the one exception: `redeem` recovers the voucher `signer` with plain ECDSA, so a voucher signer is an EOA ([ADR 003 § Voucher signatures are compact, and their signers are EOAs](003-payments.md#voucher-signatures-are-compact-and-their-signers-are-eoas)).
 - **Off-chain hot signing (problem 1):** the signing host holds a software EOA (the same trust posture as an `eth_keystore` today) and signs `operator_sig`, vouchers, and `BindNodeId` bindings with it. Off-chain verifiers recover the signer from the fixed 65-byte secp256k1 form and compare it against the expected address.
 
 The buyer side needs nothing more. A pool owner — EOA or Safe — funds a pool and issues a capped, expiring capability to a hot EOA `signer` ([ADR 003 § PaymentPool](003-payments.md#paymentpool)); only that EOA is ever recovered, so a Safe funder is servable today with no account-abstraction machinery. What remains open is one operator-side residual — a node whose *serving* identity is a smart account — recorded in [§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving).
@@ -24,7 +24,7 @@ The buyer side needs nothing more. A pool owner — EOA or Safe — funds a pool
 
 ### Universal `SignatureChecker` in All Contracts
 
-Every signature verification site across all deCDN contracts uses OpenZeppelin's [`SignatureChecker`](https://docs.openzeppelin.com/contracts/5.x/api/utils#SignatureChecker) library instead of direct `ECDSA.recover` or `ecrecover`.
+Every signature verification site across all deCDN contracts uses OpenZeppelin's [`SignatureChecker`](https://docs.openzeppelin.com/contracts/5.x/api/utils#SignatureChecker) library instead of direct `ECDSA.recover` or `ecrecover`, except the redemption voucher. The voucher check is a plain `ecrecover` over a compact signature. This keeps lane calldata static and skips an `EXTCODESIZE` per lane, so a lane stays cheap to redeem at small balances ([ADR 003 § Voucher signatures are compact, and their signers are EOAs](003-payments.md#voucher-signatures-are-compact-and-their-signers-are-eoas)).
 
 `SignatureChecker.isValidSignatureNow(signer, digest, signature)` transparently handles both:
 
@@ -39,7 +39,7 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 
 | Function | Verification |
 | --- | --- |
-| `redeem` — voucher signature | `SignatureChecker.isValidSignatureNow(signer, voucherDigest, voucherSig)` |
+| `redeem` — voucher signature | `ECDSA.tryRecover(voucherDigest, r, vs) == signer` (EOA only) |
 | `redeem` — capability signature (first redemption per signer) | `ECDSA.tryRecover(capabilityDigest, capability) == pool.owner`, else `SignatureChecker.isValidERC1271SignatureNow(pool.owner, capabilityDigest, capability)` |
 
 `signer` is the capability-authorized voucher key; `pool.owner` is the address that signs the capability ([ADR 003 § PaymentPool](003-payments.md#paymentpool)). A pool has no single pinned `voucherSigner` — it authorizes many capped signers off-chain, registered lazily on first redemption.
@@ -63,7 +63,7 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 
 ### Wallet Support — EOA Default, Safe Supported
 
-The encrypted EOA keystore is deCDN's documented default wallet for both node operators and clients. Safe — and any other ERC-1271-compliant smart account — is **supported**: because `SignatureChecker` is wired at every verification site, a Safe works as `msg.sender`, the pool `owner`, or a voucher `signer` on every on-chain path with no deCDN feature work, no config surface, and no setup tooling.
+The encrypted EOA keystore is deCDN's documented default wallet for both node operators and clients. Safe — and any other ERC-1271-compliant smart account — is **supported**: because `SignatureChecker` is wired at every verification site but the voucher, a Safe works as `msg.sender` or the pool `owner` on every on-chain path with no deCDN feature work, no config surface, and no setup tooling. A voucher `signer` is an EOA.
 
 deCDN recommends none of them. A 1-of-1 Safe carries the same trust posture as the single software-held key that owns it, and the multi-owner threshold that would buy real security cannot be reached on the hot path (below). The choice is the operator's, and the contract-level `SignatureChecker` is what makes it free.
 
@@ -79,7 +79,7 @@ deCDN recommends none of them. A 1-of-1 Safe carries the same trust posture as t
 **An EOA keystore is the default.**
 
 - **Pool operations:** The EOA (or Safe) deposits USDC into `PaymentPool.openPool()`. That address is the pool `owner` — the funder — and `SignatureChecker` makes the choice transparent to every contract.
-- **Voucher signing:** EIP-712 vouchers are signed by a capability-authorized `signer`, which the owner delegates (and which defaults to the owner itself). On-chain, `SignatureChecker` validates against it. Off-chain, nodes verify vouchers and `BindNodeId` ephemeral bindings by recovery only, against that signer — so the signer is an EOA.
+- **Voucher signing:** EIP-712 vouchers are signed by a capability-authorized `signer`, which the owner delegates (and which defaults to the owner itself). On-chain, `redeem` recovers the voucher signature with plain ECDSA and compares it against that signer. Off-chain, nodes verify vouchers and `BindNodeId` ephemeral bindings by recovery only, against that signer — so the signer is an EOA.
 - **A smart-account funder is servable today, with no residual.** Because the owner and the signer are separate roles, a Safe funds a pool and issues a capability to a plain EOA `signer`. The Safe custodies the deposit and receives the reclaim; the vouchers recover by `ecrecover` and clear the off-chain path unchanged. This is the capability delegation of [ADR 003](003-payments.md#paymentpool) doing exactly what a smart-account client needs — scope-limiting, a spending bound, and expiry-based revocation — without any account-abstraction machinery. The buyer side has no open residual.
 
 ### Off-Chain Signature Verification — EOA Recovery Only
@@ -102,7 +102,7 @@ ERC-1271 validity is not a property of a keypair; it is `isValidSignature(digest
 
 | Class | Signatures | ERC-1271 safe? | Why |
 | --- | --- | --- | --- |
-| **Consumed at call time** | bond, `registerNode` / `bindNodeId`, `redeem` voucher + capability, pool close, buyer capability grant | Yes — this is what `SignatureChecker` already does | The question is "is it valid *now*?", answered and consumed in the same transaction |
+| **Consumed at call time** | bond, `registerNode` / `bindNodeId`, `redeem` capability, pool close, buyer capability grant | Yes — this is what `SignatureChecker` already does | The question is "is it valid *now*?", answered and consumed in the same transaction |
 | **Re-verified later as evidence** | `operator_sig` on `StreamResponse` | **No** | The signer controls validity in the gap between taking payment and the later check |
 
 A `StreamResponse` signature is evidence of a serve. The requester checks it before it pays ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). A pull receipt keeps it, so that any party can check it again later, with no network access ([Appendix: Pull Receipts](appendix-pull-receipts.md#verification)). Both checks assume that the signature that authorized the paid action stays provably valid after the payment. Smart-account signers break this assumption. `operator_sig` sits in the second class, so it cannot move to ERC-1271.
@@ -127,7 +127,7 @@ A 1-of-1 Safe and any EOA are served by the stock `CompatibilityFallbackHandler`
 
 - All deCDN contracts support smart account wallets, eliminating a future retrofit across every verification site.
 - deCDN ships no bespoke Safe modules or custom fallback handlers — stock `CompatibilityFallbackHandler` + `SignatureChecker` are sufficient for 1-of-1 Safes and EOAs.
-- No contract-level changes beyond the mechanical `SignatureChecker` verification at every site.
+- No contract-level changes beyond the mechanical `SignatureChecker` verification at every site but the voucher.
 - EOA users are unaffected — `SignatureChecker` is a transparent superset of `ECDSA.recover`.
 - The approach is wallet-agnostic at the contract level. Any ERC-1271-compliant smart account, Safe included, works without contract changes — deCDN recommends and tools none of them.
 - Operator onboarding is one `decdn key-gen` keystore. No wallet-choice decision and no Safe deployment sit on the critical path to serving traffic.
@@ -136,5 +136,6 @@ A 1-of-1 Safe and any EOA are served by the stock `CompatibilityFallbackHandler`
 ### Negative
 
 - Hot-signing parties (nodes, clients) hold a single software-held EOA key. Multisig protection of the high-frequency signing path is not available; a multi-owner Safe is viable only on the infrequent stake / withdraw / pool-open paths, for parties who choose that split themselves.
+- A voucher `signer` must be an EOA. A smart account that pays per voucher delegates a capability to an EOA signer.
 - A node whose serving identity is a smart account cannot participate off-chain. The contracts accept it; the node's off-chain verifiers do not, and reject anything but the 65-byte recovery form fail-closed. Closing that gap is unimplemented, and the ERC-1271 route that looks obvious is unsound for signatures that serve as evidence ([§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving)).
 - Gas overhead for smart account signature verification is higher than pure `ecrecover` (+10–15k gas per verification). Applies only to on-chain operations (redemption, pool close, registration), not the high-frequency off-chain signing path.
