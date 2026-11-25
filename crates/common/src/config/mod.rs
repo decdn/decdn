@@ -589,7 +589,7 @@ pub fn resolve_config(
 /// inside either single-section resolver.
 ///
 /// Scope: this is a *static local-config* check only. The on-chain governance
-/// deny-set (fed at runtime through `CacheEngine::set_chain_denied`) can still
+/// deny-set (fed at runtime through `CacheEngine::set_chain_denied_one`) can still
 /// collide with a pinned hash after startup; no static check can catch that.
 // Single-section shim preserving the `anyhow::Result` API for the unit tests;
 // `resolve_config` uses the `*_into` worker with the shared bag instead.
@@ -625,13 +625,22 @@ fn ensure_no_hash_pinned_and_denied_into(
     });
 }
 
+/// Single-section wrapper over [`validate_port_layout_into`] for tests.
+#[cfg(test)]
+fn validate_port_layout(
+    network: &ResolvedNetwork,
+    observability: &ResolvedObservability,
+) -> anyhow::Result<()> {
+    one_section(|bag| validate_port_layout_into(network, observability, bag))
+}
+
 /// Cross-section check on the running node's port assignments. Lives at the
 /// resolver boundary because `bind_port`, `metrics_port`, and `admin_port`
 /// come from different sections — the collision rules are inherently
 /// cross-section, and operators who set two of them equal almost certainly
-/// made a typo. Also emits a stderr warning for well-known ports (<1024),
+/// made a typo. Also records a warning notice for well-known ports (<1024),
 /// which bind on Unix only with elevated privilege and may collide with
-/// standardized services.
+/// standardized services. Callers pass their own bag.
 ///
 /// Collision rules:
 /// - `bind_port` vs. `metrics_port` — QUIC (UDP) and metrics (TCP) would
@@ -644,15 +653,7 @@ fn ensure_no_hash_pinned_and_denied_into(
 /// with nothing (the OS picks distinct values) and needs no elevated
 /// privilege, so every check skips it. Admin disabled (`None`) means we
 /// skip the pair checks that involve it.
-#[cfg(test)]
-fn validate_port_layout(
-    network: &ResolvedNetwork,
-    observability: &ResolvedObservability,
-) -> anyhow::Result<()> {
-    one_section(|bag| validate_port_layout_into(network, observability, bag))
-}
-
-fn validate_port_layout_into(
+pub fn validate_port_layout_into(
     network: &ResolvedNetwork,
     observability: &ResolvedObservability,
     bag: &mut ConfigDiagnostics,
@@ -798,6 +799,8 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// Resolve network fields, recording any malformed `relay_urls` (#818) or
 /// `external_addrs` entry into `bag`.
 ///
+/// Callers pass their own bag.
+///
 /// Each `external_addrs` entry must pass [`crate::net::parse_external_addr`]:
 /// a public `IP:port`. A bad entry is recorded under
 /// `network.external_addrs[i]`. A repeated address is kept once.
@@ -819,7 +822,7 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// invariant bring-up enforces — a credential-bearing typo
 /// (`relay://user:pass@bad host`) is exactly the malformed shape that lands on
 /// the error path.
-fn resolve_network_into(
+pub fn resolve_network_into(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
     bag: &mut ConfigDiagnostics,

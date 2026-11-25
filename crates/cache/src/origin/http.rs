@@ -66,9 +66,7 @@ impl HttpOrigin {
     /// Build an [`HttpOrigin`] around a validated [`OriginUrl`]. The only way
     /// to obtain one is [`parse_origin_url`], so invariants are enforced at
     /// the type boundary rather than documented in prose. Timeouts default
-    /// to the `RESPONSE_HEADERS_TIMEOUT` and `CHUNK_IDLE_TIMEOUT` constants; override
-    /// with [`Self::with_timeouts`] if operator policy or tests require
-    /// different values.
+    /// to the `RESPONSE_HEADERS_TIMEOUT` and `CHUNK_IDLE_TIMEOUT` constants.
     ///
     /// Sets [`DEFAULT_USER_AGENT`] on the inner reqwest client so origin
     /// access logs can attribute CDN pull-through traffic (#435). Override
@@ -165,9 +163,8 @@ impl HttpOrigin {
         Self::new(parse_origin_url(raw)?)
     }
 
-    /// Override the phase timeouts. Primarily exists for tests — runtime
-    /// callers should use the defaults unless operator policy dictates
-    /// otherwise.
+    /// Override the phase timeouts.
+    #[cfg(test)]
     #[must_use]
     pub const fn with_timeouts(
         mut self,

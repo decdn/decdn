@@ -25,7 +25,7 @@ BLAKE3 is iroh's native hash function, so there is no translation layer between 
 
 Content addressing answers "what is this blob?" — a BLAKE3 hash, intrinsic to the bytes. It does not answer "who serves this blob, and where do I fetch it from?". That is the **namespace's** job. The bare hash carries no origin information; a request that wants a guaranteed origin must also carry the namespace under which the content is published.
 
-A **publisher** is an Ethereum address that owns at least one namespace in the `PublisherRegistry` contract ([ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)). Publisher status is acquired implicitly on the first successful `createNamespace()` call — there is no separate registration transaction. Transferring a namespace is gated (see [§ Contract: PublisherRegistry](#contract-publisherregistry) for the lifecycle).
+A **publisher** is an Ethereum address that owns at least one namespace in the `PublisherRegistry` contract ([ADR 016](016-contract-interactions.md#adr-016-smart-contract-interaction-model)). Publisher status is acquired implicitly on the first successful `createNamespace()` call — there is no separate registration transaction. The owner transfers a namespace in two steps: an offer and an acceptance (see [§ Namespace transfer](#namespace-transfer)).
 
 A **namespace** is a publisher-owned `uint256` identifier for a content set, and it is the unit of origin addressing and governance. The publisher seats a set of origin operators per namespace via `OriginAssignment`, once governance has vetted the publisher (see [ADR 011 § Origin Assignment Authority](011-content-takedown.md#origin-assignment-authority)); multiple operators may serve one namespace, so redundancy is a namespace-level property. Publishers may create multiple namespaces (subject to the anti-squatting cap in [ADR 009](009-governance.md#adr-009-governance-model)) so distinct content sets are governed independently — for example, one namespace per product line, so takedowns and origin assignments for one product do not entangle the others.
 
@@ -60,39 +60,43 @@ interface IPublisherRegistry {
     // would push namespaceCount(caller) above maxNamespacesPerPublisher.
     function createNamespace() external returns (uint256 namespaceId);
 
-    // Namespace ownership transfer with a 7-day timelock.
-    // initiateTransfer queues the transfer; finalizeTransfer completes it after
-    // the timelock; cancelTransfer (callable by current owner only) aborts.
-    function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external;
-    function finalizeNamespaceTransfer(uint256 namespaceId) external;
-    function cancelNamespaceTransfer(uint256 namespaceId) external;
+    // Namespace ownership transfer in two steps. transferNamespace (owner
+    // only) offers the namespace; a new offer replaces the open one, and
+    // newOwner == address(0) withdraws it. acceptNamespace (pending owner
+    // only) moves ownership at once.
+    function transferNamespace(uint256 namespaceId, address newOwner) external;
+    function acceptNamespace(uint256 namespaceId) external;
 
     // Views
     function ownerOf(uint256 namespaceId) external view returns (address);
     function namespaceCount(address publisher) external view returns (uint256);
-    function pendingTransfer(uint256 namespaceId) external view returns (address newOwner, uint64 readyAt);
+    function pendingOwnerOf(uint256 namespaceId) external view returns (address);
     function maxNamespacesPerPublisher() external view returns (uint64);
-    function namespaceTransferTimelock() external view returns (uint64);
 
-    // Governable parameter setters (GOVERNANCE_ROLE; standard 48h timelock).
+    // Governable parameter setter (GOVERNANCE_ROLE; standard 48h timelock).
     // Bounds enforced at the contract layer per ADR 009:
     //   - maxNamespacesPerPublisher: [1, 1000]
-    //   - namespaceTransferTimelock: [86400, 2592000] (in seconds; 24 h – 30 days)
     function setMaxNamespacesPerPublisher(uint256 newMax) external;
-    function setNamespaceTransferTimelock(uint64 newTimelock) external;
 
     // Events
     event NamespaceCreated(uint256 indexed namespaceId, address indexed owner);
-    event NamespaceTransferInitiated(uint256 indexed namespaceId, address indexed from, address indexed to, uint256 readyAt);
+    event NamespaceTransferStarted(uint256 indexed namespaceId, address indexed from, address indexed to);
     event NamespaceTransferred(uint256 indexed namespaceId, address indexed from, address indexed to);
     event MaxNamespacesPerPublisherUpdated(uint256 oldValue, uint256 newValue);
-    event NamespaceTransferTimelockUpdated(uint64 oldValue, uint64 newValue);
 }
 ```
 
 `PublisherRegistry` records namespace ownership and lifecycle. The hash→namespace association is supplied by the requester at fetch time (see [§ Hash-to-namespace association](#hash-to-namespace-association)). Origin authorization for a namespace lives in `OriginAssignment` ([ADR 011](011-content-takedown.md#origin-assignment-authority)).
 
-The per-publisher namespace cap and the ownership-transfer timelock are governable parameters with safety bounds (see [ADR 009](009-governance.md#adr-009-governance-model)). Defaults: `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`) and `namespaceTransferTimelock = 604800` seconds / 7 days (key-compromise mitigation; bounded `[86400, 2592000]` / `[24 h, 30 days]`). Both are stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` / `setNamespaceTransferTimelock` under the standard `TimelockController` delay (`172800` seconds / 48 h); the contract enforces the safety bounds at the setter in seconds and rejects out-of-range writes regardless of caller. The `maxNamespacesPerPublisher` cap is enforced at both `createNamespace` and `finalizeNamespaceTransfer` (on the recipient; self-transfers exempt), so it cannot be bypassed by minting namespaces under throwaway addresses and transferring them to a single publisher.
+The per-publisher namespace cap is a governable parameter with safety bounds (see [ADR 009](009-governance.md#adr-009-governance-model)). The default is `maxNamespacesPerPublisher = 100` (anti-squatting; bounded `[1, 1000]`). It is stored on `PublisherRegistry` itself and updated via `setMaxNamespacesPerPublisher` under the standard `TimelockController` delay (`172800` seconds / 48 h); the contract enforces the safety bounds at the setter and rejects out-of-range writes regardless of caller. The `maxNamespacesPerPublisher` cap is enforced at both `createNamespace` and `acceptNamespace` (on the recipient; self-transfers exempt), so it cannot be bypassed by minting namespaces under throwaway addresses and transferring them to a single publisher.
+
+### Namespace transfer
+
+The owner offers a namespace with `transferNamespace`. The recipient takes it with `acceptNamespace`. Ownership moves when the recipient accepts. No delay applies.
+
+The acceptance step protects the owner from a mistyped address. An offer to an address that nobody controls never completes, and the owner can replace or withdraw it.
+
+The owner key is the only guard on a namespace. A holder of a leaked key can already seat origins and sign gateway pointers for the namespace, so a delay on the transfer protects nothing. A delay also blocks recovery: each holder of the key can replace or withdraw the offer of the other. Without a delay, the first holder to complete a transfer to a key that only they control keeps the namespace. The other holder then controls nothing.
 
 ## Consequences
 

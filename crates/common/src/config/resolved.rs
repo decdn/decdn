@@ -22,7 +22,7 @@ pub struct ResolvedIdentity {
 }
 
 /// Resolved network fields.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedNetwork {
     /// QUIC bind port.
     pub bind_port: u16,
@@ -48,7 +48,7 @@ pub struct ResolvedNetwork {
 /// `node_id` a valid iroh `NodeId`, each `addr` a `SocketAddr`); the node wiring
 /// layer parses them into iroh types — the discovery-provider seam, per
 /// `adr/appendix-poc-production-seams.md`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ResolvedDiscovery {
     /// pkarr relay URL to publish this node's address record to.
     pub pkarr_url: Option<String>,
@@ -66,7 +66,7 @@ impl ResolvedDiscovery {
 }
 
 /// One resolved static peer ([`ResolvedDiscovery::peers`]).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDiscoveryPeer {
     /// Peer `NodeId` (the canonical 64-char lowercase-hex form; validated at
     /// resolution).

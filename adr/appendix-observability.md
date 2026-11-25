@@ -215,17 +215,8 @@ These give early warning that a node serves a blacklisted hash after its complia
 | `decdn_buyer_pool_adoption_failures_total` | Counter | M | live | Bootstraps that could not determine whether this node already owns a payment pool on chain, so the first cache miss opens one. Every increment is a chance the node escrows a second deposit beside one it already holds. Adoption runs once per process, so this does not self-correct before the next restart. |
 | `decdn_unredeemed_usdc` | Gauge | M | live | Raw USDC in accepted vouchers this node has not redeemed on-chain. The value sums `owed − paid` over the lanes the redeemer plans to collect. The redeemer refreshes it once per sweep (each self-tick and each serve-cutoff sweep), so it lags live accrual by up to one `redeem_interval_secs`. |
 | `decdn_buyer_pool_store_skipped_undecodable_records_total` | Counter | M | live | Buyer-pool rows omitted from successful store hydration because their persisted values cannot be decoded. One bad row does not stop healthy pools from loading or being reclaimed; each load attempt counts every omitted row, so any increase means a buyer deposit is escrowed but untracked and requires record repair. |
-| `decdn_vouchers_signed_total` | Counter | M | planned | Vouchers this node signed as the payer (node-to-node pulls). |
 | `decdn_vouchers_received_total` | Counter | R | live | Signed vouchers this node accepted as the payee on an inbound stream. `PayWord` preimage reveals are not vouchers and do not count. A `PayWord` stream counts its anchor voucher. |
 | `decdn_preimage_reveals_received_total` | Counter | R | live | `PayWord` hash-chain preimage reveals this node accepted as the payee on an inbound stream. A reveal counts when it advances its lane's chain frontier. A reveal at or below the frontier does not count. Each counted reveal hints the redeemer, so the sum of this rate and the `decdn_vouchers_received_total` rate is the redeemer's hint rate. |
-
-#### Reputation Metrics
-
-Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-system) — no cross-node propagation, so the only reputation metric is the local score gauge.
-
-| Metric | Type | Tier | Status | Description |
-|--------|------|------|--------|-------------|
-| `decdn_reputation_score` | Gauge | R | planned | This node's current local reputation score (0.0–1.0) for a peer, computed from its own delivery observations per [ADR 008](008-reputation.md#adr-008-reputation-system). |
 
 #### Node / Process Metrics
 
@@ -236,7 +227,7 @@ Reputation is local-only per [ADR 008](008-reputation.md#adr-008-reputation-syst
 | `decdn_config_reload_failures_total` | Counter | R | live | SIGHUP or admin config reloads that failed. Sections committed before the failure stay applied. The other sections keep their previous values. |
 | `decdn_node_public_address` | Gauge | R | live | `1` when `network.external_addrs` holds an address, or else when the source address of the host's default route is a public IP. `0` when the node is behind NAT. The node samples it at bring-up ([ADR 001 § Node Discovery](001-network.md#node-discovery-registry)). |
 | `decdn_inbound_connections_direct_total` | Counter | R | live | Inbound connections on any ALPN that arrived with a direct IP path. |
-| `decdn_inbound_connections_relayed_total` | Counter | R | live | Inbound connections on any ALPN that arrived over the relay only. This is expected on a node behind NAT. On a node with `decdn_node_public_address == 1`, a sustained share means that dialers do not find or reach the public address. Check the registry `multiaddrs` and the firewall. |
+| `decdn_inbound_connections_relayed_total` | Counter | R | live | Inbound connections on any ALPN that arrived over the relay only. This is expected on a node behind NAT. On a node with `decdn_node_public_address == 1`, a sustained share means that dialers do not find or reach the public address. Check the registry `multiaddrs` and the firewall. On a node with `network.external_addrs` set, also check that the port forward or load balancer delivers UDP to this host. The node does not probe a configured address. |
 | `decdn_receipt_write_failures_total` | Counter | R | live | Download-receipt audit records the writer failed to persist: an I/O error or a panicked write task. Audit only; settlement is unaffected. |
 | `decdn_otlp_export_failures_total` | Counter | R | live | OTLP span-export batches whose export call failed: connect error, non-OK gRPC status, or timeout. A sustained rate means traces are lost. The counter does not count spans that the batch queue drops when full, or spans that a collector rejects inside an OK partial-success reply, so 0 does not prove that no traces were lost. The SDK logs queue drops as `BatchSpanProcessor.SpanDroppingStarted` and `BatchSpanProcessor.SpansDropped` under the `opentelemetry_sdk` target. Stays 0 when `observability.otlp_endpoint` is unset or the node emits no spans. |
 
@@ -468,7 +459,6 @@ Each metric series has one canonical `decdn_`-prefixed name; informal short name
 | `streams_active` | `decdn_streams_active` | architecture.md |
 | `streams_completed` | `decdn_streams_completed_total` | architecture.md |
 | `streams_failed` | `decdn_streams_failed_total` | architecture.md |
-| `vouchers_signed` | `decdn_vouchers_signed_total` | architecture.md |
 | `vouchers_received` | `decdn_vouchers_received_total` | architecture.md |
 | `channels_open` | `decdn_lanes_open` | architecture.md |
 | `channels_settled` | `decdn_pool_redemptions_total` | architecture.md |

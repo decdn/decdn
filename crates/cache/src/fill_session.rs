@@ -607,7 +607,7 @@ struct PassedLeaves {
 #[derive(Debug)]
 pub struct FillSession {
     /// The per-hash captured outboard. A freshly built session starts with its own,
-    /// but registration ([`FillRegistry::register_fill`] / [`FillRegistry::claim`])
+    /// but registration ([`FillRegistry::claim`])
     /// swaps in the hash's canonical one via [`Self::adopt_outboard`], so all
     /// sessions for a hash — and every reader they mint — share the ONE buffer. The
     /// swap runs under the registry lock before the session is handed to a pull leg
@@ -1569,7 +1569,8 @@ impl FillRegistry {
     /// Publish a new pull's `session` (already scoped via [`FillSession::set_covered`]
     /// to the bytes it will fetch) and return the owner lease (observer count starts
     /// at 1). The entry stays in the map until the owning pull is joined node-side.
-    /// A test-facing helper; production registers via [`Self::claim`].
+    /// Production registers through [`Self::claim`].
+    #[cfg(any(test, feature = "test-util"))]
     pub fn register_fill(
         self: &Arc<Self>,
         hash: Hash,

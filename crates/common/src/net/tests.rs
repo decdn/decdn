@@ -153,3 +153,12 @@ fn public_quic_addrs_prefers_external_without_repeats() {
         "with none configured, the host's public IPs on bind_port"
     );
 }
+
+#[test]
+fn addr_source_is_route_without_configured_addrs_and_configured_with() {
+    assert_eq!(addr_source(&[]), "route");
+    assert_eq!(
+        addr_source(&["1.1.1.1:30443".parse().unwrap()]),
+        "configured"
+    );
+}

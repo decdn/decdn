@@ -383,7 +383,8 @@ The rules below apply to every pull:
   keeps one download store for all its entries
   (`.decdn-partial/store/`), and the store keeps what each entry fetched, so
   a rerun pays for no byte twice. A pull that lands every entry removes the
-  store.
+  staging directory (`.decdn-partial/`) with the store. The bytes of an entry
+  that the pull did not select go with it.
 - **Output** files are written under the output directory at each entry's
   relative path, resolved with the § Path-safety rules above (`..`,
   absolute, and escaping paths rejected). The pull holds the output
