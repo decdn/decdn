@@ -3,7 +3,7 @@
 //!
 //! The funding gates read the pool, the signer's registration and the lane:
 //! pool status, signer authorization, the funder deny, capability intake, the
-//! lane and its registration clamp, a closing pool, an expiring capability, and
+//! lane, a closing pool, an expiring capability, and
 //! the pool deposit gate. Each runs once per stream, at one of two points.
 //!
 //! - An open that does no fill work (a hit, a partial that covers the span, or
@@ -37,7 +37,6 @@ use super::{
 };
 use crate::load_shed::{RequestClass, ShedSlot};
 use crate::pool_view::{Lifecycle, PoolStatus};
-use decdn_incentive::payment_pool::SignerAuthorization;
 
 /// What the funding gates read and resolved for a request.
 pub(super) struct Funding {
@@ -222,8 +221,8 @@ impl ClientHandler {
     /// The funding gates up to the deposit gate, for a request that names
     /// `lane_key` on the accepted pool `deployment` (ADR 003 § Pool solvency,
     /// § Capability delegation): the pool status, the signer's authorization,
-    /// the funder deny, capability intake, the lane and its registration
-    /// clamp, a closing pool and a capability inside the expiry margin.
+    /// the funder deny, capability intake, the lane, a closing pool and a
+    /// capability inside the expiry margin.
     /// Returns what they read, or the refusal.
     ///
     /// With no pool view wired for `deployment` (dev/test) the pool gates pass
@@ -253,19 +252,13 @@ impl ClientHandler {
             return Err(ServeRejectReason::PoolUnconfirmed);
         }
 
-        // On-chain registration is write-once per `(pool, signer)`, so a
-        // registered signer's `cap` and `expiry` bound every voucher this node
-        // can redeem. Refuse a registered signer whose registration expired or
-        // whose `cap - spent` cannot pay one chunk. The registered terms clamp
-        // the lane below. A `getAuthorization` fault with no earlier registered
-        // read refuses as unconfirmed, never as an exhausted cap.
-        let mut registered_terms: Option<(u64, u64)> = None;
+        // Refuse a registered signer whose registration expired or whose
+        // `cap - spent` cannot pay one chunk. A `getAuthorization` fault with no
+        // earlier registered read refuses as unconfirmed, never as an exhausted
+        // cap.
         if let (Some(view), Some(signer)) = (pool_view, verified_client) {
             let floor_micro = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
             let auth = view.signer_authorization(pool_id, signer).await;
-            if let Some(SignerAuthorization::Registered { cap, expiry, .. }) = auth {
-                registered_terms = Some((cap, expiry));
-            }
             let now = self.coarse_clock.unix_seconds();
             if let Some(reason) = super::dispatch::signer_refusal(auth, floor_micro, now) {
                 return Err(reason);
@@ -302,13 +295,6 @@ impl ClientHandler {
         };
         #[cfg(any(test, feature = "test-support"))]
         self.fire_lane_after_resolution();
-
-        // Hold the signer's registered terms on the lane: the voucher path
-        // refuses past the lane's `cap` and `expiry`.
-        if let (Some(lane), Some((cap, expiry))) = (known_lane.as_ref(), registered_terms) {
-            self.clamp_lane_to_registration(deployment, lane, cap, expiry)
-                .await;
-        }
 
         // A `Closing` pool takes no top-up, and its redemption ends at the
         // dispute deadline, so this node does not serve on it. A requester that

@@ -1752,7 +1752,7 @@ pub(crate) fn print_reclaim_notes(replacements: &[PoolReplaced]) {
 /// [`NoAffordableSource`] stop, or a funding voucher rejection
 /// (`SpendingCapExhausted`, `CapabilityExpired`, `PoolExhausted`,
 /// `SignerCapExhausted`) names a fresh capability for a new signer key,
-/// because a registered signer's terms are write-once. A terminal `Underpaid`
+/// because nodes refuse a registered signer on its registered terms. A terminal `Underpaid`
 /// (the resync budget ran out) gets its own next step. Any other error passes
 /// through verbatim (a stall, a transport fault, a "no node will serve this",
 /// or a `NotFound` already annotated by [`annotate_cache_miss`]).
@@ -1777,9 +1777,8 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
         return err.context(format!(
             "ask the owner of pool {pool} to top it up: the capability still covers the fetch, \
              and a delegated client cannot top up a pool it does not own. A node refuses a \
-             signer whose registered terms are spent the same way; once this signer key is \
-             registered on-chain its terms are write-once, so the owner then issues a \
-             capability for a new signer key"
+             signer whose registered terms are spent the same way, whatever capability it \
+             presents, so the owner then issues a capability for a new signer key"
         ));
     }
     if funding_rejection
@@ -1788,9 +1787,9 @@ pub(crate) fn annotate_delegated_exhaustion(err: anyhow::Error) -> anyhow::Error
     {
         err.context(
             "funding needed: no provider serves this capability at its current funding. Ask \
-             the pool owner to top up the pool or issue a fresh capability; once this signer \
-             key is registered on-chain its terms are write-once, so the fresh capability must \
-             name a new signer key (a delegated client cannot top up a pool it does not own)",
+             the pool owner to top up the pool or issue a fresh capability; nodes refuse a \
+             registered signer on its registered terms, so the fresh capability must name a \
+             new signer key (a delegated client cannot top up a pool it does not own)",
         )
     } else if underpaid {
         err.context(

@@ -166,8 +166,9 @@ fn delegated_spending_cap_exhausted_gets_the_owner_remedy_hint() {
     );
 }
 
-/// A drained signer registration names the remedy a write-once
-/// registration leaves: a capability for a new signer key (#2338), whether
+/// A drained signer registration names the remedy nodes leave, refusing a
+/// registered signer on its registered terms: a capability for a new signer
+/// key (#2338), whether
 /// the fetch ended "funding needed" or on a mid-stream
 /// `SignerCapExhausted`.
 #[test]

@@ -117,9 +117,7 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     /// The admit-path signer confirm: the request's voucher `signer` on-chain
     /// authorization in `pool_id` (ADR 003 §Capability delegation, §Pool
     /// solvency). A signer's `cap` is shared across every provider, so a signer
-    /// that has drawn its full `cap` at other nodes is uncashable here. Its
-    /// registered `cap` and `expiry` are write-once, so they bound every voucher
-    /// whatever capability the client presents.
+    /// that has drawn its full `cap` at other nodes is uncashable here.
     ///
     /// - `Some(SignerAuthorization::Unregistered)` — no on-chain constraint. An
     ///   unregistered signer (it has spent nothing on-chain, so it admits on its

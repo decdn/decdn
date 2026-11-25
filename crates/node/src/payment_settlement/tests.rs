@@ -4436,9 +4436,8 @@ fn plan_lanes_skips_an_expired_capability() {
 }
 
 /// A lane with value owed and held registration material whose expiry is `0`
-/// is never planned: the contract reads `0` as already expired, and a
-/// `CapabilityReg` carrying it would pin the signer's write-once registration
-/// to unredeemable terms. The skip is metered like any expired capability.
+/// is never planned: the contract reads `0` as already expired, so its vouchers
+/// redeem nothing. The skip is metered like any expired capability.
 #[test]
 fn plan_lanes_never_plans_a_zero_expiry_lane() {
     let me = Address::from([20u8; 20]);

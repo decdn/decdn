@@ -13,8 +13,8 @@
 //! `DECDN_KEYSTORE` (password in `DECDN_KEYSTORE_PASSWORD`) with the `dcap1:`
 //! capability token in `DECDN_CAPABILITY`.
 //!
-//! A registered signer's terms are write-once on chain, so a fresh capability
-//! names a fresh key. When the pull signals that the capability runs low, the
+//! Nodes refuse a registered signer on its registered terms, so a fresh
+//! capability names a fresh key. When the pull signals that the capability runs low, the
 //! example loads the next one from `DECDN_KEYSTORE_NEXT` and
 //! `DECDN_CAPABILITY_NEXT`, where an application would ask its sponsor
 //! gateway, and swaps it in. The pull goes on under the new key at the next
