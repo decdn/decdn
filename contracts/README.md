@@ -19,7 +19,7 @@ Deployable contracts in [`src/`](src/). `PaymentPool` runs on each payment chain
 | `ManualVettingPolicy` | Genesis vetting policy: a `VETTER_ROLE` holder approves which publishers may seat origins | [011](../adr/011-content-takedown.md#vetting-policies) |
 | `OpenVettingPolicy` | Vetting policy that vets every publisher; for local and test deployments only | [011](../adr/011-content-takedown.md#vetting-policies) |
 | `ContentBlacklist` | Global + regional content-hash blacklist, operator- and origin-level blacklists | [011](../adr/011-content-takedown.md) |
-| `PublisherRegistry` | Permissionless namespace creation and timelocked namespace ownership transfer | [002](../adr/002-content-addressing.md) |
+| `PublisherRegistry` | Permissionless namespace creation and two-step namespace ownership transfer | [002](../adr/002-content-addressing.md) |
 | `DecdnGovernor` | Served-bytes-weighted on-chain governor with a Timelock executor | [036](../adr/036-served-bytes-voting-weight.md) |
 | `Ed25519Verifier` | RFC 8032 PureEdDSA verifier (crypto-lib EIP-6565) with strict canonicalization guards | — |
 
