@@ -383,9 +383,8 @@ contract CapacityBondTest is Test {
 
         vm.warp(1_000_000);
         bytes32 nodeId = bytes32(uint256(0xB1AC5));
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
         assertTrue(bond.isActive(opAddr)); // active before blacklist
 
         vm.prank(admin);
@@ -397,11 +396,9 @@ contract CapacityBondTest is Test {
         vm.prank(opAddr);
         bond.bond(bonded);
         assertFalse(bond.isActive(opAddr));
-
-        bytes memory reSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
         vm.expectRevert(CapacityBond.OperatorEjected.selector);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, reSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
     }
 
     /// @notice The re-bond of a blacklisted operator must NOT emit `Reinstated`
@@ -711,10 +708,9 @@ contract CapacityBondTest is Test {
 
         vm.warp(1_000_000);
         bytes32 nodeId = bytes32(uint256(0xDEAD));
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowCurve.selector, bonded, newRequired));
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
     }
 
     function test_registerNode_succeedsAtCurve() public {
@@ -734,9 +730,8 @@ contract CapacityBondTest is Test {
 
         vm.warp(1_000_000);
         bytes32 nodeId = bytes32(uint256(0xF00DF00D));
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
 
         assertEq(bond.addressToNodeId(opAddr), nodeId);
         assertTrue(bond.isActive(opAddr));
@@ -755,8 +750,7 @@ contract CapacityBondTest is Test {
         vm.startPrank(opAddr);
         token.approve(address(bond), type(uint256).max);
         bond.bond(bondAmount);
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
         vm.stopPrank();
     }
 
@@ -845,10 +839,8 @@ contract CapacityBondTest is Test {
         bond.bond(bonded);
         bond.declareMbps(mbps);
         vm.stopPrank();
-
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
     }
 
     function test_deregisterNode_clearsDeclaredMbpsAndEmits() public {
@@ -879,9 +871,8 @@ contract CapacityBondTest is Test {
         vm.stopPrank();
 
         bytes32 nodeId = bytes32(uint256(0x0DEC1));
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
 
         vm.recordLogs();
         vm.prank(opAddr);
@@ -966,28 +957,26 @@ contract CapacityBondTest is Test {
         uint64 readyAt = uint64(block.timestamp + bond.regionStabilityWindow());
         vm.prank(opAddr);
         bond.deregisterNode();
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.RegionCooldownActive.selector, readyAt));
-        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, hex"01");
 
         // A → B once the window has elapsed.
         vm.warp(readyAt);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, hex"01");
 
         // B → C in the same block: rejected.
         vm.prank(opAddr);
         bond.deregisterNode();
-        sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         readyAt = uint64(block.timestamp + bond.regionStabilityWindow());
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.RegionCooldownActive.selector, readyAt));
-        bond.registerNode(nodeId, hex"", "ap-south", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "ap-south", TERMS_HASH, hex"01");
 
         // Re-registering into the current region is not a change and is allowed.
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "eu-west", TERMS_HASH, hex"01");
         (string memory region, string memory prev,,) = bond.regionScopeData(opAddr);
         assertEq(region, "eu-west");
         assertEq(prev, "us-east", "the serve-time region stays in scope");
@@ -1006,9 +995,8 @@ contract CapacityBondTest is Test {
         // ADR 003: "an operator who changes their mind can re-register without
         // re-funding" — the retained bond clears `minBond` and, with the tier
         // now 0, the curve gate as well.
-        bytes memory reSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, reSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
         assertTrue(bond.isActive(opAddr));
         assertEq(bond.declaredMbps(opAddr), 0, "the tier does not come back with the registration");
 
@@ -1335,9 +1323,8 @@ contract CapacityBondTest is Test {
         vm.stopPrank();
 
         bytes32 nodeId = bytes32(uint256(0xF00DF00D));
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
 
         (string memory regionHint, string memory regionPrev, uint64 regionLastChanged, uint256 window) =
             bond.regionScopeData(opAddr);
@@ -1444,10 +1431,9 @@ contract CapacityBondTest is Test {
         ed25519.setAccept(false);
 
         bytes32 nodeId = bytes32(uint256(0xDEADBEEFDEADBEEF));
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
         vm.expectRevert(CapacityBond.InvalidEd25519Signature.selector);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
     }
 
     function test_registerNode_revertsWhenAlreadyActive() public {
@@ -1461,17 +1447,13 @@ contract CapacityBondTest is Test {
         bond.bond(MIN_BOND);
 
         bytes32 nodeId = bytes32(uint256(0xC0FFEE2C0FFEE2));
-        bytes memory bindingSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
 
-        // Second registration without deregistering — bindingNonce has moved
-        // on, so we re-sign with the new nonce to isolate the failure to the
-        // `NodeAlreadyRegistered` guard rather than `InvalidBindingSignature`.
-        bytes memory bindingSig2 = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
+        // Second registration without deregistering.
         vm.prank(opAddr);
         vm.expectRevert(CapacityBond.NodeAlreadyRegistered.selector);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, bindingSig2, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
     }
 
     // -----------------------------------------------------------------
@@ -1489,9 +1471,8 @@ contract CapacityBondTest is Test {
         bond.bond(amount);
         vm.stopPrank();
         bytes32 nodeId = bytes32(uint256(opPk));
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
     }
 
     /// @notice Core: an operator active at the launch `minBond` (50k) stays
@@ -1543,8 +1524,7 @@ contract CapacityBondTest is Test {
 
         // Activate via registerNode (no further bond()).
         vm.startPrank(opAddr);
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
         vm.stopPrank();
 
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registerNode captures live minBond as floor");
@@ -1582,8 +1562,7 @@ contract CapacityBondTest is Test {
 
         vm.warp(2_000_000);
         vm.startPrank(opAddr);
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
         vm.stopPrank();
 
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
@@ -1617,8 +1596,7 @@ contract CapacityBondTest is Test {
 
         vm.warp(2_000_000);
         vm.startPrank(opAddr);
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
         vm.stopPrank();
 
         assertEq(bond.bondFloorAtActivation(opAddr), 50_000e18, "registration records the live minBond");
@@ -1644,10 +1622,9 @@ contract CapacityBondTest is Test {
         assertEq(bond.bondFloorAtActivation(opAddr), 0);
 
         bytes32 nodeId = bytes32(uint256(opPk));
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.BondBelowMinimum.selector, MIN_BOND, 100_000e18));
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
     }
 
     /// @notice A grandfathered operator's own partial unbond below its
@@ -1796,13 +1773,12 @@ contract CapacityBondTest is Test {
         bytes32 nodeId = bytes32(uint256(0x7E125));
 
         vm.warp(1_700_000_000);
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
 
         vm.expectEmit(true, true, false, true, address(bond));
         emit CapacityBond.TermsAccepted(nodeId, TERMS_HASH, 1_700_000_000);
 
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, sig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
         assertTrue(bond.isActive(opAddr));
     }
 
@@ -1812,25 +1788,9 @@ contract CapacityBondTest is Test {
         bytes32 nodeId = bytes32(uint256(0x7E126));
         bytes32 stale = keccak256("decdn operator terms v0");
 
-        // Signature correctly covers the stale hash, so failure is the terms
-        // mismatch itself — not a signature error.
-        bytes memory sig = _signRegisterNode(opPk, opAddr, nodeId, stale);
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.TermsHashMismatch.selector, stale, TERMS_HASH));
-        bond.registerNode(nodeId, hex"", "us-east", stale, sig, hex"01");
-    }
-
-    function test_registerNode_signatureMustCoverTermsHash() public {
-        uint256 opPk = 0x7E12A7;
-        address opAddr = _readyOperator(opPk);
-        bytes32 nodeId = bytes32(uint256(0x7E127));
-
-        // A signature over the `BindNodeId` payload (no termsHash) must
-        // not authorize registration under the `RegisterNode` typehash.
-        bytes memory wrongSig = _signBindNode(opPk, opAddr, nodeId);
-        vm.prank(opAddr);
-        vm.expectRevert(CapacityBond.InvalidBindingSignature.selector);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, wrongSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", stale, hex"01");
     }
 
     function test_setCurrentTermsHash_onlyGovernance() public {
@@ -1878,77 +1838,35 @@ contract CapacityBondTest is Test {
         bytes32 nodeId = bytes32(uint256(0x7E128));
 
         // The now-stale genesis hash is rejected...
-        bytes memory staleSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
         vm.expectRevert(abi.encodeWithSelector(CapacityBond.TermsHashMismatch.selector, TERMS_HASH, next));
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, staleSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
 
         // ...and the freshly-adopted hash succeeds.
-        bytes memory freshSig = _signRegisterNode(opPk, opAddr, nodeId, next);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", next, freshSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", next, hex"01");
         assertTrue(bond.isActive(opAddr));
     }
 
     function test_bindNodeId_rebindRequiresNoTermsAcceptance() public {
         // Register under the genesis terms, then rotate the NodeId via
-        // `bindNodeId` — rebinding stays on the `BindNodeId` payload and does
-        // not re-accept terms (ADR 019 § enforcement at registration only).
+        // `bindNodeId`. Rebinding does not re-accept terms (ADR 019 §
+        // enforcement at registration only).
         uint256 opPk = 0x7E12A9;
         address opAddr = _readyOperator(opPk);
         bytes32 nodeId = bytes32(uint256(0x7E129));
-        bytes memory regSig = _signRegisterNode(opPk, opAddr, nodeId, TERMS_HASH);
         vm.prank(opAddr);
-        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, regSig, hex"01");
+        bond.registerNode(nodeId, hex"", "us-east", TERMS_HASH, hex"01");
 
         // Rotate to a fresh NodeId even after governance bumps the terms hash;
-        // the rebind must still succeed with only a BindNodeId signature.
+        // the rebind still succeeds without naming any terms.
         vm.prank(admin);
         bond.setCurrentTermsHash(keccak256("decdn operator terms v2"));
 
         bytes32 newNodeId = bytes32(uint256(0x7E129B));
-        bytes memory bindSig = _signBindNode(opPk, opAddr, newNodeId);
         vm.prank(opAddr);
-        bond.bindNodeId(newNodeId, bindSig, hex"02");
+        bond.bindNodeId(newNodeId, hex"02");
         assertEq(bond.addressToNodeId(opAddr), newNodeId);
-    }
-
-    /// @dev Construct the EIP-712 `BindNodeId(bytes32 nodeId, uint64 nonce)`
-    ///      digest used by `_verifyBindingSignature` and ECDSA-sign it with
-    ///      `opPk`. Reads the current nonce off the contract so the helper
-    ///      works for both the initial bind and any subsequent rebind.
-    function _signBindNode(uint256 opPk, address opAddr, bytes32 nodeId) internal view returns (bytes memory) {
-        uint64 nonce = bond.bindingNonce(opAddr);
-        bytes32 structHash = keccak256(abi.encode(bond.BIND_NODE_TYPEHASH(), nodeId, nonce));
-        return _sign(opPk, structHash);
-    }
-
-    /// @dev Construct the EIP-712 `RegisterNode(bytes32 nodeId, uint64 nonce,
-    ///      bytes32 termsHash)` digest used by `_verifyRegistrationSignature`
-    ///      (ADR 019 § Terms Acceptance) and ECDSA-sign it with `opPk`.
-    function _signRegisterNode(uint256 opPk, address opAddr, bytes32 nodeId, bytes32 termsHash)
-        internal
-        view
-        returns (bytes memory)
-    {
-        uint64 nonce = bond.bindingNonce(opAddr);
-        bytes32 structHash = keccak256(abi.encode(bond.REGISTER_NODE_TYPEHASH(), nodeId, nonce, termsHash));
-        return _sign(opPk, structHash);
-    }
-
-    function _sign(uint256 opPk, bytes32 structHash) internal view returns (bytes memory) {
-        bytes32 domainSeparator = keccak256(
-            abi.encode(
-                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256(bytes("CapacityBond")),
-                keccak256(bytes("1")),
-                block.chainid,
-                address(bond)
-            )
-        );
-        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(opPk, digest);
-        return abi.encodePacked(r, s, v);
     }
 
     function test_declaredMbpsAtEpoch_keepsPerEpochHistory() public {

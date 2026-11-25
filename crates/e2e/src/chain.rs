@@ -27,11 +27,10 @@ use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
-use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolValue;
 use anyhow::Context;
-use decdn_incentive::{capacity_bond_domain, node_register, register_node_signing_hash};
+use decdn_incentive::node_register;
 use decdn_node::chain_events::snapshot::SNAPSHOT_LAG_MARGIN_BLOCKS;
 
 use crate::bindings::{
@@ -564,8 +563,8 @@ impl ChainFixture {
 
     /// Take an operator from bare to on-chain `isActive`: fund gas, stake the
     /// minimum bond (TOKEN transferred from admin → approve → `bond`), then
-    /// `registerNode` with a real EIP-712 binding signature (operator eth key)
-    /// and ed25519 ownership proof (`node_secret`, the iroh node key) over the
+    /// `registerNode` from the operator eth key with a real ed25519 ownership
+    /// proof (`node_secret`, the iroh node key) over the
     /// production digest the `Ed25519Verifier` checks.
     pub async fn onboard_operator(
         &self,
@@ -669,11 +668,11 @@ impl ChainFixture {
     /// reverts on the bond floor and never reaches the binding rule it meant to
     /// exercise.
     ///
-    /// **Signatures are always real.** The EIP-712 binding signature is made
-    /// with `operator`'s eth key and the ed25519 ownership proof with
-    /// `node_secret`, both over the production digests, both at freshly-read
-    /// nonces. A negative built on this therefore proves the guard it names
-    /// fired — not that a malformed signature was rejected first.
+    /// **The signature is always real.** The ed25519 ownership proof is made
+    /// with `node_secret` over the production digest at a freshly-read nonce,
+    /// and `operator` sends the transaction. A negative built on this therefore
+    /// proves the guard it names fired — not that a malformed signature was
+    /// rejected first.
     ///
     /// The error is the `anyhow`-wrapped `alloy::contract::Error`, so
     /// [`crate::assert::expect_revert_anyhow`] can downcast it and match the
@@ -690,34 +689,22 @@ impl ChainFixture {
         let op_provider = self.provider_for(operator);
         let bond = CapacityBond::new(self.addrs.capacity_bond, &op_provider);
 
-        // Nonces feed both signature digests (fresh operator/nodeId → 0, but
-        // read them so a re-onboard converges rather than signing a stale nonce).
-        let binding_nonce = bond
-            .bindingNonce(op_addr)
-            .call()
-            .await
-            .context("read bindingNonce")?;
+        // The nonce feeds the ownership digest (fresh nodeId → 0, but read it
+        // so a re-onboard converges rather than signing a stale nonce).
         let registration_nonce = bond
             .registrationNonce(node_id)
             .call()
             .await
             .context("read registrationNonce")?;
 
-        // ADR 019 § Terms Acceptance — the registration signature commits to
-        // the on-chain `currentTermsHash`; read it back so this matches whatever
-        // genesis terms the deploy committed.
+        // ADR 019 § Terms Acceptance — registration names the on-chain
+        // `currentTermsHash`; read it back so this matches whatever genesis
+        // terms the deploy committed.
         let terms_hash = bond
             .currentTermsHash()
             .call()
             .await
             .context("read currentTermsHash")?;
-        let domain = capacity_bond_domain(self.chain_id, self.addrs.capacity_bond);
-        let bind_hash = register_node_signing_hash(node_id, binding_nonce, terms_hash, &domain);
-        let binding_sig = operator
-            .sign_hash_sync(&bind_hash)
-            .context("sign binding hash")?
-            .as_bytes()
-            .to_vec();
 
         let digest = node_register::ownership_message_digest(
             node_id,
@@ -735,7 +722,6 @@ impl ChainFixture {
                 Bytes::from(packed_multiaddrs),
                 region.to_string(),
                 terms_hash,
-                Bytes::from(binding_sig),
                 Bytes::from(ed_sig),
             )
             .send()

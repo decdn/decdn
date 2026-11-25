@@ -224,11 +224,6 @@ mod sol_types {
                     uint256 regionStabilityWindow
                 );
 
-            /// Per-operator EIP-712 `BindNodeId` nonce. Feeds the
-            /// `bindingSignature` digest at registration time (ADR 019
-            /// § Step 2.3). `0` for an operator that has never bound.
-            function bindingNonce(address operator) external view returns (uint64);
-
             /// Per-nodeId registration nonce. Feeds the ed25519
             /// ownership-proof digest (ADR 019 § Step 2.3); incremented on
             /// deregistration / rebinding so a fresh signature is required on
@@ -245,9 +240,7 @@ mod sol_types {
             // -----------------------------------------------------------------
 
             /// Atomically bind `nodeId` ↔ `msg.sender` and activate the node.
-            /// Verifies the EIP-712 `bindingSignature` over
-            /// `RegisterNode(nodeId, bindingNonce[msg.sender], termsHash)` and
-            /// the ed25519 `ed25519Signature` over the ownership digest
+            /// Verifies the ed25519 `ed25519Signature` over the ownership digest
             /// (`decdn_incentive::node_register::ownership_message_digest`).
             /// `termsHash` must equal `currentTermsHash` (ADR 019 § Terms
             /// Acceptance). Reverts if the operator's bond is below `minBond` /
@@ -258,7 +251,6 @@ mod sol_types {
                 bytes multiaddrs,
                 string regionHint,
                 bytes32 termsHash,
-                bytes bindingSignature,
                 bytes ed25519Signature
             ) external;
 
@@ -283,16 +275,14 @@ mod sol_types {
             /// survive untouched — all of them key on the Ethereum address,
             /// which does not change.
             ///
-            /// `bindingSignature` covers `BindNodeId(nodeId,
-            /// bindingNonce[msg.sender])` — the terms-free typehash, NOT
-            /// `RegisterNode`: rebinding does not re-accept operator terms
-            /// (ADR 019 § enforcement at registration only). `ed25519Signature`
-            /// is the **new** node key's proof over
+            /// Rebinding does not re-accept operator terms (ADR 019 §
+            /// enforcement at registration only). `ed25519Signature` is the
+            /// **new** node key's proof over
             /// `node_register::ownership_message_digest`. Reverts
             /// `NodeIdAlreadyBound` if a different operator holds `nodeId`,
-            /// `ZeroNodeId` on an all-zero id, and `InvalidBindingSignature` /
-            /// `InvalidEd25519Signature` on a mis-built digest.
-            function bindNodeId(bytes32 nodeId, bytes bindingSignature, bytes ed25519Signature) external;
+            /// `ZeroNodeId` on an all-zero id, and `InvalidEd25519Signature` on
+            /// a mis-built digest.
+            function bindNodeId(bytes32 nodeId, bytes ed25519Signature) external;
 
             /// (Re)publish the caller's packed `multiaddrs` (ADR 019 §
             /// Multiaddr encoding — a sequence of `(uint16 length, bytes
@@ -339,7 +329,6 @@ mod sol_types {
                 address indexed ethAddress,
                 bytes multiaddrs,
                 string regionHint,
-                uint64 bindingNonce,
                 uint64 registrationNonce
             );
 
@@ -349,9 +338,7 @@ mod sol_types {
             /// A `nodeId ↔ operator` binding was written, by either
             /// `registerNode` or `bindNodeId`. The confirmation
             /// `decdn node rotate-key` looks for in the bind receipt.
-            /// `bindingNonce` is the nonce the accepted signature consumed, not
-            /// the post-increment value.
-            event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId, uint64 bindingNonce);
+            event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId);
 
             /// Node deactivated by `ejectNode`. `nodeId`-indexed.
             event NodeAutoEjected(bytes32 indexed nodeId, uint256 remainingBond);

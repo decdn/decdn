@@ -3,16 +3,16 @@
 //! Unlike the other `node` subcommands (which talk to a running node's
 //! loopback admin RPC), this performs the on-chain operator-registration
 //! step of onboarding: it loads the local iroh node key and Ethereum keystore,
-//! reads the operator's on-chain nonces, builds the EIP-712
-//! `bindingSignature` and the ed25519 ownership signature locally, and
-//! submits `CapacityBond.registerNode`.
+//! reads the nodeId's registration nonce, builds the ed25519 ownership
+//! signature locally, and submits `CapacityBond.registerNode` from the
+//! operator's Ethereum key.
 //!
 //! Bonding (`approve` + `bond` + `declareMbps`) is a precondition:
 //! the contract reverts `BondBelowMinimum` / `BondBelowCurve` if the bond
 //! is not already posted (run `decdn node bond` first). `--dry-run` builds
 //! and prints everything but does not submit. It still reads the chain: the
 //! `maxMultiaddrSize` ceiling, so an oversized multiaddr set fails a dry run as
-//! it would a live one, and the nonces the signatures depend on.
+//! it would a live one, and the nonce the signature depends on.
 //!
 //! The signing + submit path is factored into `submit_registration` so
 //! `decdn setup` (#933) can drive registration with the same already-loaded
@@ -23,13 +23,12 @@ use std::path::Path;
 
 use alloy::primitives::{Address, B256, Bytes};
 use alloy::providers::Provider;
-use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_common::cli;
 use decdn_common::identity;
 use decdn_incentive::capacity_bond::CapacityBond;
-use decdn_incentive::{bind_sig, node_register};
+use decdn_incentive::node_register;
 
 use crate::commands::{chain_ctx, terms, update_multiaddrs};
 
@@ -52,10 +51,9 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     ensure_multiaddrs_fit(&bond, cb_addr, &multiaddrs).await?;
 
     // ADR 019 § Terms Acceptance — read the network's current terms hash, then
-    // require the operator to accept the matching embedded terms before we sign.
-    // Enforced on `--dry-run` too: a dry run still produces a real, submit-able
-    // signature that commits to `termsHash`, so it must not be generated over
-    // terms the operator hasn't seen / a stale client's hash.
+    // require the operator to accept the matching embedded terms before
+    // registering. Enforced on `--dry-run` too, so a dry run never shows a
+    // registration over terms the operator hasn't seen.
     let terms_hash = bond.currentTermsHash().call().await.with_context(|| {
         format!("failed to read currentTermsHash from CapacityBond at {cb_addr}")
     })?;
@@ -184,21 +182,18 @@ pub(crate) struct RegisterOutcome {
     pub(crate) chain_id: u64,
     pub(crate) capacity_bond: Address,
     pub(crate) region: String,
-    pub(crate) binding_nonce: u64,
     pub(crate) registration_nonce: u64,
     pub(crate) multiaddr_count: usize,
-    pub(crate) binding_sig: Vec<u8>,
     pub(crate) ed25519_sig: Vec<u8>,
     pub(crate) tx: Option<B256>,
 }
 
-/// Build the binding + ownership signatures and submit `registerNode`
-/// (ADR 019) against an already-built `provider` and `signer`.
-/// `dry_run` reads the chain for the nonces the signatures depend on but does
-/// not submit. Shared by `run` and `decdn setup` so the keystore is decrypted
-/// once across bond + register. Callers check `multiaddrs` with
-/// [`ensure_multiaddrs_fit`] before any prompt; this function does not
-/// re-check the ceiling.
+/// Build the ownership signature and submit `registerNode` (ADR 019) against
+/// an already-built `provider` and `signer`. `dry_run` reads the chain for the
+/// nonce the signature depends on but does not submit. Shared by `run` and
+/// `decdn setup` so the keystore is decrypted once across bond + register.
+/// Callers check `multiaddrs` with [`ensure_multiaddrs_fit`] before any
+/// prompt; this function does not re-check the ceiling.
 ///
 /// `tx_slot` is caller-owned for the same reason `bond::execute`'s `Outcome` is
 /// (#1355): on an unreadable receipt the transaction is broadcast and may take
@@ -234,11 +229,7 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
     let operator = signer.address();
     let bond = CapacityBond::new(cb_addr, provider);
 
-    // Nonces feed both signature digests, so they are read even on a dry run.
-    let binding_nonce: u64 =
-        bond.bindingNonce(operator).call().await.with_context(|| {
-            format!("failed to read bindingNonce from CapacityBond at {cb_addr}")
-        })?;
+    // The nonce feeds the ownership digest, so it is read even on a dry run.
     let registration_nonce: u64 =
         bond.registrationNonce(node_id)
             .call()
@@ -248,17 +239,9 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
             })?;
 
     // ADR 019 § Terms Acceptance — `terms_hash` is the accepted (and staleness-
-    // checked) `currentTermsHash` the caller obtained via `terms::ensure_accepted`
-    // before we sign. The binding signature commits to it, and the on-chain
-    // contract enforces `termsHash == currentTermsHash`.
-
-    // EIP-712 RegisterNode signature (Ethereum key). `sign_hash_sync` yields a
-    // low-s, 27/28-`v` 65-byte signature accepted by the on-chain OZ
-    // `SignatureChecker` (same path as `decdn_incentive::bind_sig`).
-    let domain = bind_sig::capacity_bond_domain(chain_id, cb_addr);
-    let bind_hash =
-        bind_sig::register_node_signing_hash(node_id, binding_nonce, terms_hash, &domain);
-    let binding_sig = signer.sign_hash_sync(&bind_hash)?.as_bytes().to_vec();
+    // checked) `currentTermsHash` the caller obtained via `terms::ensure_accepted`.
+    // The operator's transaction carries it, and the on-chain contract enforces
+    // `termsHash == currentTermsHash`.
 
     // ed25519 ownership signature (iroh node key) over the contract's
     // ownership digest.
@@ -274,10 +257,8 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
         chain_id,
         capacity_bond: cb_addr,
         region: region.to_string(),
-        binding_nonce,
         registration_nonce,
         multiaddr_count: multiaddrs.len(),
-        binding_sig: binding_sig.clone(),
         ed25519_sig: ed25519_sig.clone(),
         tx: None,
     };
@@ -301,13 +282,12 @@ pub(crate) async fn submit_registration<P: Provider + Clone>(
             Bytes::from(packed_multiaddrs),
             region.to_string(),
             terms_hash,
-            Bytes::from(binding_sig),
             Bytes::from(ed25519_sig),
         ),
         "registerNode",
         Some(
             "most likely the bond does not cover minBond / the declared-capacity curve, the \
-             nodeId/address is already bound, or a signature was rejected",
+             nodeId/address is already bound, or the ownership signature was rejected",
         ),
         tx_slot,
     )
@@ -333,10 +313,8 @@ pub(crate) fn write_outcome(
             "chain_id": o.chain_id,
             "capacity_bond": format!("{:#x}", o.capacity_bond),
             "region": o.region,
-            "binding_nonce": o.binding_nonce,
             "registration_nonce": o.registration_nonce,
             "multiaddrs": o.multiaddr_count,
-            "binding_sig": format!("0x{}", alloy::hex::encode(&o.binding_sig)),
             "ed25519_sig": format!("0x{}", alloy::hex::encode(&o.ed25519_sig)),
         });
         return writeln!(w, "{value}");
@@ -346,10 +324,8 @@ pub(crate) fn write_outcome(
     writeln!(w, "chain_id={}", o.chain_id)?;
     writeln!(w, "capacity_bond={:#x}", o.capacity_bond)?;
     writeln!(w, "region={}", o.region)?;
-    writeln!(w, "binding_nonce={}", o.binding_nonce)?;
     writeln!(w, "registration_nonce={}", o.registration_nonce)?;
     writeln!(w, "multiaddrs={}", o.multiaddr_count)?;
-    writeln!(w, "binding_sig=0x{}", alloy::hex::encode(&o.binding_sig))?;
     writeln!(w, "ed25519_sig=0x{}", alloy::hex::encode(&o.ed25519_sig))?;
     match o.tx {
         Some(h) => writeln!(w, "submitted=true tx={h:#x}"),

@@ -58,7 +58,6 @@ alloy::sol! {
             bytes multiaddrs,
             string regionHint,
             bytes32 termsHash,
-            bytes bindingSignature,
             bytes ed25519Signature
         ) external;
         function isActive(address operator) external view returns (bool);
@@ -76,7 +75,6 @@ alloy::sol! {
             string regionHint;
         }
         function getNodeByAddress(address ethAddress) external view returns (NodeInfo memory);
-        function bindingNonce(address operator) external view returns (uint64);
         function registrationNonce(bytes32 nodeId) external view returns (uint64);
         // Key-rotation surface (#1034, G-NODE-07). The two raw mappings are
         // what the journey asserts on, and they are read directly rather than

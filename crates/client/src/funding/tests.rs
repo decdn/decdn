@@ -118,14 +118,12 @@ async fn an_owned_lane_binds_its_endpoint_with_the_lane_key() -> anyhow::Result<
         .context("a configured capacity bond attaches a binding")?;
     let recovered = decdn_incentive::verify_binding(
         B256::from(*endpoint.id().as_bytes()),
-        decdn_incentive::EPHEMERAL_BINDING_NONCE,
         &binding.binding_signature,
         &capacity_bond_domain(governance.chain_id, capacity_bond),
     )?;
     anyhow::ensure!(
         decdn_incentive::verify_binding(
             B256::from(*endpoint.id().as_bytes()),
-            decdn_incentive::EPHEMERAL_BINDING_NONCE,
             &binding.binding_signature,
             &capacity_bond_domain(deployment.chain_id, capacity_bond),
         )

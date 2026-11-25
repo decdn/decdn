@@ -46,19 +46,14 @@ The EIP-712 domain separators, typed data hashes, and voucher formats are the sa
 
 **Signature validation and the accounting layer are separate concerns.** Account abstraction operates on signature *validation* — *who* counts as a valid signer, under what on-chain policy. It does not, on its own, give one pool multiple concurrent independent signers: that is a property of the payment *accounting* layer, and it is provided by the two-dimensional sharded register in [ADR 003](003-payments.md#redemption-and-close) (`authorized[poolId][signer]` plus `watermark[poolId][signer][provider]`), not by any signature scheme. `SignatureChecker` improves the *key*; the sharded register is what lets many keys draw from one pool with independent ordering and per-signer caps. The two compose: each valid signer is one `signer`, and the register runs many such signers in parallel on a single deposit.
 
-**CapacityBond ([ADR 003](003-payments.md#adr-003-payment-model)):**
-
-| Function | Verification |
-| --- | --- |
-| `registerNode` — `bindingSignature` | `SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)` |
-| `bindNodeId` — `signature` | `SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)` |
+**CapacityBond ([ADR 003](003-payments.md#adr-003-payment-model)):** verifies no Ethereum-key signature. `msg.sender` authenticates the operator on every path, so an EOA or a Safe works as `msg.sender` with no signature check.
 
 #### Gas Impact
 
 | Signer Type | Additional Gas vs `ecrecover` | Acceptable? |
 | --- | --- | --- |
 | EOA | +2,600 (EXTCODESIZE check) | Yes — negligible |
-| Safe (1-of-1) | +~12,000 (external call + `checkSignatures`) | Yes — on-chain verification happens only at redemption, pool close, and registration — not per off-chain voucher |
+| Safe (1-of-1) | +~12,000 (external call + `checkSignatures`) | Yes — on-chain verification happens only at redemption and pool close — not per off-chain voucher |
 | Safe (2-of-3) | +~15,000 | Yes — same rationale |
 
 ### Wallet Support — EOA Default, Safe Supported
@@ -72,7 +67,7 @@ deCDN recommends none of them. A 1-of-1 Safe carries the same trust posture as t
 **An EOA keystore on the signing host is the default.**
 
 - **Hot signing (`operator_sig`) — the binding constraint.** Nodes sign an `operator_sig` on every `StreamResponse`. A requester verifies the `StreamResponse` signature **off-chain**, recovering the signer and comparing it against the node's registered address, on a discovery open and on a paid stream alike. A Safe owner-key signature recovers to the *owner*, not to the Safe, so a Safe-addressed operator's stream responses are rejected — the node is neither discovered nor paid. Multi-owner thresholds are separately infeasible here: `SignatureChecker` → Safe's `checkSignatures` cannot reach a quorum at wire speed, and pre-approving every digest via `signMessage` is impractical. Closing this gap is [§ Unimplemented — Operator Custody While Serving](#unimplemented--operator-custody-while-serving).
-- **Cold paths are wallet-agnostic.** Bond management (`CapacityBond.bond(...)` + `declareMbps(...)`, `registerNode()`, `deregisterNode()`, `unbond(...)`) and node-to-node pool operations (`openPool()`, `closePool()`, `topUp()`) are all on-chain and infrequent, so `SignatureChecker` accepts an EOA or a Safe of any threshold. But the registered address is also the address a node serves under — `registerNode` binds `msg.sender` — so there is no split where a Safe custodies the bond while an EOA serves. Holding the on-chain identity in a Safe today means holding a **non-serving** identity: the bond and earnings are multisig-protected, and the node cannot complete a paid delivery.
+- **Cold paths are wallet-agnostic.** Bond management (`CapacityBond.bond(...)` + `declareMbps(...)`, `registerNode()`, `deregisterNode()`, `unbond(...)`) and node-to-node pool operations (`openPool()`, `closePool()`, `topUp()`) are all on-chain and infrequent, and `msg.sender` authenticates each one, so an EOA or a Safe of any threshold can send them. But the registered address is also the address a node serves under — `registerNode` binds `msg.sender` — so there is no split where a Safe custodies the bond while an EOA serves. Holding the on-chain identity in a Safe today means holding a **non-serving** identity: the bond and earnings are multisig-protected, and the node cannot complete a paid delivery.
 
 #### Clients
 
@@ -84,7 +79,7 @@ deCDN recommends none of them. A 1-of-1 Safe carries the same trust posture as t
 
 ### Off-Chain Signature Verification — EOA Recovery Only
 
-[ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) specifies that nodes verify client ephemeral binding signatures (`BindNodeId` with `nonce=0`) off-chain, without an on-chain call.
+[ADR 012](012-client.md#adr-012-client-architecture-bootstrap-and-trust-model) specifies that nodes verify client ephemeral binding signatures (`BindNodeId`) off-chain, without an on-chain call.
 
 Every signature deCDN produces or verifies off-chain — the node's `operator_sig`, client vouchers, and `BindNodeId` bindings — is the fixed 65-byte secp256k1 `r‖s‖v` form, verified by recovering the signer and comparing against the expected address. Verifiers reject any other length **fail-closed**. A smart-account signer is therefore un-servable off-chain even though the contracts accept it on-chain, and a party whose registered address is a smart account cannot be verified by recovery at all.
 
@@ -102,7 +97,7 @@ ERC-1271 validity is not a property of a keypair; it is `isValidSignature(digest
 
 | Class | Signatures | ERC-1271 safe? | Why |
 | --- | --- | --- | --- |
-| **Consumed at call time** | bond, `registerNode` / `bindNodeId`, `redeem` capability, pool close, buyer capability grant | Yes — this is what `SignatureChecker` already does | The question is "is it valid *now*?", answered and consumed in the same transaction |
+| **Consumed at call time** | `redeem` capability, pool close, buyer capability grant | Yes — this is what `SignatureChecker` already does | The question is "is it valid *now*?", answered and consumed in the same transaction |
 | **Re-verified later as evidence** | `operator_sig` on `StreamResponse` | **No** | The signer controls validity in the gap between taking payment and the later check |
 
 A `StreamResponse` signature is evidence of a serve. The requester checks it before it pays ([ADR 005 § Signer binding](005-protocol.md#signer-binding)). A pull receipt keeps it, so that any party can check it again later, with no network access ([Appendix: Pull Receipts](appendix-pull-receipts.md#verification)). Both checks assume that the signature that authorized the paid action stays provably valid after the payment. Smart-account signers break this assumption. `operator_sig` sits in the second class, so it cannot move to ERC-1271.

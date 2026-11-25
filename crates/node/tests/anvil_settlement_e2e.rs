@@ -74,7 +74,6 @@ use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
-use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
@@ -83,8 +82,7 @@ use decdn_client::sign_client_binding;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::payment_pool::PaymentPool;
 use decdn_incentive::{
-    BuyerPoolStore, MemoryBuyerPoolStore, PoolStateStore, capacity_bond_domain,
-    register_node_signing_hash, voucher_domain,
+    BuyerPoolStore, MemoryBuyerPoolStore, PoolStateStore, capacity_bond_domain, voucher_domain,
 };
 use decdn_node::buyer_pool::BuyerPoolService;
 use decdn_node::chain_events::boot_retry::BootRetry;
@@ -416,7 +414,6 @@ alloy::sol! {
             bytes multiaddrs,
             string regionHint,
             bytes32 termsHash,
-            bytes bindingSignature,
             bytes ed25519Signature
         ) external;
         function isActive(address operator) external view returns (bool);
@@ -547,7 +544,7 @@ async fn run_e2e() -> anyhow::Result<()> {
 
     // ---- 2. Identities. The node holds two keys: an iroh ed25519 key (its
     // NodeId + the registration ownership proof) and an eth key (staking,
-    // binding signature, and the redemption-tx signer). The `client` account is
+    // registration sender, and the redemption-tx signer). The `client` account is
     // the seller-path buyer that opens a pool and pays the node.
     let node_iroh_sk = fresh_key();
     let node_id = B256::from(*node_iroh_sk.public().as_bytes());
@@ -616,21 +613,11 @@ async fn run_e2e() -> anyhow::Result<()> {
         .await?;
     bond.bond(min_bond).send().await?.get_receipt().await?;
 
-    // Binding signature: eth key over EIP-712
-    // RegisterNode(nodeId, nonce=0, termsHash) (ADR 019 § Terms Acceptance).
-    // `termsHash` is read from the deployed contract so the signature matches
-    // whatever genesis terms the deploy script committed.
+    // `termsHash` is read from the deployed contract so registration matches
+    // whatever genesis terms the deploy script committed (ADR 019 § Terms
+    // Acceptance).
     let terms_hash = bond.currentTermsHash().call().await?;
     let bind_domain = capacity_bond_domain(CHAIN_ID, capacity_bond);
-    let binding_sig = node_signer
-        .sign_hash_sync(&register_node_signing_hash(
-            node_id,
-            0,
-            terms_hash,
-            &bind_domain,
-        ))?
-        .as_bytes()
-        .to_vec();
     // Ed25519 ownership proof: iroh key over
     // keccak256(nodeId ‖ ethAddr ‖ chainid ‖ registrationNonce=0) — PureEdDSA,
     // verified by the production Ed25519Verifier (dalek verify_strict parity).
@@ -649,7 +636,6 @@ async fn run_e2e() -> anyhow::Result<()> {
         Bytes::from_static(b"/ip4/127.0.0.1/udp/4242/quic-v1"),
         "us-east-1".to_string(),
         terms_hash,
-        Bytes::from(binding_sig),
         Bytes::from(ed_sig),
     )
     .send()

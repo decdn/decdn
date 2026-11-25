@@ -77,8 +77,8 @@ excludes `contracts/` anyway).
 4. **1 `registerNode` ownership vector** — a real ed25519 signature over the
    `CapacityBond.registerNode` digest
    `keccak256(nodeId ‖ operator ‖ chainId ‖ registrationNonce)`, with the public
-   key as the NodeId. The operator is Foundry's default account #0 (so its key is
-   forge-signable for the EIP-712 binding signature) and `chainId` is pinned to
+   key as the NodeId. The operator is Foundry's default account #0 and `chainId`
+   is pinned to
    the Foundry default `31337`; the consuming test asserts both so any drift
    fails loudly. Lets `CapacityBondRegionE2E.t.sol` register a node through the
    production verifier instead of a mock.

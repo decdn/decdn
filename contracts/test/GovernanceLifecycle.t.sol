@@ -87,13 +87,9 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     // Test accounts
     // -----------------------------------------------------------------
 
-    // Operators sign their own `registerNode` binding, so each is a keyed EOA.
-    uint256 internal constant PROPOSER_PK = 0xAAAA;
-    uint256 internal constant VOTER1_PK = 0xBBBB;
-    uint256 internal constant VOTER2_PK = 0xCCCC;
-    address internal proposer = vm.addr(PROPOSER_PK);
-    address internal voter1 = vm.addr(VOTER1_PK);
-    address internal voter2 = vm.addr(VOTER2_PK);
+    address internal proposer = address(0xAAAA);
+    address internal voter1 = address(0xBBBB);
+    address internal voter2 = address(0xCCCC);
     bytes32 internal constant TERMS_HASH = keccak256("decdn operator terms v1");
     address internal multisig = address(0xC0DE);
     bytes32 internal constant REGION_DE = bytes32("DE");
@@ -150,7 +146,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
 
     function _bondOperatorsAndSeedVoteWeight() internal {
         address[3] memory ops = [proposer, voter1, voter2];
-        uint256[3] memory pks = [PROPOSER_PK, VOTER1_PK, VOTER2_PK];
         uint256 floorMbps = bond.minCapacityMbps();
 
         // Fund each operator with TOKEN, approve CapacityBond, bond, and
@@ -168,9 +163,8 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
             vm.prank(ops[i]);
             bond.declareMbps(floorMbps);
             bytes32 nodeId = bytes32(uint256(uint160(ops[i])));
-            bytes memory bindingSig = _signRegisterNode(pks[i], ops[i], nodeId);
             vm.prank(ops[i]);
-            bond.registerNode(nodeId, hex"", "DE", TERMS_HASH, bindingSig, hex"01");
+            bond.registerNode(nodeId, hex"", "DE", TERMS_HASH, hex"01");
         }
 
         // Fund the test harness with USDC and approve the router. Each epoch
@@ -202,24 +196,6 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
         assertGt(gov.getVotes(proposer, snap), gov.proposalThreshold(), "proposer below threshold");
         assertGt(gov.getVotes(voter1, snap), 0, "voter1 unseeded");
         assertGt(gov.getVotes(voter2, snap), 0, "voter2 unseeded");
-    }
-
-    /// @dev The EIP-712 `RegisterNode` binding signature `registerNode` checks.
-    function _signRegisterNode(uint256 pk, address op, bytes32 nodeId) internal view returns (bytes memory) {
-        bytes32 structHash =
-            keccak256(abi.encode(bond.REGISTER_NODE_TYPEHASH(), nodeId, bond.bindingNonce(op), TERMS_HASH));
-        bytes32 domainSeparator = keccak256(
-            abi.encode(
-                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256(bytes("CapacityBond")),
-                keccak256(bytes("1")),
-                block.chainid,
-                address(bond)
-            )
-        );
-        (uint8 v, bytes32 r, bytes32 s) =
-            vm.sign(pk, keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash)));
-        return abi.encodePacked(r, s, v);
     }
 
     // -----------------------------------------------------------------

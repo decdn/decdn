@@ -57,9 +57,9 @@ use decdn_client::{
     stream_fetch_tracked, stream_fetch_tracked_with_progress,
 };
 use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
-    binding_signing_hash, capacity_bond_domain, min_payment, signed_to_wire_voucher,
-    stream_sig::StreamSigData, voucher_domain,
+    LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher, binding_signing_hash,
+    capacity_bond_domain, min_payment, signed_to_wire_voucher, stream_sig::StreamSigData,
+    voucher_domain,
 };
 use decdn_node::dispatch::ConnectionLimiter;
 use decdn_node::handlers::client::{ClientHandler, ClientHandlerDeps, ClientProtocol};
@@ -7804,10 +7804,10 @@ async fn request_refused_at_first_proof(
     Ok(refusal)
 }
 
-/// Sign a `BindNodeId(client_node_id, nonce = EPHEMERAL_BINDING_NONCE)` under
-/// the server's binding domain, returning the wire signature bytes.
+/// Sign a `BindNodeId(client_node_id)` under the server's binding domain,
+/// returning the wire signature bytes.
 fn sign_binding_for(signer: &PrivateKeySigner, client_node_id: B256) -> anyhow::Result<Vec<u8>> {
-    let hash = binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_domain());
+    let hash = binding_signing_hash(client_node_id, &binding_domain());
     Ok(signer.sign_hash_sync(&hash)?.as_bytes().to_vec())
 }
 

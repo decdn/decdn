@@ -396,8 +396,8 @@ use decdn_bao_range::align_range_clamped;
 #[cfg(any(test, feature = "test-util"))]
 use decdn_bao_range::{AlignedRange, IROH_BLOCK_SIZE};
 use decdn_incentive::{
-    BuyerPoolState, EPHEMERAL_BINDING_NONCE, SignedCapability, SignedVoucher, StreamSigData,
-    Voucher, binding_signing_hash, signed_to_wire_voucher,
+    BuyerPoolState, SignedCapability, SignedVoucher, StreamSigData, Voucher, binding_signing_hash,
+    signed_to_wire_voucher,
 };
 use decdn_protocol::client::{
     ClientBinding, ClientMessage, StreamError, StreamRequest, StreamRequestExt, StreamResponse,
@@ -603,7 +603,7 @@ impl PoolContext {
 }
 
 /// Sign an ADR 005 ephemeral client identity binding: an EIP-712
-/// `BindNodeId(nodeId, nonce = 0)` attestation over the requester's OWN iroh
+/// `BindNodeId(nodeId)` attestation over the requester's OWN iroh
 /// `NodeId`, signed with the lane's voucher signer key
 /// ([`PoolContext::client_signer`]). The serving node recovers the signer via
 /// `ecrecover` (`verify_binding`) and checks it signs for a known lane on the named pool before
@@ -625,7 +625,7 @@ pub fn sign_client_binding(
     own_node_id: B256,
     bind_domain: &Eip712Domain,
 ) -> anyhow::Result<ClientBinding> {
-    let hash = binding_signing_hash(own_node_id, EPHEMERAL_BINDING_NONCE, bind_domain);
+    let hash = binding_signing_hash(own_node_id, bind_domain);
     let binding_signature = signer
         .sign_hash_sync(&hash)
         .map_err(|e| anyhow::anyhow!("sign client binding: {e}").context(LocalPullFault))?

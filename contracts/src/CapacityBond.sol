@@ -4,8 +4,6 @@ pragma solidity 0.8.28;
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { SunsettingPausable } from "./SunsettingPausable.sol";
-import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
-import { SignatureChecker } from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { Checkpoints } from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
@@ -48,8 +46,7 @@ contract CapacityBond is
     ICapacityBondRegionView,
     AccessControl,
     ReentrancyGuard,
-    SunsettingPausable,
-    EIP712
+    SunsettingPausable
 {
     using SafeERC20 for IERC20;
 
@@ -126,21 +123,6 @@ contract CapacityBond is
     function epochLength() external pure override returns (uint64) {
         return EPOCH_LENGTH;
     }
-
-    // -----------------------------------------------------------------
-    // EIP-712 typehashes
-    // -----------------------------------------------------------------
-
-    bytes32 public constant BIND_NODE_TYPEHASH = keccak256("BindNodeId(bytes32 nodeId,uint64 nonce)");
-
-    // ADR 019 § Terms Acceptance — `registerNode` carries the operator's
-    // acceptance of the current operator terms inside the binding signature.
-    // Registration signs this distinct payload (not `BIND_NODE_TYPEHASH`): the
-    // acceptance is bound to the exact `termsHash`, and rebinding via
-    // `bindNodeId` (key rotation) stays on `BIND_NODE_TYPEHASH` with no terms
-    // re-acceptance, per ADR 019 § "enforcement at registration only".
-    bytes32 public constant REGISTER_NODE_TYPEHASH =
-        keccak256("RegisterNode(bytes32 nodeId,uint64 nonce,bytes32 termsHash)");
 
     // -----------------------------------------------------------------
     // Immutable wiring
@@ -294,7 +276,6 @@ contract CapacityBond is
     mapping(address operator => NodeInfo) internal _nodes;
     mapping(bytes32 nodeId => address operator) public nodeIdToAddress;
     mapping(address operator => bytes32 nodeId) public addressToNodeId;
-    mapping(address operator => uint64) public bindingNonce;
     mapping(bytes32 nodeId => uint64) public registrationNonce;
 
     address[] internal _registeredAddrs;
@@ -335,10 +316,9 @@ contract CapacityBond is
         address indexed ethAddress,
         bytes multiaddrs,
         string regionHint,
-        uint64 bindingNonce,
         uint64 registrationNonce
     );
-    event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId, uint64 bindingNonce);
+    event NodeIdBound(address indexed ethAddress, bytes32 indexed nodeId);
     event NodeMultiaddrUpdated(bytes32 indexed nodeId, bytes multiaddrs);
 
     // ADR 019 § Terms Acceptance — operator recorded acceptance of the current
@@ -371,7 +351,6 @@ contract CapacityBond is
     error NodeAlreadyRegistered();
     error NodeIdAlreadyBound(address currentOwner);
     error AddressAlreadyBound(bytes32 currentNodeId);
-    error InvalidBindingSignature();
     error InvalidEd25519Signature();
     // ADR 019 § Governance-canonical terms version — submitted `termsHash` did not match the
     // governance-canonical `currentTermsHash` (stale terms / un-upgraded CLI).
@@ -418,7 +397,7 @@ contract CapacityBond is
         uint256 maxMultiaddrSize_,
         uint256 regionStabilityWindow_,
         bytes32 currentTermsHash_
-    ) EIP712("CapacityBond", "1") {
+    ) {
         if (address(token_) == address(0) || address(ed25519Verifier_) == address(0) || admin == address(0)) {
             revert ZeroAddress();
         }
@@ -698,14 +677,13 @@ contract CapacityBond is
 
     /// @param termsHash Operator-terms hash the caller accepts. MUST equal the
     ///        governance-canonical `currentTermsHash` (ADR 019 § Terms
-    ///        Acceptance) and is covered by `bindingSignature` (over
-    ///        `REGISTER_NODE_TYPEHASH`), so assent binds to the exact bytes.
+    ///        Acceptance). The caller's own transaction carries it, so assent
+    ///        binds to the exact bytes.
     function registerNode(
         bytes32 nodeId,
         bytes calldata multiaddrs,
         string calldata regionHint,
         bytes32 termsHash,
-        bytes calldata bindingSignature,
         bytes calldata ed25519Signature
     ) external nonReentrant whenNotPaused {
         if (termsHash != currentTermsHash) {
@@ -713,12 +691,10 @@ contract CapacityBond is
         }
         _checkRegistrationPreconditions(nodeId, multiaddrs.length, bytes(regionHint).length);
         _checkBindingOneToOne(nodeId);
-        uint64 usedBindingNonce = _verifyRegistrationSignature(nodeId, termsHash, bindingSignature);
         uint64 usedRegistrationNonce = _verifyEd25519OwnershipSignature(nodeId, ed25519Signature);
 
         nodeIdToAddress[nodeId] = msg.sender;
         addressToNodeId[msg.sender] = nodeId;
-        bindingNonce[msg.sender] = usedBindingNonce + 1;
         // registerNode is an explicit entry gated on `activeBond >= minBond`, so
         // the live `minBond` is the entry floor. A floor left by an earlier
         // entry may sit above or below it after a `minBond` change; registration
@@ -730,8 +706,8 @@ contract CapacityBond is
         _writeNodeInfo(nodeId, multiaddrs, regionHint);
         _addToRegisteredSet(msg.sender);
 
-        emit NodeRegistered(nodeId, msg.sender, multiaddrs, regionHint, usedBindingNonce, usedRegistrationNonce);
-        emit NodeIdBound(msg.sender, nodeId, usedBindingNonce);
+        emit NodeRegistered(nodeId, msg.sender, multiaddrs, regionHint, usedRegistrationNonce);
+        emit NodeIdBound(msg.sender, nodeId);
         // forge-lint: disable-next-line(block-timestamp)
         emit TermsAccepted(nodeId, termsHash, block.timestamp);
     }
@@ -771,29 +747,6 @@ contract CapacityBond is
         bytes32 currentBinding = addressToNodeId[msg.sender];
         if (currentBinding != bytes32(0) && currentBinding != nodeId) {
             revert AddressAlreadyBound(currentBinding);
-        }
-    }
-
-    function _verifyBindingSignature(bytes32 nodeId, bytes calldata sig) internal view returns (uint64 nonce) {
-        nonce = bindingNonce[msg.sender];
-        bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(BIND_NODE_TYPEHASH, nodeId, nonce)));
-        if (!SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)) {
-            revert InvalidBindingSignature();
-        }
-    }
-
-    /// @dev Registration binding signature covers `termsHash` (ADR 019 § Terms
-    ///      Acceptance) over `REGISTER_NODE_TYPEHASH`, sharing the per-address
-    ///      `bindingNonce` with `bindNodeId` for cross-path replay protection.
-    function _verifyRegistrationSignature(bytes32 nodeId, bytes32 termsHash, bytes calldata sig)
-        internal
-        view
-        returns (uint64 nonce)
-    {
-        nonce = bindingNonce[msg.sender];
-        bytes32 digest = _hashTypedDataV4(keccak256(abi.encode(REGISTER_NODE_TYPEHASH, nodeId, nonce, termsHash)));
-        if (!SignatureChecker.isValidSignatureNow(msg.sender, digest, sig)) {
-            revert InvalidBindingSignature();
         }
     }
 
@@ -856,16 +809,11 @@ contract CapacityBond is
         emit NodeDeregistered(nodeId);
     }
 
-    function bindNodeId(bytes32 nodeId, bytes calldata bindingSignature, bytes calldata ed25519Signature)
-        external
-        nonReentrant
-        whenNotPaused
-    {
+    function bindNodeId(bytes32 nodeId, bytes calldata ed25519Signature) external nonReentrant whenNotPaused {
         if (nodeId == bytes32(0)) revert ZeroNodeId();
         address nodeIdOwner = nodeIdToAddress[nodeId];
         if (nodeIdOwner != address(0) && nodeIdOwner != msg.sender) revert NodeIdAlreadyBound(nodeIdOwner);
 
-        uint64 usedBindingNonce = _verifyBindingSignature(nodeId, bindingSignature);
         _verifyEd25519OwnershipSignature(nodeId, ed25519Signature);
 
         bytes32 oldNodeId = addressToNodeId[msg.sender];
@@ -876,13 +824,12 @@ contract CapacityBond is
 
         nodeIdToAddress[nodeId] = msg.sender;
         addressToNodeId[msg.sender] = nodeId;
-        bindingNonce[msg.sender] = usedBindingNonce + 1;
 
         if (_nodes[msg.sender].active) {
             _nodes[msg.sender].nodeId = nodeId;
         }
 
-        emit NodeIdBound(msg.sender, nodeId, usedBindingNonce);
+        emit NodeIdBound(msg.sender, nodeId);
     }
 
     function reclaimNodeId(bytes32 nodeId, bytes calldata ed25519Signature) external nonReentrant whenNotPaused {

@@ -40,8 +40,8 @@ use alloy::signers::local::PrivateKeySigner;
 use decdn_cache::CacheEngine;
 use decdn_client::{PoolContext, stream_fetch};
 use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore,
-    binding_signing_hash, capacity_bond_domain, voucher_domain,
+    LaneKey, LaneState, MemoryPoolStateStore, PoolStateStore, binding_signing_hash,
+    capacity_bond_domain, voucher_domain,
 };
 use decdn_node::handlers::timestamp_skew::now_us;
 use decdn_node::metrics::Metrics;
@@ -514,11 +514,7 @@ async fn client_disconnect_mid_stream_leaves_lane_reusable() -> anyhow::Result<(
         // A bound request: the pool-model serve gate refuses any request without a
         // verified client binding (it cannot name a lane), so the abort must prove
         // ownership over the connection's node id before it can reach the stream.
-        let binding_hash = binding_signing_hash(
-            client_node_id,
-            EPHEMERAL_BINDING_NONCE,
-            &hop_domains().binding,
-        );
+        let binding_hash = binding_signing_hash(client_node_id, &hop_domains().binding);
         let binding_signature = client_signer
             .sign_hash_sync(&binding_hash)?
             .as_bytes()

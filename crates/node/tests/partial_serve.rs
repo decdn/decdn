@@ -26,8 +26,8 @@ use bytes::BytesMut;
 use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use decdn_cache::{CHUNK_GROUP_BYTES, CacheEngine, Hash, HttpOrigin, Origin};
 use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
-    binding_signing_hash, capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
+    LaneState, MemoryPoolStateStore, PoolStateStore, Voucher, binding_signing_hash,
+    capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
 };
 use decdn_protocol::client::{ClientBinding, ClientMessage, StreamRequest, StreamRequestExt};
 use decdn_protocol::{ALPN_CLIENT, CHUNK_BYTES, MB_BYTES, encode_stream_request, write_frame};
@@ -125,8 +125,7 @@ async fn ranged_paid_pull(
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(client_node_id, &binding_dom());
     let binding_signature = client_eth
         .sign_hash_sync(&binding_hash)?
         .as_bytes()

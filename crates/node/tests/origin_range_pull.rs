@@ -31,8 +31,8 @@ use bytes::BytesMut;
 use decdn_cache::range_pull::{IROH_BLOCK_SIZE, align_range, encode_verified_range};
 use decdn_cache::{CacheEngine, Hash, HttpOrigin, Origin};
 use decdn_incentive::{
-    EPHEMERAL_BINDING_NONCE, LaneState, MemoryPoolStateStore, PoolStateStore, Voucher,
-    binding_signing_hash, capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
+    LaneState, MemoryPoolStateStore, PoolStateStore, Voucher, binding_signing_hash,
+    capacity_bond_domain, signed_to_wire_voucher, voucher_domain,
 };
 use decdn_node::handlers::client::ClientHandler;
 use decdn_node::handlers::timestamp_skew::now_us;
@@ -217,8 +217,7 @@ async fn ranged_paid_pull(
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
 
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(client_node_id, &binding_dom());
     let binding_signature = client_eth
         .sign_hash_sync(&binding_hash)?
         .as_bytes()
@@ -421,8 +420,7 @@ async fn idle_open(
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(client_node_id, &binding_dom());
     let binding_signature = client_eth
         .sign_hash_sync(&binding_hash)?
         .as_bytes()
@@ -2535,8 +2533,7 @@ async fn own_origin_size_proof_fault_refuses_internal_error_not_cache_miss() -> 
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(client_node_id, &binding_dom());
     let binding_signature = client_eth
         .sign_hash_sync(&binding_hash)?
         .as_bytes()
@@ -2643,8 +2640,7 @@ async fn cold_out_of_bounds_range_is_refused_before_signing() -> anyhow::Result<
         .open_bi()
         .await
         .map_err(|e| anyhow::anyhow!("open_bi: {e}"))?;
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(client_node_id, &binding_dom());
     let binding_signature = client_eth
         .sign_hash_sync(&binding_hash)?
         .as_bytes()
@@ -3842,8 +3838,7 @@ fn bound_ext(
     client_node_id: B256,
     pull_through: bool,
 ) -> anyhow::Result<StreamRequestExt> {
-    let binding_hash =
-        binding_signing_hash(client_node_id, EPHEMERAL_BINDING_NONCE, &binding_dom());
+    let binding_hash = binding_signing_hash(client_node_id, &binding_dom());
     Ok(StreamRequestExt {
         binding: Some(ClientBinding {
             ethereum_address: client_eth.address().into(),

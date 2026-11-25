@@ -26,7 +26,7 @@
 //! ```
 //!
 //! The signature shares the `CapacityBond` domain
-//! ([`crate::capacity_bond_domain`]) with the node-binding signatures, which
+//! ([`crate::capacity_bond_domain`]) with the client-binding signatures, which
 //! binds it to one chain and one deployment. The `StreamResponse` type name
 //! differs from every other type signed under that domain, so no other
 //! signature verifies as a stream response.

@@ -325,7 +325,7 @@ pub struct ClientBinding {
     /// Ephemeral client Ethereum address (20 bytes) issuing vouchers for an
     /// off-chain (unregistered) client.
     pub ethereum_address: [u8; 20],
-    /// EIP-712 `BindNodeId(nodeId, nonce=0)` signature attesting the
+    /// EIP-712 `BindNodeId(nodeId)` signature attesting the
     /// `NodeId`↔`ethereum_address` mapping for the connection's lifetime. Exactly
     /// [`BINDING_SIG_LEN`] bytes; verified by `decdn_incentive` via `ecrecover`.
     pub binding_signature: Vec<u8>,

@@ -485,7 +485,6 @@ impl ClientHandler {
             let addr_bytes = binding.ethereum_address;
             match verify_binding(
                 client_node_id,
-                decdn_incentive::EPHEMERAL_BINDING_NONCE,
                 &binding.binding_signature,
                 &self.bind_domain,
             ) {
