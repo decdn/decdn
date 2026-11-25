@@ -63,6 +63,38 @@ fn registration_multiaddrs_use_the_list_already_parsed() {
 }
 
 #[test]
+fn notes_name_the_config_file_read() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, "[network]\nbind_port = 4433\n").unwrap();
+    let file = chain_ctx::load_optional_config(Some(&path)).unwrap();
+    assert_eq!(file.source(), &chain_ctx::ConfigSource::Read(path.clone()));
+    assert_eq!(
+        no_external_addrs(file.source()),
+        format!("{} sets no network.external_addrs", path.display())
+    );
+    assert_eq!(
+        read_from(file.source()),
+        format!(" from {}", path.display())
+    );
+}
+
+#[test]
+fn notes_say_no_config_file_was_found() {
+    let path = std::path::PathBuf::from("/nonexistent/.decdn/node.toml");
+    let source = chain_ctx::ConfigSource::Missing(path.clone());
+    assert_eq!(
+        no_external_addrs(&source),
+        format!("no config file at {}", path.display())
+    );
+    assert_eq!(read_from(&source), "");
+    assert_eq!(
+        no_external_addrs(&chain_ctx::ConfigSource::None),
+        "no config file"
+    );
+}
+
+#[test]
 fn default_multiaddrs_cover_each_public_address_on_the_bind_port() {
     let public = ["8.8.8.8".parse().unwrap(), "2a01:4f8::1".parse().unwrap()];
     assert_eq!(
