@@ -465,101 +465,6 @@ fn a_plan_with_no_entry_is_nothing() {
     ));
 }
 
-/// The run-end scan counts the staging files of blobs the run did not
-/// use, once per blob, totals the disk space they take, and ignores the
-/// run's own blobs, the manifest blob, and names that are not a blob's
-/// staging file (#2190).
-#[test]
-fn leftover_partials_counts_only_unselected_blobs() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    assert_eq!(
-        leftover_partials(tmp.path(), &HashSet::new()),
-        Leftovers::default(),
-        "no staging dir, nothing left over"
-    );
-
-    let dir = tmp.path().join(STAGING_DIR);
-    std::fs::create_dir_all(&dir).expect("staging dir");
-    let hex = |b: u8| blake3::Hash::from_bytes([b; 32]).to_hex().to_string();
-    let write = |name: String, len: usize| {
-        std::fs::write(dir.join(name), vec![0u8; len]).expect("write");
-    };
-    // The run's selected entry and the manifest blob: kept for this run.
-    write(hex(1), 500);
-    write(hex(2), 300);
-    // Two finalized orphan blobs.
-    write(hex(3), 1000);
-    write(hex(4), 200);
-    // The run's download store and a stray name.
-    std::fs::create_dir_all(dir.join("store")).expect("store dir");
-    write("notes.txt".into(), 50);
-
-    let keep: HashSet<[u8; 32]> = [[1; 32], [2; 32]].into_iter().collect();
-    let on_disk =
-        |name: String| allocated_bytes(&std::fs::metadata(dir.join(name)).expect("metadata"));
-    let expected = on_disk(hex(3)) + on_disk(hex(4));
-    let leftovers = leftover_partials(tmp.path(), &keep);
-    assert_eq!(
-        leftovers,
-        Leftovers {
-            blobs: 2,
-            bytes: expected,
-        }
-    );
-    assert_eq!(
-        leftover_warning(
-            Path::new("/out/.decdn-partial"),
-            &Leftovers {
-                blobs: 2,
-                bytes: 1210,
-            }
-        )
-        .as_deref(),
-        Some(
-            "2 partial downloads (1.2 KB on disk) that this run did not use remain in \
-             /out/.decdn-partial; delete them to reclaim the space"
-        )
-    );
-    assert_eq!(
-        leftover_warning(
-            Path::new("/out/.decdn-partial"),
-            &Leftovers {
-                blobs: 1,
-                bytes: 1_500_000_000,
-            }
-        )
-        .as_deref(),
-        Some(
-            "1 partial download (1.5 GB on disk) that this run did not use remains in \
-             /out/.decdn-partial; delete it to reclaim the space"
-        )
-    );
-    assert_eq!(
-        leftover_warning(Path::new("/out"), &Leftovers::default()),
-        None
-    );
-}
-
-/// A sparse staging file, whose length runs past the bytes it holds, counts
-/// only the space it takes, not its length (#2190).
-#[cfg(unix)]
-#[test]
-fn leftover_partials_count_a_sparse_file_by_its_allocated_space() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let dir = tmp.path().join(STAGING_DIR);
-    std::fs::create_dir_all(&dir).expect("staging dir");
-    let hex = blake3::Hash::from_bytes([9; 32]).to_hex().to_string();
-    let file = std::fs::File::create(dir.join(hex)).expect("create");
-    file.set_len(64 * 1024 * 1024).expect("size the file");
-    let leftovers = leftover_partials(tmp.path(), &HashSet::new());
-    assert_eq!(leftovers.blobs, 1);
-    assert!(
-        leftovers.bytes < 1024 * 1024,
-        "a hole-only file takes almost no space: {}",
-        leftovers.bytes
-    );
-}
-
 /// A malformed glob is a hard error naming the flag it came from.
 #[test]
 fn entry_filter_rejects_bad_glob() {
@@ -1614,7 +1519,7 @@ async fn a_run_with_nothing_to_fetch_records_its_excluded_entries() {
         ActivityRecorder::start_in(records.path(), &uri, &text, out.path(), &evidence).unwrap();
     let observer = PullObserver::new(true, "pull".to_owned(), Some(Arc::clone(&activity)));
     observer
-        .nothing_to_fetch(NothingReason::Filtered, 9, out.path(), uri.hash)
+        .nothing_to_fetch(NothingReason::Filtered, 9, out.path())
         .unwrap();
     activity.finish(&Ok(()), None).await;
 
