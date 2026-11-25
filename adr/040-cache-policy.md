@@ -40,15 +40,10 @@ segment tag moves between sweeps, other than the admission-time tag.
 
 ```rust
 pub trait AdmissionPolicy: Send + Sync + std::fmt::Debug {
-    fn admit(&self, ctx: &AdmissionContext) -> AdmissionDecision;
+    fn admit(&self, ctx: &AdmissionContext) -> Segment;
 }
 
 pub enum Segment { Probation, Main }
-
-pub enum AdmissionDecision {
-    Store { segment: Segment },
-    PassThrough,
-}
 
 pub trait EvictionPolicy: Send + Sync + std::fmt::Debug {
     fn plan(&self, ctx: &EvictionContext) -> EvictionPlan;

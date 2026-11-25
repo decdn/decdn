@@ -1,7 +1,5 @@
 use super::*;
-use crate::policy::{
-    AdmissionContext, AdmissionDecision, AdmissionPolicy, EvictionContext, EvictionPolicy, Segment,
-};
+use crate::policy::{AdmissionContext, AdmissionPolicy, EvictionContext, EvictionPolicy, Segment};
 use crate::{EvictionCandidates, Hash};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -99,16 +97,10 @@ fn lru_plan_matches_recency_order() {
 }
 
 #[test]
-#[allow(clippy::panic)]
 fn always_admit_stores_to_main() {
     let ctx = AdmissionContext {
         hash: h(1),
         known_size: None,
     };
-    match AlwaysAdmit.admit(&ctx) {
-        AdmissionDecision::Store {
-            segment: Segment::Main,
-        } => {}
-        other => panic!("expected Store/Main, got {other:?}"),
-    }
+    assert_eq!(AlwaysAdmit.admit(&ctx), Segment::Main);
 }

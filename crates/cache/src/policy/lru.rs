@@ -1,7 +1,6 @@
 //! Behavior-preserving default policies: recency eviction, unconditional admit.
 use super::{
-    AdmissionContext, AdmissionDecision, AdmissionPolicy, EvictionContext, EvictionPlan,
-    EvictionPolicy, Segment,
+    AdmissionContext, AdmissionPolicy, EvictionContext, EvictionPlan, EvictionPolicy, Segment,
 };
 use crate::Hash;
 
@@ -46,10 +45,8 @@ impl EvictionPolicy for LruEviction {
 pub struct AlwaysAdmit;
 
 impl AdmissionPolicy for AlwaysAdmit {
-    fn admit(&self, _ctx: &AdmissionContext) -> AdmissionDecision {
-        AdmissionDecision::Store {
-            segment: Segment::Main,
-        }
+    fn admit(&self, _ctx: &AdmissionContext) -> Segment {
+        Segment::Main
     }
 }
 

@@ -147,8 +147,8 @@ pub enum OriginOutcome {
     Unavailable,
 }
 
-/// The three breaker states. Exposed for tests and observability; the
-/// engine only ever inspects it via [`OriginBreaker::state`].
+/// The three breaker states. The engine reads the state a request was
+/// admitted in from [`Admission::Proceed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerState {
     /// Requests flow; consecutive failures counted.
@@ -321,10 +321,9 @@ impl OriginBreaker {
         }
     }
 
-    /// Current state, for tests and observability. Note this may run the
-    /// lazy OPEN→HALF-OPEN cooldown check is *not* applied here — it
-    /// reports the raw stored phase. Use [`Self::acquire`] to drive
-    /// transitions.
+    /// The raw stored phase. The lazy OPEN→HALF-OPEN cooldown check is *not*
+    /// applied here; [`Self::acquire`] drives transitions.
+    #[cfg(test)]
     #[must_use]
     pub fn state(&self) -> BreakerState {
         self.lock().phase
