@@ -37,9 +37,6 @@ pub struct FileConfig {
     /// `cdn/client/v1` serve-path settings (ADR 005). Absent => defaults from
     /// the ADR 005 §Request rate limiting table.
     pub serve: Option<ServeConfig>,
-    /// Download-receipt audit-log retention settings (#802). Absent =>
-    /// defaults (128 MiB per file, 4 retained backups).
-    pub receipts: Option<ReceiptsConfig>,
     /// Local content denylist (ADR 011 §Local Denylist). Absent => both lists
     /// empty; nothing is denied locally.
     pub content: Option<ContentConfig>,
@@ -1044,28 +1041,6 @@ pub struct ObservabilityConfig {
     pub admin_port: Option<u16>,
     /// OTLP collector endpoint URL.
     pub otlp_endpoint: Option<String>,
-}
-
-/// Download-receipt audit-log retention section of the config file (#802).
-///
-/// Bounds the otherwise-unbounded `download_receipts.jsonl` (one line per
-/// accepted payment proof, ~1 per MiB delivered) with size-based rotation:
-/// once the live file reaches `max_file_bytes` it is rotated to a numbered
-/// backup (`download_receipts.jsonl.1`, `.2`, …) and a fresh file is opened;
-/// the oldest backup beyond `retained_files` is deleted. Both fields are
-/// optional; the defaults bound disk to roughly `(retained_files + 1) *
-/// max_file_bytes` while keeping a useful audit window.
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReceiptsConfig {
-    /// Rotate the live receipt log once it reaches this many bytes. Absent =>
-    /// default 128 MiB. Validated against a floor (1 MiB) and ceiling (1 GiB)
-    /// so a typo cannot rotate every line or defeat rotation entirely.
-    pub max_file_bytes: Option<u64>,
-    /// Number of rotated backup files to retain (`.1`..=`.N`). Absent =>
-    /// default 4. `0` keeps no backups (the live file is truncated in place on
-    /// rotation). Capped at 100.
-    pub retained_files: Option<u32>,
 }
 
 /// Local content-denylist section of the config file (ADR 011 §Local Denylist).

@@ -125,7 +125,6 @@ fn seed_resolved(rate: u64, level: LogLevel) -> ResolvedConfig {
             max_concurrent_handlers: 256,
         },
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
-        receipts: decdn_common::config::ResolvedReceipts::default(),
         dht: decdn_common::config::ResolvedDht::default(),
         serve: decdn_common::config::ResolvedServe::default(),
         content: decdn_common::config::ResolvedContent::default(),

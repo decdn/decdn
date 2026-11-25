@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use decdn_common::config::{RECEIPT_LOG_FILE, ResolvedConfig};
+use decdn_common::config::ResolvedConfig;
 
 use super::{Finding, Report, Severity};
 
@@ -226,48 +226,6 @@ pub(crate) fn evaluate_redb(name: &str, facts: &FileFacts, path: &Path) -> Findi
     }
 }
 
-/// Evaluate the receipt log: presence is optional before the first receipt.
-pub(crate) fn evaluate_receipts(facts: &FileFacts, path: &Path) -> Finding {
-    if let Some(kind) = facts.stat_error {
-        return Finding {
-            group: "State",
-            id: "state.receipts",
-            severity: Severity::Warn,
-            title: format!("cannot stat {}: {kind}", path.display()),
-            detail: Some(format!("path={}", path.display())),
-            remediation: Some("check permissions/ownership".into()),
-        };
-    }
-    if !facts.exists {
-        return Finding {
-            group: "State",
-            id: "state.receipts",
-            severity: Severity::Pass,
-            title: "receipt log absent (created on first receipt)".into(),
-            detail: None,
-            remediation: None,
-        };
-    }
-    if facts.is_file {
-        return Finding {
-            group: "State",
-            id: "state.receipts",
-            severity: Severity::Pass,
-            title: "receipt log present".into(),
-            detail: Some(format!("path={}", path.display())),
-            remediation: None,
-        };
-    }
-    Finding {
-        group: "State",
-        id: "state.receipts",
-        severity: Severity::Warn,
-        title: "receipt log path exists but is not a regular file".into(),
-        detail: Some(format!("path={}", path.display())),
-        remediation: Some("remove the non-file at the receipt log path".into()),
-    }
-}
-
 /// Every store file the doctor checks in a data dir: the daemon's own set,
 /// plus the client store a `decdn get` / `decdn pool` invocation leaves
 /// behind when it is pointed at the same directory.
@@ -305,11 +263,6 @@ pub(crate) fn check_state(report: &mut Report, cfg: &ResolvedConfig, daemon_runn
         let facts = FileFacts::read(&path);
         report.push(evaluate_redb(name, &facts, &path));
     }
-
-    // Receipt log.
-    let receipt_path = data_dir.join(RECEIPT_LOG_FILE);
-    let receipts = FileFacts::read(&receipt_path);
-    report.push(evaluate_receipts(&receipts, &receipt_path));
 
     if daemon_running {
         report.push(Finding {

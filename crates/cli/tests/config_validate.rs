@@ -437,7 +437,6 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
         load_shed: decdn_common::config::ResolvedLoadShed::default(),
         dht: decdn_common::config::ResolvedDht::default(),
         serve: decdn_common::config::ResolvedServe::default(),
-        receipts: decdn_common::config::ResolvedReceipts::default(),
         content: decdn_common::config::ResolvedContent::default(),
     };
     overrides(&mut cfg);
@@ -695,66 +694,6 @@ fn summary_redacts_relay_url_credentials() -> anyhow::Result<()> {
     anyhow::ensure!(
         out.contains("***@relay.example:7842"),
         "relay userinfo should be redacted with the host preserved: {out}"
-    );
-    Ok(())
-}
-
-#[test]
-fn summary_reports_receipt_log_path_and_rotation_cap() -> anyhow::Result<()> {
-    // #964: the download-receipt audit log (#802) must be confirmable from the
-    // summary alone. Surface the derived log path (data_dir + canonical
-    // filename) alongside the rotation cap and retained-backup count, so an
-    // operator can verify receipt logging without reading the raw TOML.
-    let cfg = sample_resolved(|c| {
-        c.receipts.max_file_bytes = 64 * 1024 * 1024;
-        c.receipts.retained_files = 7;
-    });
-    let out = render(None, &cfg)?;
-    // The log lives at the canonical filename under the resolved data_dir.
-    // Derive the expected path from the fixture's own data_dir so the
-    // assertion can't drift from the sample, tracking the same constant the
-    // daemon uses.
-    let expected_path = cfg
-        .identity
-        .data_dir
-        .join(decdn_common::config::RECEIPT_LOG_FILE)
-        .display()
-        .to_string();
-    anyhow::ensure!(
-        out.contains(&format!("receipts.log_path:        {expected_path}")),
-        "summary should surface the derived receipt log path: {out}"
-    );
-    anyhow::ensure!(
-        out.contains(&format!("receipts.max_file_bytes:  {}", 64 * 1024 * 1024)),
-        "summary should reflect the resolved rotation cap: {out}"
-    );
-    anyhow::ensure!(
-        out.contains("receipts.retained_files:  7"),
-        "summary should reflect the resolved retained-backup count: {out}"
-    );
-    Ok(())
-}
-
-#[test]
-fn summary_reports_receipt_defaults() -> anyhow::Result<()> {
-    // The defaults are always present (the [receipts] section is config-
-    // additive, #807), so the summary reports the built-in cap and retention
-    // even when nothing is configured — never a "disabled" line.
-    let cfg = sample_resolved(|_| {});
-    let out = render(None, &cfg)?;
-    anyhow::ensure!(
-        out.contains(&format!(
-            "receipts.max_file_bytes:  {}",
-            decdn_common::config::DEFAULT_RECEIPT_MAX_FILE_BYTES
-        )),
-        "summary should report the default rotation cap: {out}"
-    );
-    anyhow::ensure!(
-        out.contains(&format!(
-            "receipts.retained_files:  {}",
-            decdn_common::config::DEFAULT_RECEIPT_RETAINED_FILES
-        )),
-        "summary should report the default retained-backup count: {out}"
     );
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Leaf helpers: rate clamping, response signing, wire writes, receipts, and the
+//! Leaf helpers: rate clamping, response signing, wire writes, and the
 //! frame cutting the serve loops pull their `ChunkData` payloads from.
 
 use std::collections::VecDeque;
@@ -11,9 +11,9 @@ use decdn_protocol::{Coverage, OriginAttestation};
 use iroh::endpoint::WriteError;
 
 use super::{
-    B256, ClientHandler, ClientMessage, FrameError, Hash, MissPath, MissRefusal, RawReceipt,
-    SendStream, ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
-    StreamResponseExt, StreamSigData, U256, VoucherRejectReason, WatermarkBundle, encode_message,
+    ClientHandler, ClientMessage, FrameError, Hash, MissPath, MissRefusal, SendStream,
+    ServeRejectReason, StreamError, StreamRequest, StreamResponse, StreamResponseBody,
+    StreamResponseExt, StreamSigData, VoucherRejectReason, WatermarkBundle, encode_message,
     write_frame,
 };
 
@@ -36,40 +36,6 @@ pub(super) enum Served {
 }
 
 impl ClientHandler {
-    /// Enqueue one audit receipt for a served-and-paid chunk (issues
-    /// #248, #803). Called only after the proof advanced the lane watermark in
-    /// memory, so a dropped receipt is non-fatal — the payment stands
-    /// regardless, and the periodic lane flush mirrors the watermark to disk.
-    ///
-    /// The receipt is handed to [`ReceiptSink::record`](super::ReceiptSink::record), a **non-blocking**
-    /// enqueue: the actual `write_all` runs off the hot path in the background
-    /// receipt writer, so this never blocks before delivery continues and a slow or
-    /// full disk cannot back-pressure delivery (the bug in #803). Receipts are
-    /// enqueued in voucher-acceptance order and the single writer drains them FIFO,
-    /// so the log reads in acceptance order and a graceful shutdown writes the tail
-    /// (see [`crate::receipt_log`] §Durability).
-    ///
-    /// What crosses the seam is a [`RawReceipt`]: the two 64-char hex renders,
-    /// the `uint256` decimal render, and the `SystemTime::now()` read all happen
-    /// downstream in the background writer, not here (#1792 item 2). So on the
-    /// delivery path this is a few `Copy` field moves and a non-blocking
-    /// `try_send` — no allocation, no formatting, no syscall.
-    ///
-    /// The `voucher_amount` is widened to a `uint256` from the `u64` wire
-    /// amount (the pool voucher's cumulative amount — its sole ordering key,
-    /// there is no nonce); `client_node_id` is the iroh node id of the paying
-    /// peer; `delta_bytes` is the bytes this voucher covers.
-    pub(super) fn record_receipt(
-        &self,
-        hash: Hash,
-        delta_bytes: u64,
-        client_node_id: B256,
-        wire_amount: u64,
-    ) {
-        let receipt = RawReceipt::new(hash, delta_bytes, client_node_id.0, U256::from(wire_amount));
-        self.receipt_sink.record(receipt);
-    }
-
     /// Whether this node still holds a live attestation for `hash`, or needs
     /// none: the check a running delivery repeats before each frame (ADR 005
     /// § Serving rule). Unlike [`Self::attested`], it signs nothing and reads

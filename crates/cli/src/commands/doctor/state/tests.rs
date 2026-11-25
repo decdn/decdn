@@ -79,47 +79,6 @@ fn stat_error_on_secret_warns_instead_of_pass() {
     assert!(f.remediation.is_some());
 }
 
-// --- evaluate_receipts ---------------------------------------------
-
-#[test]
-fn absent_receipt_log_passes() {
-    let facts = FileFacts {
-        exists: false,
-        is_file: false,
-        len: 0,
-        mode: None,
-        stat_error: None,
-    };
-    let f = evaluate_receipts(&facts, Path::new("/data/receipts.jsonl"));
-    assert_eq!(f.id, "state.receipts");
-    assert_eq!(f.severity, Severity::Pass);
-    assert!(f.title.to_lowercase().contains("absent"));
-}
-
-#[test]
-fn present_regular_receipt_log_passes() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("receipts.jsonl");
-    std::fs::write(&path, "").unwrap();
-    let facts = FileFacts::read(&path);
-    let f = evaluate_receipts(&facts, &path);
-    assert_eq!(f.id, "state.receipts");
-    assert_eq!(f.severity, Severity::Pass);
-    assert!(f.title.to_lowercase().contains("present"));
-}
-
-#[test]
-fn receipt_log_path_not_a_regular_file_warns() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("receipts.jsonl");
-    std::fs::create_dir(&path).unwrap();
-    let facts = FileFacts::read(&path);
-    let f = evaluate_receipts(&facts, &path);
-    assert_eq!(f.id, "state.receipts");
-    assert_eq!(f.severity, Severity::Warn);
-    assert!(f.remediation.is_some());
-}
-
 // --- evaluate_redb ----------------------------------------------------
 
 #[test]
@@ -245,21 +204,6 @@ fn stat_error_on_redb_warns_with_cannot_stat() {
     };
     let f = evaluate_redb("lanes.redb", &facts, Path::new("/data/lanes.redb"));
     assert_eq!(f.id, "state.redb");
-    assert_eq!(f.severity, Severity::Warn);
-    assert!(f.title.to_lowercase().contains("cannot stat"));
-}
-
-#[test]
-fn stat_error_on_receipts_warns_with_cannot_stat() {
-    let facts = FileFacts {
-        exists: false,
-        is_file: false,
-        len: 0,
-        mode: None,
-        stat_error: Some(std::io::ErrorKind::PermissionDenied),
-    };
-    let f = evaluate_receipts(&facts, Path::new("/data/receipts.jsonl"));
-    assert_eq!(f.id, "state.receipts");
     assert_eq!(f.severity, Severity::Warn);
     assert!(f.title.to_lowercase().contains("cannot stat"));
 }

@@ -63,7 +63,6 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use crate::dispatch::ConnectionLimiter;
 use crate::metrics::Metrics;
 use crate::node_origin::NodeOrigin;
-use crate::receipt_log::{RawReceipt, ReceiptSink};
 use crate::warn_throttle::WarnThrottle;
 use outcome::ServeStop;
 
@@ -865,9 +864,6 @@ pub struct ClientHandlerDeps {
     /// any other pool is refused `Declined` with these pools listed (the first
     /// `decdn_protocol::MAX_PAYMENT_POOLS`).
     pub pools: Vec<PoolRoute>,
-    /// Non-blocking sink for the served-and-paid audit log. One receipt per
-    /// accepted voucher, so a single delivery emits several.
-    pub receipt_sink: Arc<dyn ReceiptSink>,
     /// Per-request rate limiter (`[serve.rate_limit]`, ADR 005 §Request rate
     /// limiting), checked once per stream before its request is read. `None`
     /// (tests) admits every stream the stream cap admits.
@@ -989,7 +985,6 @@ impl ClientHandlerDeps {
         stream_domain: Eip712Domain,
         bind_domain: Eip712Domain,
         pool: PoolRoute,
-        receipt_sink: Arc<dyn ReceiptSink>,
         rate_per_mb: u64,
         max_concurrent_streams: usize,
         content_deny: Arc<crate::content_deny::ContentDenylist>,
@@ -1006,7 +1001,6 @@ impl ClientHandlerDeps {
             stream_domain,
             bind_domain,
             pools: vec![pool],
-            receipt_sink,
             request_limiter: None,
             pool_min_remaining_deposit,
             rate_per_mb,
@@ -1164,13 +1158,6 @@ pub struct ClientHandler {
     /// Refundable minimum-remaining-deposit floor `M` for the floor-M serving
     /// guard (see [`ClientHandlerDeps::pool_min_remaining_deposit`]).
     pool_min_remaining_deposit: U256,
-    /// Non-blocking sink for the served-and-paid audit log (issues #248, #803).
-    /// The voucher-accept path enqueues one receipt here as each voucher is
-    /// accepted; the actual disk write happens off the hot path in the background
-    /// receipt writer, so receipt-log I/O can never back-pressure paid delivery.
-    /// A dropped receipt (queue full) is non-fatal — the payment already advanced
-    /// the lane watermark.
-    receipt_sink: Arc<dyn ReceiptSink>,
     /// See [`ClientHandlerDeps::request_limiter`].
     request_limiter: Option<Arc<crate::handlers::serve_rate_limit::ServeRateLimiter>>,
     /// Liveness of the node's chain reads (ADR 011 § Serving while chain-stale).
@@ -1378,7 +1365,6 @@ impl ClientHandler {
             bind_domain: deps.bind_domain,
             pools: deps.pools,
             pool_min_remaining_deposit: deps.pool_min_remaining_deposit,
-            receipt_sink: deps.receipt_sink,
             request_limiter: deps.request_limiter,
             chain_freshness: deps.chain_freshness,
             attestations: deps.attestations,
@@ -2691,9 +2677,6 @@ pub(super) async fn handler_over_store(
         domain.clone(),
         domain,
         PoolRoute::new(TEST_DEPLOYMENT, store),
-        Arc::new(crate::receipt_log::DirectReceiptSink::new(Arc::new(
-            crate::receipt_log::NoopReceiptLog,
-        ))) as Arc<dyn ReceiptSink>,
         1,
         16,
         Arc::new(crate::content_deny::ContentDenylist::empty()),

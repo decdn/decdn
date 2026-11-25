@@ -100,33 +100,6 @@ async fn verify_voucher_advances_candidate() {
         amount,
         "the candidate advances to the voucher's cumulative amount"
     );
-    assert_eq!(
-        verified.amount,
-        u64::try_from(amount).expect("amount fits u64 in this test"),
-        "the receipt amount matches the voucher's cumulative amount"
-    );
-}
-
-/// A proof's gain is the bytes it added to the lane's paid frontier: a proof
-/// that folds nothing gains zero, and a lane never gains a negative amount.
-#[test]
-fn a_proofs_gain_is_what_it_added_to_the_paid_frontier() -> anyhow::Result<()> {
-    assert_eq!(super::paid_gain(U256::ZERO, U256::from(500u64))?, 500);
-    assert_eq!(
-        super::paid_gain(U256::from(500u64), U256::from(500u64))?,
-        0,
-        "an already-satisfied proof adds nothing"
-    );
-    assert_eq!(
-        super::paid_gain(U256::from(500u64), U256::from(100u64))?,
-        0,
-        "a frontier that did not move gains zero, never a wrapped value"
-    );
-    assert!(
-        super::paid_gain(U256::ZERO, U256::MAX).is_err(),
-        "a gain past u64 is a node accounting fault"
-    );
-    Ok(())
 }
 
 /// A voucher at-or-below the lane watermark — a concurrent sibling raced ahead

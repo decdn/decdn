@@ -18,7 +18,7 @@
 //! | Payment | [`payment_settlement`] (seller-side redemption), [`buyer_pool`] and [`buyer_ledgers`] (buyer-side pools and lanes), [`pool_store`] and [`pool_view`] (lane state), [`onchain_tx`] (transaction submission) |
 //! | Chain watchers | [`chain_events`], [`blacklist_watcher`], [`chain_freshness`], [`binding_check`] |
 //! | Compliance | [`content_deny`] (the origin deny-set) |
-//! | Operations | [`admin`] (the loopback admin JSON-RPC server, [Local Admin HTTP]), [`metrics`], [`receipt_log`], [`systemd_watchdog`] |
+//! | Operations | [`admin`] (the loopback admin JSON-RPC server, [Local Admin HTTP]), [`metrics`], [`systemd_watchdog`] |
 //!
 //! Wire types live in [`decdn_protocol`]. The config schema and admin RPC types
 //! that the daemon shares with the CLI live in [`decdn_common`].
@@ -53,7 +53,6 @@ pub mod pool_store;
 pub mod pool_view;
 pub(crate) mod prune_guard;
 pub mod rate_limit;
-pub mod receipt_log;
 pub(crate) mod rpc_metrics;
 pub mod runtime;
 pub mod selection;

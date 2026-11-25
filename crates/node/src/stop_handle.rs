@@ -1,10 +1,9 @@
 //! A background task's `CancellationToken` paired with its `JoinHandle` in one
 //! type, so cancel-before-join is structural rather than call-site discipline.
 //!
-//! The receipt writer ([`crate::receipt_log::spawn_receipt_writer`]) and the
-//! warming-credit aggregator
-//! ([`crate::warming_allowance::spawn_warming_creditor`]) are each a drain loop
-//! whose queue senders live inside long-lived holders such as
+//! The warming-credit aggregator
+//! ([`crate::warming_allowance::spawn_warming_creditor`]) is a drain loop whose
+//! queue senders live inside long-lived holders such as
 //! [`crate::handlers::client::ClientHandler`]. Awaiting such a task's bare
 //! `JoinHandle` without first cancelling its token hangs until every sender
 //! drops — which for those holders is never. [`StopHandle`] carries the token

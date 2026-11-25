@@ -1072,7 +1072,6 @@ impl RuntimeReloadState {
             load_shed: decdn_common::config::ResolvedLoadShed::default(),
             dht: decdn_common::config::ResolvedDht::default(),
             serve: decdn_common::config::ResolvedServe::default(),
-            receipts: decdn_common::config::ResolvedReceipts::default(),
             content: decdn_common::config::ResolvedContent::default(),
         };
         Self::new(
@@ -1419,12 +1418,6 @@ fn warn_restart_required_sections(file: &decdn_common::config::FileConfig) {
         // `serve.rate_limit` is read once at startup; changing it requires
         // a restart (same footing as `dht.*`).
         warn_ignored("serve.* (rate_limit)");
-    }
-    if file.receipts.is_some() {
-        // `receipts.*` (rotation cap, retained backups) is read once when
-        // `JsonlReceiptLog` is opened at bring-up; changing it requires a
-        // restart.
-        warn_ignored("receipts.* (max_file_bytes, retained_files)");
     }
     // `security.*` is fully reloadable — see `RuntimeReloadState::reload`'s
     // commit step. Invalid values reject the entire reload via

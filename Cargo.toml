@@ -515,7 +515,7 @@ codegen-units = 1
 #
 # `strip = "debuginfo"`, not `"symbols"`: the symbol table stays in the shipped
 # binary, so a `RUST_BACKTRACE` panic from an operator's node symbolizes to
-# function names (`decdn_node::receipt_log::…::record`) instead of bare
+# function names (`decdn_node::handlers::client::…::record_lane`) instead of bare
 # addresses. Measured cost on `decdn-node`: 35.6 MB fully stripped → 41.3 MB with
 # symbols kept.
 #
