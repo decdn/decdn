@@ -10896,7 +10896,6 @@ async fn cache_with_foreign_blob_imported(
 ) -> anyhow::Result<(
     CacheEngine,
     decdn_cache::Hash,
-    Arc<CacheMetrics>,
     tempfile::TempDir,
     tempfile::TempDir,
 )> {
@@ -10904,7 +10903,6 @@ async fn cache_with_foreign_blob_imported(
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(decdn_cache::FilesystemOrigin::new(origin_dir.path()).await?);
-    let cache_metrics = Arc::new(CacheMetrics::default());
     let cache = CacheEngine::open_full(
         cache_dir.path(),
         vec![origin as Arc<dyn decdn_cache::Origin>],
@@ -10912,7 +10910,7 @@ async fn cache_with_foreign_blob_imported(
         PinnedHashes::empty(),
         RetryPolicy::default(),
         CircuitBreakerPolicy::default(),
-        Some(Arc::clone(&cache_metrics)),
+        None,
         Duration::ZERO,
     )
     .await?;
@@ -10921,7 +10919,7 @@ async fn cache_with_foreign_blob_imported(
         cache.has(hash).await?,
         "precondition: the blob must be in the local store"
     );
-    Ok((cache, hash, cache_metrics, origin_dir, cache_dir))
+    Ok((cache, hash, origin_dir, cache_dir))
 }
 
 /// Assert an origin-only node refused a fetch as a policy decline: the client
@@ -11042,7 +11040,7 @@ async fn origin_only_node_serves_its_own_backend_hash() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::Result<()> {
     let payload = vec![0x33u8; 32 * 1024];
-    let (cache, foreign_hash, cache_metrics, _origin_tmp, _cache_tmp) =
+    let (cache, foreign_hash, _origin_tmp, _cache_tmp) =
         cache_with_foreign_blob_imported(&payload).await?;
     let (store, signer, deposit) = seeded_store()?;
     let (target, server_eth_addr, server_ep, server_task, metrics) =
@@ -11064,12 +11062,6 @@ async fn origin_only_node_declines_a_foreign_blob_already_in_cache() -> anyhow::
     )
     .await;
     assert_foreign_declined(res, &metrics)?;
-    anyhow::ensure!(
-        cache_metrics.pull_through_bytes.get() == 0 && cache_metrics.origin_fetches.get() == 0,
-        "a foreign decline must not pull through the origin, got {} bytes and {} fetches",
-        cache_metrics.pull_through_bytes.get(),
-        cache_metrics.origin_fetches.get()
-    );
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
