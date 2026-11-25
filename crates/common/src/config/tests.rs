@@ -7063,8 +7063,8 @@ fn configured_external_addrs_names_the_bad_index() {
 
 #[test]
 fn configured_external_addrs_reports_each_bad_entry_by_index() {
-    // The same list the daemon test above uses: every bad entry is named, not
-    // only the first.
+    // The same list `resolve_network_reports_each_bad_external_addr_by_index`
+    // uses: every bad entry is named.
     let raw = [
         "node.example:4433",
         "8.8.8.8:4433",
@@ -7080,6 +7080,12 @@ fn configured_external_addrs_reports_each_bad_entry_by_index() {
     assert!(msg.contains("network.external_addrs[2]"), "{msg}");
     assert!(msg.contains("10.0.0.5"), "{msg}");
     assert!(msg.contains("network.external_addrs[3]"), "{msg}");
+    let at = |label: &str| msg.find(label).unwrap();
+    assert!(
+        at("network.external_addrs[0]") < at("network.external_addrs[2]")
+            && at("network.external_addrs[2]") < at("network.external_addrs[3]"),
+        "problems are listed in entry order: {msg}"
+    );
 }
 
 #[test]

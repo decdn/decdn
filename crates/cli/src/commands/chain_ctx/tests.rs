@@ -86,7 +86,7 @@ fn file_with(bc: FileBlockchain) -> FileConfig {
         identity: None,
         network: None,
         cache: None,
-        source: ConfigSource::None,
+        source: ConfigSource::NoPath,
     }
 }
 

@@ -44,7 +44,7 @@ pub struct FileConfig {
 pub(crate) enum ConfigSource {
     /// No file was looked for: no `--config` and no default config path.
     #[default]
-    None,
+    NoPath,
     /// The config was read from this file.
     Read(PathBuf),
     /// No `--config` was given and the default config path holds no file.
@@ -242,7 +242,7 @@ pub struct Resolved {
 /// Load the partial config from `config_path` (or the `--config` flag folded
 /// in by the caller). An explicit path that is missing/unreadable is an error;
 /// the default path simply falls through to an empty config (every field can
-/// also come from a flag).
+/// also come from a flag). The returned config records where it came from.
 pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileConfig> {
     let (path, explicit) = match config_path {
         Some(p) => (expand_tilde(p), true),

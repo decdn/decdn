@@ -237,7 +237,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     // parses it once its registration state is known, when a registration is
     // due. Either way the chosen multiaddrs are checked against the on-chain
     // size ceiling before the terms prompt and any transaction.
-    let mut clean_slate_external = (args.multiaddrs.is_empty() && !key_path.exists())
+    let clean_slate_external = (args.multiaddrs.is_empty() && !key_path.exists())
         .then(|| file.external_addrs())
         .transpose()?;
     let default_keystore = eth_identity::keystore_path(&resolved.data_dir);
@@ -261,7 +261,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     cb_addr,
                     args.mbps,
                     &args.multiaddrs,
-                    clean_slate_external.take(),
+                    clean_slate_external,
                     json,
                 )
                 .await;
@@ -455,20 +455,19 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     };
     // ---- A due registration: `Some((terms_hash, multiaddrs))`; `None` when
     //      this key is already registered (acceptance was recorded at its own
-    //      registration). The multiaddrs are chosen once, here, so a bad
-    //      `network.external_addrs` entry or a set over the on-chain size
-    //      ceiling fails before the terms prompt and any transaction. ADR 019
+    //      registration). The multiaddrs are chosen once, here (on a clean
+    //      slate from the list parsed at the top of `run`), so a set over the
+    //      on-chain size ceiling, or on a keyed node a bad
+    //      `network.external_addrs` entry, fails before the terms prompt and
+    //      any transaction. ADR 019
     //      § Terms Acceptance: the operator accepts the current terms *before*
     //      any transaction, so a refusal / stale-client abort happens before
     //      the bond is spent. ----
     let registration = if already_registered {
         None
     } else {
-        let multiaddrs = register::registration_multiaddrs(
-            &args.multiaddrs,
-            &file,
-            clean_slate_external.take(),
-        )?;
+        let multiaddrs =
+            register::registration_multiaddrs(&args.multiaddrs, &file, clean_slate_external)?;
         register::ensure_multiaddrs_fit(&bond_contract, cb_addr, &multiaddrs).await?;
         let terms_hash = accept_current_terms(&bond_contract, cb_addr, args.accept_terms).await?;
         Some((terms_hash, multiaddrs))
@@ -802,7 +801,8 @@ async fn read_readiness<P: Provider + Clone>(
 /// `--mbps` is flagged here exactly as `build_plan` would on the keyed path.
 /// A clean slate always registers, so it also checks the registration
 /// multiaddrs against the on-chain size ceiling, as the live run does, from
-/// `external`, the `network.external_addrs` list `run` already parsed.
+/// `external`, the `network.external_addrs` list `run` already parsed (`None`
+/// when `--multiaddr` is given).
 /// On a pull-through node it also prints the buyer-USDC row: the keys do not
 /// exist yet, so the row reports a wallet that holds nothing, without a chain
 /// read.

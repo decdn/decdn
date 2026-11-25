@@ -73,6 +73,8 @@ enum VarRefs {
 /// The `network.external_addrs` list rule: parse each entry with
 /// [`crate::net::parse_external_addr`], record every bad entry under
 /// `network.external_addrs[i]`, and keep each good address once, in order.
+/// Under [`VarRefs::Refuse`], a `${VAR}` entry is recorded as a problem
+/// without being parsed.
 fn resolve_external_addrs_into(
     raw: &[String],
     var_refs: VarRefs,

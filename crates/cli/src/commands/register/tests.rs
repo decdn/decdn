@@ -63,6 +63,25 @@ fn registration_multiaddrs_use_the_list_already_parsed() {
 }
 
 #[test]
+fn registration_multiaddrs_take_an_empty_parsed_list_as_final() {
+    // An empty parsed list falls through to the default route; it does not
+    // parse the (bad) file again. The route-dependent result is not checked.
+    let file = file("[network]\nexternal_addrs = [\"10.0.0.5:4433\"]\n");
+    assert!(registration_multiaddrs(&[], &file, Some(Vec::new())).is_ok());
+}
+
+#[test]
+fn explicit_multiaddrs_win_over_a_parsed_list() {
+    let explicit = vec!["/ip4/198.51.100.7/udp/5000/quic-v1".to_string()];
+    let parsed = vec!["8.8.8.8:4433".parse().unwrap()];
+    assert_eq!(
+        registration_multiaddrs(&explicit, &chain_ctx::FileConfig::default(), Some(parsed))
+            .unwrap(),
+        explicit
+    );
+}
+
+#[test]
 fn notes_name_the_config_file_read() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("node.toml");
@@ -71,7 +90,7 @@ fn notes_name_the_config_file_read() {
     assert_eq!(file.source(), &chain_ctx::ConfigSource::Read(path.clone()));
     assert_eq!(
         no_external_addrs(file.source()),
-        format!("{} sets no network.external_addrs", path.display())
+        format!("{} sets no network.external_addrs address", path.display())
     );
     assert_eq!(
         read_from(file.source()),
@@ -89,7 +108,7 @@ fn notes_say_no_config_file_was_found() {
     );
     assert_eq!(read_from(&source), "");
     assert_eq!(
-        no_external_addrs(&chain_ctx::ConfigSource::None),
+        no_external_addrs(&chain_ctx::ConfigSource::NoPath),
         "no config file"
     );
 }

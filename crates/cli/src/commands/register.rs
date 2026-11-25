@@ -123,12 +123,13 @@ pub(crate) async fn ensure_multiaddrs_fit<P: Provider>(
 ///    passes the forwarded address with `--multiaddr` instead.
 ///
 /// `external` is the list [`chain_ctx::FileConfig::external_addrs`] already
-/// returned for `file`, when the caller parsed it earlier; `None` parses it
-/// here.
+/// returned for this `file`, when the caller parsed it earlier; `None` parses
+/// it here. It is ignored when `explicit` is non-empty.
 ///
 /// The chosen default is reported on stderr, so `--json` stdout stays
-/// machine-readable. The note names the config file read, or the default
-/// path where no file was found.
+/// machine-readable. Each note names the config file it read; a fallback note
+/// instead names the default path where no file was found, or says there is
+/// no config file when no default path exists.
 ///
 /// # Errors
 ///
@@ -183,7 +184,7 @@ pub(crate) fn registration_multiaddrs(
 fn read_from(source: &chain_ctx::ConfigSource) -> String {
     match source {
         chain_ctx::ConfigSource::Read(path) => format!(" from {}", path.display()),
-        chain_ctx::ConfigSource::None | chain_ctx::ConfigSource::Missing(_) => String::new(),
+        chain_ctx::ConfigSource::NoPath | chain_ctx::ConfigSource::Missing(_) => String::new(),
     }
 }
 
@@ -193,12 +194,12 @@ fn read_from(source: &chain_ctx::ConfigSource) -> String {
 fn no_external_addrs(source: &chain_ctx::ConfigSource) -> String {
     match source {
         chain_ctx::ConfigSource::Read(path) => {
-            format!("{} sets no network.external_addrs", path.display())
+            format!("{} sets no network.external_addrs address", path.display())
         }
         chain_ctx::ConfigSource::Missing(path) => {
             format!("no config file at {}", path.display())
         }
-        chain_ctx::ConfigSource::None => "no config file".to_string(),
+        chain_ctx::ConfigSource::NoPath => "no config file".to_string(),
     }
 }
 
