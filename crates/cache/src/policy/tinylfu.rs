@@ -2,7 +2,7 @@
 use super::EvictionPolicy;
 use super::FrequencyEstimator;
 use super::sketch::ShardedCountMinSketch;
-use super::{AdmissionContext, AdmissionDecision, AdmissionPolicy, Segment};
+use super::{AdmissionContext, AdmissionPolicy, Segment};
 use super::{EvictionContext, EvictionPlan};
 use crate::Hash;
 use std::collections::HashSet;
@@ -78,13 +78,12 @@ pub struct ProbationAdmission {
 }
 
 impl AdmissionPolicy for ProbationAdmission {
-    fn admit(&self, ctx: &AdmissionContext) -> AdmissionDecision {
-        let segment = if self.freq.estimate(ctx.hash) < self.promotion_threshold {
+    fn admit(&self, ctx: &AdmissionContext) -> Segment {
+        if self.freq.estimate(ctx.hash) < self.promotion_threshold {
             Segment::Probation
         } else {
             Segment::Main
-        };
-        AdmissionDecision::Store { segment }
+        }
     }
 }
 

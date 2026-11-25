@@ -1882,13 +1882,6 @@ impl CacheEngine {
         PinnedHashes::new(set)
     }
 
-    /// Snapshot of the active retry policy. Used by tests and startup
-    /// logging. The policy is fixed at construction; changes require
-    /// a restart.
-    pub fn retry_policy(&self) -> RetryPolicy {
-        self.inner.retry_policy
-    }
-
     /// Is `hash` currently pinned? Cheap O(1) lookup against the live set.
     pub fn is_pinned(&self, hash: Hash) -> bool {
         self.inner.pinned.load().contains(&hash)
@@ -2542,7 +2535,8 @@ impl CacheEngine {
     ///
     /// Wholesale replacement, not a merge: removing an entry from the denylist
     /// and reloading must un-deny it. Touches only the local slot — a reload
-    /// must not drop what the blacklist watcher put in [`Self::set_chain_denied`].
+    /// must not drop what the blacklist watcher put in through
+    /// [`Self::set_chain_denied_one`].
     pub fn set_denied(&self, new: &DeniedHashes) -> PinDiff {
         let new_arc = Arc::new(
             new.iter()
@@ -2565,14 +2559,7 @@ impl CacheEngine {
     }
 
     /// Replace the governance deny-set wholesale.
-    ///
-    /// The set records *why* a hash is refused — governance-sourced, which selects
-    /// the wire refusal code — a fact `evicted.log` (which records only *that* a
-    /// hash was evicted) cannot express. The blacklist watcher rebuilds it each
-    /// boot by re-checking every enumerated hash through
-    /// `isHashBlacklistedForOperator` and writing survivors one at a time via
-    /// [`Self::set_chain_denied_one`]; this bulk setter is retained for tests and
-    /// any wholesale reseed.
+    #[cfg(test)]
     pub fn set_chain_denied(&self, hashes: HashSet<Hash>) {
         self.inner.chain_denied.store(Arc::new(hashes));
     }
@@ -2581,6 +2568,13 @@ impl CacheEngine {
     /// actually changed so a caller can skip logging a no-op replay (the watcher
     /// re-scans a block range after a restart and re-delivers events it has
     /// already applied).
+    ///
+    /// The governance deny-set records *why* a hash is refused —
+    /// governance-sourced, which selects the wire refusal code — a fact
+    /// `evicted.log` (which records only *that* a hash was evicted) cannot
+    /// express. The blacklist watcher rebuilds it each boot by re-checking every
+    /// enumerated hash through `isHashBlacklistedForOperator` and writing
+    /// survivors one at a time through this setter.
     ///
     /// Read-modify-write rather than in-place mutation, because [`ArcSwap`] has
     /// no such thing. Blacklist events are governance actions and therefore
@@ -3604,15 +3598,9 @@ impl CacheEngine {
         self.inner.admission.store(Arc::new(policy));
     }
 
-    /// Consult the admission policy for `ctx`, mapping its verdict onto a
-    /// [`crate::policy::Segment`]. `PassThrough` is reserved: no
-    /// shipped policy returns it yet, and no pass-through-without-storing leg
-    /// exists, so it is treated as `Store { Probation }` until one does.
+    /// Consult the admission policy for the segment `ctx`'s blob is stored in.
     fn admission_segment(&self, ctx: &crate::policy::AdmissionContext) -> crate::policy::Segment {
-        match self.inner.admission.load().admit(ctx) {
-            crate::policy::AdmissionDecision::Store { segment } => segment,
-            crate::policy::AdmissionDecision::PassThrough => crate::policy::Segment::Probation,
-        }
+        self.inner.admission.load().admit(ctx)
     }
 
     /// `admission_segment` under a test-visible name, so policy wiring can be
