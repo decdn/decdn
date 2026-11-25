@@ -211,8 +211,9 @@ pub struct ResolvedCache {
     /// [`crate::config::DEFAULT_DISK_HEADROOM_MB`]; `0` opts out of the disk
     /// clamp so only [`Self::cache_size_mb`] binds.
     pub disk_headroom_mb: u64,
-    /// Cap on the bytes of one blob the node holds, in megabytes. A blob from
-    /// the node's own origin larger than it is refused; a pull-through serves a
+    /// Cap on the bytes of one blob the node holds, in megabytes. The node
+    /// serves a blob of any size from its own origin: past the cap it streams
+    /// the rest from the origin without storing it. A pull-through serves a
     /// range at any offset of a larger blob while the bytes held for it fit.
     pub max_blob_size_mb: u64,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same

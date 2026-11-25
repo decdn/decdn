@@ -925,6 +925,12 @@ pub struct AdmitControl<'a> {
     /// An end the caller can lower while the admit streams, as a byte offset
     /// into the blob. Once the verified prefix reaches it, the admit stops.
     pub stop_at: Option<&'a AtomicU64>,
+    /// The content bytes this admit may store. A verified leaf that does not
+    /// fit, and every leaf after it, goes to the admit's session by
+    /// [`crate::FillSession::pass_leaf`] instead of the store, with no proof
+    /// node of its own. `None` stores every leaf. An admit with no session
+    /// stores every leaf too.
+    pub store_budget: Option<u64>,
 }
 
 impl AdmitControl<'_> {
@@ -948,7 +954,79 @@ impl std::fmt::Debug for AdmitControl<'_> {
         f.debug_struct("AdmitControl")
             .field("on_progress", &self.on_progress.is_some())
             .field("stop_at", &self.stop_at)
+            .field("store_budget", &self.store_budget)
             .finish()
+    }
+}
+
+/// Routes each verified item of one admit under [`AdmitControl::store_budget`]:
+/// into the store while the leaves fit, else to the admit's session.
+struct StoreRouter {
+    /// The leaf bytes the admit may store; `None` stores every item.
+    budget: Option<u64>,
+    /// The proof nodes that wait for their leaf to decide where they go.
+    waiting: Vec<BaoContentItem>,
+    /// The leaf bytes stored so far.
+    stored: u64,
+    /// A leaf missed the budget. Every later leaf passes too, so the stored part
+    /// stays a prefix of the admit that verifies on its own.
+    passing: bool,
+}
+
+impl StoreRouter {
+    const fn new(budget: Option<u64>) -> Self {
+        Self {
+            budget,
+            waiting: Vec::new(),
+            stored: 0,
+            passing: false,
+        }
+    }
+
+    /// The content end of `item` when it is a leaf.
+    fn leaf_end(item: &BaoContentItem) -> Option<u64> {
+        match item {
+            BaoContentItem::Leaf(leaf) => Some(
+                leaf.offset
+                    .saturating_add(u64::try_from(leaf.data.len()).unwrap_or(u64::MAX)),
+            ),
+            BaoContentItem::Parent(_) => None,
+        }
+    }
+
+    /// The items to send to the store for `item`. A proof node waits for its
+    /// leaf. A leaf that fits goes to the store with the nodes before it. A leaf
+    /// that does not goes to `session`, which already holds those nodes.
+    fn route(
+        &mut self,
+        item: BaoContentItem,
+        session: Option<&Arc<crate::FillSession>>,
+    ) -> Vec<BaoContentItem> {
+        let Some(budget) = self.budget else {
+            return vec![item];
+        };
+        match item {
+            BaoContentItem::Parent(_) => {
+                self.waiting.push(item);
+                Vec::new()
+            }
+            BaoContentItem::Leaf(leaf) => {
+                let len = u64::try_from(leaf.data.len()).unwrap_or(u64::MAX);
+                self.passing = self.passing || self.stored.saturating_add(len) > budget;
+                if self.passing {
+                    self.waiting.clear();
+                    if let Some(session) = session {
+                        session.pass_leaf(leaf.offset, leaf.data);
+                    }
+                    Vec::new()
+                } else {
+                    self.stored = self.stored.saturating_add(len);
+                    let mut items = std::mem::take(&mut self.waiting);
+                    items.push(BaoContentItem::Leaf(leaf));
+                    items
+                }
+            }
+        }
     }
 }
 
@@ -1817,6 +1895,23 @@ impl CacheEngine {
             .claim(hash, offset, len, total, make_session)
     }
 
+    /// Register `session` as the exclusive owner of a serve-miss of
+    /// `[offset, offset+len)` of the `total`-byte blob `hash`: no attach to a
+    /// live fill, and no later attach to this one. Always [`FillClaim::Owner`].
+    /// See [`FillRegistry::claim_exclusive`].
+    pub fn claim_exclusive_fill(
+        &self,
+        hash: Hash,
+        offset: u64,
+        len: u64,
+        total: u64,
+        session: Arc<FillSession>,
+    ) -> FillClaim {
+        self.inner
+            .fill_registry
+            .claim_exclusive(hash, offset, len, total, session)
+    }
+
     /// Subscribe to a stream of `Hash`es announcing hashes as they become
     /// advertisable in the local store: a whole blob that the private
     /// `pull_through` committed, or a ranged admit ([`Self::admit_bao`],
@@ -1887,6 +1982,31 @@ impl CacheEngine {
     /// a restart.
     pub fn retry_policy(&self) -> RetryPolicy {
         self.inner.retry_policy
+    }
+
+    /// Whether a `total_bytes`-byte blob is larger than the cap on bytes this
+    /// node holds of one blob (`cache.max_blob_size_mb`; `0` is no cap). The
+    /// node serves such a blob from its own origin by an exclusive fill that
+    /// stores up to the cap and hands the rest to its serve leg
+    /// ([`Self::claim_exclusive_fill`]).
+    #[must_use]
+    pub fn exceeds_held_cap(&self, total_bytes: u64) -> bool {
+        self.inner.max_blob_bytes > 0 && total_bytes > self.inner.max_blob_bytes
+    }
+
+    /// The content bytes of `hash` this node may still store under its cap on
+    /// bytes held of one blob: the cap less the bytes it holds. `None` when
+    /// there is no cap (`0`).
+    pub async fn held_room(&self, hash: Hash) -> Option<u64> {
+        let cap = self.inner.max_blob_bytes;
+        if cap == 0 {
+            return None;
+        }
+        let held = self
+            .present_ranges(hash)
+            .await
+            .map_or(0, |present| present.held_bytes());
+        Some(cap.saturating_sub(held))
     }
 
     /// Is `hash` currently pinned? Cheap O(1) lookup against the live set.
@@ -4504,6 +4624,8 @@ impl CacheEngine {
         let tx = handle.tx;
         let rx = handle.rx;
 
+        // A store budget binds only with a session to hand the leaves past it to.
+        let mut router = StoreRouter::new(control.store_budget.filter(|_| capture_into.is_some()));
         let driver = async move {
             let mut decoder = ResponseDecoder::new(hash.into(), chunk_ranges, tree, reader);
             let mut pairs = Vec::new();
@@ -4521,12 +4643,7 @@ impl CacheEngine {
                                 break (rest.finish(), Err(std::io::Error::from(e)), false);
                             }
                         };
-                        let leaf_end = match &item {
-                            BaoContentItem::Leaf(leaf) => Some(leaf.offset.saturating_add(
-                                u64::try_from(leaf.data.len()).unwrap_or(u64::MAX),
-                            )),
-                            BaoContentItem::Parent(_) => None,
-                        };
+                        let leaf_end = StoreRouter::leaf_end(&item);
                         // The `Parent` items ARE the outboard proof nodes; capture
                         // them for the serve leg here, in the one decode pass, rather
                         // than re-reading them back out of the store afterwards. The
@@ -4540,7 +4657,11 @@ impl CacheEngine {
                                 session.capture_many(pairs.drain(..));
                             }
                         }
-                        if tx.send(item).await.is_err() {
+                        let mut sent = true;
+                        for item in router.route(item, capture_into.as_ref()) {
+                            sent = sent && tx.send(item).await.is_ok();
+                        }
+                        if !sent {
                             // The store import ended before this item landed — its
                             // result (awaited below) explains why. Recover the reader.
                             break (rest.finish(), Ok(pairs), false);

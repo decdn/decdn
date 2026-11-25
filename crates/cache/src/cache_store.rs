@@ -90,6 +90,15 @@ impl CacheStore {
     pub const fn hash(&self) -> Hash {
         self.inner.hash()
     }
+
+    /// The session when it is exclusive ([`FillSession::mark_exclusive`]). Such
+    /// a store keeps the blob up to the node's cap on bytes held and hands every
+    /// later verified leaf to the session's serve leg. Its present ranges
+    /// include the leaves it handed over, so the pull counts them as landed and
+    /// does not fetch them again.
+    fn exclusive_session(&self) -> Option<&Arc<FillSession>> {
+        self.session.as_ref().filter(|s| s.is_exclusive())
+    }
 }
 
 impl std::fmt::Debug for CacheStore {
@@ -107,16 +116,26 @@ impl RangedStore for CacheStore {
         self.inner.total_bytes()
     }
 
+    /// The ranges the store holds, plus those an exclusive fill handed over.
     fn present_ranges(&self) -> RangedFuture<'_, bao_tree::ChunkRanges> {
-        self.inner.present_ranges()
+        let Some(session) = self.exclusive_session() else {
+            return self.inner.present_ranges();
+        };
+        Box::pin(async move { Ok(self.inner.present_ranges().await? | session.passed_ranges()) })
     }
 
+    /// The ranges the store lacks, less those an exclusive fill handed over.
     fn missing_ranges(
         &self,
         byte_offset: u64,
         byte_len: u64,
     ) -> RangedFuture<'_, bao_tree::ChunkRanges> {
-        self.inner.missing_ranges(byte_offset, byte_len)
+        let Some(session) = self.exclusive_session() else {
+            return self.inner.missing_ranges(byte_offset, byte_len);
+        };
+        Box::pin(async move {
+            Ok(self.inner.missing_ranges(byte_offset, byte_len).await? - session.passed_ranges())
+        })
     }
 
     fn admit(&self, range: AlignedRange, bao_bytes: bytes::Bytes) -> RangedFuture<'_, ()> {
@@ -175,6 +194,12 @@ impl IngestStore for CacheStore {
                 }
                 self.grew.notify_waiters();
             };
+            // An exclusive fill stores the blob up to the node's cap on bytes held
+            // and hands the rest to its serve leg.
+            let store_budget = match self.exclusive_session() {
+                Some(_) => self.inner.engine().held_room(self.inner.hash()).await,
+                None => None,
+            };
             let admitted = self
                 .inner
                 .engine()
@@ -187,6 +212,7 @@ impl IngestStore for CacheStore {
                     AdmitControl {
                         on_progress: Some(&progress),
                         stop_at,
+                        store_budget,
                     },
                 )
                 .await;

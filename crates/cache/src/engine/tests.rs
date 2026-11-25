@@ -4190,6 +4190,7 @@ async fn admit_bao_stream_until_reports_each_chunk_group_and_drains() {
             crate::AdmitControl {
                 on_progress: Some(&on_progress),
                 stop_at: None,
+                store_budget: None,
             },
         )
         .await
@@ -4228,6 +4229,7 @@ async fn admit_bao_stream_until_refuses_a_controlled_multi_span_admit() {
             crate::AdmitControl {
                 on_progress: None,
                 stop_at: Some(&stop_at),
+                store_budget: None,
             },
         )
         .await;
@@ -4264,6 +4266,7 @@ async fn admit_bao_stream_until_stops_at_a_lowered_end_and_keeps_the_prefix() {
             crate::AdmitControl {
                 on_progress: None,
                 stop_at: Some(&stop_at),
+                store_budget: None,
             },
         )
         .await
@@ -4282,6 +4285,109 @@ async fn admit_bao_stream_until_stops_at_a_lowered_end_and_keeps_the_prefix() {
         1,
         "a stopped admit protects its prefix as a whole admit does"
     );
+}
+
+#[tokio::test]
+async fn admit_bao_stream_until_hands_leaves_past_the_store_budget_to_the_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 6 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    let (hash, ranges, bao) = bao_for(root, &plaintext, outboard, 0, total, total);
+    let session = crate::FillSession::new(bao_tree::blake3::Hash::from(root), total);
+    session.mark_exclusive();
+
+    // A budget of two and a half groups stores two: the third does not fit, so it
+    // and every later group go to the session.
+    let seen = std::sync::Mutex::new(Vec::new());
+    let on_progress = |end: u64| seen.lock().unwrap().push(end);
+    let (_reader, end) = engine
+        .admit_bao_stream_until(
+            hash,
+            ranges,
+            total,
+            bao.slice(8..),
+            Some(&session),
+            crate::AdmitControl {
+                on_progress: Some(&on_progress),
+                stop_at: None,
+                store_budget: Some(2 * group + group / 2),
+            },
+        )
+        .await
+        .map_err(|(_reader, e)| e)
+        .unwrap();
+
+    assert_eq!(end, crate::AdmitEnd::Drained);
+    assert_eq!(
+        seen.lock().unwrap().last().copied(),
+        Some(total),
+        "every group verifies, stored or handed over"
+    );
+    let present = engine.present_ranges(hash).await.unwrap();
+    assert_eq!(
+        present.held_bytes(),
+        2 * group,
+        "the store holds the groups that fit"
+    );
+    assert_eq!(session.passed_bytes(), 4 * group);
+    let g = group as usize;
+    for i in 2..6u64 {
+        let i_us = i as usize;
+        assert_eq!(
+            session.take_passed(i * group, group).unwrap(),
+            plaintext[i_us * g..(i_us + 1) * g],
+            "group {i} is handed over verbatim"
+        );
+    }
+    assert!(
+        session.take_passed(2 * group, group).is_none(),
+        "a handed-over leaf is taken once"
+    );
+}
+
+#[tokio::test]
+async fn admit_bao_stream_until_with_a_zero_budget_stores_nothing_new() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = CacheEngine::open(tmp.path(), vec![], 16).await.unwrap();
+    let group = crate::CHUNK_GROUP_BYTES;
+    let total = 4 * group;
+    let (root, plaintext, outboard) = synth_blob(total as usize);
+    // The first group lands first, as a node at its cap would hold it.
+    let (hash, head, head_bao) = bao_for(root, &plaintext, outboard.clone(), 0, group, total);
+    engine
+        .admit_bao_stream(hash, head, total, head_bao.slice(8..), None)
+        .await
+        .map_err(|(_reader, e)| e)
+        .unwrap();
+    let (_, tail, tail_bao) = bao_for(root, &plaintext, outboard, group, total - group, total);
+    let session = crate::FillSession::new(bao_tree::blake3::Hash::from(root), total);
+    session.mark_exclusive();
+
+    engine
+        .admit_bao_stream_until(
+            hash,
+            tail,
+            total,
+            tail_bao.slice(8..),
+            Some(&session),
+            crate::AdmitControl {
+                on_progress: None,
+                stop_at: None,
+                store_budget: Some(0),
+            },
+        )
+        .await
+        .map_err(|(_reader, e)| e)
+        .unwrap();
+
+    assert_eq!(
+        engine.present_ranges(hash).await.unwrap().held_bytes(),
+        group,
+        "the store keeps only what it held"
+    );
+    assert_eq!(session.passed_bytes(), total - group);
 }
 
 #[tokio::test]

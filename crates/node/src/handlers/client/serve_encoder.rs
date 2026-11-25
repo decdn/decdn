@@ -9,7 +9,10 @@
 //!   present-range watch until the leaf's content lands (racing the pull's terminal
 //!   signal for the no-hang guarantee), then reads it; once the covering pull ends
 //!   cleanly the range is durably stored, so it reads straight from the store rather
-//!   than waiting on the observed bitfield, which can lag the admit;
+//!   than waiting on the observed bitfield, which can lag the admit. A leaf that an
+//!   exclusive own-origin fill verified past the node's cap on bytes held never
+//!   lands: the reader takes it from the fill session instead
+//!   ([`FillSession::take_passed`]);
 //! - the proof `(left, right)` hash pairs come from the serve leg's shared
 //!   [`decdn_cache::SessionOutboardReader`], fed by the pull leg's capture, and
 //!   from the store's outboard once no live fill covers a node;
@@ -191,6 +194,16 @@ impl AsyncSliceReader for AwaitingDataReader {
             let mut ended = Box::pin(liveness.notified());
             ended.as_mut().enable();
 
+            // An exclusive fill hands each leaf past the node's cap on bytes held
+            // to this reader instead of the store. Register for the next hand-over
+            // before looking, so a leaf that lands in between wakes this read.
+            let session = Arc::clone(&self.session);
+            let mut handed = Box::pin(session.passed_signal().notified());
+            handed.as_mut().enable();
+            if let Some(bytes) = session.take_passed(offset, need) {
+                return Ok(bytes);
+            }
+
             // No live fill still covers this range. Decide on the terminal outcome:
             if !self.session.range_still_live(&range) {
                 match self.session.outcome() {
@@ -274,6 +287,7 @@ impl AsyncSliceReader for AwaitingDataReader {
                         tokio::select! {
                             biased;
                             () = ended.as_mut() => {}
+                            () = handed.as_mut() => {}
                             () = tokio::time::sleep(WATCH_OPEN_RETRY) => {}
                         }
                         continue;
@@ -293,6 +307,7 @@ impl AsyncSliceReader for AwaitingDataReader {
             tokio::select! {
                 biased;
                 () = ended.as_mut() => {}
+                () = handed.as_mut() => {}
                 yielded = advanced => {
                     match yielded {
                         Some(ranges) => self.present = ranges,

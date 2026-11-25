@@ -50,9 +50,9 @@
 //! leg calls it on every exit. The cache owns the DATA STRUCTURE; the node DRIVES
 //! it. [`FillError`] is a flattened terminal message (`anyhow::Error` is not `Clone`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError, Weak};
 
 use bao_tree::io::fsm::Outboard;
@@ -582,6 +582,18 @@ impl DownstreamWatch {
     }
 }
 
+/// The verified leaves an exclusive fill hands to its serve leg without storing
+/// them ([`FillSession::pass_leaf`]).
+#[derive(Debug, Default)]
+struct PassedLeaves {
+    /// The leaves the serve leg has not read yet, keyed by content offset.
+    leaves: BTreeMap<u64, bytes::Bytes>,
+    /// Every chunk range the fill handed over, read or not.
+    ranges: ChunkRanges,
+    /// The content bytes the fill handed over.
+    bytes: u64,
+}
+
 /// One in-flight fill of a `total_bytes`-byte blob rooted at `root`.
 ///
 /// Holds a reference to the per-hash [`HashOutboard`] (captured by the cache admit
@@ -660,6 +672,17 @@ pub struct FillSession {
     /// out to join OFF the map lock. `None` when no pull was spawned (an attach, or a
     /// spawn that failed).
     pull_thread: StdMutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set by [`Self::mark_exclusive`]: no other serve attaches to this fill, so
+    /// the one serve leg that reads it reads every leaf the fill hands over.
+    exclusive: AtomicBool,
+    /// The leaves an exclusive fill verified and did not store, because the
+    /// node holds its cap on bytes of the blob. The serve leg takes each one as
+    /// it reads it ([`Self::take_passed`]). The pull leg runs at most its
+    /// pull-ahead bound past the serve leg's paid frontier, so few leaves wait
+    /// here at once.
+    passed: StdMutex<PassedLeaves>,
+    /// Woken each time [`Self::pass_leaf`] hands over a leaf.
+    passed_grew: Notify,
 }
 
 impl FillSession {
@@ -690,7 +713,100 @@ impl FillSession {
             cancel: CancellationToken::new(),
             registry: OnceLock::new(),
             pull_thread: StdMutex::new(None),
+            exclusive: AtomicBool::new(false),
+            passed: StdMutex::new(PassedLeaves::default()),
+            passed_grew: Notify::new(),
         })
+    }
+
+    /// Keep every other serve off this fill: [`FillRegistry::claim`] neither
+    /// attaches to it nor counts its ranges as covered. A fill past the node's
+    /// cap on bytes of the blob hands its leaves to one serve leg
+    /// ([`Self::pass_leaf`]), which a second reader would miss.
+    /// [`FillRegistry::claim_exclusive`] marks the session it registers.
+    pub(crate) fn mark_exclusive(&self) {
+        self.exclusive.store(true, Ordering::Release);
+    }
+
+    /// Whether [`FillRegistry::claim_exclusive`] registered this fill, so no
+    /// other serve attaches to it.
+    #[must_use]
+    pub fn is_exclusive(&self) -> bool {
+        self.exclusive.load(Ordering::Acquire)
+    }
+
+    /// Hand the verified leaf `data` at content offset `offset` to this fill's
+    /// serve leg without storing it, and wake the serve leg.
+    pub fn pass_leaf(&self, offset: u64, data: bytes::Bytes) {
+        let len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let end = offset.saturating_add(len);
+        {
+            let mut passed = self.passed.lock().unwrap_or_else(PoisonError::into_inner);
+            passed.ranges |=
+                ChunkRanges::from(ChunkNum::full_chunks(offset)..ChunkNum::chunks(end));
+            passed.bytes = passed.bytes.saturating_add(len);
+            passed.leaves.insert(offset, data);
+        }
+        self.passed_grew.notify_waiters();
+    }
+
+    /// Take the handed-over leaves that make up exactly `[offset, offset + len)`.
+    /// `None` when they do not: a leaf is missing or straddles an end.
+    #[must_use]
+    pub fn take_passed(&self, offset: u64, len: u64) -> Option<bytes::Bytes> {
+        let end = offset.saturating_add(len);
+        let mut passed = self.passed.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut at = offset;
+        let mut keys = Vec::new();
+        while at < end {
+            let leaf = passed.leaves.get(&at)?;
+            keys.push(at);
+            at = at.saturating_add(u64::try_from(leaf.len()).unwrap_or(u64::MAX));
+        }
+        if at != end {
+            return None;
+        }
+        let mut parts: Vec<bytes::Bytes> = keys
+            .iter()
+            .filter_map(|key| passed.leaves.remove(key))
+            .collect();
+        if parts.len() == 1 {
+            return parts.pop();
+        }
+        let mut out = bytes::BytesMut::new();
+        for part in parts {
+            out.extend_from_slice(&part);
+        }
+        Some(out.freeze())
+    }
+
+    /// Every chunk range this fill handed over by [`Self::pass_leaf`]. The
+    /// fill's store counts them as landed, so the pull does not fetch them
+    /// again.
+    #[must_use]
+    pub fn passed_ranges(&self) -> ChunkRanges {
+        self.passed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ranges
+            .clone()
+    }
+
+    /// The content bytes this fill handed over by [`Self::pass_leaf`].
+    #[must_use]
+    pub fn passed_bytes(&self) -> u64 {
+        self.passed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bytes
+    }
+
+    /// Woken each time [`Self::pass_leaf`] hands over a leaf. A waiter registers
+    /// before it calls [`Self::take_passed`], so a leaf that lands between the
+    /// two wakes it.
+    #[must_use]
+    pub const fn passed_signal(&self) -> &Notify {
+        &self.passed_grew
     }
 
     /// Park the owner's pull-thread handle on the session so whichever observer leaves
@@ -1583,8 +1699,9 @@ impl FillRegistry {
                     // `covered` neither blocks a fresh pull nor is an attach target.
                     // Reading `is_dead` under the map lock pins it against a
                     // concurrent last-out lease drop (which fires `cancel()` under
-                    // this same lock).
-                    if session.is_dead() {
+                    // this same lock). An exclusive fill hands leaves to its own
+                    // serve leg alone, so it is never an attach target either.
+                    if session.is_dead() || session.is_exclusive() {
                         continue;
                     }
                     // A live fill advances only as ITS payer pays: the pull runs a
@@ -1691,6 +1808,32 @@ impl FillRegistry {
             session: owner,
             lease,
         }
+    }
+
+    /// Register `session` as the exclusive OWNER of the whole request
+    /// `[offset, offset+len)` (`len == 0` = to end) of the `total`-byte blob
+    /// `hash`, with no attach to any live fill. The session is marked exclusive
+    /// ([`FillSession::is_exclusive`]), so no later claim attaches to it
+    /// either. Its serve leg reads every leaf from this one fill, including the
+    /// leaves it hands over past the node's cap on bytes held.
+    pub fn claim_exclusive(
+        self: &Arc<Self>,
+        hash: Hash,
+        offset: u64,
+        len: u64,
+        total: u64,
+        session: Arc<FillSession>,
+    ) -> FillClaim {
+        let r = align_range_clamped(offset, len, total).map_or_else(
+            |_| ChunkRanges::empty(),
+            |aligned| aligned.chunk_ranges().clone(),
+        );
+        session.mark_exclusive();
+        session.set_covered(r);
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        self.insert_session(&mut map, hash, &session);
+        let lease = self.mint_lease(&session, hash);
+        FillClaim::Owner { session, lease }
     }
 }
 

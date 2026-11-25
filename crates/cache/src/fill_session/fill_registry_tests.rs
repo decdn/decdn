@@ -513,6 +513,54 @@ fn claim_interior_overlap_falls_back_to_whole_owner() {
     );
 }
 
+/// An exclusive fill hands its leaves past the cap to its own serve leg. A
+/// claim never attaches to it, and an exclusive claim never attaches to a live
+/// fill: each owns a fill of its own.
+#[test]
+fn exclusive_claims_never_attach_either_way() {
+    let total = 8 * G;
+    let reg = Arc::new(FillRegistry::new());
+    let hash = store_hash(0xE1);
+
+    let FillClaim::Owner {
+        session: shared,
+        lease: _shared,
+    } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xE1), total))
+    else {
+        panic!("first whole-range claim owns");
+    };
+    let FillClaim::Owner {
+        session: exclusive,
+        lease: _exclusive,
+    } = reg.claim_exclusive(hash, 0, 0, total, FillSession::new(root(0xE1), total))
+    else {
+        panic!("an exclusive claim always owns");
+    };
+    assert!(exclusive.is_exclusive());
+    assert!(!Arc::ptr_eq(&shared, &exclusive), "two distinct fills");
+    assert_eq!(
+        shared.observer_count(),
+        1,
+        "the exclusive claim attached nowhere"
+    );
+
+    // Retire the shared fill, so only the exclusive one covers the range.
+    shared.mark_ended(Ok(()));
+    let FillClaim::Owner {
+        session: third,
+        lease: _third,
+    } = reg.claim(hash, 0, 0, total, || FillSession::new(root(0xE1), total))
+    else {
+        panic!("a claim over an exclusive fill owns its own fill");
+    };
+    assert!(!Arc::ptr_eq(&third, &exclusive));
+    assert_eq!(
+        exclusive.observer_count(),
+        1,
+        "nothing attached to the exclusive fill"
+    );
+}
+
 /// A subset claim (its `R` fully inside a live pull's `covered`) ATTACHES.
 #[test]
 fn claim_subset_attaches() {
