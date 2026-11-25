@@ -120,6 +120,19 @@ fn external_addrs_refuse_a_private_entry() {
     assert!(msg.contains("192.168.1.2"), "{msg}");
 }
 
+#[test]
+fn external_addrs_name_every_bad_entry() {
+    let file: FileConfig = toml::from_str(
+        "[network]\nexternal_addrs = [\"192.168.1.2:4433\", \"8.8.8.8:4433\", \"${LB_IP}:4433\"]\n",
+    )
+    .unwrap();
+    let msg = format!("{:#}", file.external_addrs().unwrap_err());
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(msg.contains("192.168.1.2"), "{msg}");
+    assert!(!msg.contains("network.external_addrs[1]"), "{msg}");
+    assert!(msg.contains("network.external_addrs[2]"), "{msg}");
+}
+
 /// A misspelt `[network]` key stops the CLI before it registers the wrong
 /// addresses, as it stops the daemon.
 #[test]

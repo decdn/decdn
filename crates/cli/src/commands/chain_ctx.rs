@@ -53,7 +53,8 @@ impl FileConfig {
     ///
     /// # Errors
     ///
-    /// Returns the first bad entry's error, under `network.external_addrs[i]`.
+    /// Returns one error that names every bad entry, each under
+    /// `network.external_addrs[i]`.
     pub fn external_addrs(&self) -> anyhow::Result<Vec<std::net::SocketAddr>> {
         decdn_common::config::configured_external_addrs(
             self.network

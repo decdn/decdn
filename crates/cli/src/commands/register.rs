@@ -40,7 +40,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     let cb_addr = resolved.capacity_bond_address;
     // Chosen before the signer loads, so a bad `network.external_addrs` entry
     // fails before any password prompt.
-    let multiaddrs = registration_multiaddrs(&args.multiaddrs, &file)?;
+    let multiaddrs = registration_multiaddrs(&args.multiaddrs, &file, None)?;
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
@@ -122,21 +122,29 @@ pub(crate) async fn ensure_multiaddrs_fit<P: Provider>(
 ///    source is not dialable; its operator sets `network.external_addrs` or
 ///    passes the forwarded address with `--multiaddr` instead.
 ///
+/// `external` is the list [`chain_ctx::FileConfig::external_addrs`] already
+/// returned for `file`, when the caller parsed it earlier; `None` parses it
+/// here.
+///
 /// The chosen default is reported on stderr, so `--json` stdout stays
 /// machine-readable.
 ///
 /// # Errors
 ///
-/// Returns an error when a `network.external_addrs` entry is invalid and no
-/// `explicit` multiaddr is given.
+/// Returns an error that names every invalid `network.external_addrs` entry,
+/// when no `explicit` multiaddr is given.
 pub(crate) fn registration_multiaddrs(
     explicit: &[String],
     file: &chain_ctx::FileConfig,
+    external: Option<Vec<std::net::SocketAddr>>,
 ) -> anyhow::Result<Vec<String>> {
     if !explicit.is_empty() {
         return Ok(explicit.to_vec());
     }
-    let external = file.external_addrs()?;
+    let external = match external {
+        Some(external) => external,
+        None => file.external_addrs()?,
+    };
     if !external.is_empty() {
         let chosen: Vec<String> = external
             .iter()

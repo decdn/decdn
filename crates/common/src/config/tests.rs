@@ -7062,6 +7062,50 @@ fn configured_external_addrs_names_the_bad_index() {
 }
 
 #[test]
+fn configured_external_addrs_reports_each_bad_entry_by_index() {
+    // The same list the daemon test above uses: every bad entry is named, not
+    // only the first.
+    let raw = [
+        "node.example:4433",
+        "8.8.8.8:4433",
+        "10.0.0.5:4433",
+        "8.8.8.8:0",
+    ]
+    .map(String::from);
+    let msg = format!("{:#}", configured_external_addrs(&raw).unwrap_err());
+    assert!(msg.contains("configuration has 3 problem(s):"), "{msg}");
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(msg.contains("node.example:4433"), "{msg}");
+    assert!(!msg.contains("network.external_addrs[1]"), "{msg}");
+    assert!(msg.contains("network.external_addrs[2]"), "{msg}");
+    assert!(msg.contains("10.0.0.5"), "{msg}");
+    assert!(msg.contains("network.external_addrs[3]"), "{msg}");
+}
+
+#[test]
+fn configured_external_addrs_names_a_var_entry_beside_a_bad_entry() {
+    let raw = ["10.0.0.5:4433", "8.8.8.8:4433", "${LB_IP}:30443"].map(String::from);
+    let msg = format!("{:#}", configured_external_addrs(&raw).unwrap_err());
+    assert!(msg.contains("configuration has 2 problem(s):"), "{msg}");
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(msg.contains("10.0.0.5"), "{msg}");
+    assert!(msg.contains("network.external_addrs[2]"), "{msg}");
+    assert!(msg.contains("does not expand"), "{msg}");
+}
+
+#[test]
+fn resolve_network_parses_an_expanded_var_entry() {
+    // The daemon path expands `${VAR}` before this list rule runs, so the rule
+    // does not refuse the text there: the entry fails only as an address.
+    let file = network_with_external_addrs(&["${LB_IP}:30443"]);
+    let mut bag = ConfigDiagnostics::new();
+    resolve_network_into(&empty_network_args(), Some(&file), &mut bag);
+    let msg = format!("{:#}", bag.into_result().unwrap_err());
+    assert!(msg.contains("network.external_addrs[0]"), "{msg}");
+    assert!(!msg.contains("does not expand"), "{msg}");
+}
+
+#[test]
 fn configured_external_addrs_names_an_unexpanded_var() {
     let err = configured_external_addrs(&["${LB_IP}:30443".to_string()]).unwrap_err();
     let msg = format!("{err:#}");
