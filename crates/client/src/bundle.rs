@@ -970,7 +970,7 @@ impl BundlePuller {
         overwrite: bool,
         cancel: &CancellationToken,
     ) -> BundleOutcome {
-        self.ctx.run_store.pull_started();
+        self.ctx.run_store.pull_started(out_dir);
         let outcome = Box::pin(self.ctx.run(manifest, out_dir, overwrite, cancel)).await;
         if matches!(outcome.end, BundleEnd::Complete) && outcome.report.failed == 0 {
             self.ctx.run_store.pull_settled();
@@ -1016,8 +1016,9 @@ impl BundlePuller {
     }
 
     /// Wait for every queued peer-record and watermark write to land, and close
-    /// the run's download store: it is removed once every pull settled every
-    /// entry, and kept for the next run otherwise. Call it before the process
+    /// the run's download store: once every pull settled every entry, the
+    /// store and each pull's staging directory (`.decdn-partial/`) are
+    /// removed, and otherwise they are kept for the next run. Call it before the process
     /// exits, after a cancelled pull too, so the next run resumes each lane
     /// from what it paid and each entry from what it fetched.
     pub async fn finish(self) {

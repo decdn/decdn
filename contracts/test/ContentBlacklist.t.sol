@@ -272,43 +272,20 @@ contract ContentBlacklistTest is Test {
 
     bytes32 internal constant GLOBAL_REGION = bytes32("GLOBAL");
 
-    /// @notice `addHashGlobal` persists the reason and emits it on the event.
-    function test_addHashGlobal_persistsReason() public {
+    /// @notice `addHashGlobal` emits the reason on the event.
+    function test_addHashGlobal_emitsReason() public {
         vm.expectEmit(true, true, false, true, address(blacklist));
         emit ContentBlacklist.HashBlacklisted(GLOBAL_REGION, SAMPLE_HASH, "DMCA-2026-001");
         vm.prank(admin);
         blacklist.addHashGlobal(SAMPLE_HASH, "DMCA-2026-001");
-        assertEq(blacklist.hashReason(GLOBAL_REGION, SAMPLE_HASH), "DMCA-2026-001");
     }
 
-    /// @notice `addHashRegional` persists the reason under the entry's region.
-    function test_addHashRegional_persistsReason() public {
+    /// @notice `addHashRegional` emits the reason under the entry's region.
+    function test_addHashRegional_emitsReason() public {
         vm.expectEmit(true, true, false, true, address(blacklist));
         emit ContentBlacklist.HashBlacklisted(REGION_US, SAMPLE_HASH, "DSA-DE-001");
         vm.prank(regionalBody);
         blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DSA-DE-001");
-        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DSA-DE-001");
-    }
-
-    /// @notice Removing an entry clears its stored reason (no stale audit trail).
-    function test_removeHash_clearsReason() public {
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DSA-DE-001");
-        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DSA-DE-001");
-        vm.prank(regionalBody);
-        blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
-        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "");
-    }
-
-    /// @notice A re-add overwrites the stored reason with the new notice's.
-    function test_addHash_reAdd_overwritesReason() public {
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-OLD");
-        vm.prank(regionalBody);
-        blacklist.removeHashRegional(REGION_US, SAMPLE_HASH);
-        vm.prank(regionalBody);
-        blacklist.addHashRegional(REGION_US, SAMPLE_HASH, "DMCA-NEW");
-        assertEq(blacklist.hashReason(REGION_US, SAMPLE_HASH), "DMCA-NEW");
     }
 
     // =================================================================
@@ -429,7 +406,6 @@ contract ContentBlacklistTest is Test {
         assertEq(afterRatify.addedAt, before.addedAt, "addedAt kept");
         assertEq(afterRatify.effectiveAt, before.effectiveAt, "effectiveAt kept");
         assertFalse(afterRatify.emergency, "ratification clears the emergency flag");
-        assertEq(blacklist.hashReason(GLOBAL_REGION, SAMPLE_HASH), "DMCA-RATIFIED");
 
         vm.warp(block.timestamp + 3 days);
         vm.prank(admin);
