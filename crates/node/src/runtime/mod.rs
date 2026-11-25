@@ -1009,8 +1009,8 @@ async fn build_chain_and_handlers(
     let staker_set: Arc<dyn StakerSet> = registry.staker_set;
     let registry_regions = Arc::clone(&registry.regions);
     // The shared `operator address → NodeId` reverse projection (#1110), kept
-    // current by the same registry snapshot. The lazy `ChainOriginDirectory`
-    // resolves against it directly rather than maintaining its own binding cache.
+    // current by the same registry snapshot. The `ChainOriginDirectory` resolves
+    // against it directly.
     let operator_to_node = Arc::clone(&registry.operator_to_node);
     // Registry multiaddrs as an endpoint address lookup (ADR 001 § Node
     // Discovery): every bare-`NodeId` dial resolves the node's registry
@@ -1083,61 +1083,48 @@ async fn build_chain_and_handlers(
     let record_store = Arc::new(std::sync::Mutex::new(RecordStore::new(
         RecordStoreConfig::default(),
     )));
-    // Origin directory for the node-origin FIND_VALUE reads — the last-resort
-    // fallback when the DHT returns no providers, and the supplement when a ranged
-    // pull's discovered holders do not span the blob (ADR 022 §FIND_VALUE Flow; #912,
-    // #2195) — and for the reactive pull-through gate. When the operator configures the
-    // OriginAssignment + PublisherRegistry addresses, use the chain-backed
-    // `ChainOriginDirectory` — a lazy TTL cache resolving hash → namespace →
-    // authorized origin → active NodeId on demand, reusing the
-    // already-bootstrapped `staker_set` and `operator_to_node` reverse
-    // projection for operator liveness and binding. No bootstrap RPC: the
-    // cache populates on the first lookup miss per namespace.
-    // Without those addresses this is an `EmptyOriginDirectory`: the FIND_VALUE
-    // fallback resolves nothing.
-    let origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> =
-        if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
-            let origin_assignment_addr =
-                parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
-            Arc::new(crate::dht::ChainOriginDirectory::new(
-                providers.read_only(receipt_poll_interval),
-                origin_assignment_addr,
-                Arc::clone(&operator_to_node),
-                Arc::clone(&staker_set),
-                reload_state.content_denylist(),
-                cfg.blockchain.origin_directory_cache_capacity,
-                Duration::from_secs(cfg.blockchain.origin_directory_positive_ttl_sec),
-                Duration::from_secs(cfg.blockchain.origin_directory_negative_ttl_sec),
-                Arc::clone(&infra.node_metrics),
-            ))
-        } else {
-            Arc::new(crate::dht::origin::EmptyOriginDirectory)
-        };
     // The seated-origin set every DHT record's attestation is checked against
     // (ADR 022 § Origin Attestation). The `OriginAssignment` snapshot fills it
     // at boot and keeps it current. Without that address it stays empty, and no
     // record is valid here: the check fails closed.
     let seated_origins = Arc::new(crate::dht::SeatedOriginSet::new());
-    if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
-        let origin_assignment_addr =
-            parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
-        let seat_refresh = crate::origin_seat_watcher::bootstrap(
-            providers.read_only(receipt_poll_interval),
-            origin_assignment_addr,
-            Arc::clone(&seated_origins),
-            Arc::clone(&infra.node_metrics),
-            &boot,
-            chain_sync_stop.clone(),
-        )
-        .await
-        .context("bootstrap the origin seat snapshot")?;
-        chain_sync_tasks.push(seat_refresh);
-    } else {
-        tracing::warn!(
-            "blockchain.origin_assignment_address is not set: no origin seat is known, \
-             so this node accepts and follows no DHT record"
-        );
-    }
+    // Origin directory for the node-origin FIND_VALUE reads — the last-resort
+    // fallback when the DHT returns no providers, and the supplement when a ranged
+    // pull's discovered holders do not span the blob (ADR 022 §FIND_VALUE Flow; #912,
+    // #2195) — and for the reactive pull-through gate. With an OriginAssignment
+    // address it is the `ChainOriginDirectory`, resolving namespace → seated
+    // operators (from the seat snapshot) → active NodeId, against the
+    // already-bootstrapped `staker_set` and `operator_to_node` reverse
+    // projection. Without that address it is an `EmptyOriginDirectory`: the
+    // FIND_VALUE fallback resolves nothing.
+    let origin_directory: Arc<dyn crate::dht::origin::OriginDirectory> =
+        if let Some(origin_addr) = cfg.blockchain.origin_assignment_address.as_deref() {
+            let origin_assignment_addr =
+                parse_nonzero_address(origin_addr, "blockchain.origin_assignment_address")?;
+            let seat_refresh = crate::origin_seat_watcher::bootstrap(
+                providers.read_only(receipt_poll_interval),
+                origin_assignment_addr,
+                Arc::clone(&seated_origins),
+                Arc::clone(&infra.node_metrics),
+                &boot,
+                chain_sync_stop.clone(),
+            )
+            .await
+            .context("bootstrap the origin seat snapshot")?;
+            chain_sync_tasks.push(seat_refresh);
+            Arc::new(crate::dht::ChainOriginDirectory::new(
+                Arc::clone(&seated_origins) as Arc<dyn crate::dht::SeatedOrigins>,
+                Arc::clone(&operator_to_node),
+                Arc::clone(&staker_set),
+                reload_state.content_denylist(),
+            ))
+        } else {
+            tracing::warn!(
+                "blockchain.origin_assignment_address is not set: no origin seat is known, \
+                 so this node accepts and follows no DHT record"
+            );
+            Arc::new(crate::dht::origin::EmptyOriginDirectory)
+        };
     let attestation_verifier = crate::dht::AttestationVerifier::new(
         Arc::clone(&seated_origins) as Arc<dyn crate::dht::SeatedOrigins>,
         reload_state.content_denylist(),

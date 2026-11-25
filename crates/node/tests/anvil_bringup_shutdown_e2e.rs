@@ -354,12 +354,6 @@ fn build_config(
         },
         blockchain: ResolvedBlockchain {
             origin_assignment_address: None,
-            origin_directory_positive_ttl_sec:
-                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC,
-            origin_directory_negative_ttl_sec:
-                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC,
-            origin_directory_cache_capacity:
-                decdn_common::config::DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY,
             publisher_registry_address: None,
             payment_chains: vec![decdn_common::config::ResolvedPaymentChain {
                 rpc_url: rpc_url.clone(),

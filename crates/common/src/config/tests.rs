@@ -4183,56 +4183,6 @@ fn resolve_blockchain_lone_publisher_registry_resolves() -> anyhow::Result<()> {
 }
 
 #[test]
-fn resolve_blockchain_origin_directory_ttls_default_when_unset() -> anyhow::Result<()> {
-    // Absent origin-directory knobs resolve to the DEFAULT_ORIGIN_DIRECTORY_*
-    // consts.
-    let dir = data_dir_with_keystore()?;
-    let cli = empty_blockchain_args();
-    let file = types::BlockchainConfig {
-        rpc_url: Some("https://example/rpc".to_string()),
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        origin_directory_positive_ttl_sec: None,
-        origin_directory_negative_ttl_sec: None,
-        origin_directory_cache_capacity: None,
-        ..Default::default()
-    };
-    let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
-    assert_eq!(
-        resolved.origin_directory_positive_ttl_sec,
-        DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC
-    );
-    assert_eq!(
-        resolved.origin_directory_negative_ttl_sec,
-        DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC
-    );
-    assert_eq!(
-        resolved.origin_directory_cache_capacity,
-        DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY
-    );
-    Ok(())
-}
-
-#[test]
-fn resolve_blockchain_origin_directory_ttls_pass_through() -> anyhow::Result<()> {
-    // Explicit values survive resolution unchanged.
-    let dir = data_dir_with_keystore()?;
-    let cli = empty_blockchain_args();
-    let file = types::BlockchainConfig {
-        rpc_url: Some("https://example/rpc".to_string()),
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        origin_directory_positive_ttl_sec: Some(600),
-        origin_directory_negative_ttl_sec: Some(5),
-        origin_directory_cache_capacity: Some(128),
-        ..Default::default()
-    };
-    let resolved = resolve_blockchain(&cli, Some(&file), dir.path())?;
-    assert_eq!(resolved.origin_directory_positive_ttl_sec, 600);
-    assert_eq!(resolved.origin_directory_negative_ttl_sec, 5);
-    assert_eq!(resolved.origin_directory_cache_capacity, 128);
-    Ok(())
-}
-
-#[test]
 fn resolve_blockchain_chain_staleness_grace_defaults_when_unset() -> anyhow::Result<()> {
     // An absent grace resolves to the 30-minute default.
     let dir = data_dir_with_keystore()?;

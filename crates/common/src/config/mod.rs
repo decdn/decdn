@@ -271,23 +271,6 @@ pub use decdn_config_types::{
 /// operator sets the field explicitly to override either default.
 pub const DEFAULT_RELAY_FOREIGN_NAMESPACES: bool = true;
 
-/// Positive-hit TTL for the lazy origin directory cache: how long a resolved,
-/// non-empty `getOrigins(namespaceId)` set is served before a re-read. Bounds
-/// origin-set staleness (there is no event tail); 5 min matches the negative
-/// candidate cache order of magnitude.
-pub const DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC: u64 = 300;
-/// Negative-hit TTL: how long "this namespace has no origins / does not
-/// exist" is cached. Shorter than the positive TTL so a namespace that later
-/// gains an origin becomes reachable within one short window — and long
-/// enough that a flood of bogus/attacker-chosen request namespaces cannot
-/// force a `getOrigins` RPC per request. Namespace creation is permissionless
-/// and free (`PublisherRegistry.createNamespace`), so this is the `DoS` bound.
-pub const DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC: u64 = 30;
-/// Max distinct namespaces held in the lazy origin cache (LRU eviction).
-/// Bounds memory against the permissionless global namespace count — the
-/// cache only ever holds namespaces this node was actually asked to resolve.
-pub const DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY: usize = 4096;
-
 /// Default LRU eviction driver high-water percent of `cache.cache_size_mb`
 /// (#1173, ADR 040). Above this
 /// fraction the driver actively evicts.
@@ -1519,20 +1502,6 @@ fn resolve_blockchain_into(
          default (1800s)",
     );
 
-    let origin_directory_positive_ttl_sec = file
-        .and_then(|b| b.origin_directory_positive_ttl_sec)
-        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_POSITIVE_TTL_SEC);
-    let origin_directory_negative_ttl_sec = file
-        .and_then(|b| b.origin_directory_negative_ttl_sec)
-        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_NEGATIVE_TTL_SEC);
-    let origin_directory_cache_capacity = file
-        .and_then(|b| b.origin_directory_cache_capacity)
-        .unwrap_or(DEFAULT_ORIGIN_DIRECTORY_CACHE_CAPACITY);
-    // No `!= 0` rejection: a `0` TTL is a valid "disable caching" choice
-    // (every entry reads as already-expired, matching `candidate_cache`'s
-    // documented zero-TTL behavior), and the cache clamps capacity to `>= 1`
-    // itself.
-
     let chain_id = cli
         .chain_id
         .or_else(|| file.and_then(|b| b.chain_id))
@@ -1686,9 +1655,6 @@ fn resolve_blockchain_into(
         cctp_sweep_receiver_address,
         capacity_bond_address,
         origin_assignment_address,
-        origin_directory_positive_ttl_sec,
-        origin_directory_negative_ttl_sec,
-        origin_directory_cache_capacity,
         publisher_registry_address,
         content_blacklist_address,
         content_blacklist_poll_interval_sec,

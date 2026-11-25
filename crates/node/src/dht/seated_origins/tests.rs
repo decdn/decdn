@@ -63,4 +63,25 @@ fn replace_drops_seats_the_enumeration_omits() {
     assert!(!set.is_seated_in(ns(1), &op(2)));
     assert!(set.is_seated_in(ns(3), &op(2)));
     assert_eq!(set.len(), 1);
+    assert!(set.origins_in(ns(1)).is_empty());
+    assert_eq!(set.origins_in(ns(3)), vec![op(2)]);
+}
+
+#[test]
+fn origins_in_lists_every_operator_seated_in_the_namespace() {
+    let set = SeatedOriginSet::from_seats([(ns(1), op(1)), (ns(1), op(2)), (ns(2), op(3))]);
+    let mut origins = set.origins_in(ns(1));
+    origins.sort_unstable();
+    assert_eq!(origins, vec![op(1), op(2)]);
+    assert_eq!(set.origins_in(ns(2)), vec![op(3)]);
+    assert!(set.origins_in(ns(9)).is_empty());
+}
+
+#[test]
+fn unseating_the_last_operator_empties_the_namespace() {
+    let set = SeatedOriginSet::from_seats([(ns(1), op(1)), (ns(1), op(2))]);
+    set.unseat(ns(1), op(1));
+    assert_eq!(set.origins_in(ns(1)), vec![op(2)]);
+    set.unseat(ns(1), op(2));
+    assert!(set.origins_in(ns(1)).is_empty());
 }

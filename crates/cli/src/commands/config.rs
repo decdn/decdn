@@ -1007,9 +1007,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # eth_keystore = "~/.decdn/keystore.json"
 # capacity_bond_address = ""        # REQUIRED: 0x-prefixed hex; also the EIP-712 verifyingContract of stream and attestation signatures (ADR 005)
 # origin_assignment_address = ""     # OPTIONAL: 0x-prefixed hex; `decdn publish assign` target, and the chain-backed origin directory for cache-miss pull-through fallback (ADR 022).
-# origin_directory_positive_ttl_sec = 300  # lazy origin directory: how long a resolved, non-empty getOrigins() set is served before a re-read; only consulted when origin_assignment_address is set; 0 disables caching; default 300s
-# origin_directory_negative_ttl_sec = 30   # lazy origin directory: how long "namespace has no origins" is cached — the DoS bound against permissionless/free namespace creation; only consulted when origin_assignment_address is set; 0 disables caching; default 30s
-# origin_directory_cache_capacity = 4096   # lazy origin directory: max distinct namespaces held (LRU eviction); only consulted when origin_assignment_address is set; default 4096
 # publisher_registry_address = ""    # OPTIONAL: 0x-prefixed hex; `decdn publish namespace create` target (#1029).
 # content_blacklist_address = ""     # REQUIRED: 0x-prefixed hex; deployed ContentBlacklist (ADR 011/031). Absent => startup fails before any ALPN accepts; the zero address is rejected (it is a fail-open compliance trap).
 # content_blacklist_poll_interval_sec = 300  # blacklist mutation-ledger poll cadence (ADR 011); 1 to 300; default 300s

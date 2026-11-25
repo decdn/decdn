@@ -1561,16 +1561,6 @@ pub struct DecdnMetrics {
     /// origin.
     #[default(Histogram::new(FIRST_BYTE_BUCKETS.to_vec()))]
     pub serve_first_frame_miss_seconds: Histogram,
-    /// `decdn_origin_directory_get_origins_failures_total`: `getOrigins`
-    /// lookups that failed on a cold-namespace cache miss. The directory fails
-    /// closed on each (resolves no origins for that request, does not cache
-    /// the failure), so this is the drift signal to alert on — sustained
-    /// failures mean real requests are silently losing their origin fallback.
-    pub origin_directory_get_origins_failures: Counter,
-    /// `decdn_origin_directory_cache_size`: current namespace count held in
-    /// the lazy origin directory cache (positive + negative entries).
-    /// Bounded by the configured cache capacity (LRU eviction).
-    pub origin_directory_cache_size: Gauge,
     /// Paid-delivery (`serve_stream`) requests refused because the node
     /// withdrew the blob: an operator evict or a corruption quarantine with no
     /// blacklist entry behind it (#279). One `Counter` per
@@ -3187,16 +3177,6 @@ recorders! {
     /// A cache-engine error (not a clean miss) was hit filling a miss (#831).
     node_pull_through_error => node_pull_through_errors.inc();
 
-    /// A `getOrigins` lookup failed on a cold-namespace cache miss in the lazy
-    /// origin directory. The lookup fails closed (resolves no origins for
-    /// that request) and the failure is not cached, so this is the drift
-    /// signal to alert on.
-    origin_directory_get_origins_failure => origin_directory_get_origins_failures.inc();
-
-    /// Publish the current namespace count held in the lazy origin directory
-    /// cache (positive + negative entries), after an insert.
-    origin_directory_cache_size(count: usize)
-        => origin_directory_cache_size.set(sat(count));
     /// A connection was accepted and handed to a handler.
     connection_opened => active_connections.inc();
     /// A connection closed. Pairs with `connection_opened`.
