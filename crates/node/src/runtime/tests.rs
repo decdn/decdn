@@ -1680,6 +1680,7 @@ fn spawn_boot(
             admin_port: None,
             otlp_endpoint: None,
         },
+        decdn_common::cli::run::NetworkArgs::default(),
         &cfg,
         Box::new(|_| Ok(LogLevelApply::Installed)) as LogLevelSetter,
     ));
