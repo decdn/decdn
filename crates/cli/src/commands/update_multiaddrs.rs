@@ -164,7 +164,7 @@ async fn build_plan<P: Provider + Clone>(
     let max_multiaddr_size: u64 = max_multiaddr_size.saturating_to();
     let cooldown_secs: u64 = cooldown.saturating_to();
     let ready_at = info.lastMultiaddrUpdate.saturating_add(cooldown_secs);
-    // Packed length is a handful of KB in practice; `u64::MAX` on the
+    // `usize` fits `u64` on every supported target; `u64::MAX` on the
     // impossible overflow keeps the ceiling check erring toward "too large".
     let packed_size = u64::try_from(packed.len()).unwrap_or(u64::MAX);
 

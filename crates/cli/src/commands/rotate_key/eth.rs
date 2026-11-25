@@ -608,6 +608,11 @@ async fn reonboard(
     // somewhere the operator never saw.
     ensure_planned_operator(planned_operator, new_operator)?;
 
+    // An oversized set (a long `--multiaddr` list, or a carried-forward set
+    // over a ceiling governance has since lowered) fails here, before the terms
+    // prompt and the bond transactions, not as a `registerNode` revert after them.
+    register::ensure_multiaddrs_fit(&bond_contract, cb_addr, multiaddrs).await?;
+
     // ADR 019 § Terms Acceptance — re-registration from a new address is a
     // FRESH registration, so it re-accepts terms. (`--key iroh` never does: a
     // rebind signs the terms-free `BindNodeId` payload.)

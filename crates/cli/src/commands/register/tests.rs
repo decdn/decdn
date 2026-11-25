@@ -92,3 +92,86 @@ fn submitted_output_has_tx() {
     let s = String::from_utf8(buf).unwrap();
     assert!(s.contains("submitted=true tx=0x5555"), "{s}");
 }
+
+/// `ensure_multiaddrs_fit` against a mocked provider. `Asserter` serves
+/// `eth_call` responses FIFO, so the queued responses are also an assertion
+/// about which chain reads happen.
+mod fit {
+    use alloy::primitives::U256;
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
+
+    use super::*;
+
+    /// Run the check for `multiaddrs` against a chain serving `ceiling`, or
+    /// serving nothing when `ceiling` is `None`.
+    async fn fit(multiaddrs: &[String], ceiling: Option<U256>) -> anyhow::Result<()> {
+        let asserter = Asserter::new();
+        if let Some(c) = ceiling {
+            asserter.push_success(&Bytes::from(c.to_be_bytes::<32>().to_vec()));
+        }
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let addr = Address::repeat_byte(0xCB);
+        let bond = CapacityBond::new(addr, provider);
+        ensure_multiaddrs_fit(&bond, addr, multiaddrs).await
+    }
+
+    /// One entry that packs to `packed` bytes (a 2-byte length prefix plus
+    /// its body).
+    fn entry(packed: usize) -> Vec<String> {
+        vec!["a".repeat(packed - 2)]
+    }
+
+    #[tokio::test]
+    async fn at_the_ceiling_passes() {
+        fit(&entry(64), Some(U256::from(64)))
+            .await
+            .expect("packed == maxMultiaddrSize is within bounds");
+    }
+
+    #[tokio::test]
+    async fn over_the_ceiling_names_register_node() {
+        let err = fit(&entry(65), Some(U256::from(64)))
+            .await
+            .expect_err("over the ceiling must not proceed");
+        let msg = format!("{err}");
+        assert!(msg.contains("`registerNode`"), "names the call: {msg}");
+        assert!(
+            msg.contains("MultiaddrsTooLarge"),
+            "names the revert: {msg}"
+        );
+        assert!(msg.contains("65 bytes"), "reports the packed size: {msg}");
+        assert!(msg.contains("64 bytes"), "reports the ceiling: {msg}");
+    }
+
+    /// Packing runs before the chain read: nothing is queued, so a read
+    /// would fail with an empty-queue error instead of the length-prefix one.
+    #[tokio::test]
+    async fn an_unpackable_entry_fails_before_the_chain_read() {
+        let err = fit(&["a".repeat(usize::from(u16::MAX) + 1)], None)
+            .await
+            .expect_err("an entry past the u16 prefix must not proceed");
+        assert!(
+            format!("{err}").contains("uint16 length prefix"),
+            "reports the packing error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_names_the_ceiling() {
+        let err = fit(&entry(10), None)
+            .await
+            .expect_err("an unreadable ceiling must not pass");
+        assert!(
+            format!("{err:#}").contains("failed to read maxMultiaddrSize"),
+            "names the failed read: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_set_passes() {
+        fit(&[], Some(U256::from(64)))
+            .await
+            .expect("an empty set packs to 0 bytes");
+    }
+}

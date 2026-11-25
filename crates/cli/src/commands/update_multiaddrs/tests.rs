@@ -189,12 +189,6 @@ fn packed_size_under_ceiling_passes() {
     ensure_packed_within(36, 1_024, "registerNode").expect("under the ceiling is within bounds");
 }
 
-/// The contract's check is `packed > maxMultiaddrSize`, so equality passes.
-#[test]
-fn packed_size_at_ceiling_passes() {
-    ensure_packed_within(1_024, 1_024, "registerNode").expect("size == ceiling is within bounds");
-}
-
 #[test]
 fn packed_size_over_ceiling_names_the_call_and_both_sizes() {
     let err = ensure_packed_within(1_025, 1_024, "registerNode")

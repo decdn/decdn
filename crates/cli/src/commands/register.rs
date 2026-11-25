@@ -10,8 +10,9 @@
 //! Bonding (`approve` + `bond` + `declareMbps`) is a precondition:
 //! the contract reverts `BondBelowMinimum` / `BondBelowCurve` if the bond
 //! is not already posted (run `decdn node bond` first). `--dry-run` builds
-//! and prints everything (it still reads the chain for the nonces the
-//! signatures depend on) but does not submit.
+//! and prints everything but does not submit. It still reads the chain: the
+//! `maxMultiaddrSize` ceiling, so an oversized multiaddr set fails a dry run as
+//! it would a live one, and the nonces the signatures depend on.
 //!
 //! The signing + submit path is factored into `submit_registration` so
 //! `decdn setup` (#933) can drive registration with the same already-loaded
@@ -88,10 +89,11 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
 }
 
 /// Refuse a multiaddr set whose packed form exceeds `CapacityBond.maxMultiaddrSize`,
-/// so `registerNode` never reverts `MultiaddrsTooLarge` after a prompt or a
-/// transaction. Packs with [`node_register::pack_multiaddrs`], so a single entry
+/// so an oversized set fails as a named error before the terms prompt and any
+/// transaction, not as a `registerNode` revert. Packs with
+/// [`node_register::pack_multiaddrs`] before the chain read, so a single entry
 /// past the `u16` length prefix also fails here. An empty set (a host behind
-/// NAT) packs to 0 bytes and always passes.
+/// NAT) packs to 0 bytes and is always within the ceiling.
 ///
 /// # Errors
 ///
@@ -110,7 +112,7 @@ pub(crate) async fn ensure_multiaddrs_fit<P: Provider + Clone>(
     // bounded far below `u64::MAX`, so a value past `u64` is unreachable — and
     // failing the whole command on an unreachable read would be worse than clamping.
     let max_multiaddr_size: u64 = max_multiaddr_size.saturating_to();
-    // Packed length is a handful of KB in practice; `u64::MAX` on the
+    // `usize` fits `u64` on every supported target; `u64::MAX` on the
     // impossible overflow keeps the ceiling check erring toward "too large".
     let packed_size = u64::try_from(packed.len()).unwrap_or(u64::MAX);
     update_multiaddrs::ensure_packed_within(packed_size, max_multiaddr_size, "registerNode")
@@ -201,7 +203,9 @@ pub(crate) struct RegisterOutcome {
 /// (ADR 019) against an already-built `provider` and `signer`.
 /// `dry_run` reads the chain for the nonces the signatures depend on but does
 /// not submit. Shared by `run` and `decdn setup` so the keystore is decrypted
-/// once across bond + register.
+/// once across bond + register. Callers check `multiaddrs` with
+/// [`ensure_multiaddrs_fit`] before any prompt; this function does not
+/// re-check the ceiling.
 ///
 /// `tx_slot` is caller-owned for the same reason `bond::execute`'s `Outcome` is
 /// (#1355): on an unreadable receipt the transaction is broadcast and may take

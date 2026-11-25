@@ -233,8 +233,9 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     let key_path = identity::key_path(&resolved.data_dir);
     // On a clean slate a registration is certain, so a bad
     // `network.external_addrs` entry fails here, before any key generation or
-    // prompt. A node with a key checks it once its registration state is known,
-    // before any transaction.
+    // prompt. Once its registration state is known, a node with a registration
+    // due chooses the multiaddrs and checks them against the on-chain size
+    // ceiling, before the terms prompt and any transaction.
     if args.multiaddrs.is_empty() && !key_path.exists() {
         file.external_addrs()?;
     }
@@ -253,7 +254,15 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
                     json,
                     "keys: would generate (node key + eth keystore absent)",
                 );
-                return dry_run_without_keys(&resolved, &file, cb_addr, args.mbps, json).await;
+                return dry_run_without_keys(
+                    &resolved,
+                    &file,
+                    cb_addr,
+                    args.mbps,
+                    &args.multiaddrs,
+                    json,
+                )
+                .await;
             }
             hline(json, "keys: generating (node key + eth keystore absent)");
             let kg = cli::KeyGenArgs {
@@ -441,9 +450,10 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
         RegistrationStatus::AlreadyRegistered => true,
         RegistrationStatus::Due => false,
     };
-    // A registration is due: choose the multiaddrs once, here, so a bad
+    // When a registration is due, choose the multiaddrs once, here, so a bad
     // `network.external_addrs` entry or a set over the on-chain size ceiling
-    // fails before the terms prompt and any transaction.
+    // fails before the terms prompt and any transaction. `multiaddrs` is `Some`
+    // exactly when `terms_hash` below is.
     let multiaddrs = if already_registered {
         None
     } else {
@@ -527,7 +537,7 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
             }
             let multiaddrs = multiaddrs
                 .as_deref()
-                .context("a due registration has its multiaddrs chosen before the bond phase")?;
+                .context("internal: a due registration has no multiaddrs chosen")?;
             let outcome = register::submit_registration(
                 &provider,
                 &signer,
@@ -559,10 +569,13 @@ pub async fn run(args: &cli::SetupArgs, global_config: Option<&Path>) -> anyhow:
     }
     .await;
 
-    // What registration actually submitted, defaulted multiaddrs included.
-    let multiaddr_count = register_outcome
-        .as_ref()
-        .map_or(args.multiaddrs.len(), |o| o.multiaddr_count);
+    // What registration submitted, defaulted multiaddrs included; on a run that
+    // failed before submitting, what it chose. 0 when no registration was due,
+    // as on the dry-run path.
+    let multiaddr_count = register_outcome.as_ref().map_or_else(
+        || multiaddrs.as_ref().map_or(0, Vec::len),
+        |o| o.multiaddr_count,
+    );
     let summary = |readiness: Option<&Readiness>| {
         build_summary(
             &pf,
@@ -797,6 +810,8 @@ async fn read_readiness<P: Provider + Clone>(
 /// reads only the operator-independent curve through a read-only provider and
 /// reports what *would* run. It still validates the tier band so an out-of-band
 /// `--mbps` is flagged here exactly as `build_plan` would on the keyed path.
+/// A clean slate always registers, so it also checks the registration
+/// multiaddrs against the on-chain size ceiling, as the live run does.
 /// On a pull-through node it also prints the buyer-USDC row: the keys do not
 /// exist yet, so the row reports a wallet that holds nothing, without a chain
 /// read.
@@ -805,6 +820,7 @@ async fn dry_run_without_keys(
     file: &chain_ctx::FileConfig,
     cb_addr: Address,
     mbps: u64,
+    explicit_multiaddrs: &[String],
     json: bool,
 ) -> anyhow::Result<()> {
     let provider =
@@ -845,6 +861,8 @@ async fn dry_run_without_keys(
         .await
         .context("failed to read minBond")?;
     let target = min_bond.max(required);
+    let multiaddrs = register::registration_multiaddrs(explicit_multiaddrs, file)?;
+    register::ensure_multiaddrs_fit(&bond_contract, cb_addr, &multiaddrs).await?;
     let buyer_usdc = keyless_buyer_usdc(buyer_usdc_plan(file));
     if json {
         let value = serde_json::json!({
