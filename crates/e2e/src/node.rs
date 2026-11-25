@@ -34,6 +34,11 @@ use crate::ports::{PortReservation, UdpPortClaim};
 /// via `DECDN_KEYSTORE_PASSWORD` (#1032).
 pub const KEYSTORE_PASSWORD: &str = "decdn-e2e-test-password";
 
+/// The fixture node's `blockchain.redeem_threshold_micro_usdc`. The node defers
+/// a redemption chunk below this floor, so a lane can hold an unredeemed tail
+/// smaller than it while the node runs.
+pub const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
+
 /// Kills the spawned `decdn-node` on drop so a panicking assertion never leaks
 /// the daemon process. The `Child` is behind a `Mutex` so [`NodeFixture::wait_healthy`]
 /// can `try_wait` it through a shared `&self` reference.
@@ -1044,7 +1049,7 @@ content_blacklist_poll_interval_sec = 2
 publisher_registry_address = "{publisher_registry}"
 origin_assignment_address = "{origin_assignment}"
 receipt_poll_interval_ms = 500
-redeem_threshold_micro_usdc = 10
+redeem_threshold_micro_usdc = {REDEEM_THRESHOLD_MICRO_USDC}
 
 [cache]
 cache_dir = '{cache_dir}'

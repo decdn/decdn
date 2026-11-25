@@ -806,7 +806,9 @@ async fn run_raise() -> anyhow::Result<()> {
     );
     // Each round re-reads the node's figure, so a payment the node folds after
     // the first read is in the figure the chain must match. The node's
-    // redemption lands B, so every payment it accepted redeems.
+    // redemption lands B, so every payment it accepted redeems, past A's cap.
+    // A sweep that lands before the stream's last voucher leaves a tail below
+    // the redeem floor, which the node defers while it runs.
     let settled = poll(Duration::from_secs(90), || async {
         let owed = accepted_on_pool(&node, pool_id).await?;
         let lane = e2e_assert::read_watermark(
@@ -817,7 +819,11 @@ async fn run_raise() -> anyhow::Result<()> {
             operator,
         )
         .await?;
-        Ok((lane.amount == owed).then_some(owed))
+        let paid = lane.amount;
+        Ok((paid > registered.cap
+            && paid <= owed
+            && owed - paid < decdn_e2e::node::REDEEM_THRESHOLD_MICRO_USDC)
+            .then_some(owed))
     })
     .await?;
     let Some(_settled) = settled else {
@@ -832,8 +838,11 @@ async fn run_raise() -> anyhow::Result<()> {
         .await?;
         anyhow::bail!(
             "the chain pays {} µUSDC on the delegate's lane but the node is owed {owed} µUSDC; \
-             every payment the node accepted must redeem on-chain",
-            lane.amount
+             every payment the node accepted must redeem on-chain past capability A's cap of \
+             {} µUSDC, short of at most a {} µUSDC sub-floor tail",
+            lane.amount,
+            registered.cap,
+            decdn_e2e::node::REDEEM_THRESHOLD_MICRO_USDC
         );
     };
 
