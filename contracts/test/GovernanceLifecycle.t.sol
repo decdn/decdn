@@ -534,18 +534,11 @@ contract GovernanceLifecycleTest is Test, BaseProtocolDeploy {
     }
 
     // =================================================================
-    // PublisherRegistry (2 setters)
+    // PublisherRegistry (1 setter)
     // =================================================================
 
     function test_lifecycle_PublisherRegistry_setMaxNamespacesPerPublisher_happy() public {
         _runLifecycle(address(registry), abi.encodeCall(PublisherRegistry.setMaxNamespacesPerPublisher, (uint256(500))));
         assertEq(registry.maxNamespacesPerPublisher(), 500);
-    }
-
-    function test_lifecycle_PublisherRegistry_setNamespaceTransferTimelock_happy() public {
-        _runLifecycle(
-            address(registry), abi.encodeCall(PublisherRegistry.setNamespaceTransferTimelock, (uint64(14 days)))
-        );
-        assertEq(registry.namespaceTransferTimelock(), 14 days);
     }
 }

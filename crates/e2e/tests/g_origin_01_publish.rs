@@ -6,8 +6,8 @@
 //! the signer. A second create mints a distinct id, also owned by the signer,
 //! and the reserved namespace 0 is confirmed unowned. There is no per-hash
 //! on-chain claim (ADR 002 § Hash-to-namespace association) — content is bound
-//! to a namespace off-chain at fetch time. The namespace ownership-transfer
-//! timelock is covered by the forge suite (`PublisherRegistry.t.sol`).
+//! to a namespace off-chain at fetch time. Namespace ownership transfer
+//! is covered by the forge suite (`PublisherRegistry.t.sol`).
 //!
 //! Deliberately out of scope: proving content becomes servable *as an origin*.
 //! That needs an `OriginAssignment` publisher vetting, a seated origin, and a

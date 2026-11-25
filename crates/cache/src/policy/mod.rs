@@ -20,19 +20,6 @@ pub enum Segment {
     Main,
 }
 
-/// A policy's admission verdict for a miss about to be served.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdmissionDecision {
-    /// Keep the blob, in this segment.
-    Store {
-        /// Which segment the blob enters on admission.
-        segment: Segment,
-    },
-    /// Reserved: serve without storing. No shipped impl returns it; the engine
-    /// treats it as `Store { Probation }` until a pass-through leg exists.
-    PassThrough,
-}
-
 /// Inputs available to an admission decision.
 #[derive(Debug, Clone)]
 pub struct AdmissionContext {
@@ -42,10 +29,10 @@ pub struct AdmissionContext {
     pub known_size: Option<u64>,
 }
 
-/// Decides whether a miss about to be served is worth keeping, and where.
+/// Decides which segment a miss about to be served is stored in.
 pub trait AdmissionPolicy: Send + Sync + std::fmt::Debug {
     /// Judge one miss. Called on the serve path, so it must not block.
-    fn admit(&self, ctx: &AdmissionContext) -> AdmissionDecision;
+    fn admit(&self, ctx: &AdmissionContext) -> Segment;
 }
 
 /// Everything a policy needs to plan one eviction sweep. The engine assembles

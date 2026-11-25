@@ -1,5 +1,4 @@
 use super::*;
-use std::assert_matches;
 fn h(i: u32) -> Hash {
     Hash::new(i.to_le_bytes())
 }
@@ -92,20 +91,10 @@ fn probation_admission_first_sight_is_probation() {
         hash: h(1u32),
         known_size: None,
     };
-    assert_matches!(
-        pol.admit(&ctx),
-        crate::policy::AdmissionDecision::Store {
-            segment: crate::policy::Segment::Probation
-        }
-    );
+    assert_eq!(pol.admit(&ctx), crate::policy::Segment::Probation);
     freq.observe(h(1u32));
     freq.observe(h(1u32));
-    assert_matches!(
-        pol.admit(&ctx),
-        crate::policy::AdmissionDecision::Store {
-            segment: crate::policy::Segment::Main
-        }
-    );
+    assert_eq!(pol.admit(&ctx), crate::policy::Segment::Main);
 }
 
 #[test]

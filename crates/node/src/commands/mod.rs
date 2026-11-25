@@ -75,6 +75,7 @@ pub async fn run(
 
     let reload_state = Arc::new(runtime::RuntimeReloadState::new(
         run_args.observability.clone(),
+        run_args.network.clone(),
         &resolved,
         log_level_setter,
     ));
