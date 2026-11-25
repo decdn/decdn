@@ -798,6 +798,10 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// Resolve network fields, recording any malformed `relay_urls` (#818) or
 /// `external_addrs` entry into `bag`.
 ///
+/// Startup ([`resolve_config`]) resolves the table into the shared bag. The
+/// SIGHUP reload (`runtime::reload`) resolves it into a bag of its own, to
+/// report a bad or changed `[network]` that only the next restart applies.
+///
 /// Each `external_addrs` entry must pass [`crate::net::parse_external_addr`]:
 /// a public `IP:port`. A bad entry is recorded under
 /// `network.external_addrs[i]`. A repeated address is kept once.
@@ -819,7 +823,7 @@ fn normalize_region(raw: &str) -> anyhow::Result<String> {
 /// invariant bring-up enforces — a credential-bearing typo
 /// (`relay://user:pass@bad host`) is exactly the malformed shape that lands on
 /// the error path.
-fn resolve_network_into(
+pub fn resolve_network_into(
     cli: &crate::cli::run::NetworkArgs,
     file: Option<&types::NetworkConfig>,
     bag: &mut ConfigDiagnostics,

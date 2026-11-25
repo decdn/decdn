@@ -31,7 +31,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use decdn_common::cli::common::LogLevel;
-use decdn_common::cli::run::ObservabilityArgs;
+use decdn_common::cli::run::{NetworkArgs, ObservabilityArgs};
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedIdentity, ResolvedNetwork,
     ResolvedObservability, ResolvedPayment, ResolvedSecurity,
@@ -258,6 +258,10 @@ async fn persistent_sighup_observes_both_signals() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
+        },
         &initial,
         setter,
     ));
@@ -334,6 +338,10 @@ async fn sighup_applies_security_changes() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
+        },
         &initial,
         setter,
     ));
@@ -373,10 +381,10 @@ async fn sighup_applies_security_changes() {
 }
 
 /// SIGHUP must apply changes to the mutable `observability.log_level` while
-/// restart-required sections (`payment`, `network`, `blockchain`, `cache`,
-/// `identity`) surface an `info`-level "ignoring change to X
-/// (requires restart)" notice, and a changed restart-required `[observability]`
-/// field surfaces a `warn`-level one — never a silently-applied or silently-dropped
+/// restart-required sections (`payment`, `blockchain`, `cache`, `identity`)
+/// surface an `info`-level "ignoring change to X (requires restart)" notice,
+/// and a changed restart-required `[observability]` or `[network]` field
+/// surfaces a `warn`-level one — never a silently-applied or silently-dropped
 /// value (#499). `payment.rate_per_mb` is restart-required, so a `[payment]`
 /// change earns the notice like any other non-reloadable section.
 ///
@@ -387,17 +395,20 @@ async fn sighup_applies_security_changes() {
 /// Without it, a regression that wrongly classified a restart-required section as
 /// reloadable (applying it silently) would go uncaught.
 ///
-/// For every section but `[observability]` the notice is unconditional
-/// (`warn_restart_required_sections`): it fires once per restart-required
-/// section *present* in the reloaded file, whether or not the section changed.
-/// `[observability]` instead warns once per restart-required field whose
-/// resolved value differs from startup. The two reloads assert that:
-///   - **Reload #1** carries `[network]` and `[payment]` → one notice each;
+/// For every section but `[observability]` and `[network]` the notice is
+/// unconditional (`warn_restart_required_sections`): it fires once per
+/// restart-required section *present* in the reloaded file, whether or not the
+/// section changed. `[observability]` and `[network]` instead warn once per
+/// restart-required field whose resolved value differs from startup. The two
+/// reloads assert that:
+///   - **Reload #1** carries `[payment]` → one notice, and a `[network]` that
+///     changes `bind_port` → one `network.bind_port` notice;
 ///     `[blockchain]` / `[cache]` (absent from the file) stay silent, and a
 ///     `log_level`-only `[observability]` stays silent.
-///   - **Reload #2** carries `[network]` and `[payment]` again plus new
+///   - **Reload #2** carries `[payment]` again plus new
 ///     `[blockchain]` / `[cache]` / `[identity]` → each present
 ///     restart-required section emits one notice (no cross-reload suppression);
+///     `[network]` sets `bind_port` back to its startup value → no notice;
 ///     `[observability]` changes `metrics_port` and `otlp_endpoint` → one
 ///     notice per changed field; all alongside the mutable
 ///     `observability.log_level` change that must still apply.
@@ -447,6 +458,10 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
+        },
         &initial,
         setter,
     ));
@@ -471,19 +486,24 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     // `[observability]` notices name the changed field, never its value, and
     // are `warn`-level: an `info` regression would hide them at
     // `log_level = warn`.
-    let observability_notice_count = |logs: &str, field: &str| -> usize {
-        let prefix = format!("ignoring change to observability.{field}");
+    let field_notice_count = |logs: &str, section: &str, field: &str| -> usize {
+        let prefix = format!("ignoring change to {section}.{field}");
         logs.lines()
             .filter(|l| {
                 l.contains(" WARN ") && l.contains(&prefix) && l.contains("(requires restart)")
             })
             .count()
     };
+    let observability_notice_count =
+        |logs: &str, field: &str| field_notice_count(logs, "observability", field);
+    // `[network]` notices follow the same shape: one per changed field.
+    let network_notice_count = |logs: &str, field: &str| field_notice_count(logs, "network", field);
 
     // --- Reload #1: a mutable `log_level` + restart-required `[payment]`
     //     and `[network]` sections. The log_level change applies; `[payment]`
-    //     and `[network]` are present so each emits exactly one notice;
-    //     blockchain/cache (not in the file) stay silent.
+    //     is present so it emits exactly one notice; `[network]` changes
+    //     `bind_port` so it names that field once; blockchain/cache (not in
+    //     the file) stay silent.
     write_config(
         &path,
         "[payment]\n\
@@ -504,10 +524,15 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     );
     let after_first = captured_logs(&log_buf);
     assert_eq!(
-        notice_count(&after_first, "network"),
+        network_notice_count(&after_first, "bind_port"),
         1,
-        "a present restart-required [network] section must emit exactly \
-         one (requires restart) notice, got:\n{after_first}"
+        "a changed network.bind_port must emit exactly one (requires restart) \
+         notice, got:\n{after_first}"
+    );
+    assert_eq!(
+        network_notice_count(&after_first, ""),
+        1,
+        "only the changed network field may warn, got:\n{after_first}"
     );
     assert_eq!(
         notice_count(&after_first, "payment"),
@@ -541,8 +566,9 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     log_buf.lock().unwrap().clear();
 
     // --- Reload #2: the mutable `log_level` change applies, bundled with
-    //     restart-required ones. payment/network/blockchain/identity/
-    //     dht/serve/receipts warn on presence; `[cache]`
+    //     restart-required ones. payment/blockchain/identity/
+    //     dht/serve/receipts warn on presence; `[network]` is back at its
+    //     startup `bind_port`, so it stays silent; `[cache]`
     //     warns because it sets the non-reloadable `cache_dir` (a
     //     pinned_hashes-only edit would not); `[observability]` warns once for
     //     each of `metrics_port` and `otlp_endpoint`, which differ from
@@ -559,7 +585,7 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
          metrics_port = 9999\n\
          otlp_endpoint = \"http://collector:4317\"\n\n\
          [network]\n\
-         bind_port = 5555\n\n\
+         bind_port = 4433\n\n\
          [blockchain]\n\
          rpc_url = \"http://changed.example:9999\"\n\n\
          [cache]\n\
@@ -586,11 +612,10 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
     let logs = captured_logs(&log_buf);
 
     // Every section carrying a non-reloadable field emits exactly one
-    // notice — including `[payment]` and `[network]`, present again (the
-    // notice fires on field presence, not on a change vs the previous reload).
+    // notice — including `[payment]`, present again (the notice fires on field
+    // presence, not on a change vs the previous reload).
     for section in [
         "payment",
-        "network",
         "blockchain",
         "cache",
         "identity",
@@ -605,6 +630,13 @@ async fn sighup_applies_mutable_but_rejects_restart_required_fields() {
              carrying a non-reloadable field, got:\n{logs}"
         );
     }
+
+    // `[network]` matches startup again, so it stays silent.
+    assert_eq!(
+        network_notice_count(&logs, ""),
+        0,
+        "an unchanged [network] must not warn, got:\n{logs}"
+    );
 
     // Fully-reloadable `[security]` stays silent.
     assert_eq!(
@@ -695,6 +727,10 @@ async fn sighup_routes_a_resolve_notice_into_the_log_stream() {
             metrics_bind: None,
             admin_port: None,
             otlp_endpoint: None,
+        },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
         },
         &initial,
         setter,
@@ -791,6 +827,10 @@ async fn a_failed_commit_reports_no_notices() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
+        },
         &initial,
         failing_setter,
     ));
@@ -866,6 +906,10 @@ async fn observability_restart_notice_follows_cli_precedence() {
             admin_port: None,
             otlp_endpoint: Some("http://cli-collector:4317".to_string()),
         },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
+        },
         &initial,
         setter,
     );
@@ -916,6 +960,10 @@ async fn an_aborted_reload_reports_no_observability_notice() {
             metrics_bind: None,
             admin_port: None,
             otlp_endpoint: None,
+        },
+        NetworkArgs {
+            bind_port: None,
+            relay_url: None,
         },
         &initial,
         setter,
