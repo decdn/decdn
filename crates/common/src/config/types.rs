@@ -374,8 +374,9 @@ pub struct CacheConfig {
     /// soft-evict/GC cycle means the margin is defended reactively, so keep it
     /// comfortably above one GC interval's worth of writes.
     pub disk_headroom_mb: Option<u64>,
-    /// Cap on the bytes of one blob the node holds, in megabytes. A blob from
-    /// the node's own origin larger than it is refused; a pull-through serves a
+    /// Cap on the bytes of one blob the node holds, in megabytes. The node
+    /// serves a blob of any size from its own origin: past the cap it streams
+    /// the rest from the origin without storing it. A pull-through serves a
     /// range at any offset of a larger blob while the bytes held for it fit.
     pub max_blob_size_mb: Option<u64>,
     /// Buyer-side ABSOLUTE per-MB rate ceiling for paid pulls (#1375), in the same

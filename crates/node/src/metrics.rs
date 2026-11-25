@@ -1730,6 +1730,18 @@ pub struct DecdnMetrics {
     /// rising value means clients ask this node for more of a blob than its cap
     /// lets it hold. Visible name: `decdn_serve_stream_midstream_blob_too_large_total`.
     pub serve_stream_midstream_blob_too_large: Counter,
+    /// `decdn_serve_origin_passthrough_streams_total`: own-origin serves that
+    /// passed at least one leaf through from the origin without storing it,
+    /// because this node holds its cap on bytes of the blob (`max_blob_size`,
+    /// ADR 005 §`max_blob_size` enforcement). Pass-through bytes are verified
+    /// against `H` like stored ones. A rising value means clients fetch more of
+    /// this node's own-origin blobs than its cap lets it keep, and each such
+    /// stream costs origin egress.
+    pub serve_origin_passthrough_streams: Counter,
+    /// `decdn_serve_origin_passthrough_bytes_total`: the leaf bytes those serves
+    /// passed through. The origin egress itself is in
+    /// `decdn_cache_pull_through_bytes_total`.
+    pub serve_origin_passthrough_bytes: Counter,
     /// Whole-blob requests from an active staker refused while this node's own
     /// upstream open for the blob was in progress (#2224): the guard that stops
     /// partial holders pulling a blob from each other in a loop. Signed as
@@ -2940,6 +2952,13 @@ recorders! {
     /// Record a pull-through serve stopped mid-stream with `Declined` because its
     /// fill ended at this node's cap on bytes held for the blob.
     serve_stream_midstream_blob_too_large => serve_stream_midstream_blob_too_large.inc();
+
+    /// Record an own-origin serve that passed at least one leaf through from the
+    /// origin without storing it.
+    serve_origin_passthrough_stream => serve_origin_passthrough_streams.inc();
+
+    /// Record `n` leaf bytes an own-origin serve passed through from the origin.
+    serve_origin_passthrough_bytes_by(n: u64) => serve_origin_passthrough_bytes.inc_by(n);
 
     /// Record a whole-blob request from an active staker refused while this
     /// node's own upstream open for the blob was in progress (#2224).

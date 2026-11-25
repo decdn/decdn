@@ -698,12 +698,10 @@ impl ClientHandler {
                 .await;
         }
 
-        // (3) No size gate on the origin-claimed total (#1895): this own-origin leg
-        // has no untrusted counterparty, but the ceiling still binds on RECEIVED bytes
-        // for wire-parity with the peer path. Its local pull leg's admission enforces
-        // the engine cap on the bytes it actually stores, so an over-ceiling origin
-        // blob fails the fill there rather than being refused up front on the probe
-        // size.
+        // (3) No size gate and no held-bytes gate: own origin serves every range of
+        // a blob, whatever its size. The node keeps at most its cap on bytes of the
+        // blob (`cache.max_blob_size_mb`); past it, the exclusive fill claimed below
+        // hands the verified bytes to the serve leg without storing them.
 
         // (4) Sign + send the response up front: it states `total_bytes` by
         // its proof, a size the caller already proved for the origin object.
@@ -767,11 +765,25 @@ impl ClientHandler {
         let byte_offset = req.byte_offset;
         let byte_len = req.byte_len;
         let root = bao_tree::blake3::Hash::from(*hash.as_bytes());
-        let claim = self
-            .cache
-            .claim_fill(hash, byte_offset, byte_len, total_bytes, || {
-                decdn_cache::FillSession::starting_at(root, total_bytes, byte_offset)
-            });
+        // A blob larger than the node's cap on bytes held gets an exclusive fill: it
+        // stores the blob up to the cap and hands every later verified leaf to this
+        // serve leg alone, so own origin serves a blob of any size (ADR 005
+        // §`max_blob_size` enforcement). It attaches to no live fill, and no other
+        // serve attaches to it.
+        let claim = if self.cache.exceeds_held_cap(total_bytes) {
+            self.cache.claim_exclusive_fill(
+                hash,
+                byte_offset,
+                byte_len,
+                total_bytes,
+                decdn_cache::FillSession::starting_at(root, total_bytes, byte_offset),
+            )
+        } else {
+            self.cache
+                .claim_fill(hash, byte_offset, byte_len, total_bytes, || {
+                    decdn_cache::FillSession::starting_at(root, total_bytes, byte_offset)
+                })
+        };
 
         // Resolve the claim into the uniform serve shape (twin of the peer path,
         // `plan_serve`): the session to serve from, the optional local pull range, the
@@ -893,6 +905,8 @@ impl ClientHandler {
             )
             .await;
 
+        self.report_passthrough(hash, total_bytes, &serve_session);
+
         // Teardown (LEASE-driven, #1610): release every lease. A last-out release
         // cancels the pull (if still running) and hands back the session's parked
         // pull-thread handle for THIS caller to join off-task — a non-last-out release
@@ -911,6 +925,25 @@ impl ClientHandler {
             .await;
         }
         serve_result
+    }
+
+    /// Meter and log the origin pass-through of one own-origin serve: the bytes
+    /// its fill handed to the serve leg past this node's cap on bytes held. The
+    /// operator's view of a node that streams blobs larger than it keeps.
+    fn report_passthrough(&self, hash: Hash, total_bytes: u64, session: &decdn_cache::FillSession) {
+        let passed = session.passed_bytes();
+        if passed == 0 {
+            return;
+        }
+        self.metrics.serve_origin_passthrough_stream();
+        self.metrics.serve_origin_passthrough_bytes_by(passed);
+        tracing::info!(
+            %hash,
+            total_bytes,
+            passed,
+            "own-origin stream passed bytes past this node's cap on bytes held \
+             (cache.max_blob_size_mb) through from the origin without storing them"
+        );
     }
 
     /// Discover + open a bounded upstream pull leg for `hash`, classifying every

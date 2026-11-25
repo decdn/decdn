@@ -119,8 +119,8 @@ pub trait BlobSource: Send + Sync {
     /// with [`crate::BlobTooLarge`] once a missing byte could only land past it.
     /// The cap bounds bytes held, never the offsets read, and never reads the
     /// peer's `total_bytes`. `0` = unlimited — the default, and
-    /// correct for an own-origin source whose engine store already caps on stored
-    /// bytes.
+    /// correct for an own-origin source, whose store keeps the cap itself and
+    /// hands the bytes past it to the serve leg.
     fn max_blob_size_bytes(&self) -> u64 {
         0
     }

@@ -73,7 +73,12 @@ fn domains() -> HandlerDomains {
 /// A distinctive 200 KiB payload (so a 16 KiB-aligned sub-range is a strict
 /// interior slice) plus its pre-order bao outboard and content hash.
 fn blob_with_outboard() -> (Vec<u8>, Vec<u8>, Hash) {
-    let blob: Vec<u8> = (0..200 * 1024u32)
+    blob_of_len(200 * 1024)
+}
+
+/// A deterministic blob of `len` bytes, its pre-order outboard and its hash.
+fn blob_of_len(len: u64) -> (Vec<u8>, Vec<u8>, Hash) {
+    let blob: Vec<u8> = (0..len)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
     let ob = PreOrderMemOutboard::create(&blob, IROH_BLOCK_SIZE);
@@ -99,22 +104,57 @@ async fn handler_over_http_origin(
     Arc<Metrics>,
     tempfile::TempDir,
 )> {
+    handler_over_http_origin_capped(
+        origin_uri,
+        &[pool_id],
+        client,
+        server_eth,
+        server_id,
+        pull_through,
+        16,
+    )
+    .await
+}
+
+/// [`handler_over_http_origin`] with a `max_blob_size` of `max_blob_mb`, and
+/// one lane per pool in `pool_ids`, so a test can run one stream per pool.
+async fn handler_over_http_origin_capped(
+    origin_uri: &str,
+    pool_ids: &[B256],
+    client: Address,
+    server_eth: &Arc<PrivateKeySigner>,
+    server_id: iroh::PublicKey,
+    pull_through: Option<Duration>,
+    max_blob_mb: u64,
+) -> anyhow::Result<(
+    Arc<ClientHandler>,
+    CacheEngine,
+    Arc<Metrics>,
+    tempfile::TempDir,
+)> {
     let store = Arc::new(MemoryPoolStateStore::new());
-    store.record(&LaneState::hydrate(
-        pool_id,
-        client,               // capability signer
-        server_eth.address(), // provider (the serving node operator)
-        U256::from(10_000_000u64),
-        u64::MAX, // expiry: far future, never expires in-test
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    ))?;
+    for &pool_id in pool_ids {
+        store.record(&LaneState::hydrate(
+            pool_id,
+            client,               // capability signer
+            server_eth.address(), // provider (the serving node operator)
+            U256::from(10_000_000u64),
+            u64::MAX, // expiry: far future, never expires in-test
+            U256::ZERO,
+            U256::ZERO,
+            None,
+            decdn_incentive::LaneChain::NONE,
+        ))?;
+    }
 
     let cache_dir = tempfile::tempdir()?;
     let origin = Arc::new(HttpOrigin::parse(origin_uri)?);
-    let cache = CacheEngine::open(cache_dir.path(), vec![origin as Arc<dyn Origin>], 16).await?;
+    let cache = CacheEngine::open(
+        cache_dir.path(),
+        vec![origin as Arc<dyn Origin>],
+        max_blob_mb,
+    )
+    .await?;
 
     let metrics = Arc::new(Metrics::new());
     let limiter = permissive_limiter(&metrics);
@@ -977,6 +1017,292 @@ async fn offset_past_the_blob_is_rejected_before_delivery() -> anyhow::Result<()
 
     shutdown([server_task], [&client_ep, &server_ep]).await?;
     Ok(())
+}
+
+/// A blob origin that answers every `Range: bytes=a-b` GET with that slice.
+struct RangeOrigin(Vec<u8>);
+
+impl wiremock::Respond for RangeOrigin {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        let slice = req
+            .headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes="))
+            .and_then(|v| v.split_once('-'))
+            .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+            .and_then(|(a, b)| self.0.get(a..=b));
+        slice.map_or_else(
+            || ResponseTemplate::new(416),
+            |bytes| ResponseTemplate::new(206).set_body_bytes(bytes.to_vec()),
+        )
+    }
+}
+
+/// An origin-only node with a 1 MiB cap on bytes held, over a wiremock origin
+/// that serves a blob's outboard and size proof, and any `Range` of `data`
+/// (the blob, or a tampered copy). One lane per pool in `pool_ids`.
+struct CappedOriginNode {
+    /// Held for the node's life: the mock origin stops when it drops.
+    _server: MockServer,
+    cache: CacheEngine,
+    metrics: Arc<Metrics>,
+    _cache_tmp: tempfile::TempDir,
+    server_task: tokio::task::JoinHandle<()>,
+    server_ep: iroh::Endpoint,
+    target: EndpointAddr,
+    client_eth: Arc<PrivateKeySigner>,
+    provider: Address,
+    hash: Hash,
+}
+
+impl CappedOriginNode {
+    async fn start(
+        blob: &[u8],
+        outboard: Vec<u8>,
+        hash: Hash,
+        data: Vec<u8>,
+        pool_ids: &[B256],
+    ) -> anyhow::Result<Self> {
+        let hex = hash.to_hex();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}.obao4")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(outboard))
+            .mount(&server)
+            .await;
+        mount_size_proof(&server, &hex, blob).await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{hex}")))
+            .and(header_exists("range"))
+            .respond_with(RangeOrigin(data))
+            .mount(&server)
+            .await;
+
+        let client_eth = Arc::new(PrivateKeySigner::random());
+        let server_sk = fresh_key();
+        let server_id = server_sk.public();
+        let server_eth = Arc::new(PrivateKeySigner::random());
+        let provider = server_eth.address();
+        let (handler, cache, metrics, cache_tmp) = handler_over_http_origin_capped(
+            &server.uri(),
+            pool_ids,
+            client_eth.address(),
+            &server_eth,
+            server_id,
+            None,
+            1,
+        )
+        .await?;
+        let (server_ep, server_addr) =
+            local_endpoint(server_sk, vec![ALPN_CLIENT.to_vec()]).await?;
+        let server_task = spawn_server(server_ep.clone(), handler);
+        Ok(Self {
+            _server: server,
+            cache,
+            metrics,
+            _cache_tmp: cache_tmp,
+            server_task,
+            server_ep,
+            target: EndpointAddr::new(server_id).with_ip_addr(server_addr),
+            client_eth,
+            provider,
+            hash,
+        })
+    }
+
+    /// Pull `[offset, offset + len)` on the lane of `pool_id` from a fresh
+    /// client endpoint, verifying every byte against the hash.
+    async fn pull(&self, pool_id: B256, offset: u64, len: u64) -> anyhow::Result<Vec<u8>> {
+        let client_sk = fresh_key();
+        let client_node_id = B256::from(*client_sk.public().as_bytes());
+        let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
+        let got = ranged_paid_pull(
+            &client_ep,
+            self.target.clone(),
+            client_node_id,
+            &self.client_eth,
+            pool_id,
+            self.provider,
+            self.hash,
+            offset,
+            len,
+            RATE_PER_MB,
+        )
+        .await;
+        client_ep.close().await;
+        got
+    }
+
+    async fn held(&self) -> anyhow::Result<u64> {
+        Ok(self.cache.present_ranges(self.hash).await?.held_bytes())
+    }
+
+    fn counter(&self, name: &str) -> anyhow::Result<u64> {
+        counter_value(&self.metrics, name)
+    }
+
+    /// No stream of this node was refused or stopped for its cap, and none
+    /// ended on a node or local-origin fault.
+    fn ensure_no_refusal_or_fault(&self) -> anyhow::Result<()> {
+        for name in [
+            "serve_stream_rejected_blob_too_large_total",
+            "serve_stream_midstream_blob_too_large_total",
+            "serve_stream_node_fault_total",
+            "node_pull_local_fault_total",
+        ] {
+            let got = self.counter(name)?;
+            anyhow::ensure!(got == 0, "{name} must stay 0, got {got}");
+        }
+        Ok(())
+    }
+
+    async fn shutdown(self) -> anyhow::Result<()> {
+        shutdown([self.server_task], [&self.server_ep]).await?;
+        Ok(())
+    }
+}
+
+/// The `[a, b)` content slice of `blob`.
+fn span_of(blob: &[u8], a: u64, b: u64) -> anyhow::Result<&[u8]> {
+    blob.get(usize::try_from(a)?..usize::try_from(b)?)
+        .ok_or_else(|| anyhow::anyhow!("span [{a}, {b}) past the blob"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_serves_a_blob_past_the_cap() -> anyhow::Result<()> {
+    // ADR 005 §`max_blob_size` enforcement, own origin: a blob twice the cap
+    // serves in full. The node stores bytes until it holds the cap's worth and
+    // passes the rest through from the origin without storing it.
+    let cap = MB_BYTES;
+    let (blob, outboard, hash) = blob_of_len(2 * cap);
+    let blob_size = u64::try_from(blob.len())?;
+    let pool = B256::repeat_byte(0x4a);
+    let node = CappedOriginNode::start(&blob, outboard, hash, blob.clone(), &[pool]).await?;
+
+    let got = node.pull(pool, 0, blob_size).await?;
+    anyhow::ensure!(got == blob, "the whole blob must serve, verified");
+
+    let held = node.held().await?;
+    anyhow::ensure!(
+        held <= cap,
+        "the node holds {held} bytes, past its {cap}-byte cap"
+    );
+    node.ensure_no_refusal_or_fault()?;
+    anyhow::ensure!(
+        node.counter("serve_origin_passthrough_streams_total")? == 1,
+        "the stream must count as a pass-through stream"
+    );
+    let passthrough = node.counter("serve_origin_passthrough_bytes_total")?;
+    anyhow::ensure!(
+        passthrough == blob_size - held,
+        "every byte the node does not hold came by pass-through: {passthrough} != {}",
+        blob_size - held
+    );
+
+    node.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_range_past_a_held_cap_serves_at_open() -> anyhow::Result<()> {
+    // Once the node holds the cap's worth of an own-origin blob, a range it
+    // lacks still opens `ok: true` and serves in full by pass-through. The
+    // store does not change.
+    let cap = MB_BYTES;
+    let (blob, outboard, hash) = blob_of_len(2 * cap);
+    let (first, second) = (B256::repeat_byte(0x4b), B256::repeat_byte(0x4c));
+    let node =
+        CappedOriginNode::start(&blob, outboard, hash, blob.clone(), &[first, second]).await?;
+
+    let got = node.pull(first, 0, cap).await?;
+    anyhow::ensure!(
+        got == span_of(&blob, 0, cap)?,
+        "the first cap's worth serves"
+    );
+    let held = node.held().await?;
+    anyhow::ensure!(held == cap, "the first range lands in full: held {held}");
+    anyhow::ensure!(
+        node.counter("serve_origin_passthrough_streams_total")? == 0,
+        "a range that lands under the cap needs no pass-through"
+    );
+
+    let got = node.pull(second, cap, cap).await?;
+    anyhow::ensure!(
+        got == span_of(&blob, cap, 2 * cap)?,
+        "a range past the held cap must serve, verified"
+    );
+    anyhow::ensure!(node.held().await? == held, "pass-through stores nothing");
+    node.ensure_no_refusal_or_fault()?;
+    anyhow::ensure!(node.counter("serve_origin_passthrough_streams_total")? == 1);
+    anyhow::ensure!(
+        node.counter("serve_origin_passthrough_bytes_total")? == cap,
+        "the whole second range came by pass-through"
+    );
+
+    node.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_origin_passthrough_rejects_tampered_bytes() -> anyhow::Result<()> {
+    // Pass-through bytes are verified against `H` before the serve leg sees
+    // them. An origin that serves a wrong byte past the cap ends the stream
+    // before the client takes a wrong byte, and never as a cap refusal.
+    let cap = MB_BYTES;
+    let (blob, outboard, hash) = blob_of_len(2 * cap);
+    let blob_size = u64::try_from(blob.len())?;
+    let mut tampered = blob.clone();
+    let at = usize::try_from(cap + cap / 2)?;
+    let byte = tampered
+        .get_mut(at)
+        .ok_or_else(|| anyhow::anyhow!("tamper offset past the blob"))?;
+    *byte ^= 0xff;
+    let pool = B256::repeat_byte(0x4d);
+    let node = CappedOriginNode::start(&blob, outboard, hash, tampered, &[pool]).await?;
+
+    let pulled = node.pull(pool, 0, blob_size).await;
+    anyhow::ensure!(
+        pulled.is_err(),
+        "a tampered pass-through byte must fail the stream"
+    );
+    anyhow::ensure!(
+        node.held().await? <= cap,
+        "the node holds no more than its cap"
+    );
+    for name in [
+        "serve_stream_rejected_blob_too_large_total",
+        "serve_stream_midstream_blob_too_large_total",
+    ] {
+        anyhow::ensure!(
+            node.counter(name)? == 0,
+            "{name}: a bad origin byte is not a cap stop"
+        );
+    }
+
+    node.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_own_origin_serves_of_one_blob_past_the_cap() -> anyhow::Result<()> {
+    // Two own-origin streams of disjoint halves of a blob twice the cap run at
+    // once. Each owns its own fill, and both serve in full: what a fill does not
+    // store passes through. Each fill checks the bytes held as each of its legs
+    // opens, so together they can pass the cap by at most one leg each.
+    let cap = MB_BYTES;
+    let (blob, outboard, hash) = blob_of_len(2 * cap);
+    let half = cap;
+    let (first, second) = (B256::repeat_byte(0x50), B256::repeat_byte(0x51));
+    let node =
+        CappedOriginNode::start(&blob, outboard, hash, blob.clone(), &[first, second]).await?;
+
+    let (low, high) = tokio::join!(node.pull(first, 0, half), node.pull(second, half, half));
+    anyhow::ensure!(low? == span_of(&blob, 0, half)?, "the low half serves");
+    anyhow::ensure!(
+        high? == span_of(&blob, half, 2 * half)?,
+        "the high half serves"
+    );
+    node.ensure_no_refusal_or_fault()?;
+
+    node.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread")]
