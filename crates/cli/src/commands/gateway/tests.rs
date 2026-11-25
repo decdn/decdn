@@ -982,6 +982,10 @@ async fn a_site_directory_serves_its_index() {
     let bare = request(&gateway, &host, "/docs", CLICK).await;
     assert_eq!(bare.status, StatusCode::FOUND);
     assert_eq!(bare.header(header::LOCATION), Some("docs/"));
+    // The query belongs to the page, and the redirect keeps it.
+    let queried = request(&gateway, &host, "/docs?tab=2", CLICK).await;
+    assert_eq!(queried.status, StatusCode::FOUND);
+    assert_eq!(queried.header(header::LOCATION), Some("docs/?tab=2"));
     let missing = request(&gateway, &host, "/nope.html", CLICK).await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
     assert!(
@@ -989,6 +993,83 @@ async fn a_site_directory_serves_its_index() {
             .headers
             .contains_key(header::CONTENT_SECURITY_POLICY)
     );
+}
+
+/// A directory in a bundle under `/_decdn/` serves its `index.html`, as a
+/// site's own directory does, and its redirect keeps the request's `ns=`.
+#[tokio::test]
+async fn a_directory_under_decdn_serves_its_index() {
+    let (gateway, host) = site_gateway().await;
+    let hex = alloy::hex::encode(BLOB);
+    let bare = request(&gateway, &host, &format!("/_decdn/{hex}/docs"), SAME_ORIGIN).await;
+    assert_eq!(bare.status, StatusCode::FOUND, "{}", bare.body);
+    assert_eq!(bare.header(header::LOCATION), Some("docs/"));
+    let docs = request(
+        &gateway,
+        &host,
+        &format!("/_decdn/{hex}/docs/"),
+        SAME_ORIGIN,
+    )
+    .await;
+    assert_eq!(
+        (docs.status, docs.body.as_str()),
+        (StatusCode::OK, "<p>docs</p>")
+    );
+    let hinted = request(
+        &gateway,
+        &host,
+        &format!("/_decdn/{hex}/docs?ns=7"),
+        SAME_ORIGIN,
+    )
+    .await;
+    assert_eq!(hinted.status, StatusCode::FOUND, "{}", hinted.body);
+    assert_eq!(hinted.header(header::LOCATION), Some("docs/?ns=7"));
+    let hinted_docs = request(
+        &gateway,
+        &host,
+        &format!("/_decdn/{hex}/docs/?ns=7"),
+        SAME_ORIGIN,
+    )
+    .await;
+    assert_eq!(
+        (hinted_docs.status, hinted_docs.body.as_str()),
+        (StatusCode::OK, "<p>docs</p>")
+    );
+    // A navigation opens the directory itself on the bundle's site.
+    let opened = request(&gateway, &host, &format!("/_decdn/{hex}/docs/"), CLICK).await;
+    assert_eq!(opened.status, StatusCode::FOUND, "{}", opened.body);
+    let docs_url = format!("{}/docs/", gateway.sites.origin(&host));
+    assert_eq!(opened.header(header::LOCATION), Some(docs_url.as_str()));
+    // A directory without an `index.html` has nothing to serve.
+    let bare_dir = request(&gateway, &host, &format!("/_decdn/{hex}/css/"), SAME_ORIGIN).await;
+    assert_eq!(bare_dir.status, StatusCode::NOT_FOUND, "{}", bare_dir.body);
+}
+
+/// A directory under `/_decdn/` names its `index.html`; the bundle root, a
+/// file and the query stay as they are.
+#[test]
+fn directory_index_names_a_bundle_directorys_index() {
+    let h = alloy::hex::encode(BLOB);
+    for (rest, named) in [
+        (format!("{h}/docs/"), format!("{h}/docs/index.html")),
+        (
+            format!("{h}/docs/?ns=7"),
+            format!("{h}/docs/index.html?ns=7"),
+        ),
+        (format!("{h}/a/b/"), format!("{h}/a/b/index.html")),
+        // An empty segment stays one, for the URI parser to refuse.
+        (format!("{h}//"), format!("{h}//index.html")),
+    ] {
+        assert_eq!(directory_index(&rest), (named, Named::Directory), "{rest}");
+    }
+    for same in [
+        format!("{h}/"),
+        h.clone(),
+        format!("{h}/a.txt?ns=7"),
+        format!("{h}/?ns=7"),
+    ] {
+        assert_eq!(directory_index(&same), (same.clone(), Named::AsIs));
+    }
 }
 
 #[tokio::test]
@@ -2412,6 +2493,28 @@ async fn a_site_answers_head_under_decdn() {
     )
     .await;
     assert!(bundle.status.is_redirection(), "{:?}", bundle.status);
+    assert!(logs.caps.lock().unwrap().is_empty(), "HEAD pulls nothing");
+}
+
+/// `HEAD` of a directory under a site's `/_decdn/` redirects to the
+/// directory on the bundle's site, at no pull.
+#[tokio::test]
+async fn a_site_answers_head_for_a_directory_under_decdn() {
+    let (gateway, logs, host) = public_gateway().await;
+    let blob = alloy::hex::encode(BLOB);
+    let docs = send(
+        &gateway,
+        Method::HEAD,
+        &host,
+        &format!("/_decdn/{blob}/docs/"),
+        &[],
+    )
+    .await;
+    assert_eq!(docs.status, StatusCode::FOUND, "{}", docs.body);
+    assert_eq!(
+        docs.header(header::LOCATION),
+        Some(format!("https://{host}/docs/").as_str())
+    );
     assert!(logs.caps.lock().unwrap().is_empty(), "HEAD pulls nothing");
 }
 
