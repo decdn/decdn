@@ -6,16 +6,16 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /// @title PublisherRegistry — namespace ownership and lifecycle (ADR 002)
 /// @notice Permissionless namespace creation (publisher identity is implicit
-///         on first `createNamespace`) and a timelocked 2-step namespace
-///         ownership transfer. The registry records who owns each namespace and
+///         on first `createNamespace`) and a 2-step namespace ownership
+///         transfer (offer, then accept). The registry records who owns each namespace and
 ///         stores no content hashes — the hash→namespace association is supplied
 ///         off-chain by the requester at fetch time (ADR 002 §
 ///         Hash-to-namespace association). Spec: ADR 002 § Contract:
 ///         PublisherRegistry.
 ///
-/// @dev    OZ composition: `AccessControl` only — the two governable
-///         parameters (`maxNamespacesPerPublisher`, `namespaceTransferTimelock`)
-///         carry `GOVERNANCE_ROLE`, held by the Timelock post-deploy.
+/// @dev    OZ composition: `AccessControl` only — the one governable
+///         parameter (`maxNamespacesPerPublisher`) carries `GOVERNANCE_ROLE`,
+///         held by the Timelock post-deploy.
 ///
 ///         No `ReentrancyGuard`: the contract makes no external calls and
 ///         holds no funds — every function is pure storage bookkeeping, so a
@@ -29,7 +29,7 @@ import { SafeCast } from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 contract PublisherRegistry is AccessControl {
     using SafeCast for uint256;
 
-    /// @notice Setter authority for the two governable parameters. Held by
+    /// @notice Setter authority for the governable namespace cap. Held by
     ///         `TimelockController` post-deploy.
     bytes32 public constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
 
@@ -38,17 +38,6 @@ contract PublisherRegistry is AccessControl {
     uint256 internal constant MAX_NAMESPACES_FLOOR = 1;
     uint256 internal constant MAX_NAMESPACES_CEILING = 1000;
 
-    uint64 internal constant DEFAULT_TRANSFER_TIMELOCK = 7 days;
-    uint64 internal constant TRANSFER_TIMELOCK_FLOOR = 1 days;
-    uint64 internal constant TRANSFER_TIMELOCK_CEILING = 30 days;
-
-    /// @dev Packs into a single slot: address (20 bytes) + uint64 (8 bytes).
-    ///      A uint64 unix timestamp is good past the year 500-billion.
-    struct PendingTransfer {
-        address newOwner;
-        uint64 readyAt;
-    }
-
     /// @notice Owner of each namespace. `address(0)` for unassigned ids
     ///         (including the reserved no-namespace id 0).
     mapping(uint256 namespaceId => address) public ownerOf;
@@ -56,54 +45,41 @@ contract PublisherRegistry is AccessControl {
     /// @notice Number of namespaces a publisher currently owns.
     mapping(address publisher => uint256) public namespaceCount;
 
-    /// @notice In-flight ownership transfer per namespace (`(0,0)` if none).
-    mapping(uint256 namespaceId => PendingTransfer) public pendingTransfer;
+    /// @notice Address a namespace is offered to, which takes it with
+    ///         `acceptNamespace`. `address(0)` if no offer is open.
+    mapping(uint256 namespaceId => address) public pendingOwnerOf;
 
-    // The three fields below are all uint64 and declared consecutively so
-    // they pack into a single storage slot (3 * 8 = 24 bytes). `_nextNamespaceId`
-    // is incremented on every createNamespace and the cap is read there too, so
-    // co-locating them also warms one slot per call.
+    // The two fields below are both uint64 and declared consecutively so they
+    // pack into a single storage slot. `createNamespace` reads the cap and
+    // increments `_nextNamespaceId`, so each call warms one slot.
 
     /// @notice Per-publisher namespace cap (anti-squatting). Default 100,
     ///         bounded `[1, 1000]` (well within uint64).
     uint64 public maxNamespacesPerPublisher;
-
-    /// @notice Delay between initiating and finalizing a namespace transfer
-    ///         (key-compromise mitigation). Default 7 days, bounded `[1d, 30d]`.
-    uint64 public namespaceTransferTimelock;
 
     /// @dev Monotonic namespace id allocator. Pre-incremented so the first
     ///      assigned id is 1, leaving 0 as the reserved no-namespace id.
     uint64 internal _nextNamespaceId;
 
     event NamespaceCreated(uint256 indexed namespaceId, address indexed owner);
-    event NamespaceTransferInitiated(
-        uint256 indexed namespaceId, address indexed from, address indexed to, uint256 readyAt
-    );
+    /// @dev `to == address(0)` withdraws the open offer.
+    event NamespaceTransferStarted(uint256 indexed namespaceId, address indexed from, address indexed to);
     event NamespaceTransferred(uint256 indexed namespaceId, address indexed from, address indexed to);
-    /// @dev Not in the ADR 002 interface block, but cancellation should be
-    ///      observable on-chain alongside initiate/complete.
-    event NamespaceTransferCancelled(uint256 indexed namespaceId, address indexed owner);
     event MaxNamespacesPerPublisherUpdated(uint256 oldValue, uint256 newValue);
-    event NamespaceTransferTimelockUpdated(uint64 oldValue, uint64 newValue);
 
     error ZeroAddress();
     error NamespaceCapReached(uint256 cap);
     error NotNamespaceOwner(uint256 namespaceId, address caller);
-    error TransferToZeroAddress();
-    error NoPendingTransfer(uint256 namespaceId);
-    error TransferNotReady(uint256 readyAt);
     error NotPendingOwner(uint256 namespaceId, address caller);
     error ParamOutOfBounds(uint256 value, uint256 floor, uint256 ceiling);
 
     /// @param admin Initial `DEFAULT_ADMIN_ROLE` + `GOVERNANCE_ROLE` holder
     ///              (Timelock at mainnet per ADR 016 § Deployment Order).
-    ///              The two governable parameters start at their ADR 002
-    ///              defaults; no economic constructor args (ADR 016 step 8).
+    ///              The governable namespace cap starts at its ADR 002
+    ///              default; no economic constructor args (ADR 016 step 8).
     constructor(address admin) {
         if (admin == address(0)) revert ZeroAddress();
         maxNamespacesPerPublisher = DEFAULT_MAX_NAMESPACES;
-        namespaceTransferTimelock = DEFAULT_TRANSFER_TIMELOCK;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(GOVERNANCE_ROLE, admin);
     }
@@ -125,52 +101,36 @@ contract PublisherRegistry is AccessControl {
         emit NamespaceCreated(namespaceId, msg.sender);
     }
 
-    /// @notice Queue a transfer of `namespaceId` to `newOwner`. Completes only
-    ///         after `namespaceTransferTimelock` via `finalizeNamespaceTransfer`;
-    ///         the current owner can `cancelNamespaceTransfer` during the window.
-    function initiateNamespaceTransfer(uint256 namespaceId, address newOwner) external {
+    /// @notice Offer `namespaceId` to `newOwner`, who takes it with
+    ///         `acceptNamespace`. A new offer replaces the pending one, and
+    ///         `newOwner == address(0)` withdraws it. Ownership moves the
+    ///         moment the offer is accepted (ADR 002 § Namespace transfer).
+    function transferNamespace(uint256 namespaceId, address newOwner) external {
         _requireOwner(namespaceId);
-        if (newOwner == address(0)) revert TransferToZeroAddress();
-        // Fits uint64 comfortably (block.timestamp + <= 30 days); SafeCast
-        // reverts on the (unreachable) overflow.
-        uint64 readyAt = (block.timestamp + namespaceTransferTimelock).toUint64();
-        pendingTransfer[namespaceId] = PendingTransfer({ newOwner: newOwner, readyAt: readyAt });
-        emit NamespaceTransferInitiated(namespaceId, msg.sender, newOwner, readyAt);
+        pendingOwnerOf[namespaceId] = newOwner;
+        emit NamespaceTransferStarted(namespaceId, msg.sender, newOwner);
     }
 
-    /// @notice Complete a queued transfer once the timelock has elapsed.
-    ///         Callable only by the pending recipient (explicit acceptance).
-    function finalizeNamespaceTransfer(uint256 namespaceId) external {
-        PendingTransfer memory pending = pendingTransfer[namespaceId];
-        if (pending.newOwner == address(0)) revert NoPendingTransfer(namespaceId);
-        if (msg.sender != pending.newOwner) revert NotPendingOwner(namespaceId, msg.sender);
-        // Transfer timelock is days-scale; validator timestamp skew (seconds)
-        // is immaterial here.
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp < pending.readyAt) revert TransferNotReady(pending.readyAt);
+    /// @notice Take ownership of `namespaceId`. Callable only by its pending
+    ///         owner, so an offer to a mistyped address never completes.
+    function acceptNamespace(uint256 namespaceId) external {
+        // An unset pending owner is address(0), which no caller matches.
+        if (msg.sender != pendingOwnerOf[namespaceId]) revert NotPendingOwner(namespaceId, msg.sender);
 
         address from = ownerOf[namespaceId];
         // Enforce the anti-squatting cap on the receiving side too — otherwise
         // it could be bypassed by creating namespaces under throwaway addresses
         // and transferring them to one publisher. Self-transfers (from ==
         // newOwner) leave the count unchanged, so they're exempt.
-        if (from != pending.newOwner && namespaceCount[pending.newOwner] >= maxNamespacesPerPublisher) {
+        if (from != msg.sender && namespaceCount[msg.sender] >= maxNamespacesPerPublisher) {
             revert NamespaceCapReached(maxNamespacesPerPublisher);
         }
-        ownerOf[namespaceId] = pending.newOwner;
+        ownerOf[namespaceId] = msg.sender;
         namespaceCount[from] -= 1;
-        namespaceCount[pending.newOwner] += 1;
-        delete pendingTransfer[namespaceId];
+        namespaceCount[msg.sender] += 1;
+        delete pendingOwnerOf[namespaceId];
 
-        emit NamespaceTransferred(namespaceId, from, pending.newOwner);
-    }
-
-    /// @notice Abort a queued transfer. Callable only by the current owner.
-    function cancelNamespaceTransfer(uint256 namespaceId) external {
-        _requireOwner(namespaceId);
-        if (pendingTransfer[namespaceId].newOwner == address(0)) revert NoPendingTransfer(namespaceId);
-        delete pendingTransfer[namespaceId];
-        emit NamespaceTransferCancelled(namespaceId, msg.sender);
+        emit NamespaceTransferred(namespaceId, from, msg.sender);
     }
 
     // -----------------------------------------------------------------
@@ -185,15 +145,6 @@ contract PublisherRegistry is AccessControl {
         // newMax <= 1000 after the bound check, so the cast never reverts.
         maxNamespacesPerPublisher = newMax.toUint64();
         emit MaxNamespacesPerPublisherUpdated(old, newMax);
-    }
-
-    function setNamespaceTransferTimelock(uint64 newTimelock) external onlyRole(GOVERNANCE_ROLE) {
-        if (newTimelock < TRANSFER_TIMELOCK_FLOOR || newTimelock > TRANSFER_TIMELOCK_CEILING) {
-            revert ParamOutOfBounds(newTimelock, TRANSFER_TIMELOCK_FLOOR, TRANSFER_TIMELOCK_CEILING);
-        }
-        uint64 old = namespaceTransferTimelock;
-        namespaceTransferTimelock = newTimelock;
-        emit NamespaceTransferTimelockUpdated(old, newTimelock);
     }
 
     // -----------------------------------------------------------------

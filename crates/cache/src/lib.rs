@@ -101,8 +101,8 @@ pub use origin::{
 pub use origin::{S3Credentials, S3Origin, S3OriginConfig};
 pub use origin_range::{MAX_CONCURRENT_RANGE_PULLS, OriginRangeWire, RANGE_PULL_WINDOW_BYTES};
 pub use policy::{
-    AdmissionContext, AdmissionDecision, AdmissionPolicy, AlwaysAdmit, EvictionContext,
-    EvictionPlan, EvictionPolicy, FrequencyEstimator, LruEviction, Segment,
+    AdmissionContext, AdmissionPolicy, AlwaysAdmit, EvictionContext, EvictionPlan, EvictionPolicy,
+    FrequencyEstimator, LruEviction, Segment,
 };
 pub use ranged_store::NodeRangedStore;
 pub use serve_store::{EncodeStream, PresentRangeWatch, ServeStore};

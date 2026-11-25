@@ -13,8 +13,6 @@ contract PublisherRegistryTest is Test {
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
 
-    uint64 internal constant DEFAULT_TIMELOCK = 7 days;
-
     function setUp() public {
         reg = new PublisherRegistry(admin);
     }
@@ -25,7 +23,6 @@ contract PublisherRegistryTest is Test {
 
     function test_constructor_setsDefaultsAndRoles() public view {
         assertEq(reg.maxNamespacesPerPublisher(), 100);
-        assertEq(reg.namespaceTransferTimelock(), DEFAULT_TIMELOCK);
         assertTrue(reg.hasRole(reg.DEFAULT_ADMIN_ROLE(), admin));
         assertTrue(reg.hasRole(reg.GOVERNANCE_ROLE(), admin));
     }
@@ -74,103 +71,115 @@ contract PublisherRegistryTest is Test {
     }
 
     // -----------------------------------------------------------------
-    // Namespace transfer (2-step + timelock)
+    // Namespace transfer (offer, then accept)
     // -----------------------------------------------------------------
 
     function test_transfer_fullFlow() public {
         vm.prank(alice);
         uint256 id = reg.createNamespace();
 
+        vm.expectEmit(address(reg));
+        emit PublisherRegistry.NamespaceTransferStarted(id, alice, bob);
         vm.prank(alice);
-        reg.initiateNamespaceTransfer(id, bob);
+        reg.transferNamespace(id, bob);
 
-        (address pendingOwner, uint256 readyAt) = reg.pendingTransfer(id);
-        assertEq(pendingOwner, bob);
-        assertEq(readyAt, block.timestamp + DEFAULT_TIMELOCK);
+        assertEq(reg.pendingOwnerOf(id), bob);
+        // An offer alone moves nothing.
+        assertEq(reg.ownerOf(id), alice);
 
-        // Cannot finalize before timelock.
-        vm.warp(block.timestamp + DEFAULT_TIMELOCK - 1);
+        // The recipient accepts in the same block: no delay applies.
+        vm.expectEmit(address(reg));
+        emit PublisherRegistry.NamespaceTransferred(id, alice, bob);
         vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.TransferNotReady.selector, readyAt));
-        reg.finalizeNamespaceTransfer(id);
-
-        // After timelock, the new owner finalizes.
-        vm.warp(readyAt);
-        vm.prank(bob);
-        reg.finalizeNamespaceTransfer(id);
+        reg.acceptNamespace(id);
 
         assertEq(reg.ownerOf(id), bob);
         assertEq(reg.namespaceCount(alice), 0);
         assertEq(reg.namespaceCount(bob), 1);
-        (address clearedOwner,) = reg.pendingTransfer(id);
-        assertEq(clearedOwner, address(0));
+        assertEq(reg.pendingOwnerOf(id), address(0));
     }
 
-    function test_transfer_initiateRevertsIfNotOwner() public {
+    function test_transfer_revertsIfNotOwner() public {
         vm.prank(alice);
         uint256 id = reg.createNamespace();
         vm.prank(bob);
         vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotNamespaceOwner.selector, id, bob));
-        reg.initiateNamespaceTransfer(id, bob);
+        reg.transferNamespace(id, bob);
     }
 
-    function test_transfer_initiateRevertsZeroNewOwner() public {
+    function test_transfer_acceptRevertsIfNotPendingOwner() public {
         vm.prank(alice);
         uint256 id = reg.createNamespace();
         vm.prank(alice);
-        vm.expectRevert(PublisherRegistry.TransferToZeroAddress.selector);
-        reg.initiateNamespaceTransfer(id, address(0));
-    }
+        reg.transferNamespace(id, bob);
 
-    function test_transfer_finalizeRevertsIfNotPendingOwner() public {
-        vm.prank(alice);
-        uint256 id = reg.createNamespace();
-        vm.prank(alice);
-        reg.initiateNamespaceTransfer(id, bob);
-
-        vm.warp(block.timestamp + DEFAULT_TIMELOCK);
-        // alice (current owner) cannot finalize; only the pending recipient.
+        // alice (current owner) cannot accept; only the pending recipient.
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotPendingOwner.selector, id, alice));
-        reg.finalizeNamespaceTransfer(id);
+        reg.acceptNamespace(id);
     }
 
-    function test_transfer_cancelByOwner() public {
-        vm.prank(alice);
-        uint256 id = reg.createNamespace();
-        vm.prank(alice);
-        reg.initiateNamespaceTransfer(id, bob);
-
-        vm.prank(alice);
-        reg.cancelNamespaceTransfer(id);
-
-        (address pendingOwner,) = reg.pendingTransfer(id);
-        assertEq(pendingOwner, address(0));
-
-        // bob can no longer finalize.
-        vm.warp(block.timestamp + DEFAULT_TIMELOCK);
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NoPendingTransfer.selector, id));
-        reg.finalizeNamespaceTransfer(id);
-    }
-
-    function test_transfer_cancelRevertsIfNotOwner() public {
-        vm.prank(alice);
-        uint256 id = reg.createNamespace();
-        vm.prank(alice);
-        reg.initiateNamespaceTransfer(id, bob);
-
-        vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotNamespaceOwner.selector, id, bob));
-        reg.cancelNamespaceTransfer(id);
-    }
-
-    function test_transfer_finalizeRevertsNoPending() public {
+    function test_transfer_acceptRevertsWithoutOffer() public {
         vm.prank(alice);
         uint256 id = reg.createNamespace();
         vm.prank(bob);
-        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NoPendingTransfer.selector, id));
-        reg.finalizeNamespaceTransfer(id);
+        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotPendingOwner.selector, id, bob));
+        reg.acceptNamespace(id);
+    }
+
+    function test_transfer_zeroAddressWithdrawsOffer() public {
+        vm.prank(alice);
+        uint256 id = reg.createNamespace();
+        vm.prank(alice);
+        reg.transferNamespace(id, bob);
+
+        vm.expectEmit(address(reg));
+        emit PublisherRegistry.NamespaceTransferStarted(id, alice, address(0));
+        vm.prank(alice);
+        reg.transferNamespace(id, address(0));
+        assertEq(reg.pendingOwnerOf(id), address(0));
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotPendingOwner.selector, id, bob));
+        reg.acceptNamespace(id);
+    }
+
+    function test_transfer_newOfferReplacesPending() public {
+        address carol = makeAddr("carol");
+        vm.prank(alice);
+        uint256 id = reg.createNamespace();
+        vm.prank(alice);
+        reg.transferNamespace(id, bob);
+        vm.prank(alice);
+        reg.transferNamespace(id, carol);
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotPendingOwner.selector, id, bob));
+        reg.acceptNamespace(id);
+
+        vm.prank(carol);
+        reg.acceptNamespace(id);
+        assertEq(reg.ownerOf(id), carol);
+    }
+
+    function test_transfer_firstAcceptLocksOutTheOldKey() public {
+        // The owner of a leaked key moves the namespace to a fresh key before
+        // the key's other holder acts. Once accepted, the old key controls
+        // nothing: it can neither offer the namespace nor accept it.
+        address freshKey = makeAddr("freshKey");
+        vm.prank(alice);
+        uint256 id = reg.createNamespace();
+        vm.prank(alice);
+        reg.transferNamespace(id, freshKey);
+        vm.prank(freshKey);
+        reg.acceptNamespace(id);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotNamespaceOwner.selector, id, alice));
+        reg.transferNamespace(id, alice);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NotPendingOwner.selector, id, alice));
+        reg.acceptNamespace(id);
     }
 
     function test_transfer_revertsWhenRecipientAtCap() public {
@@ -186,12 +195,11 @@ contract PublisherRegistryTest is Test {
         vm.prank(alice);
         uint256 id = reg.createNamespace();
         vm.prank(alice);
-        reg.initiateNamespaceTransfer(id, bob);
+        reg.transferNamespace(id, bob);
 
-        vm.warp(block.timestamp + DEFAULT_TIMELOCK);
         vm.prank(bob);
         vm.expectRevert(abi.encodeWithSelector(PublisherRegistry.NamespaceCapReached.selector, 1));
-        reg.finalizeNamespaceTransfer(id);
+        reg.acceptNamespace(id);
     }
 
     function test_transfer_selfTransferExemptFromCap() public {
@@ -204,10 +212,9 @@ contract PublisherRegistryTest is Test {
         // Transferring to oneself leaves the count unchanged, so the cap
         // check must not block it.
         vm.prank(alice);
-        reg.initiateNamespaceTransfer(id, alice);
-        vm.warp(block.timestamp + DEFAULT_TIMELOCK);
+        reg.transferNamespace(id, alice);
         vm.prank(alice);
-        reg.finalizeNamespaceTransfer(id);
+        reg.acceptNamespace(id);
 
         assertEq(reg.ownerOf(id), alice);
         assertEq(reg.namespaceCount(alice), 1);
@@ -233,33 +240,12 @@ contract PublisherRegistryTest is Test {
     }
 
     function test_setMaxNamespaces_revertsWithoutRole() public {
-        vm.prank(alice);
-        vm.expectRevert();
-        reg.setMaxNamespacesPerPublisher(50);
-    }
-
-    function test_setTransferTimelock_withinBounds() public {
-        vm.prank(admin);
-        reg.setNamespaceTransferTimelock(14 days);
-        assertEq(reg.namespaceTransferTimelock(), 14 days);
-    }
-
-    function test_setTransferTimelock_revertsOutOfBounds() public {
-        vm.prank(admin);
-        vm.expectRevert();
-        reg.setNamespaceTransferTimelock(1 hours); // < 1 day
-        vm.prank(admin);
-        vm.expectRevert();
-        reg.setNamespaceTransferTimelock(60 days); // > 30 days
-    }
-
-    function test_setTransferTimelock_revertsWithoutRole() public {
         bytes32 govRole = reg.GOVERNANCE_ROLE();
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, alice, govRole)
         );
         vm.prank(alice);
-        reg.setNamespaceTransferTimelock(7 days);
+        reg.setMaxNamespacesPerPublisher(50);
     }
 
     // -----------------------------------------------------------------

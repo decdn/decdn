@@ -72,6 +72,7 @@ impl Seats {
             .insert(operator);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn remove(&mut self, namespace: U256, operator: Address) {
         if let Some(namespaces) = self.by_operator.get_mut(&operator) {
             namespaces.remove(&namespace);
@@ -120,6 +121,7 @@ impl SeatedOriginSet {
     }
 
     /// Record that `operator` holds a seat in `namespace`.
+    #[cfg(test)]
     pub fn seat(&self, namespace: U256, operator: Address) {
         self.seats
             .write()
@@ -130,6 +132,7 @@ impl SeatedOriginSet {
     /// Record that `operator` no longer holds a seat in `namespace`. The
     /// operator leaves the set with its last seat, and the namespace with its
     /// last operator.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn unseat(&self, namespace: U256, operator: Address) {
         self.seats
             .write()

@@ -332,44 +332,34 @@ impl RoutingTable {
             .is_some_and(|b| b.iter().any(|p| p == peer))
     }
 
-    /// Return up to `n` peers from the table sorted by XOR distance to
-    /// `target` (closest first). Capped at `K_BUCKET_SIZE` since the wire
-    /// `closer_nodes` field is itself capped at `MAX_CLOSER_NODES`.
-    ///
-    /// Walks every bucket; with 256 × 20 entries the worst case is 5120
-    /// XOR computes (once each, cached) + a sort over those cached distances —
-    /// well under a microsecond on modern hardware and dwarfed by the QUIC
-    /// round-trip cost.
-    ///
-    /// The result is capped at [`K_BUCKET_SIZE`] (= [`MAX_CLOSER_NODES`])
-    /// so it can be serialised directly into a wire `closer_nodes` field.
-    /// Callers needing more than K candidates use [`Self::closest_unbounded`].
-    /// This is the unfiltered base; the wire answer reads
-    /// [`Self::closest_active`].
+    /// [`Self::closest_active`] with no staker filter: up to `n` peers of any
+    /// standing, closest to `target` first, capped at [`K_BUCKET_SIZE`].
+    #[cfg(test)]
     #[must_use]
     pub fn closest(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
-        let cap = n.min(K_BUCKET_SIZE);
-        self.closest_unbounded(target, cap)
+        self.closest_unbounded(target, n.min(K_BUCKET_SIZE))
     }
 
-    /// Like [`Self::closest`] but without the wire-cap clamp at
-    /// [`K_BUCKET_SIZE`], and unfiltered. The republish path fans out to the
-    /// K+3 closest bonded peers per ADR 022 §STORE Flow ("three positions
-    /// beyond K are overflow targets — publishing to a wider set than the
-    /// minimum required by the routing geometry means an attacker forcing
-    /// record expiry by suppressing receivers must take down K+3 hosts rather
-    /// than K") through [`Self::closest_active_unbounded`].
-    ///
-    /// MUST NOT be used to populate wire responses — those are bound at
-    /// [`MAX_CLOSER_NODES`] and a larger result would violate the
-    /// ADR 022 wire-cost ceiling. Use [`Self::closest_active`] for that path.
+    /// [`Self::closest_active_unbounded`] with no staker filter.
+    #[cfg(test)]
     #[must_use]
     pub fn closest_unbounded(&self, target: &[u8; NODE_ID_LEN], n: usize) -> Vec<NodeId> {
         self.closest_where(target, n, |_| true)
     }
 
-    /// Like [`Self::closest`], counting only the entries `stakers` holds as
-    /// active bonded operators. Serves the wire `closer_nodes` answers.
+    /// Return up to `n` peers that `stakers` holds as active bonded
+    /// operators, sorted by XOR distance to `target` (closest first). Serves
+    /// the wire `closer_nodes` answers.
+    ///
+    /// The result is capped at [`K_BUCKET_SIZE`] (= [`MAX_CLOSER_NODES`])
+    /// so it can be serialised directly into a wire `closer_nodes` field.
+    /// Callers needing more than K candidates use
+    /// [`Self::closest_active_unbounded`].
+    ///
+    /// Walks every bucket; with 256 × 20 entries the worst case is 5120
+    /// XOR computes (once each, cached) + a sort over those cached distances —
+    /// well under a microsecond on modern hardware and dwarfed by the QUIC
+    /// round-trip cost.
     #[must_use]
     pub fn closest_active(
         &self,
@@ -380,9 +370,17 @@ impl RoutingTable {
         self.closest_active_unbounded(target, n.min(K_BUCKET_SIZE), stakers)
     }
 
-    /// Like [`Self::closest_unbounded`], counting only the entries `stakers`
-    /// holds as active bonded operators. Serves the lookup seed and the
-    /// republish fan-out, never a wire answer.
+    /// Like [`Self::closest_active`] but without the wire-cap clamp at
+    /// [`K_BUCKET_SIZE`]. Serves the lookup seed and the republish fan-out.
+    /// The republish path fans out to the K+3 closest bonded peers per
+    /// ADR 022 §STORE Flow ("three positions beyond K are overflow targets —
+    /// publishing to a wider set than the minimum required by the routing
+    /// geometry means an attacker forcing record expiry by suppressing
+    /// receivers must take down K+3 hosts rather than K").
+    ///
+    /// MUST NOT be used to populate wire responses — those are bound at
+    /// [`MAX_CLOSER_NODES`] and a larger result would violate the
+    /// ADR 022 wire-cost ceiling. Use [`Self::closest_active`] for that path.
     #[must_use]
     pub fn closest_active_unbounded(
         &self,
@@ -424,7 +422,7 @@ impl RoutingTable {
     /// Iterator over every peer currently held. Order is bucket-major,
     /// recency within bucket — useful for republish scans and bootstrap
     /// snapshots, but **not** distance-sorted (callers wanting closeness
-    /// must use [`Self::closest`]).
+    /// must use [`Self::closest_active`]).
     pub fn iter_peers(&self) -> impl Iterator<Item = &NodeId> + '_ {
         self.buckets.iter().flatten()
     }

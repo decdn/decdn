@@ -9,10 +9,12 @@
 //! `multiaddrs` do not carry one of its public addresses, since peers dial the
 //! registered address first. When `network.external_addrs` is set, its
 //! addresses are the public ones and the host's own addresses do not count.
+//! When the node has a public address, the report names its source (`route`
+//! or `configured`, from [`addr_source`]).
 
 use std::net::SocketAddr;
 
-use decdn_common::net::{public_quic_addrs, quic_multiaddr, route_public_ips};
+use decdn_common::net::{addr_source, public_quic_addrs, quic_multiaddr, route_public_ips};
 
 use crate::metrics::Metrics;
 
@@ -58,6 +60,7 @@ pub(super) fn report(
 ) {
     let public = public_quic_addrs(&route_public_ips(), bind_port, external_addrs);
     metrics.node_public_address(!public.is_empty());
+    let source = addr_source(external_addrs);
     match classify(&public, registered) {
         Reachability::BehindNat => tracing::info!(
             bind_port,
@@ -69,10 +72,12 @@ pub(super) fn report(
         ),
         Reachability::PublicRegistered => tracing::info!(
             public = ?public,
+            source,
             "public address registered: peers dial this node directly"
         ),
         Reachability::PublicUnregistered { missing } => tracing::warn!(
             missing = ?missing,
+            source,
             "the registry multiaddrs do not carry this node's public address, so peers that \
              dial from the registry may go through the relay. Register it with \
              `decdn node update-multiaddrs --multiaddr <addr>` for each missing address"

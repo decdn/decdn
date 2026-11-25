@@ -161,6 +161,7 @@ async fn reload_applies_log_level_and_ignores_rate_change() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -193,6 +194,7 @@ async fn reload_skips_log_level_when_unchanged() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -229,6 +231,7 @@ async fn kept_rust_log_filter_is_not_reported_as_the_live_level() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &seed_resolved(1, LogLevel::Info),
         setter,
     );
@@ -267,6 +270,7 @@ async fn reload_errors_when_log_level_setter_fails() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         failing_setter,
     );
@@ -303,6 +307,7 @@ async fn reload_errors_when_log_level_mutex_poisoned() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -344,6 +349,7 @@ async fn reload_recovers_from_poisoned_reload_lock() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -382,6 +388,7 @@ async fn reload_ignores_invalid_rate_since_payment_is_restart_required() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -408,6 +415,7 @@ async fn reload_returns_error_on_missing_file() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -438,6 +446,7 @@ async fn reload_returns_error_on_malformed_toml() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -462,6 +471,7 @@ fn denylist_state(initial: &decdn_common::config::ResolvedConfig) -> RuntimeRelo
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         initial,
         recording_setter().0,
     )
@@ -626,6 +636,7 @@ async fn reload_swaps_pinned_hashes_on_attached_cache() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -663,6 +674,7 @@ async fn reload_rejects_invalid_pinned_hash_and_keeps_previous_set() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -707,6 +719,7 @@ async fn reload_without_attached_cache_is_noop_for_pinning() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -740,6 +753,7 @@ async fn reload_unpins_when_pinned_hashes_emptied() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -780,6 +794,7 @@ async fn attach_cache_recovers_from_poisoned_mutex() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     ));
@@ -845,6 +860,7 @@ async fn reload_applies_security_when_limiter_attached() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -880,6 +896,7 @@ async fn reload_without_attached_limiter_is_noop_for_security() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -915,6 +932,7 @@ async fn reload_rejects_an_invalid_section_and_keeps_previous() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -956,6 +974,7 @@ async fn reload_aggregates_problems_across_sections() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -1009,6 +1028,7 @@ async fn reload_keeps_security_when_log_level_setter_fails() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         failing_setter,
     );
@@ -1048,6 +1068,7 @@ async fn attach_limiter_recovers_from_poisoned_mutex() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     ));
@@ -1076,14 +1097,14 @@ async fn attach_limiter_recovers_from_poisoned_mutex() {
 
 /// A non-reloadable section present in the file only earns a
 /// "requires restart" notice — it must not gate the reload. A file
-/// carrying `[network]` (restart-only) alongside a reloadable
+/// carrying `[identity]` (restart-only) alongside a reloadable
 /// `log_level` change still applies the reloadable field.
 #[tokio::test]
 async fn reload_applies_despite_restart_only_section_present() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(
         dir.path(),
-        "[observability]\nlog_level = \"debug\"\n\n[network]\nbind_port = 4433\n",
+        "[observability]\nlog_level = \"debug\"\n\n[identity]\nregion = \"US\"\n",
     );
 
     let initial = seed_resolved(42, LogLevel::Info);
@@ -1097,6 +1118,7 @@ async fn reload_applies_despite_restart_only_section_present() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -1217,6 +1239,7 @@ async fn load_shed_section_swaps_policy_on_reload() {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &initial,
         setter,
     );
@@ -1234,4 +1257,182 @@ async fn load_shed_section_swaps_policy_on_reload() {
             .is_ok(),
         "reload to always-admit must let a previously-shed miss through"
     );
+}
+
+// ----- [network] validation and diff (#2979) ------------------------------
+
+/// Resolve `toml_body` (a whole config file) for the `[network]` notice, with
+/// no observability CLI overrides.
+fn network_notice(
+    cli: &NetworkArgs,
+    toml_body: &str,
+) -> anyhow::Result<(ResolvedNetwork, Vec<ConfigNotice>)> {
+    let file: FileConfig = toml::from_str(toml_body).unwrap();
+    let observability_cli = ObservabilityArgs {
+        log_level: None,
+        log_format: None,
+        metrics_port: None,
+        metrics_bind: None,
+        admin_port: None,
+        otlp_endpoint: None,
+    };
+    resolve_network_for_notice(cli, &observability_cli, &file)
+}
+
+#[test]
+fn resolve_network_for_notice_accepts_a_valid_table() {
+    let resolved = network_notice(
+        &NetworkArgs::default(),
+        "[network]\nbind_port = 5555\nexternal_addrs = [\"8.8.8.8:4433\"]\n",
+    )
+    .unwrap()
+    .0;
+    assert_eq!(resolved.bind_port, 5555);
+    assert_eq!(resolved.external_addrs.len(), 1);
+}
+
+/// The CLI/env overrides the node started with keep precedence over the
+/// reloaded file, as at startup.
+#[test]
+fn resolve_network_for_notice_keeps_cli_precedence() {
+    let cli = NetworkArgs {
+        bind_port: Some(7777),
+        relay_url: None,
+    };
+    let resolved = network_notice(&cli, "[network]\nbind_port = 5555\n")
+        .unwrap()
+        .0;
+    assert_eq!(resolved.bind_port, 7777);
+}
+
+/// A reloaded `bind_port` equal to the reloaded `metrics_port` is the clash
+/// startup rejects, so the reload reports it.
+#[test]
+fn resolve_network_for_notice_reports_a_port_clash() {
+    let err = network_notice(
+        &NetworkArgs::default(),
+        "[network]\nbind_port = 7000\n\n[observability]\nmetrics_port = 7000\n",
+    )
+    .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("network.bind_port vs observability.metrics_port"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn network_restart_required_changes_is_empty_when_unchanged() {
+    let startup = seed_resolved(10, LogLevel::Info).network;
+    let reloaded = network_notice(&NetworkArgs::default(), "[network]\nbind_port = 4433\n")
+        .unwrap()
+        .0;
+    assert!(network_restart_required_changes(&startup, &reloaded).is_empty());
+}
+
+#[test]
+fn network_restart_required_changes_names_each_changed_field() {
+    let startup = seed_resolved(10, LogLevel::Info).network;
+
+    let reloaded = network_notice(&NetworkArgs::default(), "[network]\nbind_port = 5555\n")
+        .unwrap()
+        .0;
+    assert_eq!(
+        network_restart_required_changes(&startup, &reloaded),
+        vec!["bind_port"]
+    );
+
+    let reloaded = network_notice(
+        &NetworkArgs::default(),
+        "[network]\nexternal_addrs = [\"8.8.8.8:4433\"]\n",
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        network_restart_required_changes(&startup, &reloaded),
+        vec!["external_addrs"]
+    );
+
+    let reloaded = network_notice(
+        &NetworkArgs::default(),
+        "[network]\nbind_port = 5555\nrelay_urls = [\"https://relay.example\"]\n\
+         external_addrs = [\"8.8.8.8:4433\"]\n",
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        network_restart_required_changes(&startup, &reloaded),
+        vec!["bind_port", "relay_urls", "external_addrs"]
+    );
+}
+
+/// A `[network]` table removed from the file resolves to the defaults, so it
+/// is a change against a startup that set non-default values.
+#[test]
+fn a_removed_network_table_diffs_against_the_defaults() {
+    let mut startup = seed_resolved(10, LogLevel::Info).network;
+    let reloaded = network_notice(&NetworkArgs::default(), "").unwrap().0;
+    assert!(network_restart_required_changes(&startup, &reloaded).is_empty());
+
+    startup.bind_port = 5555;
+    assert_eq!(
+        network_restart_required_changes(&startup, &reloaded),
+        vec!["bind_port"]
+    );
+}
+
+#[test]
+fn network_restart_required_changes_names_a_discovery_change() {
+    let startup = seed_resolved(10, LogLevel::Info).network;
+    let reloaded = network_notice(
+        &NetworkArgs::default(),
+        "[network.discovery]\npkarr_url = \"https://pkarr.example\"\n\
+         dns_origin = \"dns.example\"\n",
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        network_restart_required_changes(&startup, &reloaded),
+        vec!["discovery"]
+    );
+}
+
+/// `--relay-url` overrides a reloaded `relay_urls` list as at startup: the
+/// table is valid, nothing changes, and the override notice comes back for
+/// the reload to emit.
+#[test]
+fn resolve_network_for_notice_returns_the_relay_override_notice() {
+    let cli = NetworkArgs {
+        bind_port: None,
+        relay_url: Some("https://cli-relay.example".to_string()),
+    };
+    let mut startup = seed_resolved(10, LogLevel::Info).network;
+    startup.relay_urls = vec!["https://cli-relay.example".to_string()];
+    let (reloaded, notices) = network_notice(
+        &cli,
+        "[network]\nrelay_urls = [\"https://a.example\", \"https://b.example\"]\n",
+    )
+    .unwrap();
+    assert!(network_restart_required_changes(&startup, &reloaded).is_empty());
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices.first().unwrap().field, "network.relay_url");
+}
+
+/// The problems name each bad key, and a relay URL's userinfo never reaches
+/// them.
+#[test]
+fn resolve_network_for_notice_names_each_key_redacted() {
+    let err = network_notice(
+        &NetworkArgs::default(),
+        "[network]\nrelay_urls = [\"relay://user:hunter2@bad host\"]\n\
+         external_addrs = [\"10.0.0.5:4433\"]\n",
+    )
+    .unwrap_err();
+    let rendered = format!("{err:#}");
+    assert!(rendered.contains("network.relay_urls[0]: "), "{rendered}");
+    assert!(
+        rendered.contains("network.external_addrs[0]: "),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("hunter2"), "{rendered}");
 }

@@ -66,7 +66,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context;
 use decdn_common::admin::{AdminRpcClient, DrainRequest, HealthResponse};
-use decdn_common::cli::run::ObservabilityArgs;
+use decdn_common::cli::run::{NetworkArgs, ObservabilityArgs};
 use decdn_common::config::{
     ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedDht, ResolvedDiscovery,
     ResolvedIdentity, ResolvedNetwork, ResolvedObservability, ResolvedPayment, ResolvedReceipts,
@@ -597,6 +597,7 @@ async fn anvil_bringup_shutdown_runtime_graceful_drain() -> anyhow::Result<()> {
             admin_port: None,
             otlp_endpoint: None,
         },
+        NetworkArgs::default(),
         &cfg,
         Box::new(|_| Ok(decdn_node::runtime::LogLevelApply::Installed)) as LogLevelSetter,
     ));
