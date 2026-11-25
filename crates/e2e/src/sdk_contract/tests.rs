@@ -17,8 +17,8 @@ fn content_fixture_names_its_keys() {
         .get("files")
         .and_then(serde_json::Value::as_object)
         .expect("files is a JSON object");
-    assert_eq!(files.len(), 3, "{files:?}");
-    for path in ["a.txt", "index.html", "data.bin"] {
+    assert_eq!(files.len(), 4, "{files:?}");
+    for path in ["a.txt", "index.html", "data.bin", "docs/index.html"] {
         assert!(files.contains_key(path), "no {path} in files");
     }
 }

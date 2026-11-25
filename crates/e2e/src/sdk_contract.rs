@@ -384,7 +384,8 @@ fn bytes(len: usize, seed: u32) -> Vec<u8> {
     v
 }
 
-/// The content both runs serve: a raw blob and a bundle of three entries.
+/// The content both runs serve: a raw blob and a bundle of four entries, one
+/// of them a directory's `index.html` (`docs/`, with no `docs` entry).
 struct Content {
     blob: Vec<u8>,
     files: Vec<(&'static str, Vec<u8>)>,
@@ -402,6 +403,7 @@ impl Content {
                 format!("<a href=\"decdn:{blob_hash}\">blob</a>\n").into_bytes(),
             ),
             ("data.bin", bytes(256 * 1024, 0xDA7A_0002)),
+            ("docs/index.html", b"<p>docs</p>\n".to_vec()),
         ];
         let entries: Vec<_> = files
             .iter()
