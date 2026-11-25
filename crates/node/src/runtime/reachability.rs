@@ -9,6 +9,8 @@
 //! `multiaddrs` do not carry one of its public addresses, since peers dial the
 //! registered address first. When `network.external_addrs` is set, its
 //! addresses are the public ones and the host's own addresses do not count.
+//! The report names the address source (`route` or `configured`); the node
+//! trusts a configured address from config and does not probe it.
 
 use std::net::SocketAddr;
 
@@ -45,6 +47,19 @@ fn classify(public: &[SocketAddr], registered: &[SocketAddr]) -> Reachability {
     }
 }
 
+/// Where the public addresses come from: `"configured"` when
+/// `network.external_addrs` is set (the node does not probe these), else
+/// `"route"` (the host's route-public IPs). This matches
+/// [`public_quic_addrs`], which uses exactly the configured list whenever it is
+/// non-empty.
+const fn addr_source(external_addrs: &[SocketAddr]) -> &'static str {
+    if external_addrs.is_empty() {
+        "route"
+    } else {
+        "configured"
+    }
+}
+
 /// Log the node's reachability once and set `decdn_node_public_address`.
 /// The public addresses are each of `external_addrs` (`network.external_addrs`)
 /// on its own port when there are any, else the host's route-public IPs on
@@ -58,6 +73,7 @@ pub(super) fn report(
 ) {
     let public = public_quic_addrs(&route_public_ips(), bind_port, external_addrs);
     metrics.node_public_address(!public.is_empty());
+    let source = addr_source(external_addrs);
     match classify(&public, registered) {
         Reachability::BehindNat => tracing::info!(
             bind_port,
@@ -69,10 +85,12 @@ pub(super) fn report(
         ),
         Reachability::PublicRegistered => tracing::info!(
             public = ?public,
+            source,
             "public address registered: peers dial this node directly"
         ),
         Reachability::PublicUnregistered { missing } => tracing::warn!(
             missing = ?missing,
+            source,
             "the registry multiaddrs do not carry this node's public address, so peers that \
              dial from the registry may go through the relay. Register it with \
              `decdn node update-multiaddrs --multiaddr <addr>` for each missing address"

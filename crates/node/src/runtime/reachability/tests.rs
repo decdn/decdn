@@ -50,6 +50,12 @@ fn unregistered_external_addr_names_its_own_port() {
 }
 
 #[test]
+fn addr_source_is_route_without_configured_addrs_and_configured_with() {
+    assert_eq!(addr_source(&[]), "route");
+    assert_eq!(addr_source(&[sock("1.1.1.1:30443")]), "configured");
+}
+
+#[test]
 fn report_marks_a_configured_external_addr_public() {
     // The configured address replaces the host's own, so the gauge reads 1
     // on any host, behind NAT included.

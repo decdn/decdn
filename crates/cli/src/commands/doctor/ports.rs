@@ -73,8 +73,15 @@ fn try_udp(port: u16) -> Result<(), ErrorKind> {
 /// there are any, else the host's route-public IPs on `bind_port`, as the
 /// daemon counts them. `bind_port` feeds only the behind-NAT remediation
 /// text. Both outcomes pass: a host behind NAT is a supported setup whose inbound
-/// runs through the relay and hole-punching.
-pub(crate) fn classify_reachability(public: &[SocketAddr], bind_port: u16) -> Finding {
+/// runs through the relay and hole-punching. `configured` is true when
+/// `public` comes from `network.external_addrs`. The doctor does not probe such
+/// an address, so the public finding's detail names its source and says the
+/// forward or load balancer is unverified.
+pub(crate) fn classify_reachability(
+    public: &[SocketAddr],
+    bind_port: u16,
+    configured: bool,
+) -> Finding {
     if public.is_empty() {
         Finding {
             group: "Ports",
@@ -100,7 +107,11 @@ pub(crate) fn classify_reachability(public: &[SocketAddr], bind_port: u16) -> Fi
             id: "port.reachability",
             severity: Severity::Pass,
             title: format!("public address: peers dial {} directly", addrs.join(", ")),
-            detail: None,
+            detail: configured.then(|| {
+                "source=network.external_addrs (configured, not probed — verify the forward \
+                 or load balancer delivers UDP to this host)"
+                    .to_string()
+            }),
             remediation: None,
         }
     }
@@ -116,6 +127,7 @@ pub(crate) fn check_ports(report: &mut Report, cfg: &ResolvedConfig, daemon_runn
             &cfg.network.external_addrs,
         ),
         cfg.network.bind_port,
+        !cfg.network.external_addrs.is_empty(),
     ));
     report.push(classify_bind(
         "quic bind",
