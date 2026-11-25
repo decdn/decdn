@@ -1728,9 +1728,7 @@ impl ClientHandler {
         let expiry = capability.expiry;
         // The on-chain `PaymentPool` reads an expiry of `0` as already expired
         // (`block.timestamp >= expiry`), so a `0`-expiry grant can never redeem.
-        // On-chain registration is write-once per `(pool, signer)`, so a
-        // redemption that registered such a grant would pin the signer to
-        // unredeemable terms. Drop it: the node registers no lane, the request
+        // Drop it: the node registers no lane, the request
         // refuses as an unknown lane, and the client must present a valid
         // capability.
         if expiry == 0 {
@@ -1968,45 +1966,6 @@ impl ClientHandler {
             && let Err(e) = self.register_lane(deployment, state)
         {
             tracing::warn!(error = %e, "test seam: armed lane registration failed");
-        }
-    }
-
-    /// Clamp a live lane to its signer's on-chain registration (ADR 003
-    /// §Capability delegation): the lane holds `min(held, registered)` for `cap`
-    /// and `expiry` and records the registered expiry as `registered_until`. On-chain
-    /// registration is write-once, so the clamp is final for this `(pool, signer)`
-    /// and the lane store persists it with the lane. A change is recorded to the
-    /// buffered store under the per-lane lock, the same path as a voucher advance.
-    /// A store fault is logged and leaves the in-memory clamp in place: the live
-    /// lane is what the voucher path reads.
-    async fn clamp_lane_to_registration(
-        &self,
-        deployment: Deployment,
-        lane: &Arc<Mutex<LaneDeliveryState>>,
-        cap: u64,
-        expiry: u64,
-    ) {
-        let Some(route) = self.pool_route(deployment) else {
-            return;
-        };
-        let mut guard = lane.lock().await;
-        if !guard.state.clamp_to_registration(cap, expiry) {
-            return;
-        }
-        tracing::debug!(
-            pool_id = %guard.state.pool_id,
-            signer = %guard.state.signer,
-            held_cap = %guard.state.cap,
-            held_expiry = guard.state.expiry,
-            "lane clamped to the signer's on-chain registration"
-        );
-        if let Err(error) = route.store.record(&guard.state) {
-            tracing::warn!(
-                pool_id = %guard.state.pool_id,
-                signer = %guard.state.signer,
-                %error,
-                "failed to record a lane clamped to its signer's registration"
-            );
         }
     }
 

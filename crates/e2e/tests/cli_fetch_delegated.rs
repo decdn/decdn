@@ -611,20 +611,18 @@ fn delegate_fetch_argv(
     ]
 }
 
-/// The registered capability A's cap in micro-USDC: four one-MiB voucher
-/// intervals at the fixture node's rate of 10 per MiB. Enough to admit a stream,
-/// far below what the 16 MiB blob costs.
-const REGISTERED_CAP_MICRO_USDC: u64 = 40;
+/// The narrow capability A's cap in micro-USDC: four one-MiB voucher intervals
+/// at the fixture node's rate of 10 per MiB. Enough to admit a stream, far below
+/// what the 16 MiB blob costs.
+const NARROW_CAP_MICRO_USDC: u64 = 40;
 /// The presented capability B's cap: 5 USDC, far above the blob's cost.
 const PRESENTED_CAP_MICRO_USDC: u64 = 5_000_000;
-/// The fixture node's quoted rate, in micro-USDC per MiB.
-const NODE_RATE_PER_MB: u64 = 10;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn presented_capability_is_clamped_to_the_signers_registered_terms() -> anyhow::Result<()> {
-    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_clamp()))
+async fn presented_capability_raises_a_narrower_registration() -> anyhow::Result<()> {
+    tokio::time::timeout(OVERALL_TIMEOUT, Box::pin(run_raise()))
         .await
-        .context("capability-clamp e2e exceeded the overall timeout")??;
+        .context("capability-raise e2e exceeded the overall timeout")??;
     Ok(())
 }
 
@@ -642,17 +640,6 @@ async fn accepted_on_pool(node: &NodeFixture, pool_id: B256) -> anyhow::Result<u
         .map(|l| l.outstanding_micro_usdc)
         .max()
         .unwrap_or(0))
-}
-
-/// Whether the node has accepted a voucher on any lane of `pool_id` since it
-/// started, from its admin `lanes()` surface.
-async fn voucher_seen_on_pool(node: &NodeFixture, pool_id: B256) -> anyhow::Result<bool> {
-    let wanted = format!("{pool_id}");
-    let resp = node.admin_client()?.lanes().await.context("admin lanes")?;
-    Ok(resp
-        .lanes
-        .iter()
-        .any(|l| l.pool_id.eq_ignore_ascii_case(&wanted) && l.seconds_since_last_voucher.is_some()))
 }
 
 /// A fresh 0o700 keystore directory for one role, returning the directory, the
@@ -674,17 +661,19 @@ fn new_keystore(role: &str) -> anyhow::Result<(tempfile::TempDir, std::path::Pat
     Ok((dir, keystore, addr))
 }
 
-/// On-chain registration is write-once per `(pool, signer)` (ADR 003 §Capability
-/// delegation). The owner registers the delegate with a small capability A, then
-/// signs a second capability B for the same delegate with a far larger cap and a
-/// later expiry. The delegate presents B to a node. The node must hold the
-/// registered terms, not B's: every voucher it accepts must redeem on-chain.
+/// On-chain registration keeps the larger value of each field per
+/// `(pool, signer)` (ADR 003 §Capability delegation). The owner lands a narrow
+/// capability A for the delegate itself, then signs a capability B for the same
+/// delegate with a far larger cap and a later expiry. The delegate presents B to
+/// a node. The node serves the whole blob under B, its redemption lands B and
+/// raises the registration, and every payment the node accepted redeems
+/// on-chain (#2839).
 #[allow(
     clippy::too_many_lines,
     reason = "one sequential end-to-end journey; each step depends on the previous step's \
               pool / registration / delivery state"
 )]
-async fn run_clamp() -> anyhow::Result<()> {
+async fn run_raise() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init();
@@ -692,7 +681,7 @@ async fn run_clamp() -> anyhow::Result<()> {
     ensure_decdn_cli_built()?;
     let chain = ChainFixture::launch().await?;
 
-    // 16 MiB at 10 µUSDC/MiB costs ~160 µUSDC: four times the registered cap.
+    // 16 MiB at 10 µUSDC/MiB costs ~160 µUSDC: four times the narrow cap.
     let blob = vec![0xC1u8; 16 * MIB];
     let blob_hash = Hash::new(&blob);
     let (node, hash) = NodeFixture::launch(&chain, "US", &blob).await?;
@@ -738,7 +727,7 @@ async fn run_clamp() -> anyhow::Result<()> {
     let token_a = extract_dcap1_token(
         &run_cli_capture(
             owner_dir.path(),
-            &assign(REGISTERED_CAP_MICRO_USDC, EXPIRY_SECS),
+            &assign(NARROW_CAP_MICRO_USDC, EXPIRY_SECS),
             "decdn pool assign (A)",
         )
         .await?,
@@ -760,7 +749,7 @@ async fn run_clamp() -> anyhow::Result<()> {
 
     // Register the delegate with capability A. `redeemMany` is permissionless and
     // a batch with a capability and no vouchers only registers, so the admin key
-    // stands in for whichever provider landed the delegate's first redemption.
+    // stands in for the owner landing the narrow capability ahead of the node.
     let pool_contract = PaymentPool::new(payment_pool, chain.admin());
     let receipt = pool_contract
         .redeemMany(vec![PaymentPool::PoolBatch {
@@ -787,8 +776,7 @@ async fn run_clamp() -> anyhow::Result<()> {
         "the delegate must be registered with capability A's terms"
     );
 
-    // The delegate fetches presenting capability B. The fetch may fail once the
-    // node stops at the registered cap; what matters is what the node accepted.
+    // The delegate fetches the whole blob presenting capability B.
     let out = delegate_dir.path().join("blob.bin");
     let fetch_args = delegate_fetch_argv(
         &chain,
@@ -799,50 +787,26 @@ async fn run_clamp() -> anyhow::Result<()> {
         &delegate_keystore,
         &out,
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    loop {
-        let fetched = tokio::time::timeout(
-            Duration::from_secs(60),
-            tokio::process::Command::from(decdn_command(delegate_dir.path(), KEYSTORE_PASSWORD)?)
-                .arg("get")
-                .args(&fetch_args)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-        let succeeded = matches!(&fetched, Ok(Ok(o)) if o.status.success());
-        // Retry only while the node has accepted no voucher on the pool: a fetch
-        // that ran before the node saw the fresh pool. Once the node accepted a
-        // voucher, the outcome stands; a later fetch meets a drained signer,
-        // which the node refuses at admission.
-        if succeeded || voucher_seen_on_pool(&node, pool_id).await? {
-            break;
-        }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "the delegate fetch never reached the node's paid path: {fetched:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(750)).await;
-    }
+    run_fetch_until_ready(delegate_dir.path(), &fetch_args).await?;
+    let got = std::fs::read(&out).context("read the fetch output under capability B")?;
+    anyhow::ensure!(
+        got == blob,
+        "the fetch under capability B produced {} bytes, expected {}",
+        got.len(),
+        blob.len()
+    );
 
-    // The node holds every payment the delegate made once the fetch returns,
-    // and it redeems all of it. Check what the node is owed against the
-    // registered cap, then wait for the chain to pay exactly that figure.
+    // The node accepted payment past capability A's cap, under B's terms.
     let accepted = accepted_on_pool(&node, pool_id).await?;
     anyhow::ensure!(
-        accepted > 0,
-        "the node reports nothing owed on the delegate's pool, so the cap check below would \
-         pass vacuously"
-    );
-    anyhow::ensure!(
-        accepted <= registered.cap,
-        "the node accepted {accepted} µUSDC of vouchers and preimages under capability B, past \
-         the delegate's registered cap of {} µUSDC; the part past the cap redeems to 0",
+        accepted > registered.cap,
+        "the node accepted {accepted} µUSDC under capability B, no more than capability A's cap \
+         of {} µUSDC, so the raise below would pass vacuously",
         registered.cap
     );
     // Each round re-reads the node's figure, so a payment the node folds after
-    // the first read is in the figure the chain must match. The node accepts
-    // nothing it cannot redeem, so the two meet exactly.
+    // the first read is in the figure the chain must match. The node's
+    // redemption lands B, so every payment it accepted redeems.
     let settled = poll(Duration::from_secs(90), || async {
         let owed = accepted_on_pool(&node, pool_id).await?;
         let lane = e2e_assert::read_watermark(
@@ -856,7 +820,7 @@ async fn run_clamp() -> anyhow::Result<()> {
         Ok((lane.amount == owed).then_some(owed))
     })
     .await?;
-    let Some(settled) = settled else {
+    let Some(_settled) = settled else {
         let owed = accepted_on_pool(&node, pool_id).await?;
         let lane = e2e_assert::read_watermark(
             chain.admin(),
@@ -872,56 +836,15 @@ async fn run_clamp() -> anyhow::Result<()> {
             lane.amount
         );
     };
-    anyhow::ensure!(
-        settled <= registered.cap,
-        "the node accepted and redeemed {settled} µUSDC under capability B, past the delegate's \
-         registered cap of {} µUSDC",
-        registered.cap
-    );
 
-    // The registration is write-once: B changed nothing on-chain.
+    // The node's redemption landed B: each field holds the larger value.
     let after =
         e2e_assert::read_authorization(chain.admin(), payment_pool, pool_id, delegate_addr).await?;
     anyhow::ensure!(
-        after.cap == grant_a.spending_cap && after.expiry == grant_a.expiry,
-        "the registered terms must stay capability A's"
-    );
-
-    // A fetch on the spent signer stops at once with the new-key remedy. A
-    // node that reads the signer as spent refuses it at admission `Unfunded`,
-    // and a delegated client with no funder ends "funding needed" rather than
-    // retrying until it gives up (#2338). A node whose projection has not
-    // folded the last redemption yet admits the stream and rejects its first
-    // voucher past the registered cap instead; that remedy names a new signer
-    // key too.
-    let headroom = after.cap.saturating_sub(after.spent);
-    anyhow::ensure!(
-        U256::from(headroom)
-            < decdn_incentive::min_payment(
-                decdn_protocol::client::CHUNK_BYTES + decdn_client::VERIFY_LAG_BYTES,
-                NODE_RATE_PER_MB
-            ),
-        "precondition: the signer must be spent below one chunk, but {headroom} µUSDC of its \
-         registered cap is left"
-    );
-    let started = tokio::time::Instant::now();
-    let drained = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio::process::Command::from(decdn_command(delegate_dir.path(), KEYSTORE_PASSWORD)?)
-            .arg("get")
-            .args(&fetch_args)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .context("a fetch on the spent signer must stop, not retry until its timeout")?
-    .context("run the fetch on the spent signer")?;
-    let stderr = String::from_utf8_lossy(&drained.stderr);
-    anyhow::ensure!(
-        !drained.status.success() && stderr.contains("new signer key"),
-        "a fetch on a signer with {headroom} µUSDC of headroom must fail with the new-key \
-         remedy (took {:?}): {stderr}",
-        started.elapsed()
+        after.cap == grant_b.spending_cap && after.expiry == grant_b.expiry,
+        "the registration must rise to capability B's terms, but holds cap {} expiry {}",
+        after.cap,
+        after.expiry
     );
 
     drop(node);

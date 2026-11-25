@@ -418,8 +418,9 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     ///         Pays `operatorBps` of the total paid to `msg.sender` in the same
     ///         transaction and accrues the rest, with the paid-proportional
     ///         served bytes, in `pending[msg.sender]`. The pool clamps no bytes.
-    /// @dev    `_registerCapability` is idempotent and reverts on a bad owner
-    ///         signature. `_applyVoucher` returns zeros on a transient-empty
+    /// @dev    `_registerCapability` keeps the larger value of each field, is a
+    ///         no-op for a capability that raises neither, and reverts on a bad
+    ///         owner signature. `_applyVoucher` returns zeros on a transient-empty
     ///         voucher, which the loop skips, and reverts on a bad voucher
     ///         signature. Every lane advance lands before the single transfer.
     function redeemMany(PoolBatch[] calldata batches) external nonReentrant returns (uint256 totalPaid) {
@@ -614,11 +615,14 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
     // Internal
     // -----------------------------------------------------------------
 
-    /// @dev Register a signer once, on its first redemption, by verifying the
-    ///      owner's EIP-712 `Capability`. Idempotent: an already-registered
-    ///      signer returns without re-verifying, so a stray capability cannot
-    ///      raise the cap or extend the expiry. A capability that can pay
-    ///      nothing is never recorded.
+    /// @dev Register a signer's terms by verifying the owner's EIP-712
+    ///      `Capability`. The registration holds the larger value of each field
+    ///      over every capability the owner signed for the signer and anyone
+    ///      landed: the owner is bound by the most generous terms it signed, so
+    ///      a provider that holds a capability always redeems under at least its
+    ///      terms. A capability that raises neither field returns without
+    ///      re-verifying, and one that can pay nothing (a zero cap or an
+    ///      expiry already past) is never recorded.
     function _registerCapability(
         bytes32 poolId,
         address signer,
@@ -627,7 +631,7 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
         bytes calldata ownerSig
     ) internal {
         Authorization storage a = authorized[poolId][signer];
-        if (a.cap != 0 || a.expiry != 0) return;
+        if (spendingCap <= a.cap && expiry <= a.expiry) return;
         // forge-lint: disable-next-line(block-timestamp)
         if (spendingCap == 0 || expiry <= block.timestamp) return;
 
@@ -643,8 +647,8 @@ abstract contract PaymentPoolBase is ReentrancyGuard, SunsettingPausable, EIP712
             !(err == ECDSA.RecoverError.NoError && recovered == owner)
                 && !SignatureChecker.isValidERC1271SignatureNow(owner, digest, ownerSig)
         ) revert InvalidCapabilitySignature();
-        a.cap = spendingCap;
-        a.expiry = expiry;
+        if (spendingCap > a.cap) a.cap = spendingCap;
+        if (expiry > a.expiry) a.expiry = expiry;
     }
 
     /// @dev The cumulative-`min` redemption core (ADR 003 § Redemption

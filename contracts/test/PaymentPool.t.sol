@@ -1676,19 +1676,14 @@ contract PaymentPoolTest is Test {
         pool.redeemMany(_batch(id, caps, noVouchers));
     }
 
-    function test_redeemMany_registersSignerOncePerNewSigner() public {
+    function test_redeemMany_capabilityRaisingNeitherFieldIsANoOp() public {
         bytes32 id = _open();
 
         PaymentPoolBase.CapabilityReg[] memory caps = new PaymentPoolBase.CapabilityReg[](2);
-        caps[0] = PaymentPoolBase.CapabilityReg({
-            signer: signer,
-            spendingCap: SPENDING_CAP,
-            expiry: expiry,
-            ownerSig: _signCapabilityFor(address(pool), id, signer, SPENDING_CAP, expiry, OWNER_PK)
-        });
-        // A duplicate entry for the same signer, advertising a different
-        // cap/expiry and a signature that would fail if re-verified. The
-        // second registration is a no-op, so it is never evaluated.
+        caps[0] = _capabilityReg(id, SPENDING_CAP, expiry);
+        // A second entry for the same signer with lower terms and a signature
+        // that would fail if verified. It raises neither field, so it is never
+        // evaluated.
         caps[1] = PaymentPoolBase.CapabilityReg({ signer: signer, spendingCap: 1, expiry: 1, ownerSig: hex"00" });
         PaymentPoolBase.LaneVoucher[] memory noVouchers = new PaymentPoolBase.LaneVoucher[](0);
 
@@ -1696,8 +1691,107 @@ contract PaymentPoolTest is Test {
         pool.redeemMany(_batch(id, caps, noVouchers));
 
         (uint64 cap, uint64 exp,) = pool.authorized(id, signer);
-        assertEq(cap, SPENDING_CAP, "first registration wins");
+        assertEq(cap, SPENDING_CAP, "lower terms leave the cap");
+        assertEq(uint256(exp), uint256(expiry), "lower terms leave the expiry");
+    }
+
+    /// The owner lands a narrow capability first; a provider that holds a wider
+    /// one for the same signer lands it with its redemption and is paid in full
+    /// under the wider terms (#2839).
+    function test_redeemMany_widerCapabilityRaisesANarrowRegistration() public {
+        bytes32 id = _open();
+        PaymentPoolBase.LaneVoucher[] memory noVouchers = new PaymentPoolBase.LaneVoucher[](0);
+
+        PaymentPoolBase.CapabilityReg[] memory narrow = new PaymentPoolBase.CapabilityReg[](1);
+        narrow[0] = _capabilityReg(id, 1, uint64(block.timestamp + 60));
+        vm.prank(owner);
+        pool.redeemMany(_batch(id, narrow, noVouchers));
+
+        PaymentPoolBase.CapabilityReg[] memory wide = new PaymentPoolBase.CapabilityReg[](1);
+        wide[0] = _capabilityReg(id, SPENDING_CAP, expiry);
+        PaymentPoolBase.LaneVoucher[] memory vouchers = new PaymentPoolBase.LaneVoucher[](1);
+        vouchers[0] = _laneOf(signer, 100e6, 10_000_000, _voucher(id, 100e6, 10_000_000));
+        vm.prank(provider);
+        uint256 paid = pool.redeemMany(_batch(id, wide, vouchers));
+
+        assertEq(paid, 100e6, "the wider capability pays in full");
+        (uint64 cap, uint64 exp,) = pool.authorized(id, signer);
+        assertEq(cap, SPENDING_CAP);
         assertEq(uint256(exp), uint256(expiry));
+    }
+
+    /// Two capabilities that each win one field merge to the larger value of
+    /// each, in either landing order.
+    function test_redeemMany_crossedCapabilitiesMergeToTheMaxOfEachField() public {
+        bytes32 id = _open();
+        uint64 shortExpiry = uint64(block.timestamp + 60);
+        PaymentPoolBase.LaneVoucher[] memory noVouchers = new PaymentPoolBase.LaneVoucher[](0);
+
+        PaymentPoolBase.CapabilityReg[] memory caps = new PaymentPoolBase.CapabilityReg[](2);
+        caps[0] = _capabilityReg(id, 1, expiry);
+        caps[1] = _capabilityReg(id, SPENDING_CAP, shortExpiry);
+        vm.prank(provider);
+        pool.redeemMany(_batch(id, caps, noVouchers));
+
+        (uint64 cap, uint64 exp,) = pool.authorized(id, signer);
+        assertEq(cap, SPENDING_CAP, "cap takes the larger value");
+        assertEq(uint256(exp), uint256(expiry), "expiry takes the later value");
+    }
+
+    /// A capability whose expiry is already past raises nothing, even a cap.
+    function test_redeemMany_expiredCapabilityRaisesNothing() public {
+        bytes32 id = _open();
+        PaymentPoolBase.LaneVoucher[] memory noVouchers = new PaymentPoolBase.LaneVoucher[](0);
+
+        PaymentPoolBase.CapabilityReg[] memory first = new PaymentPoolBase.CapabilityReg[](1);
+        first[0] = _capabilityReg(id, 1, expiry);
+        vm.prank(provider);
+        pool.redeemMany(_batch(id, first, noVouchers));
+
+        uint64 past = uint64(block.timestamp);
+        PaymentPoolBase.CapabilityReg[] memory expired = new PaymentPoolBase.CapabilityReg[](1);
+        expired[0] = _capabilityReg(id, SPENDING_CAP, past);
+        vm.prank(provider);
+        pool.redeemMany(_batch(id, expired, noVouchers));
+
+        (uint64 cap,,) = pool.authorized(id, signer);
+        assertEq(cap, 1, "an expired capability leaves the cap");
+    }
+
+    /// A capability that raises a field is verified, so a bad owner signature
+    /// on a raise reverts against an existing registration too.
+    function test_redeemMany_raiseWithBadOwnerSigReverts() public {
+        bytes32 id = _open();
+        PaymentPoolBase.LaneVoucher[] memory noVouchers = new PaymentPoolBase.LaneVoucher[](0);
+
+        PaymentPoolBase.CapabilityReg[] memory first = new PaymentPoolBase.CapabilityReg[](1);
+        first[0] = _capabilityReg(id, 1, expiry);
+        vm.prank(provider);
+        pool.redeemMany(_batch(id, first, noVouchers));
+
+        PaymentPoolBase.CapabilityReg[] memory raise = new PaymentPoolBase.CapabilityReg[](1);
+        raise[0] = PaymentPoolBase.CapabilityReg({
+            signer: signer,
+            spendingCap: SPENDING_CAP,
+            expiry: expiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer, 1, expiry, OWNER_PK)
+        });
+        vm.prank(provider);
+        vm.expectRevert(PaymentPoolBase.InvalidCapabilitySignature.selector);
+        pool.redeemMany(_batch(id, raise, noVouchers));
+    }
+
+    function _capabilityReg(bytes32 id, uint64 spendingCap, uint64 capExpiry)
+        internal
+        view
+        returns (PaymentPoolBase.CapabilityReg memory)
+    {
+        return PaymentPoolBase.CapabilityReg({
+            signer: signer,
+            spendingCap: spendingCap,
+            expiry: capExpiry,
+            ownerSig: _signCapabilityFor(address(pool), id, signer, spendingCap, capExpiry, OWNER_PK)
+        });
     }
 
     function test_redeemMany_emitsOneEventCarryingEveryPaidLane() public {

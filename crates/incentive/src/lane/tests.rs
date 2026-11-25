@@ -20,60 +20,6 @@ fn hydrate_seeds_registered_until_zero() {
     assert_eq!(st.registered_until, 0, "hydrate seeds unknown");
 }
 
-fn lane_with_terms(cap: u64, expiry: u64) -> LaneState {
-    LaneState::hydrate(
-        B256::ZERO,
-        Address::ZERO,
-        Address::ZERO,
-        U256::from(cap),
-        expiry,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        LaneChain::NONE,
-    )
-}
-
-/// A presented capability wider than the registration holds the registered
-/// terms; one narrower keeps its own (#2265).
-#[test]
-fn clamp_to_registration_holds_the_lower_terms() {
-    let mut wider = lane_with_terms(5_000_000, 2_000);
-    assert!(wider.clamp_to_registration(40, 1_000));
-    assert_eq!(wider.cap, U256::from(40u64));
-    assert_eq!(wider.expiry, 1_000);
-    assert_eq!(wider.registered_until, 1_000);
-
-    let mut narrower = lane_with_terms(10, 500);
-    assert!(narrower.clamp_to_registration(40, 1_000));
-    assert_eq!(narrower.cap, U256::from(10u64));
-    assert_eq!(narrower.expiry, 500);
-    assert_eq!(
-        narrower.registered_until, 1_000,
-        "the registration is recorded"
-    );
-
-    assert!(
-        !narrower.clamp_to_registration(40, 1_000),
-        "the same registration again changes nothing"
-    );
-}
-
-/// A held expiry of `0` takes the registered expiry, the term the chain
-/// redeems under. A registered expiry of `0` is already expired on-chain, so
-/// the lane holds the past moment `1`.
-#[test]
-fn clamp_to_registration_maps_the_zero_expiries() {
-    let mut held_zero = lane_with_terms(100, 0);
-    held_zero.clamp_to_registration(100, 1_000);
-    assert_eq!(held_zero.expiry, 1_000);
-
-    let mut expired = lane_with_terms(100, 0);
-    expired.clamp_to_registration(100, 0);
-    assert_eq!(expired.expiry, 1, "a zero registered expiry holds as past");
-    assert_eq!(expired.registered_until, 0);
-}
-
 const CHAIN_ID: u64 = 421_614;
 const VERIFYING: Address = address!("0000000000000000000000000000000000001234");
 const PROVIDER: Address = address!("00000000000000000000000000000000000000b2");

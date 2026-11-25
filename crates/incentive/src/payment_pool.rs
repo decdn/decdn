@@ -604,10 +604,11 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignerAuthorization {
     /// The signer holds no registration (the all-zero `Authorization`). Its first
-    /// redemption registers whichever owner-signed capability lands first.
+    /// redemption registers the owner-signed capability it carries.
     Unregistered,
-    /// The signer is registered. `cap` and `expiry` are write-once on-chain, so
-    /// they never change for this `(pool, signer)`; `spent` only grows.
+    /// The signer is registered. On-chain registration keeps the larger value of
+    /// each of `cap` and `expiry` over every capability landed for this
+    /// `(pool, signer)`, so both only grow; `spent` only grows.
     Registered {
         /// The registered spending cap, in micro-USDC.
         cap: u64,

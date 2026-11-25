@@ -111,8 +111,8 @@ struct SlotInner {
 /// its key and capability in the lane's [`PoolContext`]. After a
 /// [`Self::swap`], the fetch ends every live lane on the old key at its next
 /// voucher boundary, paid for what it received, and opens new lanes under the
-/// new credential. A registered signer's terms are write-once on chain, so a
-/// new capability names a new signer key.
+/// new credential. Nodes refuse a registered signer on its registered terms,
+/// so a new capability names a new signer key.
 #[derive(Clone, Debug)]
 pub struct CredentialSlot {
     inner: Arc<SlotInner>,

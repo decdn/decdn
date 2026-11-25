@@ -74,13 +74,13 @@ pub struct LaneState {
     /// provider is rejected — a capability voucher is scoped to one node.
     pub provider: Address,
     /// The cumulative spending cap the node holds (token base units): the
-    /// presented capability's cap, clamped to the signer's on-chain registration
-    /// once the node reads one ([`Self::clamp_to_registration`]). Vouchers MUST
-    /// NOT exceed this value.
+    /// presented capability's cap. The node's redemption lands that capability,
+    /// and on-chain registration keeps the larger cap, so the chain redeems up to
+    /// it. Vouchers MUST NOT exceed this value.
     pub cap: U256,
-    /// The capability expiry the node holds (Unix seconds), clamped like
-    /// [`Self::cap`]. The node handler holds the clock and refuses vouchers at or
-    /// past this. An `expiry` of `0` is expired: the payment contract reads it as
+    /// The capability expiry the node holds (Unix seconds): the presented
+    /// capability's expiry, which registration honors like [`Self::cap`]. The
+    /// node handler holds the clock and refuses vouchers at or past this. An `expiry` of `0` is expired: the payment contract reads it as
     /// already past, and intake never registers a lane with it.
     pub expiry: u64,
     /// The observed on-chain capability expiry for this lane's signer
@@ -299,35 +299,6 @@ impl LaneState {
             last_signature,
             chain,
         }
-    }
-
-    /// Hold the lower of this lane's terms and its signer's on-chain registration
-    /// (ADR 003 §Capability delegation). On-chain registration is write-once per
-    /// `(pool, signer)`, so a voucher past the registered `cap` or `expiry`
-    /// redeems to nothing whatever capability the client presented. `cap` and
-    /// `expiry` are the registered `authorized[pool_id][signer]` terms; the lane
-    /// keeps `min(held, registered)` for each and records the registered expiry
-    /// as `registered_until`. Returns whether any field changed.
-    ///
-    /// A held expiry of `0` takes the registered expiry: the chain's write-once
-    /// registration is the term that redeems. The chain reads a registered
-    /// `expiry` of `0` as already expired, so the clamp holds such a
-    /// registration as expiry `1`, a moment that is always past.
-    ///
-    /// A clamped lane holds terms its `owner_sig` does not cover. That is sound:
-    /// the clamp runs only for a registered signer, and on-chain registration
-    /// returns before it checks the signature of a registered signer.
-    pub fn clamp_to_registration(&mut self, cap: u64, expiry: u64) -> bool {
-        let before = (self.cap, self.expiry, self.registered_until);
-        self.cap = self.cap.min(U256::from(cap));
-        let held_expiry = expiry.max(1);
-        self.expiry = if self.expiry == 0 {
-            held_expiry
-        } else {
-            self.expiry.min(held_expiry)
-        };
-        self.registered_until = self.registered_until.max(expiry);
-        before != (self.cap, self.expiry, self.registered_until)
     }
 
     /// This lane's persistence key.

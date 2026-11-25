@@ -13,16 +13,6 @@ const fn tpool(pool_id: B256) -> PoolKey {
     (TEST_DEPLOYMENT, pool_id)
 }
 
-/// The lane store of the handler's test pool.
-fn test_store(handler: &ClientHandler) -> Arc<dyn PoolStateStore> {
-    Arc::clone(
-        &handler
-            .pool_route(TEST_DEPLOYMENT)
-            .expect("the test pool is routed")
-            .store,
-    )
-}
-
 /// The test pool whose id repeats `byte`.
 const fn tpool_byte(byte: u8) -> PoolKey {
     tpool(B256::repeat_byte(byte))
@@ -1550,47 +1540,6 @@ async fn pool_funds_committed_stops_at_the_floor() -> anyhow::Result<()> {
         handler.pool_funds_committed(m.saturating_add(U256::from(1u64))),
         "remaining above M funds delivery"
     );
-    Ok(())
-}
-
-/// A live lane registered from a wider capability narrows to the signer's
-/// on-chain registration, and the store persists the clamped terms (#2265).
-#[tokio::test]
-async fn clamp_lane_to_registration_narrows_the_live_lane_and_persists() -> anyhow::Result<()> {
-    let metrics = Arc::new(Metrics::new());
-    let (handler, _projection, _dir) = handler_with_projection_view(&metrics).await;
-    let lane = LaneState::hydrate(
-        B256::repeat_byte(0x61),
-        Address::new([0xa2; 20]),
-        handler.eth_signer.address(),
-        U256::from(5_000_000u64),
-        2_000_000_000,
-        U256::ZERO,
-        U256::ZERO,
-        None,
-        decdn_incentive::LaneChain::NONE,
-    );
-    let key = lane.key();
-    handler.register_lane(TEST_DEPLOYMENT, lane)?;
-    let live = handler
-        .lanes
-        .get(&tid(key))
-        .map(|e| Arc::clone(e.value()))
-        .ok_or_else(|| anyhow::anyhow!("the lane is live"))?;
-
-    handler
-        .clamp_lane_to_registration(TEST_DEPLOYMENT, &live, 40, 1_900_000_000)
-        .await;
-
-    let held = live.lock().await.state.clone();
-    assert_eq!(held.cap, U256::from(40u64));
-    assert_eq!(held.expiry, 1_900_000_000);
-    assert_eq!(held.registered_until, 1_900_000_000);
-    let stored = test_store(&handler)
-        .get(key)?
-        .ok_or_else(|| anyhow::anyhow!("the lane row exists"))?;
-    assert_eq!((stored.cap, stored.expiry), (held.cap, held.expiry));
-    assert_eq!(stored.registered_until, 1_900_000_000);
     Ok(())
 }
 

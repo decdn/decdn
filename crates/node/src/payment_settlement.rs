@@ -171,8 +171,8 @@ const ADMIT_CHAIN_READ_SLOT_WAIT: Duration = Duration::from_secs(5);
 
 /// One `getAuthorization` read held in the signer-auth cache.
 ///
-/// A registered signer's `cap` and `expiry` are write-once, but its `spent`
-/// grows with every provider's redemption, and an unregistered signer may
+/// A registered signer's `cap`, `expiry` and `spent` grow as providers land
+/// capabilities and redemptions, and an unregistered signer may
 /// register on any provider's next redemption. So a read answers admission for
 /// [`POOL_REFRESH_INTERVAL`] only; the settlement service re-reads every live
 /// signer at that cadence.
@@ -2484,9 +2484,9 @@ fn is_redemption_failure(outcome: &TxOutcome) -> bool {
 ///
 /// The persisted value is the expiry the chain registered, read back with one
 /// batched `getAuthorizations`, not the attached `CapabilityReg`'s expiry.
-/// On-chain registration is write-once: when another provider landed a
-/// different capability for the signer first, the attached one was a no-op and
-/// its expiry is not the signer's. A failed or short read persists nothing for
+/// On-chain registration keeps the larger value of each field, so the chain's
+/// expiry is at least the attached one and can be later when another capability
+/// for the signer landed too. A failed or short read persists nothing for
 /// the unread lanes; the next sweep attaches their `CapabilityReg` again (a
 /// no-op on-chain) and re-reads.
 async fn record_landed_chunk<P: Provider + Clone>(
