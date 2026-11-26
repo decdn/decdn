@@ -784,18 +784,29 @@ async fn ensure_every_read_refuses(paths: &[PathBuf; 3], needle: &str) -> anyhow
 /// blocks the open nor is read: the open returns at once, and the check on
 /// the opened file refuses it. A blocked open would pin a blocking-pool
 /// thread that no timeout frees.
+///
+/// The test owns its runtime and bounds its shutdown. A `#[tokio::test]`
+/// runtime waits for every blocking-pool thread when it drops, so a blocked
+/// open would hang the test instead of reporting the timeout error.
 #[cfg(unix)]
-#[tokio::test]
-async fn a_fifo_swapped_in_after_resolve_is_refused_without_blocking() -> anyhow::Result<()> {
+#[test]
+fn a_fifo_swapped_in_after_resolve_is_refused_without_blocking() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
-    let origin = FilesystemOrigin::new(tmp.path()).await?;
-    let paths = seed_and_resolve(&origin).await?;
-    for (i, path) in paths.iter().enumerate() {
-        let fifo = origin.base().join(format!("fifo-{i}"));
-        make_fifo(&fifo)?;
-        tokio::fs::rename(&fifo, path).await?;
-    }
-    ensure_every_read_refuses(&paths, "not a regular file").await
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let paths = seed_and_resolve(&origin).await?;
+        for (i, path) in paths.iter().enumerate() {
+            let fifo = origin.base().join(format!("fifo-{i}"));
+            make_fifo(&fifo)?;
+            tokio::fs::rename(&fifo, path).await?;
+        }
+        ensure_every_read_refuses(&paths, "not a regular file").await
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
 
 /// A symlink out of the base put in place of a path after the resolve is
