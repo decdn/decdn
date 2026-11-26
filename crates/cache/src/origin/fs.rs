@@ -124,9 +124,11 @@ impl FilesystemOrigin {
     /// fails containment. The stat never opens the file, so it cannot
     /// block.
     ///
-    /// These checks fail fast; they do not bind the later open. A path
-    /// swapped between this stat and the open meets [`open_resolved`]
-    /// instead, which every read opens through.
+    /// These checks fail fast; they do not bind the later open. Every read
+    /// opens through [`open_resolved`], which re-checks the file type on
+    /// the opened file. On unix it also refuses a symlink swapped in after
+    /// this check. On other platforms the open follows such a symlink, and
+    /// nothing checks containment again.
     ///
     /// `Ok(None)` means nothing exists at the path: no leaf, or no shard
     /// directory. Each caller maps that to its own "absent" answer. A
@@ -257,7 +259,9 @@ async fn dangling_link(path: &Path) -> Option<&Path> {
 /// maps that, and a `NotFound` open, to its own absent answer. A symlink
 /// escape, a dangling symlink and a non-regular file are not `io::Error`s
 /// either: `resolve_regular` and [`open_resolved`] emit
-/// `OriginPullError::Permanent` directly.
+/// `OriginPullError::Permanent` directly. The one exception is a unix
+/// system whose `O_NOFOLLOW` open reports a symlink with a code other than
+/// `ELOOP`: that error comes through here and is permanent.
 fn classify_io_error(err: std::io::Error) -> OriginPullError {
     use std::io::ErrorKind;
     match err.kind() {
@@ -439,10 +443,15 @@ impl Origin for FilesystemOrigin {
 /// - `O_NONBLOCK` makes a read-only open of a FIFO return at once instead of
 ///   waiting for a writer. A blocked open would pin a blocking-pool thread
 ///   past every timeout, because dropping the future does not stop the
-///   thread. On a regular file the flag changes nothing.
-/// - `O_NOFOLLOW` fails the open with `ELOOP` when the leaf is a symlink.
-///   The resolved path holds no links, so a link there was swapped in, and
-///   it could point outside the base.
+///   thread. On a regular file on a local filesystem the flag changes
+///   nothing. A FUSE filesystem can honour it and return `EAGAIN`, which
+///   [`classify_io_error`] treats as transient, so the read is retried.
+/// - `O_NOFOLLOW` fails the open when the leaf is a symlink. The resolved
+///   path held no links at the resolve, so a link there was swapped in, and
+///   it could point outside the base. Linux and macOS report `ELOOP`, which
+///   maps to a refusal that names the swap. Other unix systems report
+///   another code, for example `EMLINK` on FreeBSD; the open still fails,
+///   and the error is permanent without that message.
 ///
 /// The fstat of the opened file then refuses anything that is not a regular
 /// file, for example a FIFO or a device that the open let through. The
@@ -459,7 +468,7 @@ async fn open_resolved(
     let file = match opts.open(canonical).await {
         Ok(f) => f,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) if is_swapped_symlink(&err) => return Err(not_regular_file(canonical)),
+        Err(err) if is_swapped_symlink(&err) => return Err(swapped_symlink(canonical)),
         Err(err) => {
             let msg = format!(
                 "cache.origin.path {what} open failed for {}",
@@ -487,10 +496,22 @@ fn is_swapped_symlink(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(libc::ELOOP)
 }
 
-/// Without `O_NOFOLLOW` no open error marks a symlink.
+/// Without `O_NOFOLLOW` the open follows a swapped-in symlink, so no open
+/// error marks one.
 #[cfg(not(unix))]
 const fn is_swapped_symlink(_err: &std::io::Error) -> bool {
     false
+}
+
+/// The permanent fault for an origin entry at `path` whose open met a
+/// symlink: the entry changed to a symlink after the resolve, or a
+/// component of its path loops.
+fn swapped_symlink(path: &Path) -> OriginPullError {
+    OriginPullError::Permanent(anyhow::anyhow!(
+        "cache.origin.path entry {} changed to a symlink after it was resolved, \
+         or a component of its path loops",
+        path.display()
+    ))
 }
 
 /// The permanent fault for an origin entry at `path` that is not a regular
@@ -522,7 +543,10 @@ async fn read_range(
     // derived from the proven blob size) means the origin copy is stale or
     // truncated: a permanent fault.
     if let Err(err) = file.seek(std::io::SeekFrom::Start(req.fetch_start)).await {
-        let msg = format!("cache.origin.path seek failed for {}", canonical.display());
+        let msg = format!(
+            "cache.origin.path data seek failed for {}",
+            canonical.display()
+        );
         return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
     }
     let want = usize::try_from(req.len()).unwrap_or(usize::MAX);
@@ -538,7 +562,7 @@ async fn read_range(
             )));
         }
         let msg = format!(
-            "cache.origin.path range read failed for {}",
+            "cache.origin.path data range read failed for {}",
             canonical.display()
         );
         return Err(classify_io_error(err).map_inner(|e| e.context(msg)));

@@ -826,5 +826,38 @@ async fn a_symlink_swapped_in_after_resolve_is_refused() -> anyhow::Result<()> {
         tokio::fs::remove_file(path).await?;
         tokio::fs::symlink(&secret, path).await?;
     }
-    ensure_every_read_refuses(&paths, "not a regular file").await
+    ensure_every_read_refuses(&paths, "changed to a symlink").await
+}
+
+/// A path removed after the resolve and before the open is an absence, not
+/// a fault: a delete or re-import racing a read reports a miss.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_removed_after_resolve_reads_as_absent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let paths = seed_and_resolve(&origin).await?;
+    for path in &paths {
+        tokio::fs::remove_file(path).await?;
+    }
+    let [data, outboard, proof] = &paths;
+    anyhow::ensure!(
+        matches!(
+            read_range(data, first_bytes(1024)).await?,
+            OriginRangeFetch::NotFound
+        ),
+        "read_range: expected NotFound"
+    );
+    anyhow::ensure!(
+        matches!(
+            read_outboard(outboard, 1 << 20).await?,
+            OutboardFetch::NotFound
+        ),
+        "read_outboard: expected NotFound"
+    );
+    anyhow::ensure!(
+        read_size_proof(proof).await?.is_none(),
+        "read_size_proof: expected None"
+    );
+    Ok(())
 }
