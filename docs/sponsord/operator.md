@@ -93,8 +93,10 @@ own address.
 
 The rate limits count an IPv4 address or an IPv6 /64 as one client. The
 onramp counts up to 100,000 clients each minute one by one. Past that, the
-rest share one budget, so a flood of addresses can neither grow its memory
-nor get around the limits. The installers wait out a 429 and retry.
+rest share 1,024 budgets, each client assigned to one by a hash keyed per
+process. A flood of addresses can neither grow its memory nor get around the
+limits, and it spends only the budgets it lands in, not every untracked
+client's. The installers wait out a 429 and retry.
 
 ### Your own gate page
 
