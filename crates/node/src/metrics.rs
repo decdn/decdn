@@ -1518,8 +1518,8 @@ pub struct DecdnMetrics {
     /// own or one already in flight for the pair.
     pub serve_signer_auth_first_read: Counter,
     /// `decdn_serve_signer_auth_reread_total`: admit-path signer confirms that
-    /// re-read an `Unregistered` signer, because the read aged out or the
-    /// projection has since folded a redemption by it. Each waits on a
+    /// re-read a `(pool, signer)` whose held read is older than
+    /// `POOL_REFRESH_INTERVAL`. Each waits on a
     /// `getAuthorization`, its own or one already in flight for the pair.
     pub serve_signer_auth_reread: Counter,
     /// `decdn_serve_response_hit_seconds`: the response phase of a paid hit,

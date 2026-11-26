@@ -173,13 +173,16 @@ struct PoolEntry {
     read_at: Instant,
 }
 
-/// The node's held `getPool` reads, one per pool.
+/// The node's held `getPool` reads, one per pool this node admits or redeems.
 ///
-/// The map is published through an [`ArcSwap`] so a read (`status` at admission,
-/// `cached_status` at a voucher boundary on the re-check cadence) is a single
-/// atomic load — no lock — and never contends with a concurrent reader on the
-/// serve hot path. Writes are rare (one per `getPool` read) next to the reads
-/// every admission and live stream make; each clones-then-publishes the map.
+/// The map holds only this node's own pools: an admission or a settlement
+/// read adds one, and [`Self::prune_idle`] drops a read with no live lane once
+/// it is older than [`POOL_REFRESH_INTERVAL`]. It is published through an
+/// [`ArcSwap`] so a read (`status` at admission, `cached_status` at a voucher
+/// boundary on the re-check cadence) is a single atomic load — no lock — and
+/// never contends with a concurrent reader on the serve hot path. Each write
+/// (one per `getPool` read) clones-then-publishes the map, which costs the
+/// size of this node's own pool set.
 ///
 /// Cheaply cloneable (an `Arc` around the cell). The admit view, the settlement
 /// refresh and the redeemer share one.
