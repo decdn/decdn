@@ -795,6 +795,23 @@ async fn lane_owner_sig(handler: &ClientHandler, key: &LaneKey) -> Option<[u8; 6
     lane.lock().await.state.owner_sig
 }
 
+/// Capability intake outside the funding gates: verify `capability` against
+/// `pool_owner`, then register the lane it authorizes.
+fn intake(
+    handler: &ClientHandler,
+    deployment: Deployment,
+    pool_id: B256,
+    signer: Address,
+    pool_owner: Address,
+    capability: &decdn_protocol::client::WireCapability,
+) {
+    if let Some(lane) =
+        handler.verify_capability(deployment, pool_id, signer, pool_owner, capability)
+    {
+        handler.register_grant(deployment, lane);
+    }
+}
+
 /// A [`crate::pool_view::PoolView`] returning a fixed owner (and unbounded
 /// remaining, so the floor-`M` gate never interferes) for every pool, for the
 /// tests that need a wired view holding a live status.
@@ -1011,7 +1028,14 @@ async fn intake_rejects_wrong_owner_capability() {
 
     // A capability signed by a NON-owner is dropped: no lane, no material.
     let bad = make_wire(&PrivateKeySigner::random());
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &bad);
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &bad,
+    );
     assert!(
         !handler.lanes.contains_key(&tid(lane_key)),
         "a forged-owner capability must not register a lane"
@@ -1026,7 +1050,14 @@ async fn intake_rejects_wrong_owner_capability() {
     let good = make_wire(&owner);
     let expected_sig =
         <[u8; 65]>::try_from(good.owner_signature.as_slice()).expect("65-byte owner sig");
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &good);
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &good,
+    );
     assert!(
         handler.lanes.contains_key(&tid(lane_key)),
         "a correct-owner capability registers its lane so vouchers can be served"
@@ -1035,6 +1066,117 @@ async fn intake_rejects_wrong_owner_capability() {
         lane_owner_sig(&handler, &lane_key).await,
         Some(expected_sig),
         "the verified owner signature is captured on the lane record for the redeemer"
+    );
+}
+
+/// The funding gates of a capability-carrying request from `signer` on
+/// `pool_id`, against `handler`'s fixed-owner pool view.
+async fn funding_gates_with_capability(
+    handler: &ClientHandler,
+    pool_id: B256,
+    signer: Address,
+    capability: decdn_protocol::client::WireCapability,
+) -> Result<super::admission::Funding, ServeRejectReason> {
+    let req = decdn_protocol::client::StreamRequest {
+        hash: [0x42; 32],
+        namespace_id: decdn_protocol::client::NO_NAMESPACE,
+        payment_pool: decdn_protocol::PoolAccount::eip155(421_614, [0x34; 20]),
+        pool_id: pool_id.into(),
+        byte_offset: 0,
+        byte_len: 0,
+        timestamp_us: 0,
+    };
+    let ext = decdn_protocol::client::StreamRequestExt {
+        capability: Some(capability),
+        ..Default::default()
+    };
+    let lane_key = LaneKey {
+        pool_id,
+        signer,
+        provider: handler.eth_signer.address(),
+    };
+    handler
+        .funding_gates(
+            &req,
+            &ext,
+            TEST_DEPLOYMENT,
+            Some(signer),
+            Some(tid(lane_key)),
+            1,
+        )
+        .await
+}
+
+/// A capability inside the expiry margin is refused `CapabilityExpired` before
+/// it registers a lane, so a refused request leaves no lane in the pool store.
+/// The same grant with an expiry past the margin registers its lane.
+#[tokio::test]
+async fn an_expiring_capability_is_refused_before_its_lane_registers() {
+    let metrics = Arc::new(Metrics::new());
+    let owner = PrivateKeySigner::random();
+    let (handler, _dir) = handler_with_capability_intake(&metrics, owner.address()).await;
+    let domain = TEST_DEPLOYMENT.voucher_domain();
+    let pool_id = B256::repeat_byte(0x78);
+    let signer = Address::repeat_byte(0x12);
+    let spending_cap = 1_000_000u64;
+    let now = handler.coarse_clock.unix_seconds();
+    let margin = handler.capability_expiry_margin_secs;
+    let wire = |expiry: u64| -> decdn_protocol::client::WireCapability {
+        let signed_cap = Capability {
+            signer,
+            spending_cap,
+            pool_id,
+            expiry,
+        }
+        .sign(&owner, &domain)
+        .expect("sign capability");
+        decdn_protocol::client::WireCapability {
+            spending_cap,
+            expiry,
+            owner_signature: signed_cap.signature.as_bytes().to_vec(),
+        }
+    };
+    let lane_key = LaneKey {
+        pool_id,
+        signer,
+        provider: handler.eth_signer.address(),
+    };
+    let store = handler
+        .pool_route(TEST_DEPLOYMENT)
+        .map(|route| Arc::clone(&route.store))
+        .expect("route");
+    let stored = || {
+        store
+            .load_all()
+            .expect("load lanes")
+            .iter()
+            .any(|lane| lane.pool_id == pool_id && lane.signer == signer)
+    };
+
+    let refused = funding_gates_with_capability(&handler, pool_id, signer, wire(now + margin / 2))
+        .await
+        .err();
+    assert_eq!(refused, Some(ServeRejectReason::CapabilityExpired));
+    assert!(
+        !handler.lanes.contains_key(&tid(lane_key)),
+        "a refused grant must not register a live lane"
+    );
+    assert!(
+        !stored(),
+        "a refused grant must not record a lane in the pool store"
+    );
+
+    let funding =
+        funding_gates_with_capability(&handler, pool_id, signer, wire(now + margin + 3_600))
+            .await
+            .expect("a grant past the margin is admitted");
+    assert!(
+        funding.known_lane.is_some(),
+        "the admitted grant's lane is read"
+    );
+    assert!(
+        stored(),
+        "an admitted grant records its lane in the pool store"
     );
 }
 
@@ -1097,7 +1239,14 @@ async fn assert_intake_drop(
             expiry: 1_900_000_000,
         },
     );
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &wire,
+    );
 
     let lane_key = LaneKey {
         pool_id,
@@ -1212,7 +1361,14 @@ async fn intake_counts_a_lane_store_failure() {
             expiry: 1_900_000_000,
         },
     );
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &wire,
+    );
 
     let lane_key = LaneKey {
         pool_id,
@@ -1281,7 +1437,14 @@ async fn intake_stores_a_raw_parity_owner_signature_canonicalized() {
         .expect("a non-empty signature");
     *v = canonical_v - 27; // the raw-parity (0/1) wire form an off-spec client sends
 
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &wire,
+    );
 
     let lane_key = LaneKey {
         pool_id,
@@ -1400,8 +1563,22 @@ async fn high_s_capability_is_dropped_and_cached_as_invalid() {
         expiry: signed.capability.expiry,
         owner_signature: bytes.to_vec(),
     };
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &wire,
+    );
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &wire,
+    );
 
     assert!(
         !handler.lanes.contains_key(&tid(lane_key)),
@@ -1459,8 +1636,22 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
         owner_signature: genuine_sig.to_vec(),
     };
 
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
-    handler.intake_capability(TEST_DEPLOYMENT, pool_id, signer, owner.address(), &wire);
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &wire,
+    );
+    intake(
+        &handler,
+        TEST_DEPLOYMENT,
+        pool_id,
+        signer,
+        owner.address(),
+        &wire,
+    );
     let cache_len = handler
         .capability_verify_cache
         .lock()
@@ -1496,7 +1687,8 @@ async fn repeat_capability_send_hits_verify_cache_and_keeps_the_genuine_material
         expiry: forged.capability.expiry,
         owner_signature: forged.signature.as_bytes().to_vec(),
     };
-    handler.intake_capability(
+    intake(
+        &handler,
         TEST_DEPLOYMENT,
         pool_id,
         signer,

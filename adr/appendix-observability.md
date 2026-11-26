@@ -390,7 +390,7 @@ An event inside a span also has `span` and `spans`. `span` is the current span. 
 - `hash` — a content hash, as lowercase hex.
 - `tx` — a transaction hash.
 
-**Peer-triggered warnings.** A remote peer can fire some `WARN` lines at any rate: a bad client binding, a request with no binding, a request on an unknown lane. Each of these lines passes a per-cause throttle. The throttle admits one line per window and counts the lines it drops. The admitted line carries `peer` and `suppressed`.
+**Peer-triggered warnings.** A remote peer can fire some `WARN` lines at any rate: a bad client binding, a request with no binding, a request on an unknown lane, a capability that the pool owner did not sign, and a failed admit-path chain read (`getPool`, `getAuthorization`). Each of these lines passes a per-cause throttle. The throttle admits one line per window and counts the lines it drops. The admitted line carries `suppressed`, and `peer` when the line names the peer.
 
 ### Trace Spans
 

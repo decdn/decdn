@@ -1046,7 +1046,7 @@ enum CapabilityVerifyOutcome {
 /// Bounded LRU cache of capability owner-recovery outcomes, keyed by the full
 /// signed material `(EIP-712 signing hash, signature bytes)`.
 ///
-/// Ownership verification in [`ClientHandler::intake_capability`] runs
+/// Ownership verification in [`ClientHandler::verify_capability`] runs
 /// `ecrecover` on every capability-carrying request; `ecrecover` is a pure
 /// function of `(digest, signature)`, so the same signed material always
 /// recovers the same owner and the result can be cached deterministically.
@@ -1058,7 +1058,7 @@ enum CapabilityVerifyOutcome {
 /// Holds no I/O, and a hit is one hash lookup under one short lock, so the
 /// cache never lengthens the open path it exists to shorten. It carries no TTL — unlike the TTL-anchored `dht::negative_cache`, an entry
 /// lives until the capacity evicts it. That is safe because the value is the
-/// recovered ADDRESS, not a verdict: [`ClientHandler::intake_capability`]
+/// recovered ADDRESS, not a verdict: [`ClientHandler::verify_capability`]
 /// re-compares it against the live pool owner on every call, so an on-chain
 /// owner transfer takes effect immediately.
 #[derive(Debug)]
@@ -1193,7 +1193,7 @@ pub struct ClientHandler {
     /// Bounded cache of capability owner-recovery outcomes keyed by the full
     /// signed material (#1789 item 2), so a client that re-sends the same
     /// capability on every request skips the per-request `ecrecover` in
-    /// [`ClientHandler::intake_capability`].
+    /// [`ClientHandler::verify_capability`].
     capability_verify_cache: std::sync::Mutex<CapabilityVerifyCache>,
     /// Node-to-node cache-miss pull-through deadline (#831), set at construction
     /// via [`ClientHandlerDeps`]. `None` (the default — feature off, and in
@@ -1257,6 +1257,11 @@ pub struct ClientHandler {
     /// Throttle for the `warn!` on a stream request that names no known lane. A
     /// remote peer triggers it at will.
     unknown_lane_warn: WarnThrottle,
+    /// Throttle for the `warn!` on a capability whose owner signature recovers
+    /// an address other than the pool owner. A remote peer triggers it at will.
+    /// Each event also counts on the `wrong_owner` reason of
+    /// `decdn_capability_intake_dropped_total`.
+    wrong_owner_warn: WarnThrottle,
     /// Throttle for the serve-miss refusal line on a request with no lane here
     /// ([`MissPath::NoLane`]). A remote peer triggers it at will.
     no_lane_miss_log: WarnThrottle,
@@ -1385,6 +1390,7 @@ impl ClientHandler {
             timestamp_skew_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unbound_request_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             unknown_lane_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
+            wrong_owner_warn: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             no_lane_miss_log: WarnThrottle::new(Self::PEER_FAULT_WARN_INTERVAL),
             pool_recheck_stale_warn: WarnThrottle::new(Self::POOL_RECHECK_STALE_WARN_INTERVAL),
             idle_timeout: deps.idle_timeout,
@@ -1677,14 +1683,16 @@ impl ClientHandler {
         outcome
     }
 
-    /// Accept an owner-signed capability presented at session start (ADR 003
-    /// §Capability delegation): verify the owner signature against the on-chain
-    /// pool owner, register the lane so the voucher path serves it, and persist
-    /// the grant so the redeemer can register the signer on its first on-chain
-    /// redemption. `signer` is the request's bound Ethereum address; `pool` is
-    /// the routed pool deployment with [`StreamRequest::pool_id`]; `pool_owner`
-    /// is `getPool.owner` from the cached pool-view. The capability verifies
-    /// against that deployment's EIP-712 domain.
+    /// Verify an owner-signed capability presented at session start (ADR 003
+    /// §Capability delegation) against the on-chain pool owner, and return the
+    /// lane it authorizes, or `None` when the grant drops. The caller registers
+    /// the lane ([`Self::register_grant`]) once the request passes its funding
+    /// gates, so the voucher path serves it and the redeemer can register the
+    /// signer on its first on-chain redemption. `signer` is the request's bound
+    /// Ethereum address; `deployment` is the routed pool deployment with
+    /// [`StreamRequest::pool_id`]; `pool_owner` is `getPool.owner` from the
+    /// cached pool-view. The capability verifies against that deployment's
+    /// EIP-712 domain.
     ///
     /// The owner check is authoritative here, not deferred: the on-chain
     /// `PaymentPool.redeemMany` verifies every capability's owner signature
@@ -1703,27 +1711,20 @@ impl ClientHandler {
     /// pool owners.
     ///
     /// Each drop logs and counts on one `reason` of
-    /// `decdn_capability_intake_dropped_total`, and so does a verified grant
-    /// whose lane the store refuses to record (`store_failed`): to the client,
-    /// either is an unknown-lane refusal, the same as an ordinary miss.
-    ///
-    /// Best-effort and off the durability path otherwise: a persist failure never
-    /// fails the stream. Lane registration is idempotent — a re-observed grant for
-    /// an already-tracked lane does NOT reset the accepted-voucher watermark
-    /// (#527); the lane's `cap`/`expiry` are set once at first registration.
-    #[allow(clippy::cognitive_complexity)] // linear verify → register → persist sequence.
-    fn intake_capability(
+    /// `decdn_capability_intake_dropped_total`: to the client, a drop is an
+    /// unknown-lane refusal, the same as an ordinary miss. A peer can present a
+    /// wrong-owner grant at any rate, so that `warn!` line is throttled.
+    #[allow(clippy::cognitive_complexity)] // linear decode → recover → compare sequence.
+    fn verify_capability(
         &self,
         deployment: Deployment,
         pool_id: B256,
         signer: Address,
         pool_owner: Address,
         capability: &decdn_protocol::client::WireCapability,
-    ) {
+    ) -> Option<LaneState> {
         use crate::metrics::CapabilityIntakeDropReason;
-        let Some(route) = self.pool_route(deployment) else {
-            return;
-        };
+        let route = self.pool_route(deployment)?;
         let spending_cap = capability.spending_cap;
         let expiry = capability.expiry;
         // The on-chain `PaymentPool` reads an expiry of `0` as already expired
@@ -1735,7 +1736,7 @@ impl ClientHandler {
             tracing::debug!(%pool_id, %signer, "dropping capability: expiry 0 is never redeemable");
             self.metrics
                 .capability_intake_dropped(CapabilityIntakeDropReason::ExpiryZero);
-            return;
+            return None;
         }
         // Only the common EOA (65-byte) owner signature is recoverable off-chain;
         // a contract-wallet signature is dropped rather than persisted unverified.
@@ -1743,13 +1744,13 @@ impl ClientHandler {
             tracing::debug!(%pool_id, %signer, "dropping capability: owner signature is not a recoverable EOA signature");
             self.metrics
                 .capability_intake_dropped(CapabilityIntakeDropReason::NotEoaSignature);
-            return;
+            return None;
         };
         let Ok(signature) = alloy::primitives::Signature::from_raw(&sig_bytes) else {
             tracing::debug!(%pool_id, %signer, "dropping capability: malformed owner signature");
             self.metrics
                 .capability_intake_dropped(CapabilityIntakeDropReason::MalformedSignature);
-            return;
+            return None;
         };
         let grant = SignedCapability {
             capability: Capability {
@@ -1770,18 +1771,22 @@ impl ClientHandler {
         match self.recover_capability_owner(&grant, route.voucher_domain()) {
             CapabilityVerifyOutcome::Owner(owner) if owner == pool_owner => {}
             CapabilityVerifyOutcome::Owner(recovered) => {
-                tracing::warn!(
-                    %pool_id,
-                    %signer,
-                    error = %decdn_incentive::capability::CapabilityError::WrongOwner {
-                        expected: pool_owner,
-                        recovered,
-                    },
-                    "dropping capability: owner verification failed"
-                );
+                if let Some(suppressed) = self.wrong_owner_warn.admit() {
+                    tracing::warn!(
+                        %pool_id,
+                        %signer,
+                        error = %decdn_incentive::capability::CapabilityError::WrongOwner {
+                            expected: pool_owner,
+                            recovered,
+                        },
+                        suppressed,
+                        interval = ?self.wrong_owner_warn.interval(),
+                        "dropping capability: owner verification failed"
+                    );
+                }
                 self.metrics
                     .capability_intake_dropped(CapabilityIntakeDropReason::WrongOwner);
-                return;
+                return None;
             }
             CapabilityVerifyOutcome::Invalid => {
                 tracing::debug!(
@@ -1792,14 +1797,12 @@ impl ClientHandler {
                 );
                 self.metrics
                     .capability_intake_dropped(CapabilityIntakeDropReason::InvalidSignature);
-                return;
+                return None;
             }
         }
 
-        // The grant is authentic. Register the lane so the voucher path accepts
-        // vouchers for `(pool_id, signer, this operator)` — without this a
-        // brand-new lane's first request is never served, since the serve gate
-        // admits only known lanes. Idempotent for an already-tracked lane.
+        // The grant is authentic. Its lane lets the voucher path accept
+        // vouchers for `(pool_id, signer, this operator)` once registered.
         //
         // The verified owner signature rides the lane record itself, alongside
         // the `cap`/`expiry` it authorizes: it is the `ownerSig` the redeemer
@@ -1813,9 +1816,7 @@ impl ClientHandler {
         // owner, so the grant is normalized, not refused.
         // Kept ON the lane — not in a side table — so it is written in the same
         // durable transaction as the voucher frontier and can never be lost while
-        // the frontier survives (#1906). A buffered in-memory insert like every
-        // lane `record`; the row lands on disk in the periodic lane flush's
-        // fsynced commit, not a per-request fsync on the intake path.
+        // the frontier survives (#1906).
         let mut lane = LaneState::hydrate(
             pool_id,
             signer,
@@ -1830,10 +1831,27 @@ impl ClientHandler {
             decdn_incentive::LaneChain::NONE,
         );
         lane.owner_sig = Some(signature.as_bytes());
-        if let Err(e) = self.register_lane(route.deployment, lane) {
+        Some(lane)
+    }
+
+    /// Register the lane of a grant [`Self::verify_capability`] accepted, so the
+    /// voucher path accepts vouchers for it. Without this a brand-new lane's
+    /// first request is never served, since the serve gate admits only known
+    /// lanes. A buffered in-memory insert like every lane `record`; the row
+    /// lands on disk in the periodic lane flush's fsynced commit, not a
+    /// per-request fsync on the intake path.
+    ///
+    /// Best-effort: a store that refuses the lane logs and counts on the
+    /// `store_failed` reason of `decdn_capability_intake_dropped_total`, and the
+    /// request refuses as an unknown lane. Registration is idempotent: a
+    /// re-observed grant for an already-tracked lane does NOT reset the
+    /// accepted-voucher watermark (#527).
+    fn register_grant(&self, deployment: Deployment, lane: LaneState) {
+        let (pool_id, signer) = (lane.pool_id, lane.signer);
+        if let Err(e) = self.register_lane(deployment, lane) {
             tracing::warn!(%pool_id, %signer, error = %e, "lane registration failed; the request refuses as an unknown lane and the client retries");
             self.metrics
-                .capability_intake_dropped(CapabilityIntakeDropReason::StoreFailed);
+                .capability_intake_dropped(crate::metrics::CapabilityIntakeDropReason::StoreFailed);
         }
     }
 
@@ -1853,9 +1871,10 @@ impl ClientHandler {
     /// Register a lane so the voucher path accepts vouchers for it — its
     /// capability handle is registered on-chain and its [`LaneState`] recorded
     /// in the lane store, then inserted into the live map. Called from the
-    /// seller-side capability intake (`intake_capability`) for every
-    /// request that carries a verified capability, so an already-tracked lane is
-    /// registered again whenever its client re-sends the capability.
+    /// seller-side capability intake (`register_grant`) for every
+    /// request whose verified capability passes the funding gates, so an
+    /// already-tracked lane is registered again whenever its client re-sends
+    /// the capability.
     ///
     /// **Idempotent:** a re-observed registration for an already-tracked lane is
     /// a no-op — it MUST NOT reset the accepted-voucher watermark and reopen the
