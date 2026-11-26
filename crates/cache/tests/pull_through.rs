@@ -1226,11 +1226,15 @@ async fn origin_range_request_len_and_empty() {
     assert_eq!(z.len(), 0);
 }
 
-/// An origin that serves only a fixed `{H}.obao4` via `fetch_outboard`.
+/// An origin that serves a fixed `{H}.obao4` via `fetch_outboard` and the
+/// blob's bytes via `fetch_range_data`.
 #[derive(Debug)]
-struct OutboardOnlyOrigin(bytes::Bytes);
+struct RangeServingOrigin {
+    outboard: bytes::Bytes,
+    data: bytes::Bytes,
+}
 
-impl Origin for OutboardOnlyOrigin {
+impl Origin for RangeServingOrigin {
     fn kind(&self) -> OriginKind {
         OriginKind::Http
     }
@@ -1242,60 +1246,77 @@ impl Origin for OutboardOnlyOrigin {
     ) -> Pin<
         Box<dyn Future<Output = Result<decdn_cache::OutboardFetch, OriginPullError>> + Send + '_>,
     > {
-        let ob = self.0.clone();
+        let ob = self.outboard.clone();
         Box::pin(async move { Ok(decdn_cache::OutboardFetch::Found(ob)) })
+    }
+
+    fn fetch_range_data(
+        &self,
+        _hash: Hash,
+        req: OriginRangeRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<decdn_cache::OriginRangeFetch, OriginPullError>> + Send + '_,
+        >,
+    > {
+        let span = usize::try_from(req.fetch_start)
+            .ok()
+            .zip(usize::try_from(req.fetch_end).ok())
+            .and_then(|(s, e)| self.data.get(s..e))
+            .map(bytes::Bytes::copy_from_slice);
+        Box::pin(async move {
+            Ok(
+                span.map_or(decdn_cache::OriginRangeFetch::NotFound, |data| {
+                    decdn_cache::OriginRangeFetch::Ranged { data }
+                }),
+            )
+        })
     }
 }
 
 #[tokio::test]
-async fn outboard_read_rejects_a_wrong_length_outboard_and_advances_the_chain() -> anyhow::Result<()>
-{
+async fn range_draw_rejects_a_wrong_length_outboard_and_advances_the_chain() -> anyhow::Result<()> {
     // A truncated `{H}.obao4` (an HTML error body under the cap, a half-written
     // upload) can never verify against `H`, and a broken origin 1 must not
-    // shadow a healthy origin 2. The outboard read treats a wrong length as a
-    // decline that advances the origin chain.
+    // shadow a healthy origin 2. The draw treats a wrong length as a decline
+    // that advances the origin chain.
     use bao_tree::io::outboard::PreOrderMemOutboard;
+    use decdn_cache::range_pull::align_range;
     let payload: Vec<u8> = (0..200 * 1024u32)
         .map(|i| u8::try_from(i % 251).unwrap_or(0))
         .collect();
     let ob = PreOrderMemOutboard::create(&payload, decdn_cache::range_pull::IROH_BLOCK_SIZE);
     let hash = Hash::from_bytes(*ob.root.as_bytes());
     let total = u64::try_from(payload.len())?;
+    let aligned = align_range(0, 0, total)?;
+    let data = bytes::Bytes::from(payload);
     let correct = bytes::Bytes::from(ob.data);
     anyhow::ensure!(correct.len() > 8, "test premise: non-trivial outboard");
     let short = correct.slice(..correct.len() - 7);
+    let origin = |outboard: &bytes::Bytes| {
+        Arc::new(RangeServingOrigin {
+            outboard: outboard.clone(),
+            data: data.clone(),
+        }) as Arc<dyn Origin>
+    };
 
-    // Chain: broken origin first, healthy origin second → the healthy one wins.
+    // Chain: broken origin first, healthy origin second → the healthy one serves.
     let tmp = tempfile::tempdir()?;
-    let engine = CacheEngine::open(
-        tmp.path(),
-        vec![
-            Arc::new(OutboardOnlyOrigin(short.clone())) as Arc<dyn Origin>,
-            Arc::new(OutboardOnlyOrigin(correct.clone())) as Arc<dyn Origin>,
-        ],
-        16,
-    )
-    .await?;
-    let got = engine
-        .origin_fetch_outboard_bytes(hash, total)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("the healthy origin's outboard must win"))?;
-    anyhow::ensure!(got == correct, "the correct-length outboard wins the chain");
+    let engine = CacheEngine::open(tmp.path(), vec![origin(&short), origin(&correct)], 16).await?;
+    let mut wire = engine.origin_range_wire(hash, &aligned).await?;
+    let mut drawn = 0usize;
+    while let Some(chunk) = wire.next_chunk().await {
+        drawn += chunk?.len();
+    }
+    anyhow::ensure!(drawn > 0, "the healthy origin's draw streams the wire");
 
-    // Only the broken origin configured → a clean decline, never a poisoned Some.
+    // Only the broken origin configured → a hard verify fault, never a wire.
     let tmp2 = tempfile::tempdir()?;
-    let engine2 = CacheEngine::open(
-        tmp2.path(),
-        vec![Arc::new(OutboardOnlyOrigin(short)) as Arc<dyn Origin>],
-        16,
-    )
-    .await?;
+    let engine2 = CacheEngine::open(tmp2.path(), vec![origin(&short)], 16).await?;
+    let err = err_of(engine2.origin_range_wire(hash, &aligned).await)?;
     anyhow::ensure!(
-        engine2
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .is_none(),
-        "a wrong-length outboard must decline, not serve"
+        matches!(err, CacheError::VerifyFailed { expected } if expected == hash),
+        "a wrong-length outboard must fail the draw, got {err:?}"
     );
     Ok(())
 }

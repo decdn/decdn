@@ -2717,7 +2717,7 @@ fn local_outboard_pull_test_blob() -> Vec<u8> {
     (0..size).map(|i| (i % 251) as u8).collect()
 }
 
-// -- origin_range_wire / origin_fetch_outboard_bytes --
+// -- origin_range_wire --
 
 /// A test origin that serves chunk-group-aligned ranges plus a configurable
 /// `{H}.obao4` outboard, so the raw origin fetch+encode surface can be
@@ -3494,38 +3494,6 @@ async fn origin_range_wire_hard_faults_on_wrong_length_outboard() -> anyhow::Res
         engine.cached_outboard(hash, total).is_none(),
         "a wrong-length outboard must not be cached"
     );
-    anyhow::ensure!(
-        engine
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .is_none(),
-        "an outboard read declines a wrong-length outboard"
-    );
-    Ok(())
-}
-
-/// An origin size claim past the engine's blob cap reads no outboard: the
-/// claim would otherwise size the outboard read itself.
-#[tokio::test]
-async fn an_origin_size_past_the_blob_cap_reads_no_outboard() -> anyhow::Result<()> {
-    let (_data, hash, origin, _aligned) = multi_window_stub();
-    let origin = Arc::new(origin);
-    let tmp = tempfile::tempdir()?;
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 1).await?;
-    let claim = (1u64 << 20) + 1;
-    anyhow::ensure!(
-        engine
-            .origin_fetch_outboard_bytes(hash, claim)
-            .await?
-            .is_none(),
-        "a size claim past the cap must read no outboard"
-    );
-    anyhow::ensure!(
-        origin.outboard_fetches.load(Ordering::SeqCst) == 0,
-        "the origin must not be asked for the outboard, asked {}",
-        origin.outboard_fetches.load(Ordering::SeqCst)
-    );
     Ok(())
 }
 
@@ -3533,18 +3501,11 @@ async fn an_origin_size_past_the_blob_cap_reads_no_outboard() -> anyhow::Result<
 /// serves `{H}.obao4` once, however many draws follow.
 #[tokio::test]
 async fn origin_range_wire_reads_the_outboard_once_per_hash() -> anyhow::Result<()> {
-    let (data, hash, origin, aligned) = multi_window_stub();
+    let (_, hash, origin, aligned) = multi_window_stub();
     let origin = Arc::new(origin);
     let tmp = tempfile::tempdir()?;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 64).await?;
-    let total = u64::try_from(data.len())?;
-    anyhow::ensure!(
-        engine
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .is_some()
-    );
     for _ in 0..3 {
         let wire = engine.origin_range_wire(hash, &aligned).await?;
         let (_, fault) = drain_wire(wire).await;
@@ -3552,51 +3513,58 @@ async fn origin_range_wire_reads_the_outboard_once_per_hash() -> anyhow::Result<
     }
     anyhow::ensure!(
         origin.outboard_fetches.load(Ordering::SeqCst) == 1,
-        "the probe and three draws must read the outboard once, read {}",
+        "three draws must read the outboard once, read {}",
         origin.outboard_fetches.load(Ordering::SeqCst)
     );
     Ok(())
 }
 
-/// Concurrent cold misses of one hash read the outboard from the origin
-/// once: the later probes wait for the first read and take its cached copy.
+/// Concurrent cold draws of one hash read the outboard from the origin
+/// once: the later draws wait for the first read and take its cached copy.
 #[tokio::test]
-async fn concurrent_cold_probes_read_the_outboard_once() -> anyhow::Result<()> {
-    let (data, hash, mut origin, _) = multi_window_stub();
+async fn concurrent_cold_draws_read_the_outboard_once() -> anyhow::Result<()> {
+    let (_, hash, mut origin, aligned) = multi_window_stub();
     origin.gate_outboard = true;
     let origin = Arc::new(origin);
     let gate = Arc::clone(&origin.gate);
     let tmp = tempfile::tempdir()?;
     let engine =
         CacheEngine::open(tmp.path(), vec![Arc::clone(&origin) as Arc<dyn Origin>], 64).await?;
-    let total = u64::try_from(data.len())?;
-    let probes: Vec<_> = (0..8)
+    // One draw per range-pull permit, so every draw reaches the outboard read
+    // at once.
+    let draws: Vec<_> = (0..crate::MAX_CONCURRENT_RANGE_PULLS)
         .map(|_| {
             let engine = engine.clone();
-            tokio::spawn(async move { engine.origin_fetch_outboard_bytes(hash, total).await })
+            let aligned = aligned.clone();
+            tokio::spawn(async move {
+                let wire = engine.origin_range_wire(hash, &aligned).await?;
+                let (_, fault) = drain_wire(wire).await;
+                fault.map_or(Ok(()), Err)
+            })
         })
         .collect();
-    // Let every probe reach the origin read or the flight lock, then open
-    // the gate for the one read in flight.
+    // Let every draw reach the origin read or the flight lock, then open the
+    // gate for the one read in flight.
     tokio::time::sleep(Duration::from_millis(50)).await;
     gate.add_permits(64);
-    for probe in probes {
-        anyhow::ensure!(probe.await??.is_some(), "every probe gets the outboard");
+    for draw in draws {
+        draw.await??;
     }
     anyhow::ensure!(
         origin.outboard_fetches.load(Ordering::SeqCst) == 1,
-        "eight concurrent probes must read the outboard once, read {}",
+        "{} concurrent draws must read the outboard once, read {}",
+        crate::MAX_CONCURRENT_RANGE_PULLS,
         origin.outboard_fetches.load(Ordering::SeqCst)
     );
     Ok(())
 }
 
 /// `pull_through_bytes` counts the outboard once, at the origin read, plus
-/// each data window; the probe and later draws that reuse the cached copy do
-/// not count it again.
+/// each data window; later draws that reuse the cached copy do not count it
+/// again.
 #[tokio::test]
 async fn pull_through_bytes_counts_the_outboard_once() -> anyhow::Result<()> {
-    let (data, hash, origin, aligned) = multi_window_stub();
+    let (_, hash, origin, aligned) = multi_window_stub();
     let outboard_len = u64::try_from(origin.outboard.as_ref().map_or(0, Bytes::len))?;
     let tmp = tempfile::tempdir()?;
     let cm = Arc::new(CacheMetrics::default());
@@ -3611,13 +3579,6 @@ async fn pull_through_bytes_counts_the_outboard_once() -> anyhow::Result<()> {
         Duration::ZERO,
     )
     .await?;
-    let total = u64::try_from(data.len())?;
-    anyhow::ensure!(
-        engine
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .is_some()
-    );
     let draws = 2u64;
     for _ in 0..draws {
         let wire = engine.origin_range_wire(hash, &aligned).await?;
@@ -3664,23 +3625,21 @@ async fn a_verify_fault_evicts_the_cached_outboard() -> anyhow::Result<()> {
 }
 
 /// A stuck outboard fetch runs past its budget and advances the chain to
-/// the next origin. With no other origin, the probe reports the timeout as
+/// the next origin. With no other origin, the draw reports the timeout as
 /// a fault (the #1129 latch), not as a clean absence.
 #[tokio::test]
 async fn a_stuck_outboard_fetch_times_out_and_advances_the_chain() -> anyhow::Result<()> {
     let (_, hash, serving, aligned) = multi_window_stub();
-    let total = aligned.blob_size();
     let mut stuck =
         RangeStubOrigin::serving(hash, &[], serving.outboard.clone().unwrap_or_default());
     stuck.gate_outboard = true;
     let (engine, _tmp) = stub_engine(vec![stuck, serving]).await?;
     engine.set_origin_read_budget(Duration::from_millis(50), u64::MAX);
+    let wire = engine.origin_range_wire(hash, &aligned).await?;
+    let (_, fault) = drain_wire(wire).await;
     anyhow::ensure!(
-        engine
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .is_some(),
-        "the second origin serves the outboard after the first times out"
+        fault.is_none(),
+        "the second origin serves after the first times out: {fault:?}"
     );
 
     let (_, hash, serving, _) = multi_window_stub();
@@ -3688,7 +3647,7 @@ async fn a_stuck_outboard_fetch_times_out_and_advances_the_chain() -> anyhow::Re
     stuck.gate_outboard = true;
     let (engine, _tmp) = stub_engine(vec![stuck]).await?;
     engine.set_origin_read_budget(Duration::from_millis(50), u64::MAX);
-    let err = engine.origin_fetch_outboard_bytes(hash, total).await.err();
+    let err = engine.origin_range_wire(hash, &aligned).await.err();
     anyhow::ensure!(
         matches!(&err, Some(CacheError::OriginError { source, .. })
             if source.to_string().contains("budget")),
@@ -3727,16 +3686,11 @@ async fn an_origin_without_data_does_not_lend_its_outboard() -> anyhow::Result<(
     let genuine = serving.outboard.clone().unwrap_or_default();
     // Same length, wrong bytes: passes the length gate, fails verification.
     let corrupt = Bytes::from(vec![0u8; genuine.len()]);
-    let mut orphan = RangeStubOrigin::serving(hash, &[], corrupt);
+    let mut orphan = RangeStubOrigin::serving(hash, &[], corrupt.clone());
     orphan.support_range = false;
     let (engine, _tmp) = stub_engine(vec![orphan, serving]).await?;
-    // The probe caches the orphan's copy: it is first in the chain.
-    anyhow::ensure!(
-        engine
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .is_some()
-    );
+    // The orphan's copy is cached, so the first draw tries the orphan first.
+    anyhow::ensure!(engine.inner.outboards.insert(hash, corrupt, 0));
     for _ in 0..2 {
         let wire = engine.origin_range_wire(hash, &aligned).await?;
         let (_, fault) = drain_wire(wire).await;
@@ -3927,66 +3881,6 @@ async fn a_mid_stream_range_fault_memoises_an_origin_fault() -> anyhow::Result<(
         "{fault:?}"
     );
     anyhow::ensure!(engine.origin_presence(hash).await == OriginPresence::Fault);
-    Ok(())
-}
-
-/// `origin_fetch_outboard_bytes` returns the outboard when an origin
-/// publishes it, and `None` when none do.
-#[tokio::test]
-async fn origin_fetch_outboard_bytes_found_and_absent() -> anyhow::Result<()> {
-    use bao_tree::io::outboard::PreOrderMemOutboard;
-
-    let data = local_outboard_pull_test_blob();
-    let ob = PreOrderMemOutboard::create(&data, crate::range_pull::IROH_BLOCK_SIZE);
-    let outboard = Bytes::from(ob.data.clone());
-    let hash = Hash::new(&data);
-    let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
-
-    let serving = RangeStubOrigin::serving(hash, &data, outboard.clone());
-    let tmp = tempfile::tempdir()?;
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(serving) as Arc<dyn Origin>], 64).await?;
-    anyhow::ensure!(
-        engine.origin_fetch_outboard_bytes(hash, total).await? == Some(outboard),
-        "a publishing origin must return its outboard bytes"
-    );
-
-    let mut bare = RangeStubOrigin::serving(hash, &data, Bytes::new());
-    bare.outboard = None;
-    let tmp2 = tempfile::tempdir()?;
-    let engine2 =
-        CacheEngine::open(tmp2.path(), vec![Arc::new(bare) as Arc<dyn Origin>], 64).await?;
-    anyhow::ensure!(
-        engine2
-            .origin_fetch_outboard_bytes(hash, total)
-            .await?
-            .is_none(),
-        "no origin publishes the outboard; must be Ok(None)"
-    );
-    Ok(())
-}
-
-/// A genuine transport fault fetching the outboard (a degraded own origin) is
-/// surfaced as `Err`, NOT collapsed into a clean `Ok(None)` absence — so the
-/// serviceability caller can latch it into `fault_seen` (#1129) and terminate a
-/// resulting miss as `InternalError` rather than a bare `NotFound`.
-#[tokio::test]
-async fn origin_fetch_outboard_bytes_surfaces_a_transport_fault() -> anyhow::Result<()> {
-    let data = local_outboard_pull_test_blob();
-    let hash = Hash::new(&data);
-    let total = u64::try_from(data.len()).unwrap_or(u64::MAX);
-
-    let faulting = RangeStubOrigin::outboard_faulting(hash);
-    let tmp = tempfile::tempdir()?;
-    let engine =
-        CacheEngine::open(tmp.path(), vec![Arc::new(faulting) as Arc<dyn Origin>], 64).await?;
-    anyhow::ensure!(
-        engine
-            .origin_fetch_outboard_bytes(hash, total)
-            .await
-            .is_err(),
-        "an outboard transport fault must surface as Err, not a clean Ok(None)"
-    );
     Ok(())
 }
 
