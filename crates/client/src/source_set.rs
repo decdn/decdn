@@ -678,9 +678,10 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         let failures = self.build_failures(provider);
         let error = decdn_common::redact::sanitize_err_chain(err);
         if failures >= BUILD_RETRY_WARN_AT {
-            // The backoff holds the provider to one build per
+            // This set's backoff holds the provider to one build per
             // `BUILD_RETRY_CAP`, so this line repeats at most once per 30 s
-            // per provider.
+            // per provider in this fetch. Each fetch keeps its own backoff,
+            // so concurrent fetches log independently.
             tracing::warn!(%provider, failures, %error, "lane build failed");
         } else {
             tracing::debug!(%provider, failures, %error, "lane build failed");
