@@ -2621,21 +2621,138 @@ fn serve_cutoff_wake_is_one_second_past_the_cutoff() {
     let me = Address::from([20u8; 20]);
     let paid = PaidWatermarks::default();
     let st = expiring_lane(1, 10_000);
-    assert_eq!(serve_cutoff_wake(&st, &paid, me, 420, 0, 0), Some(9_581));
     assert_eq!(
-        serve_cutoff_wake(&st, &paid, me, 420, 9_580, 9_580),
+        serve_cutoff_wake(&st, &paid, me, 420, None, 0, 0),
+        Some(9_581)
+    );
+    assert_eq!(
+        serve_cutoff_wake(&st, &paid, me, 420, None, 9_580, 9_580),
         Some(9_581),
         "a wake still ahead of the last scan is kept"
     );
     assert_eq!(
-        serve_cutoff_wake(&st, &paid, me, 420, 9_581, 9_581),
+        serve_cutoff_wake(&st, &paid, me, 420, None, 9_581, 9_581),
         None,
         "the sweep at a cutoff does not schedule that cutoff again"
     );
     assert_eq!(
-        serve_cutoff_wake(&expiring_lane(1, 200), &paid, me, 100, 0, 0),
+        serve_cutoff_wake(&expiring_lane(1, 200), &paid, me, 100, None, 0, 0),
         Some(101),
         "an expiry inside the margin saturates instead of underflowing"
+    );
+    assert_eq!(
+        serve_cutoff_wake(
+            &st,
+            &paid,
+            me,
+            420,
+            Some(status(500, Lifecycle::Open)),
+            0,
+            0
+        ),
+        Some(9_581),
+        "an open pool leaves the cutoff at the capability's"
+    );
+}
+
+/// A `Closing` pool's dispute deadline moves the lane's cutoff forward to
+/// `deadline − margin + 1` when it comes before the capability expiry: the
+/// mid-stream re-check stops the stream there, so the claim is final.
+#[test]
+fn a_closing_pools_deadline_wakes_the_redeemer() {
+    let me = Address::from([20u8; 20]);
+    let paid = PaidWatermarks::default();
+    let st = expiring_lane(1, 10_000);
+    let closing = |deadline| Some(status(500, Lifecycle::Closing { deadline }));
+    assert_eq!(
+        serve_cutoff_wake(&st, &paid, me, 420, closing(5_000), 0, 0),
+        Some(4_581),
+        "the close deadline comes first"
+    );
+    assert_eq!(
+        serve_cutoff_wake(&st, &paid, me, 420, closing(20_000), 0, 0),
+        Some(9_581),
+        "the capability expiry comes first"
+    );
+    assert_eq!(
+        serve_cutoff_wake(&st, &paid, me, 420, closing(5_000), 4_581, 4_581),
+        None,
+        "the sweep at the close cutoff does not schedule it again"
+    );
+    assert_eq!(
+        serve_cutoff_wake(&st, &paid, me, 420, closing(5_000), 0, 4_700),
+        Some(4_700),
+        "a close cutoff passed unscanned is due at once"
+    );
+    assert_eq!(
+        serve_cutoff_wake(
+            &st,
+            &paid,
+            me,
+            420,
+            closing(5_000),
+            0,
+            5_000 - REDEEM_LANDING_SLACK_SECS
+        ),
+        None,
+        "a pool inside the landing slack cannot be redeemed, so it is not due"
+    );
+    assert_eq!(
+        serve_cutoff_wake(
+            &st,
+            &paid,
+            me,
+            420,
+            Some(status(0, Lifecycle::Closing { deadline: 5_000 })),
+            0,
+            0
+        ),
+        None,
+        "a drained closing pool cannot pay, so it is not due"
+    );
+}
+
+/// The close wake falls one second after the mid-stream re-check starts to
+/// stop a stream on the closing pool, and the sweep it starts still meets a
+/// redeemable pool.
+#[test]
+fn the_close_wake_follows_the_serve_stop_and_precedes_the_slack() {
+    use decdn_common::config::inside_capability_expiry_margin;
+    let me = Address::from([20u8; 20]);
+    let paid = PaidWatermarks::default();
+    let (deadline, margin) = (5_000, 420);
+    let pool = Some(status(500, Lifecycle::Closing { deadline }));
+    let wake = serve_cutoff_wake(&expiring_lane(1, 10_000), &paid, me, margin, pool, 0, 0);
+    assert_eq!(wake, Some(4_581));
+    assert!(!inside_capability_expiry_margin(deadline, margin, 4_579));
+    assert!(
+        inside_capability_expiry_margin(deadline, margin, 4_580),
+        "the re-check stops the stream one second before the wake"
+    );
+    assert!(
+        pool_is_redeemable(pool, 4_581),
+        "the sweep at the wake still meets a redeemable pool"
+    );
+}
+
+/// The scan reads each lane's pool from the projection, so a lane on a
+/// closing pool takes its cutoff from the pool's deadline.
+#[test]
+fn next_serve_cutoff_reads_the_close_deadline_from_the_projection() {
+    let me = Address::from([20u8; 20]);
+    let paid = PaidWatermarks::default();
+    let states = [expiring_lane(1, 10_000)];
+    let projection = PoolProjection::new();
+    assert_eq!(
+        next_serve_cutoff(&states, &paid, me, 420, &projection, 0, 0),
+        Some(9_581)
+    );
+    let pool_id = states.first().map(|st| st.pool_id).unwrap_or_default();
+    projection.record_read(pool_id, status(500, Lifecycle::Closing { deadline: 5_000 }));
+    assert_eq!(
+        next_serve_cutoff(&states, &paid, me, 420, &projection, 0, 0),
+        Some(4_581),
+        "a folded close pulls the cutoff forward"
     );
 }
 
@@ -2647,22 +2764,30 @@ fn a_cutoff_passed_unscanned_is_due_now() {
     let paid = PaidWatermarks::default();
     let st = expiring_lane(1, 10_000);
     assert_eq!(
-        serve_cutoff_wake(&st, &paid, me, 420, 0, 9_700),
+        serve_cutoff_wake(&st, &paid, me, 420, None, 0, 9_700),
         Some(9_700),
         "the node was down at the cutoff"
     );
     assert_eq!(
-        serve_cutoff_wake(&st, &paid, me, 420, 9_500, 9_700),
+        serve_cutoff_wake(&st, &paid, me, 420, None, 9_500, 9_700),
         Some(9_700),
         "the last scan ran before the cutoff"
     );
     assert_eq!(
-        serve_cutoff_wake(&st, &paid, me, 420, 9_600, 9_700),
+        serve_cutoff_wake(&st, &paid, me, 420, None, 9_600, 9_700),
         None,
         "a scan after the cutoff already read the final claim"
     );
     assert_eq!(
-        serve_cutoff_wake(&st, &paid, me, 420, 0, 10_000 - REDEEM_LANDING_SLACK_SECS),
+        serve_cutoff_wake(
+            &st,
+            &paid,
+            me,
+            420,
+            None,
+            0,
+            10_000 - REDEEM_LANDING_SLACK_SECS
+        ),
         None,
         "a lane inside the landing slack cannot be redeemed, so it is not due"
     );
@@ -2673,20 +2798,20 @@ fn serve_cutoff_wake_skips_lanes_that_need_no_redeem() {
     let me = Address::from([20u8; 20]);
     let paid = PaidWatermarks::default();
     assert_eq!(
-        serve_cutoff_wake(&expiring_lane(1, 0), &paid, me, 420, 0, 0),
+        serve_cutoff_wake(&expiring_lane(1, 0), &paid, me, 420, None, 0, 0),
         None,
         "a lane with expiry 0 is already expired, so it gets no cutoff wake"
     );
     let other = Address::from([9u8; 20]);
     assert_eq!(
-        serve_cutoff_wake(&expiring_lane(1, 10_000), &paid, other, 420, 0, 0),
+        serve_cutoff_wake(&expiring_lane(1, 10_000), &paid, other, 420, None, 0, 0),
         None,
         "another provider's lane"
     );
     let settled = expiring_lane(1, 10_000);
     paid.set(settled.key(), settled.owed());
     assert_eq!(
-        serve_cutoff_wake(&settled, &paid, me, 420, 0, 0),
+        serve_cutoff_wake(&settled, &paid, me, 420, None, 0, 0),
         None,
         "a fully paid lane"
     );
@@ -2702,21 +2827,22 @@ fn next_serve_cutoff_picks_the_earliest_wake() {
         expiring_lane(3, 10_000),
         expiring_lane(4, 20_000),
     ];
+    let view = PoolProjection::new();
     assert_eq!(
-        next_serve_cutoff(&states, &paid, me, 420, 0, 0),
+        next_serve_cutoff(&states, &paid, me, 420, &view, 0, 0),
         Some(9_581)
     );
     assert_eq!(
-        next_serve_cutoff(&states, &paid, me, 420, 9_581, 9_581),
+        next_serve_cutoff(&states, &paid, me, 420, &view, 9_581, 9_581),
         Some(19_581),
         "a scanned cutoff yields to the next one"
     );
     assert_eq!(
-        next_serve_cutoff(&states, &paid, me, 420, 0, 9_700),
+        next_serve_cutoff(&states, &paid, me, 420, &view, 0, 9_700),
         Some(9_700),
         "an unscanned passed cutoff comes first"
     );
-    assert_eq!(next_serve_cutoff(&[], &paid, me, 420, 0, 0), None);
+    assert_eq!(next_serve_cutoff(&[], &paid, me, 420, &view, 0, 0), None);
 }
 
 /// The voucher path's margin predicate refuses from the cutoff on, and the
@@ -2728,7 +2854,7 @@ fn the_cutoff_wake_follows_the_voucher_margin_gate() {
     let me = Address::from([20u8; 20]);
     let paid = PaidWatermarks::default();
     let (expiry, margin) = (10_000, 420);
-    let wake = serve_cutoff_wake(&expiring_lane(1, expiry), &paid, me, margin, 0, 0);
+    let wake = serve_cutoff_wake(&expiring_lane(1, expiry), &paid, me, margin, None, 0, 0);
     assert_eq!(wake, Some(9_581));
     assert!(!inside_capability_expiry_margin(expiry, margin, 9_579));
     assert!(

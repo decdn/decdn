@@ -38,10 +38,12 @@
 //!   unredeemed value across that chunk's lanes clears a configurable floor,
 //!   so a dropped hint never strands a lane whose chunk has cleared the floor.
 //!   The same sweep also runs at each serve cutoff: one second after the voucher
-//!   and preimage paths start to refuse a lane whose capability expiry is near.
-//!   The lane's claim is final there, and the sweep has about one redeem interval
-//!   to start the redemption and the landing slack to land it before the
-//!   contract stops paying the capability. On a restart, a lane whose cutoff
+//!   and preimage paths start to refuse a lane whose capability expiry is near,
+//!   or the mid-stream re-check stops a stream whose `Closing` pool's dispute
+//!   deadline is near. The lane's claim is final there, and the sweep has about
+//!   one redeem interval to start the redemption and the landing slack to land
+//!   it before the contract stops paying the capability or the pool. On a
+//!   restart, a lane whose cutoff
 //!   passed while the node was down is swept at once. A value that stays below
 //!   the floor is not redeemed by the cutoff sweep; a later sweep before the
 //!   landing slack can still pack it with other lanes.
@@ -1377,8 +1379,12 @@ async fn pool_refresh_loop<P: Provider + Clone + 'static>(
 /// self-tick that sweeps every lane into chunked `redeemMany` transactions so a
 /// dropped hint can never strand a lane whose chunk has cleared the floor, and a
 /// sweep at the earliest serve cutoff of a lane with a finite capability expiry
-/// and value owed ([`serve_cutoff_wake`]). Ends cleanly when every hint sender
-/// is dropped.
+/// and value owed ([`serve_cutoff_wake`]). A lane on a pool the projection holds
+/// as `Closing` takes its cutoff from the pool's dispute deadline when that
+/// comes first. Each sweep and each hint re-reads the projection, and the
+/// grace window outlasts the redeem interval many times over, so a close the
+/// pool refresh folds is scheduled long before its cutoff. Ends cleanly when
+/// every hint sender is dropped.
 ///
 /// The cutoff sweep is what makes a delegated lane's final claim redeemable. The
 /// claim stops growing at the serve cutoff, and the sweep then has about one
@@ -1433,6 +1439,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             &paid,
             self_address,
             margin_secs,
+            &pool_view,
             swept_at,
             unix_now(),
         )
@@ -1490,6 +1497,7 @@ async fn redeemer_loop<P: Provider + Clone>(
             &paid,
             self_address,
             margin_secs,
+            &pool_view,
             swept_at,
             swept_at,
         );
@@ -1703,16 +1711,20 @@ pub(crate) const fn capability_expired(expiry: u64, now: u64) -> bool {
 }
 
 /// When the redeemer wakes for one lane's serve cutoff, in Unix seconds, or
-/// `None` when the lane needs no cutoff sweep.
+/// `None` when the lane needs no cutoff sweep. `pool` is the lane's pool as the
+/// projection holds it, `None` when the projection holds no read.
 ///
-/// The serve cutoff is `expiry − margin_secs`. From that second on, the voucher
+/// The lane's serve deadline is its capability `expiry`, or its pool's dispute
+/// deadline when the pool is `Closing` and that deadline comes first. The serve
+/// cutoff is that deadline less `margin_secs`. From that second on, the voucher
 /// and preimage paths refuse the lane's proofs with `CapabilityExpired`
 /// ([`inside_capability_expiry_margin`](decdn_common::config::inside_capability_expiry_margin)),
-/// so the lane's claim is final. The wake
-/// is one second after the cutoff, because those paths read a coarse clock that
-/// can lag the wall clock by up to one refresh. A sweep at the wake has one
-/// redeem interval, less that second, to start the redemption before
-/// [`capability_expired`] skips the lane, and [`REDEEM_LANDING_SLACK_SECS`] to
+/// and the mid-stream pool re-check stops a stream on a closing pool, so the
+/// lane's claim is final. The wake is one second after the cutoff, because
+/// those paths read a coarse clock that can lag the wall clock by up to one
+/// refresh. A sweep at the wake has one redeem interval, less that second, to
+/// start the redemption before [`capability_expired`] or
+/// [`pool_is_redeemable`] skips the lane, and [`REDEEM_LANDING_SLACK_SECS`] to
 /// land it.
 ///
 /// Only a lane this node provides, with a nonzero expiry and value owed beyond
@@ -1723,11 +1735,16 @@ fn lane_cutoff_wake(
     paid: &PaidWatermarks,
     self_address: Address,
     margin_secs: u64,
+    pool: Option<PoolStatus>,
 ) -> Option<u64> {
     if st.provider != self_address || st.expiry == 0 || st.owed() <= lane_paid(paid, st) {
         return None;
     }
-    Some(st.expiry.saturating_sub(margin_secs).saturating_add(1))
+    let deadline = match pool.map(|status| status.lifecycle) {
+        Some(Lifecycle::Closing { deadline }) => deadline.min(st.expiry),
+        Some(Lifecycle::Open) | None => st.expiry,
+    };
+    Some(deadline.saturating_sub(margin_secs).saturating_add(1))
 }
 
 /// When the redeemer must sweep for one lane's cutoff, given that its last
@@ -1737,32 +1754,39 @@ fn lane_cutoff_wake(
 /// claim, so the lane needs no further cutoff sweep. Otherwise the sweep is due
 /// at the wake, or at `now` when the wake has passed unscanned: the node was
 /// down at the cutoff, or the lane's first hint waited behind redemption work
-/// until after it. A lane that [`capability_expired`] skips at `now` cannot be
-/// redeemed and needs no sweep.
+/// until after it. A lane that [`capability_expired`] or [`pool_is_redeemable`]
+/// skips at `now` cannot be redeemed and needs no sweep.
 fn serve_cutoff_wake(
     st: &LaneState,
     paid: &PaidWatermarks,
     self_address: Address,
     margin_secs: u64,
+    pool: Option<PoolStatus>,
     swept_at: u64,
     now: u64,
 ) -> Option<u64> {
-    let wake = lane_cutoff_wake(st, paid, self_address, margin_secs)?;
-    (wake > swept_at && !capability_expired(st.expiry, now)).then_some(wake.max(now))
+    let wake = lane_cutoff_wake(st, paid, self_address, margin_secs, pool)?;
+    let redeemable = !capability_expired(st.expiry, now) && pool_is_redeemable(pool, now);
+    (wake > swept_at && redeemable).then_some(wake.max(now))
 }
 
-/// The earliest [`serve_cutoff_wake`] across `states`.
+/// The earliest [`serve_cutoff_wake`] across `states`, each read against its
+/// pool in `pool_view`.
 fn next_serve_cutoff(
     states: &[LaneState],
     paid: &PaidWatermarks,
     self_address: Address,
     margin_secs: u64,
+    pool_view: &PoolProjection,
     swept_at: u64,
     now: u64,
 ) -> Option<u64> {
     states
         .iter()
-        .filter_map(|st| serve_cutoff_wake(st, paid, self_address, margin_secs, swept_at, now))
+        .filter_map(|st| {
+            let pool = pool_view.snapshot(st.pool_id);
+            serve_cutoff_wake(st, paid, self_address, margin_secs, pool, swept_at, now)
+        })
         .min()
 }
 
@@ -2094,7 +2118,8 @@ async fn redeem_one<P: Provider + Clone>(
         }
     };
     let now = unix_now();
-    let wake = serve_cutoff_wake(&st, paid, self_address, margin_secs, swept_at, now);
+    let pool = pool_view.snapshot(st.pool_id);
+    let wake = serve_cutoff_wake(&st, paid, self_address, margin_secs, pool, swept_at, now);
     let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view, now);
     // Hint path: require the durability floor and skip the submit on a failed
     // flush (`strict_flush`); the lane defers to the next sweep.
