@@ -1261,12 +1261,13 @@ jobs:
         with:
           checks: 'true'
       # The gateway serves three fixed paths under a policy with no inline
-      # script: a fourth file, or a script in the page, would not load.
+      # script: a fourth file, or a script in the page, would not load. The
+      # tracked `.gitignore` beside the build is not part of it.
       - name: The build is the three files the gateway embeds
         working-directory: crates/cli/dashboard/dist
         run: |
-          [ "$(find . -type f | sort | tr '\n' ' ')" = "./app.css ./app.js ./index.html " ] || {
-            echo "::error::dist/ must hold exactly index.html, app.js and app.css:"
+          [ "$(find . -type f ! -path ./.gitignore | sort | tr '\n' ' ')" = "./app.css ./app.js ./index.html " ] || {
+            echo "::error::dist/ must hold exactly index.html, app.js and app.css (beside its .gitignore):"
             find . -type f
             exit 1
           }
