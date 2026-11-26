@@ -19,6 +19,7 @@
 
 use std::hash::{BuildHasher as _, Hasher as _};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::Path;
 
 use anyhow::Context;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -173,9 +174,7 @@ fn claim_range(ephemeral_low: u16) -> anyhow::Result<(u16, u16)> {
 /// range, which starts at 49152.
 fn ephemeral_low() -> anyhow::Result<u16> {
     if cfg!(target_os = "linux") {
-        const RANGE: &str = "/proc/sys/net/ipv4/ip_local_port_range";
-        let text = std::fs::read_to_string(RANGE).with_context(|| format!("read {RANGE}"))?;
-        return parse_ephemeral_low(&text).with_context(|| format!("parse {RANGE}: {text:?}"));
+        return read_ephemeral_low(Path::new("/proc/sys/net/ipv4/ip_local_port_range"));
     }
     if cfg!(target_os = "macos") {
         const SYSCTL: &str = "/usr/sbin/sysctl";
@@ -194,6 +193,13 @@ fn ephemeral_low() -> anyhow::Result<u16> {
         return parse_ephemeral_low(&text).with_context(|| format!("parse {KEY}: {text:?}"));
     }
     Ok(49152)
+}
+
+/// The first port of the range in an `ip_local_port_range` file at `path`.
+fn read_ephemeral_low(path: &Path) -> anyhow::Result<u16> {
+    let shown = path.display();
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {shown}"))?;
+    parse_ephemeral_low(&text).with_context(|| format!("parse {shown}: {text:?}"))
 }
 
 /// The first number in an `ip_local_port_range` line (`"32768\t60999\n"`)

@@ -34,7 +34,10 @@ const LISTEN_BACKLOG: i32 = 1024;
 /// # Errors
 /// Returns the underlying `std::io::Error` if socket creation, `bind`, or
 /// `listen` fails.
-pub(crate) fn bind_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
+///
+/// Public so `decdn-e2e`'s port reservation tests bind exactly as the daemon
+/// does.
+pub fn bind_reuseaddr(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     // Unix: allow rebinding over a `TIME_WAIT` remnant. Skipped on Windows,
     // where the same option would also permit two live listeners on the port.
