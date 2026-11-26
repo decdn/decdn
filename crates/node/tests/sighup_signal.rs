@@ -1051,3 +1051,107 @@ async fn sighup_reports_an_invalid_network_table() {
     assert_eq!(invalid_lines(&logs), 1, "got:\n{logs}");
     assert!(logs.contains("network.external_addrs[0]"), "got:\n{logs}");
 }
+
+/// A reloaded `network.bind_port` equal to `observability.metrics_port` or
+/// `observability.admin_port` is the port layout startup rejects (#2985). The
+/// reload warns once that the next restart fails, naming the clashing pair,
+/// and still applies its reloadable change and counts no failure.
+#[tokio::test(flavor = "current_thread")]
+async fn sighup_reports_a_port_layout_clash() {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = BufferWriter(Arc::clone(&log_buf));
+    let _log_guard = tracing_subscriber::fmt()
+        .with_writer(move || sink.clone())
+        .with_ansi(false)
+        .with_max_level(LevelFilter::INFO)
+        .finish()
+        .set_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+
+    // Starts with metrics on 9090 and admin on 9191.
+    let initial = seed_resolved(10, LogLevel::Info);
+    let (setter, levels) = recording_setter();
+    let state = RuntimeReloadState::new(
+        ObservabilityArgs {
+            log_level: None,
+            log_format: None,
+            metrics_port: None,
+            metrics_bind: None,
+            admin_port: None,
+            otlp_endpoint: None,
+        },
+        NetworkArgs::default(),
+        &initial,
+        setter,
+    );
+    let metrics = Arc::new(Metrics::new());
+    state.attach_metrics(Arc::clone(&metrics));
+
+    let invalid_lines = |logs: &str| -> usize {
+        logs.lines()
+            .filter(|l| {
+                l.contains(" WARN ") && l.contains("[network] is invalid; the next restart fails")
+            })
+            .count()
+    };
+    let failures = |metrics: &Metrics| -> String {
+        let text = metrics.encode().unwrap();
+        text.lines()
+            .find(|l| l.starts_with("decdn_config_reload_failures_total "))
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // `bind_port` moves onto the metrics port beside a reloadable change.
+    write_config(
+        &path,
+        "[observability]\n\
+         log_level = \"debug\"\n\
+         metrics_port = 9090\n\n\
+         [network]\n\
+         bind_port = 9090\n",
+    );
+    state
+        .reload(&path)
+        .await
+        .expect("a port clash must not gate the reload");
+    assert_eq!(levels.lock().unwrap().clone(), vec![LogLevel::Debug]);
+    let logs = captured_logs(&log_buf);
+    assert_eq!(invalid_lines(&logs), 1, "got:\n{logs}");
+    assert!(
+        logs.contains("network.bind_port vs observability.metrics_port"),
+        "got:\n{logs}"
+    );
+    assert!(
+        !logs.contains("ignoring change to network."),
+        "an invalid table reports no field change, got:\n{logs}"
+    );
+    assert_eq!(failures(&metrics), "decdn_config_reload_failures_total 0");
+
+    log_buf.lock().unwrap().clear();
+
+    // `bind_port` moves onto the admin port.
+    write_config(
+        &path,
+        "[observability]\n\
+         admin_port = 9191\n\n\
+         [network]\n\
+         bind_port = 9191\n",
+    );
+    state
+        .reload(&path)
+        .await
+        .expect("a port clash must not gate the reload");
+    let logs = captured_logs(&log_buf);
+    assert_eq!(invalid_lines(&logs), 1, "got:\n{logs}");
+    assert!(
+        logs.contains("network.bind_port vs observability.admin_port"),
+        "got:\n{logs}"
+    );
+    assert_eq!(failures(&metrics), "decdn_config_reload_failures_total 0");
+}
