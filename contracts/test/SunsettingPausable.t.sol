@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import { Test } from "forge-std/Test.sol";
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
+import { Pausable } from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { SunsettingPausable } from "../src/SunsettingPausable.sol";
 
@@ -24,6 +25,17 @@ contract SunsettingPausableHarness is AccessControl, SunsettingPausable {
 
     function unpause() external onlyRole(PAUSER_ROLE) {
         _unpause();
+    }
+
+    /// @dev A `whenNotPaused` entrypoint standing in for the gated protocol
+    ///      calls (`deposit`, `openPool`, `topUp`, …).
+    function gated() external view whenNotPaused returns (bool) {
+        return true;
+    }
+
+    /// @dev A `whenPaused` entrypoint, to pin the inverse gate.
+    function gatedWhilePaused() external view whenPaused returns (bool) {
+        return true;
     }
 }
 
@@ -85,6 +97,51 @@ contract SunsettingPausableTest is Test {
         vm.prank(governance);
         vm.expectRevert(SunsettingPausable.PauseExpired.selector);
         harness.pause();
+    }
+
+    /// @dev A pause in force at the deadline still holds at the deadline.
+    function test_pauseInForce_holdsAtDeadline() public {
+        vm.warp(harness.pauseDeadline() - 1);
+        vm.prank(admin);
+        harness.pause();
+
+        vm.warp(harness.pauseDeadline());
+        assertTrue(harness.paused());
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        harness.gated();
+        assertTrue(harness.gatedWhilePaused());
+    }
+
+    /// @dev A pause in force ends at the sunset: `paused()` reads false and
+    ///      every `whenNotPaused` gate opens, with no `unpause()` call.
+    function test_pauseInForce_endsAfterDeadline() public {
+        vm.warp(harness.pauseDeadline() - 1);
+        vm.prank(admin);
+        harness.pause();
+        assertTrue(harness.paused());
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        harness.gated();
+
+        vm.warp(harness.pauseDeadline() + 1);
+        assertFalse(harness.paused());
+        assertTrue(harness.gated());
+        vm.expectRevert(Pausable.ExpectedPause.selector);
+        harness.gatedWhilePaused();
+    }
+
+    /// @dev Past the sunset the contract already reads unpaused, so
+    ///      `unpause()` reverts `ExpectedPause` and leaves it unpaused.
+    function test_unpause_afterDeadline_revertsAndStaysUnpaused() public {
+        vm.warp(harness.pauseDeadline() - 1);
+        vm.prank(admin);
+        harness.pause();
+
+        vm.warp(harness.pauseDeadline() + 1);
+        vm.prank(admin);
+        vm.expectRevert(Pausable.ExpectedPause.selector);
+        harness.unpause();
+        assertFalse(harness.paused());
+        assertTrue(harness.gated());
     }
 
     /// @dev Role enforcement is unchanged: a non-pauser still trips access
