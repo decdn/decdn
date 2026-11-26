@@ -74,7 +74,7 @@ use super::{
 use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UnconfirmedEscrows, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::fault::{carries_untracked_escrow, fold_escrow};
-use crate::funding::RunFunding;
+use crate::funding::{RunFunding, StalePoolRetired};
 use crate::lane_sources::{FirstLeg, LaneSources, discovery_span};
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
@@ -1921,10 +1921,20 @@ impl<P: Provider + Clone> PullCtx<P> {
         let bytes = if let Some(cached) = cached {
             cached
         } else {
-            let fetched = self
-                .fetch_manifest_bytes(hash, out_root)
-                .await
-                .map_err(manifest_fetch_error)?;
+            let fetched = match self.fetch_manifest_bytes(hash, out_root).await {
+                Ok(fetched) => fetched,
+                Err(err) => {
+                    let err = if err.downcast_ref::<PoolReplaced>().is_none() {
+                        self.retire_stale_pools()
+                            .await
+                            .into_iter()
+                            .fold(err, anyhow::Error::context)
+                    } else {
+                        err
+                    };
+                    return Err(manifest_fetch_error(err));
+                }
+            };
             if let Some(warning) = manifest_cache::store(out_root, hash, &fetched) {
                 self.warn(&warning);
             }
@@ -1950,6 +1960,41 @@ impl<P: Provider + Clone> PullCtx<P> {
             .chain(self.parked.values())
             .flat_map(|pass| pass.recovery.replacements())
             .collect()
+    }
+
+    /// Drop the stored buyer row of each pool a pass paid through that the
+    /// chain holds no record of, once a manifest fetch or a pull failed with
+    /// no byte paid for ([`RunFunding::retire_stale_pool`]).
+    async fn retire_stale_pools(&self) -> Vec<StalePoolRetired> {
+        let mut retired = Vec::new();
+        for pass in std::iter::once(&self.pass).chain(self.parked.values()) {
+            if let Some(stale) = pass
+                .funding
+                .retire_stale_pool(&pass.contract, self.store.as_ref())
+                .await
+            {
+                retired.push(stale);
+            }
+        }
+        retired
+    }
+
+    /// `stopped`, the fault that ended a failed pull, with each pool
+    /// [`Self::retire_stale_pools`] dropped as context on it. A pull that no
+    /// fault stopped takes each one as a warning instead.
+    async fn note_stale_pools(
+        &self,
+        mut stopped: Option<anyhow::Error>,
+        warnings: &mut Vec<String>,
+    ) -> Option<anyhow::Error> {
+        for retired in self.retire_stale_pools().await {
+            if let Some(err) = stopped {
+                stopped = Some(err.context(retired));
+            } else {
+                warnings.push(retired.to_string());
+            }
+        }
+        stopped
     }
 
     /// The warning for a wallet seen to hold too little USDC to top a pool
@@ -2117,14 +2162,21 @@ impl<P: Provider + Clone> PullCtx<P> {
             paid,
             wire,
         } = pass;
+        let failed = leaves_work(&run);
         let PullRun {
             outcomes,
             mut warnings,
             transfer,
             interrupted,
-            stopped,
+            mut stopped,
         } = run;
         warnings.extend(self.funding_shortfalls());
+        // A pull that failed with no byte paid for drops a stored pool the
+        // chain holds no record of, which every node refuses `NotFound`, so
+        // the next run opens or adopts a pool (ADR 003 § Funding recovery).
+        if failed && paid.is_zero() && rerun.is_none() {
+            stopped = self.note_stale_pools(stopped, &mut warnings).await;
+        }
         let mut report = bundle_report(&outcomes, transfer, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
         report.wire_bytes = wire;

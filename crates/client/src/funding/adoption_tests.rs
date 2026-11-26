@@ -3577,3 +3577,213 @@ async fn a_replacement_open_after_an_untracked_escrow_is_refused() {
     );
     assert!(opens.is_empty(), "the refusal sends no openPool");
 }
+
+/// A contract whose `eth_call`s answer in order from `calls`; `None` faults a
+/// call, and so does a call past the end of the queue.
+fn scripted_contract(
+    calls: Vec<Option<Bytes>>,
+) -> (
+    PaymentPool::PaymentPoolInstance<impl alloy::providers::Provider + Clone>,
+    Asserter,
+) {
+    let asserter = Asserter::new();
+    for call in calls {
+        match call {
+            Some(response) => asserter.push_success(&response),
+            None => asserter.push_failure_msg("transient rpc fault"),
+        }
+    }
+    let rpc = ProviderBuilder::new()
+        .layer(SendLegLayer)
+        .connect_mocked_client(asserter.clone());
+    (PaymentPool::new(PP, rpc), asserter)
+}
+
+/// A store that tracks `owner`'s pool `id`, and the run whose first lane build
+/// read that pool with `first_read` ([`pool_to_reuse`]).
+async fn run_that_read(
+    dir: &tempfile::TempDir,
+    owner: Address,
+    id: PoolId,
+    first_read: Bytes,
+) -> (RedbBuyerPoolStore, RunFunding) {
+    let store = client_store(dir);
+    store
+        .record(&BuyerPoolState::new(
+            id,
+            DEPLOYMENT,
+            owner,
+            TOKEN,
+            U256::from(WORKING),
+        ))
+        .unwrap();
+    let (contract, _) = scripted_contract(vec![Some(first_read)]);
+    let funding = RunFunding::default();
+    let kept = pool_to_reuse(
+        &store,
+        &contract,
+        &funding,
+        owner,
+        DEPLOYMENT,
+        ChainAdoption::Refused,
+    )
+    .await
+    .unwrap();
+    // The first read keeps the row either way: a lagging RPC can miss a
+    // pool opened moments ago.
+    assert_eq!(kept.map(|state| state.pool_id), Some(id));
+    (store, funding)
+}
+
+/// The case the retire step exists for (#2678). The stored pool reads with no
+/// record at the run's first lane build, every node refuses it `NotFound`, and
+/// the fetch fails with no byte paid for. The step reads the pool once more,
+/// still finds no record, drops the row, and names the pool. The next run
+/// finds no row to reuse.
+#[tokio::test]
+async fn a_failed_fetch_drops_a_stored_pool_the_chain_holds_no_record_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Address::repeat_byte(0x11);
+    let id = B256::repeat_byte(0xCD);
+    let (store, funding) = run_that_read(&dir, owner, id, no_record_on_chain()).await;
+
+    let (contract, asserter) = scripted_contract(vec![Some(no_record_on_chain())]);
+    let retired = funding.retire_stale_pool(&contract, &store).await;
+    assert_eq!(retired, Some(StalePoolRetired { pool_id: id }));
+    assert!(asserter.read_q().is_empty(), "the step read the pool again");
+    let err = anyhow::anyhow!("gave up").context(retired.unwrap());
+    let text = format!("{err:#}");
+    assert!(text.contains(&id.to_string()), "{text}");
+    assert!(text.contains("next run opens or adopts a pool"), "{text}");
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_none());
+
+    // The next run has no row to reuse, so it adopts or opens a pool.
+    let (contract, _) = scripted_contract(Vec::new());
+    let next = pool_to_reuse(
+        &store,
+        &contract,
+        &RunFunding::default(),
+        owner,
+        DEPLOYMENT,
+        ChainAdoption::Refused,
+    )
+    .await
+    .unwrap();
+    assert!(
+        next.is_none(),
+        "the next run does not reuse the dropped row"
+    );
+}
+
+/// The end read is the authoritative check. When it shows the pool, or fails,
+/// the first read was a lagging RPC or cannot be told from one, so the row
+/// stays and the fetch error names no pool.
+#[tokio::test]
+async fn a_stored_pool_the_end_read_shows_or_cannot_read_keeps_its_row() {
+    let owner = Address::repeat_byte(0x11);
+    let id = B256::repeat_byte(0xCD);
+    let cases = [
+        ("open", Some(still_open(owner))),
+        ("read fault", None),
+        (
+            "another owner",
+            Some(
+                pool(Address::repeat_byte(0x99), WORKING, 0)
+                    .abi_encode()
+                    .into(),
+            ),
+        ),
+    ];
+    for (case, end_read) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, funding) = run_that_read(&dir, owner, id, no_record_on_chain()).await;
+        let (contract, asserter) = scripted_contract(vec![end_read]);
+        assert_eq!(
+            funding.retire_stale_pool(&contract, &store).await,
+            None,
+            "{case}"
+        );
+        assert!(
+            asserter.read_q().is_empty(),
+            "{case}: the step read the pool"
+        );
+        assert_eq!(
+            store
+                .get_by_owner(DEPLOYMENT, owner)
+                .unwrap()
+                .map(|state| state.pool_id),
+            Some(id),
+            "{case}: the row stays"
+        );
+    }
+}
+
+/// The step acts only on a pool the run's first lane build read with no
+/// record, and only while no run on the escrow handle saw it live: a pool a
+/// run saw live reads so only on a lagging RPC. Neither case reads the chain
+/// again.
+#[tokio::test]
+async fn a_pool_seen_live_or_read_open_is_never_retired() {
+    let owner = Address::repeat_byte(0x11);
+    let id = B256::repeat_byte(0xCD);
+    for case in ["seen live", "read open"] {
+        let dir = tempfile::tempdir().unwrap();
+        let first_read = match case {
+            "seen live" => no_record_on_chain(),
+            _ => still_open(owner),
+        };
+        let (store, funding) = run_that_read(&dir, owner, id, first_read).await;
+        if case == "seen live" {
+            funding.escrows().note_live(id);
+        }
+        let (contract, asserter) = scripted_contract(vec![Some(no_record_on_chain())]);
+        assert_eq!(
+            funding.retire_stale_pool(&contract, &store).await,
+            None,
+            "{case}"
+        );
+        assert!(!asserter.read_q().is_empty(), "{case}: no read is made");
+        assert!(
+            store.get_by_owner(DEPLOYMENT, owner).unwrap().is_some(),
+            "{case}: the row stays"
+        );
+    }
+}
+
+/// A fetch that paid for bytes on the pool was served on it, so a node saw the
+/// pool on chain. The step keeps the row and reads nothing.
+#[tokio::test]
+async fn a_run_that_paid_for_bytes_never_retires_its_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Address::repeat_byte(0x11);
+    let id = B256::repeat_byte(0xCD);
+    let (store, funding) = run_that_read(&dir, owner, id, no_record_on_chain()).await;
+    let ledger = Arc::new(PoolLedger::new(Cumulative::default()));
+    funding.join_lane(
+        LaneKey {
+            pool_id: id,
+            signer: owner,
+            provider: PROVIDER,
+        },
+        LaneSpend {
+            outside: U256::ZERO,
+            prior: U256::ZERO,
+            recorded: false,
+            from_chain: false,
+        },
+        &ledger,
+    );
+    ledger
+        .issue(
+            1_000,
+            10,
+            crate::ledger::EpochAction::Open,
+            |_n, _c| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+    let (contract, asserter) = scripted_contract(vec![Some(no_record_on_chain())]);
+    assert_eq!(funding.retire_stale_pool(&contract, &store).await, None);
+    assert!(!asserter.read_q().is_empty(), "no read is made");
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_some());
+}

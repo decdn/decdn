@@ -1650,6 +1650,7 @@ pub(crate) async fn fetch_on(
             eprintln!("warning: {shortfall}");
         }
         let result = result.map_err(|err| annotate(err, &sources.fault_context()));
+        let result = retire_on_failure(result, &funding, &contract, store.as_ref()).await;
         match next_pass(result, &mut replaced, streams) {
             Some(Err(err)) if !streamed.get() => match passes.next() {
                 // The nodes routed to another pool, and those that refused
@@ -1672,6 +1673,30 @@ pub(crate) async fn fetch_on(
             None => recovery.start_next_pass(),
         }
         first = false;
+    }
+}
+
+/// `result`, the end of a fetch pass, with the stored pool it dropped named
+/// as context. A failed pass that paid for no byte drops a stored pool the
+/// chain holds no record of, which every node refuses `NotFound`, so the next
+/// run opens or adopts a pool ([`RunFunding::retire_stale_pool`], ADR 003 §
+/// Funding recovery). A pass a pool replacement ended drops nothing.
+async fn retire_on_failure<P>(
+    result: anyhow::Result<()>,
+    funding: &RunFunding,
+    contract: &PaymentPool::PaymentPoolInstance<P>,
+    store: &dyn BuyerPoolStore,
+) -> anyhow::Result<()>
+where
+    P: alloy::providers::Provider + Clone,
+{
+    let err = match result {
+        Err(err) if err.downcast_ref::<PoolReplaced>().is_none() => err,
+        other => return other,
+    };
+    match funding.retire_stale_pool(contract, store).await {
+        Some(retired) => Err(err.context(retired)),
+        None => Err(err),
     }
 }
 

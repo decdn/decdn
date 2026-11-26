@@ -110,7 +110,40 @@ pub struct RunFunding {
     /// run. A handle shared with another live
     /// `RunFunding` is not serialized by it.
     top_up_serial: tokio::sync::Mutex<()>,
+    /// The stored pool the run's first lane build read with no record on chain
+    /// ([`PoolStanding::Unknown`]), kept for [`RunFunding::retire_stale_pool`].
+    read_unknown: OnceLock<StoredPool>,
 }
+
+/// A stored buyer pool row's key: its deployment, owner and pool id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredPool {
+    deployment: Deployment,
+    owner: Address,
+    pool_id: PoolId,
+}
+
+/// A failed fetch's note that the stored pool it paid from has no record on
+/// chain, and that its buyer row is dropped ([`RunFunding::retire_stale_pool`]).
+/// The next run opens or adopts a pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StalePoolRetired {
+    /// The pool the dropped row named.
+    pub pool_id: PoolId,
+}
+
+impl std::fmt::Display for StalePoolRetired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the chain holds no record of stored buyer pool {}, so nodes refuse it; its row is \
+             dropped, and the next run opens or adopts a pool",
+            self.pool_id
+        )
+    }
+}
+
+impl std::error::Error for StalePoolRetired {}
 
 /// The refusal of an `openPool` or `topUp` once the run's handle holds an
 /// escrow no local record credits
@@ -254,6 +287,104 @@ impl RunFunding {
     /// The pool the run's lanes pay from, once a lane is built.
     pub fn pool_id(&self) -> Option<PoolId> {
         self.pool_id.get().copied()
+    }
+
+    /// Record that the run's first lane build read `state`'s pool with no
+    /// record on chain ([`still_open`]), which keeps the row.
+    fn note_read_unknown(&self, state: &BuyerPoolState) {
+        let _ = self.read_unknown.set(StoredPool {
+            deployment: state.deployment,
+            owner: state.owner,
+            pool_id: state.pool_id,
+        });
+    }
+
+    /// Whether any lane of the run paid for bytes ([`PoolLedger::paid_bytes`]).
+    fn lanes_paid(&self) -> bool {
+        let run = self.spend.lock().unwrap_or_else(PoisonError::into_inner);
+        run.lanes
+            .values()
+            .flatten()
+            .any(|ledger| !ledger.paid_bytes().is_zero())
+    }
+
+    /// Drop the stored buyer row of a pool the chain holds no record of, at
+    /// the end of a fetch that failed with no byte paid for (ADR 003 §
+    /// Funding recovery).
+    ///
+    /// The first lane build keeps a stored row whose pool reads with no record
+    /// on chain ([`still_open`]): a lagging RPC can miss a pool opened moments
+    /// ago. Nodes refuse lanes on such a pool `NotFound`, the same as a missing
+    /// blob, so the acquire loop never asks for a funding recovery step, and
+    /// every later run reuses the row. So a failed fetch reads the pool once
+    /// more. The step acts only when the first lane build read the pool so, no
+    /// run on the escrow handle saw it live
+    /// ([`UnconfirmedEscrows::saw_live`]), and no lane of the run paid for a
+    /// byte. When the read again shows no record, the step drops the row
+    /// ([`BuyerPoolStore::forget_if_pool`]) and returns the note the caller
+    /// adds to the fetch error. The next run adopts a live pool or opens one.
+    ///
+    /// A read that fails, or that shows the pool, keeps the row. So does a
+    /// row that names another pool now, and a store that cannot drop it, which
+    /// logs a warning.
+    pub async fn retire_stale_pool<P>(
+        &self,
+        contract: &PaymentPool::PaymentPoolInstance<P>,
+        store: &dyn BuyerPoolStore,
+    ) -> Option<StalePoolRetired>
+    where
+        P: alloy::providers::Provider + Clone,
+    {
+        let stored = *self.read_unknown.get()?;
+        let pool_id = stored.pool_id;
+        if self.escrows.saw_live(pool_id) || self.lanes_paid() {
+            return None;
+        }
+        let pool = match contract.getPool(pool_id).call().await {
+            Ok(pool) => pool,
+            Err(error) => {
+                tracing::debug!(
+                    %pool_id,
+                    %error,
+                    "could not read the stored buyer pool the fetch found no record of; \
+                     keeping its row"
+                );
+                return None;
+            }
+        };
+        if pool_standing(&pool, stored.owner) != PoolStanding::Unknown {
+            return None;
+        }
+        Self::forget_stale_pool(store, stored)
+    }
+
+    /// Drop `stored`'s buyer row once the chain shows no record of its pool
+    /// twice ([`Self::retire_stale_pool`]). A row that names another pool now
+    /// is kept, and a store that cannot drop the row logs a warning.
+    fn forget_stale_pool(
+        store: &dyn BuyerPoolStore,
+        stored: StoredPool,
+    ) -> Option<StalePoolRetired> {
+        let pool_id = stored.pool_id;
+        match store.forget_if_pool(stored.deployment, stored.owner, pool_id) {
+            Ok(true) => {
+                tracing::warn!(
+                    %pool_id,
+                    "the chain holds no record of the stored buyer pool; dropped its row"
+                );
+                Some(StalePoolRetired { pool_id })
+            }
+            Ok(false) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %pool_id,
+                    %error,
+                    "the chain holds no record of the stored buyer pool, and its row could \
+                     not be dropped"
+                );
+                None
+            }
+        }
     }
 
     /// Record that `lane` joins the run, paying through `ledger`.
@@ -1234,7 +1365,9 @@ where
 /// pool `NotFound`, the same as a missing blob, so a fetch on it never reaches
 /// a funding recovery step. So the first lane build of a run reads the pool
 /// once ([`still_open`]), and a pool the chain shows `Closing` or `Closed` is
-/// treated as no row: the run adopts or opens another.
+/// treated as no row: the run adopts or opens another. A pool the chain holds
+/// no record of keeps its row, and a failed fetch drops it
+/// ([`RunFunding::retire_stale_pool`]).
 ///
 /// No row is not the same as no pool. The store loses rows — a reset data dir, a
 /// new machine, a store-format change — while the pool they named is still open
@@ -1265,7 +1398,7 @@ where
     // A lane of this run already pays from the pool, so its first build read it.
     let tracked = match tracked {
         Some(state) if funding.pool_id() != Some(state.pool_id) => {
-            let kept = still_open(contract, self_address, funding.escrows(), state).await;
+            let kept = still_open(contract, self_address, funding, state).await;
             if let Some(state) = &kept {
                 funding.note_pool(state.pool_id);
             }
@@ -1323,7 +1456,9 @@ fn pool_standing(pool: &PaymentPool::Pool, owner: Address) -> PoolStanding {
 /// moments ago, and replacing it on that read would escrow a second deposit.
 /// The funding recovery step tells the two apart
 /// ([`PoolFunder::chain_remaining`]), so an open pool is noted live in
-/// `escrows` ([`UnconfirmedEscrows::note_live`]).
+/// the run's escrow handle ([`UnconfirmedEscrows::note_live`]). A pool with no
+/// record is noted on `funding`, and a fetch that fails reads it once more
+/// ([`RunFunding::retire_stale_pool`]).
 /// An open pool's `state` takes in its on-chain deposit and redeemed spend
 /// ([`BuyerPoolState::reconcile_with_chain`]), so the run's funding counts what
 /// other signers on the pool spent. This is a run's first lane build, so the
@@ -1331,7 +1466,7 @@ fn pool_standing(pool: &PaymentPool::Pool, owner: Address) -> PoolStanding {
 async fn still_open<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     self_address: Address,
-    escrows: &UnconfirmedEscrows,
+    funding: &RunFunding,
     state: BuyerPoolState,
 ) -> Option<BuyerPoolState>
 where
@@ -1350,13 +1485,17 @@ where
             // The pool is open: take in the top-ups and redemptions of the other
             // signers that share it, which reach this row only from chain.
             PoolStanding::Open => {
-                escrows.note_live(state.pool_id);
+                funding.escrows().note_live(state.pool_id);
                 let mut state = state;
                 state
                     .reconcile_with_chain(U256::from(pool.deposit), U256::from(pool.totalRedeemed));
                 Some(state)
             }
-            PoolStanding::Unknown | PoolStanding::Foreign => Some(state),
+            PoolStanding::Unknown => {
+                funding.note_read_unknown(&state);
+                Some(state)
+            }
+            PoolStanding::Foreign => Some(state),
         },
         Err(error) => {
             tracing::warn!(
