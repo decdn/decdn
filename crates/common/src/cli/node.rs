@@ -715,7 +715,9 @@ pub struct RegisterArgs {
     /// has one. With neither, a host behind NAT registers none, and peers reach it through
     /// the relay; set the forwarded address in `network.external_addrs` or
     /// pass it here if UDP `network.bind_port` is forwarded, or add it later
-    /// with `decdn node update-multiaddrs`.
+    /// with `decdn node update-multiaddrs`. Without this flag, a bad
+    /// `network.external_addrs` entry, or one that holds `${VAR}`, stops the
+    /// command; the error names every such entry.
     #[arg(long = "multiaddr", value_name = "MA")]
     pub multiaddrs: Vec<String>,
 

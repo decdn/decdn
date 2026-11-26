@@ -964,8 +964,9 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # after bring-up but never fails on it (iroh retries in the background).
 # relay_urls = ["https://relay-a.example.", "https://relay-b.example."]
 # Public IP:port addresses where peers reach this node through a port forward or a
-# load balancer (IPv6 in brackets). The node publishes each one; `decdn setup` and
-# `decdn node register` register them when no --multiaddr is given. Restart to apply.
+# load balancer (IPv6 in brackets). The node publishes each one. `decdn setup` and
+# `decdn node register` register them when no --multiaddr is given; when they do,
+# a bad entry, or one that holds ${VAR}, stops the command. Restart to apply.
 # external_addrs = ["<public-ip>:4433"]
 # Operator-configurable address discovery (#818). Absent => n0-hosted pkarr/DNS.
 # Present => the node drops the n0 discovery leg and uses only what is set here.

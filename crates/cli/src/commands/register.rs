@@ -40,7 +40,7 @@ pub async fn run(args: &cli::RegisterArgs, global_config: Option<&Path>) -> anyh
     let cb_addr = resolved.capacity_bond_address;
     // Chosen before the signer loads, so a bad `network.external_addrs` entry
     // fails before any password prompt.
-    let multiaddrs = registration_multiaddrs(&args.multiaddrs, &file)?;
+    let multiaddrs = registration_multiaddrs(&args.multiaddrs, &file, None)?;
 
     let signer = chain_ctx::load_operator_signer(&args.chain.common, &resolved.keystore).await?;
     let provider = decdn_client::provider::build_provider(&resolved.rpc_url, &signer)?;
@@ -122,28 +122,39 @@ pub(crate) async fn ensure_multiaddrs_fit<P: Provider>(
 ///    source is not dialable; its operator sets `network.external_addrs` or
 ///    passes the forwarded address with `--multiaddr` instead.
 ///
+/// `external` is the list [`chain_ctx::FileConfig::external_addrs`] already
+/// returned for this `file`, when the caller parsed it earlier; `None` parses
+/// it here. It is ignored when `explicit` is non-empty.
+///
 /// The chosen default is reported on stderr, so `--json` stdout stays
-/// machine-readable.
+/// machine-readable. Each note names the config file it read; a fallback note
+/// instead names the default path where no file was found, or says there is
+/// no config file when no default path exists.
 ///
 /// # Errors
 ///
-/// Returns an error when a `network.external_addrs` entry is invalid and no
-/// `explicit` multiaddr is given.
+/// Returns an error that names every invalid `network.external_addrs` entry,
+/// when no `explicit` multiaddr is given.
 pub(crate) fn registration_multiaddrs(
     explicit: &[String],
     file: &chain_ctx::FileConfig,
+    external: Option<Vec<std::net::SocketAddr>>,
 ) -> anyhow::Result<Vec<String>> {
     if !explicit.is_empty() {
         return Ok(explicit.to_vec());
     }
-    let external = file.external_addrs()?;
+    let external = match external {
+        Some(external) => external,
+        None => file.external_addrs()?,
+    };
     if !external.is_empty() {
         let chosen: Vec<String> = external
             .iter()
             .map(|a| decdn_common::net::quic_multiaddr(a.ip(), a.port()))
             .collect();
         eprintln!(
-            "note: no --multiaddr given; registering network.external_addrs: {}",
+            "note: no --multiaddr given; registering network.external_addrs{}: {}",
+            read_from(file.source()),
             chosen.join(", ")
         );
         return Ok(chosen);
@@ -152,18 +163,44 @@ pub(crate) fn registration_multiaddrs(
     let chosen = default_multiaddrs(&decdn_common::net::route_public_ips(), bind_port);
     if chosen.is_empty() {
         eprintln!(
-            "note: no --multiaddr given and no public address on the default route (behind \
-             NAT); registering none. Peers reach the node through the relay and its pkarr \
+            "note: no --multiaddr given ({}) and no public address on the default route \
+             (behind NAT); registering none. Peers reach the node through the relay and its pkarr \
              record. If UDP {bind_port} is forwarded to this host, set the forwarded address \
-             in network.external_addrs or pass it with --multiaddr."
+             in network.external_addrs or pass it with --multiaddr.",
+            no_external_addrs(file.source()),
         );
     } else {
         eprintln!(
-            "note: no --multiaddr given; registering this host's public address: {}",
+            "note: no --multiaddr given ({}); registering this host's public address: {}",
+            no_external_addrs(file.source()),
             chosen.join(", ")
         );
     }
     Ok(chosen)
+}
+
+/// `" from <path>"` when the config was read from a file, else nothing: the
+/// suffix the configured-list note puts after `network.external_addrs`.
+fn read_from(source: &chain_ctx::ConfigSource) -> String {
+    match source {
+        chain_ctx::ConfigSource::Read(path) => format!(" from {}", path.display()),
+        chain_ctx::ConfigSource::NoPath | chain_ctx::ConfigSource::Missing(_) => String::new(),
+    }
+}
+
+/// Why no `network.external_addrs` list applies: the file read sets none, or
+/// no config file was found. The fallback notes carry it, so an operator sees
+/// which config the command looked at.
+fn no_external_addrs(source: &chain_ctx::ConfigSource) -> String {
+    match source {
+        chain_ctx::ConfigSource::Read(path) => {
+            format!("{} sets no network.external_addrs address", path.display())
+        }
+        chain_ctx::ConfigSource::Missing(path) => {
+            format!("no config file at {}", path.display())
+        }
+        chain_ctx::ConfigSource::NoPath => "no config file".to_string(),
+    }
 }
 
 fn default_multiaddrs(public: &[std::net::IpAddr], bind_port: u16) -> Vec<String> {

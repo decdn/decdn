@@ -34,9 +34,29 @@ pub struct FileConfig {
     identity: Option<FileIdentity>,
     network: Option<FileNetwork>,
     cache: Option<FileCache>,
+    #[serde(skip)]
+    source: ConfigSource,
+}
+
+/// Where a [`FileConfig`] came from, so a command can name the file it read
+/// or say that it found none.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigSource {
+    /// No file was looked for: no `--config` and no default config path.
+    #[default]
+    NoPath,
+    /// The config was read from this file.
+    Read(PathBuf),
+    /// No `--config` was given and the default config path holds no file.
+    Missing(PathBuf),
 }
 
 impl FileConfig {
+    /// The file this config was read from, or why none was read.
+    pub(crate) const fn source(&self) -> &ConfigSource {
+        &self.source
+    }
+
     /// The daemon's QUIC bind port, resolved as the daemon resolves it (see
     /// [`decdn_common::config::configured_bind_port`]).
     pub fn bind_port(&self) -> u16 {
@@ -53,7 +73,8 @@ impl FileConfig {
     ///
     /// # Errors
     ///
-    /// Returns the first bad entry's error, under `network.external_addrs[i]`.
+    /// Returns one error that names every bad entry, each under
+    /// `network.external_addrs[i]`.
     pub fn external_addrs(&self) -> anyhow::Result<Vec<std::net::SocketAddr>> {
         decdn_common::config::configured_external_addrs(
             self.network
@@ -221,7 +242,7 @@ pub struct Resolved {
 /// Load the partial config from `config_path` (or the `--config` flag folded
 /// in by the caller). An explicit path that is missing/unreadable is an error;
 /// the default path simply falls through to an empty config (every field can
-/// also come from a flag).
+/// also come from a flag). The returned config records where it came from.
 pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileConfig> {
     let (path, explicit) = match config_path {
         Some(p) => (expand_tilde(p), true),
@@ -231,9 +252,16 @@ pub fn load_optional_config(config_path: Option<&Path>) -> anyhow::Result<FileCo
         },
     };
     match std::fs::read_to_string(&path) {
-        Ok(contents) => toml::from_str(&contents)
-            .with_context(|| format!("failed to parse config file {}", path.display())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound && !explicit => Ok(FileConfig::default()),
+        Ok(contents) => {
+            let mut file: FileConfig = toml::from_str(&contents)
+                .with_context(|| format!("failed to parse config file {}", path.display()))?;
+            file.source = ConfigSource::Read(path);
+            Ok(file)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound && !explicit => Ok(FileConfig {
+            source: ConfigSource::Missing(path),
+            ..FileConfig::default()
+        }),
         Err(e) => {
             Err(anyhow::Error::new(e)
                 .context(format!("failed to read config file {}", path.display())))

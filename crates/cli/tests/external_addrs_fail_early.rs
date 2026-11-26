@@ -2,7 +2,8 @@
 //! password prompt or any chain read, and stops `decdn setup` on a node with
 //! no key before key generation or any chain read (ADR 019 § Phase 2). Setup
 //! on a node with a key checks the entries after it reads the registration
-//! state; `crates/e2e/tests/cli_setup_external_addrs.rs` covers that.
+//! state; `crates/e2e/tests/cli_setup_external_addrs.rs` covers that. The
+//! error names every bad entry.
 //!
 //! Drives the real `decdn` binary against a refused RPC port: a command that
 //! reached the chain would fail with an RPC error instead of naming the entry.
@@ -55,7 +56,10 @@ fn run(data_dir: &Path, config: &Path, args: &[&str]) -> Output {
 #[test]
 fn setup_refuses_a_private_external_addr_before_generating_keys() {
     let data_dir = TempDir::new().expect("temp data dir");
-    let config = write_config(data_dir.path(), r#"["10.0.0.5:4433"]"#);
+    let config = write_config(
+        data_dir.path(),
+        r#"["10.0.0.5:4433", "8.8.8.8:4433", "node.example:4433"]"#,
+    );
 
     let output = run(
         data_dir.path(),
@@ -69,6 +73,7 @@ fn setup_refuses_a_private_external_addr_before_generating_keys() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("network.external_addrs[0]"), "{stderr}");
+    assert!(stderr.contains("network.external_addrs[2]"), "{stderr}");
     assert!(stderr.contains("10.0.0.5"), "{stderr}");
     assert!(
         !stderr.contains("RPC reachable?"),
@@ -122,7 +127,10 @@ fn setup_with_explicit_multiaddr_skips_the_external_addrs_check() {
 #[test]
 fn register_refuses_a_private_external_addr_before_loading_the_signer() {
     let data_dir = TempDir::new().expect("temp data dir");
-    let config = write_config(data_dir.path(), r#"["10.0.0.5:4433"]"#);
+    let config = write_config(
+        data_dir.path(),
+        r#"["10.0.0.5:4433", "8.8.8.8:4433", "node.example:4433"]"#,
+    );
 
     let output = run(
         data_dir.path(),
@@ -136,8 +144,60 @@ fn register_refuses_a_private_external_addr_before_loading_the_signer() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("network.external_addrs[0]"), "{stderr}");
+    assert!(stderr.contains("network.external_addrs[2]"), "{stderr}");
     assert!(
         !stderr.to_lowercase().contains("keystore"),
         "the entry fails before the signer loads: {stderr}"
     );
+}
+
+#[test]
+fn register_note_names_the_config_file_read() {
+    let data_dir = TempDir::new().expect("temp data dir");
+    let config = write_config(data_dir.path(), r#"["8.8.8.8:4433"]"#);
+
+    let output = run(
+        data_dir.path(),
+        &config,
+        &["node", "register", "--region", "US"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "register still fails without a keystore"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let want = format!(
+        "registering network.external_addrs from {}: /ip4/8.8.8.8/udp/4433/quic-v1",
+        config.display()
+    );
+    assert!(stderr.contains(&want), "{stderr}");
+}
+
+#[test]
+fn register_note_names_the_missing_default_config() {
+    // No `--config`, and the isolated HOME holds no `.decdn/node.toml`, so
+    // either fallback note names the default path it looked at.
+    let home = TempDir::new().expect("temp home");
+    let output = common::decdn_command(home.path())
+        .args(["node", "register", "--region", "US"])
+        .arg("--rpc-url")
+        .arg(refused_rpc_url())
+        .args([
+            "--capacity-bond-address",
+            "0x0000000000000000000000000000000000000002",
+        ])
+        .output()
+        .expect("run decdn binary");
+
+    assert!(
+        !output.status.success(),
+        "register still fails without a keystore"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let want = format!(
+        "no config file at {}",
+        home.path().join(".decdn").join("node.toml").display()
+    );
+    assert!(stderr.contains(&want), "{stderr}");
 }

@@ -282,9 +282,10 @@ impl ConfigDiagnostics {
 /// — `resolve_config` and `RuntimeReloadState::reload` — drive the workers
 /// against their own bag and drain it with
 /// [`ConfigDiagnostics::take_notices`]. Every wrapper built on this is
-/// therefore `#[cfg(test)]`, except `resolve_discovery`, whose worker records
-/// no notices; a worker that grows one needs its caller moved off this
-/// wrapper, not a second sink here.
+/// therefore `#[cfg(test)]`, except `resolve_discovery` and
+/// `configured_external_addrs`, whose workers record no notices; a worker
+/// that grows one needs its caller moved off this wrapper, not a second sink
+/// here.
 pub(crate) fn one_section<T>(f: impl FnOnce(&mut ConfigDiagnostics) -> T) -> anyhow::Result<T> {
     let mut bag = ConfigDiagnostics::new();
     let value = f(&mut bag);

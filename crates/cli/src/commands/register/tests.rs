@@ -4,7 +4,7 @@ use super::*;
 fn explicit_multiaddrs_win_over_the_default() {
     let explicit = vec!["/ip4/198.51.100.7/udp/5000/quic-v1".to_string()];
     assert_eq!(
-        registration_multiaddrs(&explicit, &chain_ctx::FileConfig::default()).unwrap(),
+        registration_multiaddrs(&explicit, &chain_ctx::FileConfig::default(), None).unwrap(),
         explicit
     );
 }
@@ -21,7 +21,7 @@ fn registration_multiaddrs_default_to_configured_external_addrs() {
          external_addrs = [\"8.8.8.8:30443\", \"[2606:4700::1111]:4434\"]\n",
     );
     assert_eq!(
-        registration_multiaddrs(&[], &file).unwrap(),
+        registration_multiaddrs(&[], &file, None).unwrap(),
         vec![
             "/ip4/8.8.8.8/udp/30443/quic-v1".to_string(),
             "/ip6/2606:4700::1111/udp/4434/quic-v1".to_string(),
@@ -33,15 +33,84 @@ fn registration_multiaddrs_default_to_configured_external_addrs() {
 fn registration_multiaddrs_explicit_skips_a_bad_external_addr() {
     let file = file("[network]\nexternal_addrs = [\"node.example:4433\"]\n");
     let explicit = vec!["/ip4/8.8.8.8/udp/5000/quic-v1".to_string()];
-    assert_eq!(registration_multiaddrs(&explicit, &file).unwrap(), explicit);
+    assert_eq!(
+        registration_multiaddrs(&explicit, &file, None).unwrap(),
+        explicit
+    );
 }
 
 #[test]
 fn registration_multiaddrs_refuse_a_private_external_addr() {
     let file = file("[network]\nexternal_addrs = [\"8.8.8.8:4433\", \"10.0.0.5:4433\"]\n");
-    let msg = format!("{:#}", registration_multiaddrs(&[], &file).unwrap_err());
+    let msg = format!(
+        "{:#}",
+        registration_multiaddrs(&[], &file, None).unwrap_err()
+    );
     assert!(msg.contains("network.external_addrs[1]"), "{msg}");
     assert!(msg.contains("10.0.0.5"), "{msg}");
+}
+
+#[test]
+fn registration_multiaddrs_use_the_list_already_parsed() {
+    // The file's list is bad, so a result means the parsed list was used and
+    // the file was not parsed again.
+    let file = file("[network]\nexternal_addrs = [\"10.0.0.5:4433\"]\n");
+    let parsed = vec!["8.8.8.8:30443".parse().unwrap()];
+    assert_eq!(
+        registration_multiaddrs(&[], &file, Some(parsed)).unwrap(),
+        vec!["/ip4/8.8.8.8/udp/30443/quic-v1".to_string()]
+    );
+}
+
+#[test]
+fn registration_multiaddrs_take_an_empty_parsed_list_as_final() {
+    // An empty parsed list falls through to the default route; it does not
+    // parse the (bad) file again. The route-dependent result is not checked.
+    let file = file("[network]\nexternal_addrs = [\"10.0.0.5:4433\"]\n");
+    assert!(registration_multiaddrs(&[], &file, Some(Vec::new())).is_ok());
+}
+
+#[test]
+fn explicit_multiaddrs_win_over_a_parsed_list() {
+    let explicit = vec!["/ip4/198.51.100.7/udp/5000/quic-v1".to_string()];
+    let parsed = vec!["8.8.8.8:4433".parse().unwrap()];
+    assert_eq!(
+        registration_multiaddrs(&explicit, &chain_ctx::FileConfig::default(), Some(parsed))
+            .unwrap(),
+        explicit
+    );
+}
+
+#[test]
+fn notes_name_the_config_file_read() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, "[network]\nbind_port = 4433\n").unwrap();
+    let file = chain_ctx::load_optional_config(Some(&path)).unwrap();
+    assert_eq!(file.source(), &chain_ctx::ConfigSource::Read(path.clone()));
+    assert_eq!(
+        no_external_addrs(file.source()),
+        format!("{} sets no network.external_addrs address", path.display())
+    );
+    assert_eq!(
+        read_from(file.source()),
+        format!(" from {}", path.display())
+    );
+}
+
+#[test]
+fn notes_say_no_config_file_was_found() {
+    let path = std::path::PathBuf::from("/nonexistent/.decdn/node.toml");
+    let source = chain_ctx::ConfigSource::Missing(path.clone());
+    assert_eq!(
+        no_external_addrs(&source),
+        format!("no config file at {}", path.display())
+    );
+    assert_eq!(read_from(&source), "");
+    assert_eq!(
+        no_external_addrs(&chain_ctx::ConfigSource::NoPath),
+        "no config file"
+    );
 }
 
 #[test]

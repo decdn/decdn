@@ -51,26 +51,55 @@ pub fn configured_bind_port(file_bind_port: Option<u16>) -> u16 {
 /// that does not run [`resolve_config`]. Each entry follows the same rule as
 /// in [`resolve_config`] ([`crate::net::parse_external_addr`]), in order, each
 /// address kept once. Unlike [`resolve_config`], it refuses an entry that
-/// holds `${VAR}` and stops at the first bad entry.
+/// holds `${VAR}`.
 ///
 /// # Errors
 ///
-/// Returns the first bad entry's error, under `network.external_addrs[i]`.
+/// Returns one error that names every bad entry, each under
+/// `network.external_addrs[i]`.
 pub fn configured_external_addrs(raw: &[String]) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    one_section(|bag| resolve_external_addrs_into(raw, VarRefs::Refuse, bag))
+}
+
+/// How [`resolve_external_addrs_into`] treats an entry that holds `${VAR}`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VarRefs {
+    /// The entries are already expanded, so `${` is plain text for the parser.
+    Expanded,
+    /// The caller does not expand the entries, so a `${VAR}` entry is a problem.
+    Refuse,
+}
+
+/// The `network.external_addrs` list rule: parse each entry with
+/// [`crate::net::parse_external_addr`], record every bad entry under
+/// `network.external_addrs[i]`, and keep each good address once, in order.
+/// Under [`VarRefs::Refuse`], a `${VAR}` entry is recorded as a problem
+/// without being parsed.
+fn resolve_external_addrs_into(
+    raw: &[String],
+    var_refs: VarRefs,
+    bag: &mut ConfigDiagnostics,
+) -> Vec<std::net::SocketAddr> {
     let mut out = Vec::with_capacity(raw.len());
     for (i, entry) in raw.iter().enumerate() {
-        anyhow::ensure!(
-            !entry.contains("${"),
-            "network.external_addrs[{i}]: {entry:?} holds a ${{VAR}} reference, which this \
-             command does not expand; pass the address with --multiaddr"
-        );
-        let addr = crate::net::parse_external_addr(entry)
-            .with_context(|| format!("network.external_addrs[{i}]"))?;
-        if !out.contains(&addr) {
+        let label = format!("network.external_addrs[{i}]");
+        if var_refs == VarRefs::Refuse && entry.contains("${") {
+            bag.push(
+                label,
+                format!(
+                    "{entry:?} holds a ${{VAR}} reference, which this command does not \
+                     expand; pass the address with --multiaddr"
+                ),
+            );
+            continue;
+        }
+        if let Some(addr) = bag.try_with(label, crate::net::parse_external_addr(entry))
+            && !out.contains(&addr)
+        {
             out.push(addr);
         }
     }
-    Ok(out)
+    out
 }
 
 /// Default maximum cache size in megabytes (100 GB) — sized for the large-file
@@ -845,19 +874,12 @@ pub fn resolve_network_into(
         }
     }
 
-    let mut external_addrs = Vec::new();
-    let raw_external = file
-        .and_then(|n| n.external_addrs.as_deref())
-        .unwrap_or_default();
-    for (i, raw) in raw_external.iter().enumerate() {
-        if let Some(addr) = bag.try_with(
-            format!("network.external_addrs[{i}]"),
-            crate::net::parse_external_addr(raw),
-        ) && !external_addrs.contains(&addr)
-        {
-            external_addrs.push(addr);
-        }
-    }
+    let external_addrs = resolve_external_addrs_into(
+        file.and_then(|n| n.external_addrs.as_deref())
+            .unwrap_or_default(),
+        VarRefs::Expanded,
+        bag,
+    );
 
     let discovery = resolve_discovery_into(file, bag);
 
