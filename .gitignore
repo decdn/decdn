@@ -43,6 +43,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# The gateway dashboard's Vite build and dependencies (crates/cli/dashboard/).
-/crates/cli/dashboard/dist/
+# The gateway dashboard's dependencies (crates/cli/dashboard/). Its Vite build
+# is ignored by crates/cli/dashboard/dist/.gitignore.
 /crates/cli/dashboard/node_modules/

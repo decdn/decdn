@@ -1,0 +1,4 @@
+# The Vite build. This directory exists in every checkout, so
+# `crates/cli/build.rs` watches it, and nothing else, for the build to appear.
+*
+!.gitignore

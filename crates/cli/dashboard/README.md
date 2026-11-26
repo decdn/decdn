@@ -6,8 +6,8 @@ three sources, each only as far as it answers: the `decdn get` runs on the
 host, the gateway at `--gateway`, and the node at `--admin-url` and
 `--metrics-url`. The dashboard reads every source itself, so the page reads
 nothing from another origin. `crates/cli/build.rs` embeds the build in the
-`decdn` binary; a build with no `dist/` embeds a page that says how to make
-one.
+`decdn` binary; a build with no Vite output in `dist/` embeds a page that
+says how to make one.
 
 Node 24 and pnpm 10 (`corepack enable` provides it):
 

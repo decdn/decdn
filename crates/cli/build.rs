@@ -43,18 +43,19 @@ fn main() -> io::Result<()> {
     let dist = Path::new("dashboard/dist");
     let built = FILES.iter().all(|file| dist.join(file).is_file());
     println!("cargo::rerun-if-changed=build.rs");
+    // `dashboard/dist/` is tracked (it holds its own `.gitignore`), so the
+    // watched path always exists: a missing one reruns the script, and
+    // rebuilds the crate, on every build. Watching all of `dashboard/` would
+    // take in `node_modules/`, too many files for a compiler cache to digest.
+    println!("cargo::rerun-if-changed=dashboard/dist");
     if built {
         for file in FILES {
             fs::copy(dist.join(file), out.join(file))?;
         }
-        println!("cargo::rerun-if-changed=dashboard/dist");
     } else {
         fs::write(out.join("index.html"), FALLBACK)?;
         fs::write(out.join("app.js"), "")?;
         fs::write(out.join("app.css"), "")?;
-        // A path that does not exist reruns the script, and rebuilds the
-        // crate, on every build; the dashboard's own directory does exist.
-        println!("cargo::rerun-if-changed=dashboard");
     }
     println!("cargo::rustc-env=DECDN_DASHBOARD_BUILT={}", u8::from(built));
     Ok(())

@@ -6,13 +6,15 @@ import { defineConfig } from "vitest/config";
 // dashboard` serves them at `/`, `/_dashboard/app.js` and
 // `/_dashboard/app.css`, so the build
 // emits one script and one stylesheet under fixed names, with every asset
-// inlined.
+// inlined. Those fixed names overwrite the last build in place, so `dist/`
+// is never emptied: it keeps its tracked `.gitignore`, which `build.rs`
+// relies on.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   base: "/_dashboard/",
   build: {
     outDir: "dist",
-    emptyOutDir: true,
+    emptyOutDir: false,
     assetsDir: "",
     cssCodeSplit: false,
     modulePreload: { polyfill: false },
