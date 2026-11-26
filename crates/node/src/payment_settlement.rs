@@ -102,8 +102,8 @@ use decdn_incentive::payment_pool::SignerAuthorization;
 pub const REDEEM_HINT_CAPACITY: usize = 256;
 
 /// How long the admit path suppresses a repeat `getPool` for a pool it just
-/// found not-servable (nonexistent / `Closed`). A not-servable pool never folds
-/// into the projection, so its `snapshot` stays `None`; without this a client
+/// found not-servable (nonexistent / `Closed`). The projection holds no read of a
+/// not-servable pool, so its `snapshot` stays `None`; without this a client
 /// re-sending its capability on every request would drive one `getPool` per
 /// request against the same dead pool. On expiry the pool is re-checked once
 /// — the window is short enough that a pool opened after a negative result still
@@ -1552,21 +1552,20 @@ fn sum_unredeemed(plans: &[PlannedLane]) -> U256 {
 ///
 /// `remaining`, not the raw deposit: already-redeemed funds have left the pool
 /// and are not recoverable from it, so counting them would overstate what the
-/// node can still collect. A pool the projection has not folded contributes
+/// node can still collect. A pool the projection holds no read of contributes
 /// nothing rather than a guess — the same fail-quiet direction the planner
 /// takes on an unknown pool.
 ///
-/// Scoped to planned lanes, which is what bounds it to this node's own
-/// counterparties: the projection also folds `PoolOpened` for pools this node
-/// has no lane on, and summing those would report the network's escrow as its
-/// own. The precise reading is therefore "pools that currently owe this node",
-/// not every pool it has ever been paid by — a lane settles out of the planned
-/// set once it is fully redeemed. The caller skips the publish on an empty plan
-/// set so that settling out does not read as the escrow disappearing.
+/// Scoped to planned lanes, so it reads "pools that currently owe this node":
+/// the projection also holds reads of pools this node admitted but is owed
+/// nothing by, such as a pool whose lane is fully redeemed. A lane settles out
+/// of the planned set once it is fully redeemed. The caller skips the publish
+/// on an empty plan set so that settling out does not read as the escrow
+/// disappearing.
 ///
-/// A pool the projection has not folded contributes nothing rather than a
-/// guess, so the gauge under-reports in the window after a restart where the
-/// planner has deliberately failed open on an unknown pool.
+/// The gauge under-reports while the projection holds no read of a planned
+/// pool, as after a restart, where the planner deliberately fails open on an
+/// unknown pool.
 fn sum_recoverable_deposit(plans: &[PlannedLane], pool_view: &PoolProjection) -> U256 {
     let mut seen: HashSet<PoolId> = HashSet::new();
     plans
@@ -1647,7 +1646,7 @@ fn chunk_redemptions(
 
 /// Redemption policy: whether a lane whose pool has this `status` is worth
 /// submitting now. An unknown pool (`None`) passes planning: a projection gap
-/// (cold start, reorg, an unfolded event) must never hold a lane and strand real
+/// (cold start, a pruned idle read, a faulted `getPool`) must never hold a lane and strand real
 /// money, and [`resolve_unknown_pools`] reads the pool before any submit. Only a
 /// positive zero-`remaining` holds. A drained `Open` pool is held
 /// (a top-up re-drives it); a drained `Closing` pool is dropped (it cannot be

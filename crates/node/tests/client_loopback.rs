@@ -6383,10 +6383,9 @@ fn forgotten_pool_view() -> Arc<dyn decdn_node::pool_view::PoolView> {
     })
 }
 
-/// A [`ClosesMidStreamPoolView`] with `deadline`, and the flag that closes it.
-fn closing_pool_view(
-    deadline: u64,
-) -> (
+/// A [`ClosesMidStreamPoolView`] whose dispute deadline is far off, and the
+/// flag that closes it.
+fn closing_pool_view() -> (
     Arc<dyn decdn_node::pool_view::PoolView>,
     Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -6394,7 +6393,7 @@ fn closing_pool_view(
     let view = Arc::new(ClosesMidStreamPoolView {
         owner: operator_addr(),
         remaining: closing_pool_remaining(),
-        deadline,
+        deadline: u64::MAX,
         closing: Arc::clone(&closing),
     });
     (view, closing)
@@ -6482,15 +6481,15 @@ async fn forgotten_pool_stops_a_serve_miss_stream() -> anyhow::Result<()> {
     assert_own_origin_spine(&metrics, &cache_metrics)
 }
 
-/// The owner calls `initiateClose` under a live cache-hit stream, and the
-/// dispute deadline has come: the `deliver` loop stops the stream, although the
-/// pool's `remaining` still funds it.
+/// The owner calls `initiateClose` under a live cache-hit stream: the `deliver`
+/// loop stops the stream at the next re-check, although the dispute deadline
+/// is far off and the pool's `remaining` still funds it.
 #[tokio::test(flavor = "multi_thread")]
-async fn closing_pool_past_its_cutoff_stops_a_cache_hit_stream() -> anyhow::Result<()> {
+async fn closing_pool_stops_a_cache_hit_stream() -> anyhow::Result<()> {
     let payload = vec![0xC7u8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
-    let (view, closing) = closing_pool_view(unix_now()?);
+    let (view, closing) = closing_pool_view();
     closed_pool_stops_the_stream(cache, hash, signer, view, || {
         closing.store(true, std::sync::atomic::Ordering::Relaxed);
     })
@@ -6498,16 +6497,15 @@ async fn closing_pool_past_its_cutoff_stops_a_cache_hit_stream() -> anyhow::Resu
     Ok(())
 }
 
-/// The serve-miss twin of
-/// [`closing_pool_past_its_cutoff_stops_a_cache_hit_stream`]: the own-origin
-/// `serve_leg` loop stops the stream.
+/// The serve-miss twin of [`closing_pool_stops_a_cache_hit_stream`]: the
+/// own-origin `serve_leg` loop stops the stream.
 #[tokio::test(flavor = "multi_thread")]
-async fn closing_pool_past_its_cutoff_stops_a_serve_miss_stream() -> anyhow::Result<()> {
+async fn closing_pool_stops_a_serve_miss_stream() -> anyhow::Result<()> {
     let payload = vec![0xC8u8; 16 * 1024 * 1024];
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
-    let (view, closing) = closing_pool_view(unix_now()?);
+    let (view, closing) = closing_pool_view();
     let metrics = closed_pool_stops_the_stream(cache, hash, signer, view, || {
         closing.store(true, std::sync::atomic::Ordering::Relaxed);
     })
@@ -6515,15 +6513,15 @@ async fn closing_pool_past_its_cutoff_stops_a_serve_miss_stream() -> anyhow::Res
     assert_own_origin_spine(&metrics, &cache_metrics)
 }
 
-/// A slow payer pays a sliver of the owed chunk after the pool's close cutoff
-/// passes, and holds the rest. The `deliver` loop stops the stream between
+/// A slow payer pays a sliver of the owed chunk after the pool turns
+/// `Closing`, and holds the rest. The `deliver` loop stops the stream between
 /// proofs. It does not wait for the payer to settle the chunk.
 #[tokio::test(flavor = "multi_thread")]
 async fn closing_pool_stops_a_slow_payers_cache_hit_batch_between_proofs() -> anyhow::Result<()> {
     let payload = vec![0xCBu8; 16 * 1024 * 1024];
     let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
-    let (view, closing) = closing_pool_view(unix_now()?);
+    let (view, closing) = closing_pool_view();
     let close = || closing.store(true, std::sync::atomic::Ordering::Relaxed);
     closed_pool_stops_the_stream_after(cache, hash, signer, view, close, SLIVER_BYTES).await?;
     Ok(())
@@ -6538,57 +6536,11 @@ async fn closing_pool_stops_a_slow_payers_serve_miss_batch_between_proofs() -> a
     let (cache, hash, cache_metrics, _origin_tmp, _cache_tmp) =
         empty_cache_with_fs_origin(&payload).await?;
     let signer = Arc::new(PrivateKeySigner::random());
-    let (view, closing) = closing_pool_view(unix_now()?);
+    let (view, closing) = closing_pool_view();
     let close = || closing.store(true, std::sync::atomic::Ordering::Relaxed);
     let metrics =
         closed_pool_stops_the_stream_after(cache, hash, signer, view, close, SLIVER_BYTES).await?;
     assert_own_origin_spine(&metrics, &cache_metrics)
-}
-
-/// A pool that turns `Closing` mid-stream with its dispute deadline a day out
-/// still pays for the stream, so the stream runs to a clean `StreamEnd`.
-#[tokio::test(flavor = "multi_thread")]
-async fn closing_pool_before_its_cutoff_serves_the_stream_to_its_end() -> anyhow::Result<()> {
-    let payload = vec![0xC9u8; 16 * 1024 * 1024];
-    let (cache, hash, _cache_tmp) = cache_with_blob(&payload).await?;
-    let signer = Arc::new(PrivateKeySigner::random());
-    let store = closing_pool_store(&signer)?;
-    let (view, closing) = closing_pool_view(unix_now()?.saturating_add(86_400));
-    let m = U256::from(HARNESS_CHUNK_COST);
-    let (target, server_ep, server_task, metrics) =
-        spawn_handler_server_with_pool_view(cache, store, view, Duration::ZERO, m).await?;
-
-    let client_sk = fresh_key();
-    let client_node_id = B256::from(*client_sk.public().as_bytes());
-    let (client_ep, _) = local_endpoint(client_sk, vec![]).await?;
-    let conn = client_ep
-        .connect(target, ALPN_CLIENT)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-    let ext = binding_ext(&signer, client_node_id)?;
-
-    // The first proof admits the stream while the pool reads open; the pool
-    // then turns `Closing`.
-    let (mut send, mut recv) = open_paid_stream(&conn, *hash.as_bytes(), Some(&ext)).await?;
-    let admitted = admit_with_first_frames(&mut send, &mut recv, &signer).await?;
-    closing.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    let wire = support::bao_wire_len_whole(payload.len() as u64);
-    let received = pay_and_read_to_end_from(&mut send, &mut recv, &signer, wire, admitted).await?;
-    anyhow::ensure!(
-        received >= payload.len() as u64,
-        "expected at least the full {}-byte blob (wire = content + bao proof), received \
-         {received} bytes",
-        payload.len()
-    );
-    anyhow::ensure!(
-        counter(&metrics, "decdn_serve_stream_midstream_pool_closed_total")? == 0,
-        "a closing pool outside the redeem margin must keep serving"
-    );
-
-    conn.close(0u32.into(), b"done");
-    shutdown([server_task], [&client_ep, &server_ep]).await?;
-    Ok(())
 }
 
 /// #2664: a mid-stream `PoolExhausted` follows proofs the node accepted, and

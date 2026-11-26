@@ -738,6 +738,37 @@ contract DeployProtocolTest is Test, BaseProtocolDeploy {
         this.externalRunFullDeploy(bad);
     }
 
+    /// @notice On Ethereum mainnet the deploy requires a bootstrap multisig. Without
+    ///         one the Governor would be proposer at genesis with zero threshold and
+    ///         quorum.
+    function test_mainnet_revertsWithoutBootstrapMultisig() public {
+        vm.chainId(1);
+        DeployConfig memory bad = _testConfig();
+        bad.emergencyMultisig = address(new MockMultisig());
+        vm.expectRevert(BaseProtocolDeploy.BootstrapMultisigRequired.selector);
+        this.externalRunFullDeploy(bad);
+    }
+
+    /// @notice On Ethereum mainnet a deploy with both multisigs set lands in the
+    ///         bootstrap phase: the multisig proposes and the Governor cannot.
+    function test_mainnet_deploysWithBootstrapMultisig() public {
+        vm.chainId(1);
+        DeployConfig memory good = _testConfig();
+        good.emergencyMultisig = address(new MockMultisig());
+        good.bootstrapMultisig = bootstrapMultisig;
+        Deployment memory m = this.externalRunFullDeploy(good);
+        assertTrue(m.timelock.hasRole(m.timelock.PROPOSER_ROLE(), bootstrapMultisig));
+        assertFalse(m.timelock.hasRole(m.timelock.PROPOSER_ROLE(), address(m.governor)));
+    }
+
+    /// @notice Off mainnet `BOOTSTRAP_MULTISIG` stays optional: the default deploy
+    ///         seats the Governor as proposer at genesis.
+    function test_testnet_deploysWithoutBootstrapMultisig() public {
+        vm.chainId(421_614);
+        Deployment memory t = this.externalRunFullDeploy(_testConfig());
+        assertTrue(t.timelock.hasRole(t.timelock.PROPOSER_ROLE(), address(t.governor)));
+    }
+
     function externalRunFullDeploy(DeployConfig calldata cfgIn) external returns (Deployment memory) {
         return _runFullDeploy(cfgIn);
     }
