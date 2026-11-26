@@ -504,6 +504,35 @@ pub enum WatermarkRow {
     Delegated(Deployment),
 }
 
+/// The lowest nonce the next transaction from one owner may pin, set by a
+/// transaction of that owner that mined at the nonce below it.
+///
+/// A mined transaction at nonce `n` proves the chain nonce is at least `n + 1`.
+/// A load-balanced RPC whose backend lags can still answer the pending count
+/// `n`. A send that pins that answer reuses the spent nonce, and the node
+/// rejects it as `nonce too low`. [`ensure_allowance`] returns the floor of the
+/// `approve` it mined. [`open_pool`] and [`top_up`] pin no nonce below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonceFloor(u64);
+
+impl NonceFloor {
+    /// The floor a transaction that mined at `nonce` sets: `nonce + 1`.
+    /// `None` when `nonce` has no successor.
+    #[must_use]
+    pub const fn after_mined(nonce: u64) -> Option<Self> {
+        match nonce.checked_add(1) {
+            Some(floor) => Some(Self(floor)),
+            None => None,
+        }
+    }
+
+    /// The lowest nonce the next send may pin.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Ensure `owner` holds a sufficient USDC allowance for the `PaymentPool`
 /// `spender`, issuing at most one `approve` when the current allowance is below
 /// what `amount` requires. `amount == None` grants an unlimited (`U256::MAX`)
@@ -513,23 +542,33 @@ pub enum WatermarkRow {
 /// `approve_decision` for the skip logic. Idempotent across runs — a wallet
 /// already at or above the required allowance skips the tx.
 ///
+/// The `approve` pins `owner`'s pending nonce. So `provider` must sign for
+/// `owner` and read the pending nonce on every send (alloy's
+/// `with_simple_nonce_management`), as for [`open_pool`].
+///
+/// It returns `Some` [`NonceFloor`] when it sent an `approve` at nonce `n`
+/// that mined and succeeded: the floor is `n + 1`. It returns `None` when the
+/// allowance is already sufficient. A caller that sends an `openPool` or a
+/// `topUp` next passes the floor to [`open_pool`] or [`top_up`].
+///
 /// # Errors
 ///
-/// Fails on the allowance read, the `approve` submission, a receipt that is not
-/// read (a failed read, or none within [`RECEIPT_TIMEOUT`]; the error names the
-/// tx, which may still mine), or a reverted approve. A submission whose
-/// broadcast is unknown ([`decdn_incentive::tx::send_broadcast_unknown`]: the
-/// send request failed in transport, or the node answered `already known`,
-/// `nonce too low` or `replacement transaction underpriced`) says the
-/// `approve` may be pending; one whose chain reads failed before the send does
-/// not, since nothing was signed.
+/// Fails on the allowance read, the pending-nonce read, the `approve`
+/// submission, a receipt that is not read (a failed read, or none within
+/// [`RECEIPT_TIMEOUT`]; the error names the tx, which may still mine), or a
+/// reverted approve. A submission whose broadcast is unknown
+/// ([`decdn_incentive::tx::send_broadcast_unknown`]: the send request failed
+/// in transport, or the node answered `already known`, `nonce too low` or
+/// `replacement transaction underpriced`) says the `approve` may be pending;
+/// one whose chain reads failed before the send does not, since nothing was
+/// signed.
 pub async fn ensure_allowance<P: Provider + Clone>(
     provider: &P,
     token: Address,
     owner: Address,
     spender: Address,
     amount: Option<U256>,
-) -> Result<()> {
+) -> Result<Option<NonceFloor>> {
     let erc20 = Erc20::new(token, provider.clone());
     let current = erc20
         .allowance(owner, spender)
@@ -538,9 +577,20 @@ pub async fn ensure_allowance<P: Provider + Clone>(
         .context("read USDC allowance")?;
     let Some(approve_value) = approve_decision(current, amount) else {
         debug!(%current, "USDC allowance already sufficient; skipping approve");
-        return Ok(());
+        return Ok(None);
     };
-    let pending = match erc20.approve(spender, approve_value).send().await {
+    let nonce = provider
+        .get_transaction_count(owner)
+        .pending()
+        .await
+        .context("read the pending nonce for the USDC approve")?;
+    let pending = match erc20
+        .approve(spender, approve_value)
+        .from(owner)
+        .nonce(nonce)
+        .send()
+        .await
+    {
         Ok(pending) => pending,
         Err(err) => {
             // A send request that failed in transport may have reached the
@@ -578,9 +628,30 @@ pub async fn ensure_allowance<P: Provider + Clone>(
         %spender,
         %approve_value,
         unlimited = amount.is_none(),
+        nonce,
         "issued USDC approval for PaymentPool deposits"
     );
-    Ok(())
+    NonceFloor::after_mined(nonce)
+        .context("the approve nonce has no successor")
+        .map(Some)
+}
+
+/// The nonce a send pins: `owner`'s `pending` count, raised to `floor` when
+/// that is higher. A pending count below the floor comes from a backend that
+/// has not seen the transaction that set the floor, and is logged.
+fn floored_nonce(pending: u64, floor: Option<NonceFloor>) -> u64 {
+    match floor {
+        Some(floor) if pending < floor.get() => {
+            warn!(
+                pending,
+                floor = floor.get(),
+                "the RPC answered a pending nonce below the mined approve's floor; \
+                 sending at the floor"
+            );
+            floor.get()
+        }
+        _ => pending,
+    }
 }
 
 /// Open a fresh `PaymentPool` deposit for `owner`, escrowing `deposit` USDC, and
@@ -677,6 +748,13 @@ pub async fn ensure_allowance<P: Provider + Clone>(
 /// pending nonce on every send (alloy's `with_simple_nonce_management`), as for
 /// [`top_up`]. It must also carry [`decdn_incentive::tx::SendLegLayer`], as
 /// [`crate::provider::build_provider`] does.
+///
+/// `open_pool` pins no nonce below `nonce_floor`. A caller that sends an
+/// `approve` first passes the [`NonceFloor`] that [`ensure_allowance`]
+/// returned, so a lagging RPC backend that answers the pending count from
+/// before the `approve` mined cannot make the open reuse the spent nonce.
+/// `None` pins the pending count.
+#[allow(clippy::too_many_arguments)]
 pub async fn open_pool<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     deployment: Deployment,
@@ -685,6 +763,7 @@ pub async fn open_pool<P: Provider + Clone>(
     deposit: U256,
     escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
+    nonce_floor: Option<NonceFloor>,
 ) -> Result<(OpenedPool, UnrecordedEscrow)> {
     anyhow::ensure!(
         *contract.address() == deployment.payment_pool,
@@ -697,13 +776,14 @@ pub async fn open_pool<P: Provider + Clone>(
         return Err(anyhow::Error::new(earlier)
             .context("refusing a second openPool while an earlier one is unconfirmed"));
     }
-    let nonce = contract
+    let pending_count = contract
         .provider()
         .get_transaction_count(owner)
         .pending()
         .await
         .context("read the pending nonce for openPool")
         .context(PoolOpenFailureReason::RpcError)?;
+    let nonce = floored_nonce(pending_count, nonce_floor);
     // A caller with no handle holds the entries in one nobody reads.
     let escrows = escrows.cloned().unwrap_or_default();
     let submitted = OpenUnconfirmed { tx: None, nonce };
@@ -1453,8 +1533,9 @@ pub async fn pool_accepts_funds<P: Provider + Clone>(
     }
 }
 
-/// Send `topUp(pool_id, amount)` from `owner` at its pending nonce, and
-/// return the pending transaction with the nonce it holds. The errors are
+/// Send `topUp(pool_id, amount)` from `owner` at its pending nonce, raised to
+/// `nonce_floor` when that is higher ([`NonceFloor`]), and return the
+/// pending transaction with the nonce it holds. The errors are
 /// [`top_up`]'s submit errors, and [`FetchEnded`](crate::funding::FetchEnded)
 /// once `ended` fires before the send.
 ///
@@ -1471,15 +1552,17 @@ async fn send_top_up<P: Provider + Clone>(
     amount: u64,
     escrows: &UnconfirmedEscrows,
     ended: Option<&CancellationToken>,
+    nonce_floor: Option<NonceFloor>,
 ) -> Result<(PendingTransactionBuilder<Ethereum>, u64)> {
     // Refuse the send once the fetch ended: its lane would never run.
     crate::funding::refuse_after_end(ended)?;
-    let nonce = contract
+    let pending_count = contract
         .provider()
         .get_transaction_count(owner)
         .pending()
         .await
         .context("read the pending nonce for topUp")?;
+    let nonce = floored_nonce(pending_count, nonce_floor);
     let call = contract.topUp(pool_id, amount).from(owner).nonce(nonce);
     let submitted = TopUpUnconfirmed { tx: None, nonce };
     // Held across the submit: a drop while it is in flight leaves a
@@ -1593,6 +1676,12 @@ pub async fn send_top_up_at<P: Provider + Clone>(
 /// and carry [`decdn_incentive::tx::SendLegLayer`], as
 /// [`crate::provider::build_provider`] does.
 ///
+/// `top_up` pins no nonce below `nonce_floor`. A caller that sends an
+/// `approve` first passes the [`NonceFloor`] that [`ensure_allowance`]
+/// returned, so a lagging RPC backend that answers the pending count from
+/// before the `approve` mined cannot make the `topUp` reuse the spent nonce.
+/// `None` pins the pending count.
+///
 /// `top_up` sends one `topUp` at one nonce and never a second at another. A
 /// submit answered `nonce too low` or `replacement transaction underpriced`
 /// fails with [`TopUpUnconfirmed`] at that nonce, as a transport failure does:
@@ -1643,6 +1732,7 @@ pub async fn top_up<P: Provider + Clone>(
     additional: U256,
     escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
+    nonce_floor: Option<NonceFloor>,
 ) -> Result<(ToppedUpPool, UnrecordedEscrow)> {
     top_up_unless_ended(
         contract,
@@ -1652,6 +1742,7 @@ pub async fn top_up<P: Provider + Clone>(
         escrows,
         receipt_timeout,
         None,
+        nonce_floor,
     )
     .await
 }
@@ -1664,6 +1755,7 @@ pub async fn top_up<P: Provider + Clone>(
 ///
 /// As [`top_up`], and [`crate::funding::FetchEnded`] once `ended` fires
 /// before a send.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn top_up_unless_ended<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     owner: Address,
@@ -1672,11 +1764,21 @@ pub(crate) async fn top_up_unless_ended<P: Provider + Clone>(
     escrows: Option<&UnconfirmedEscrows>,
     receipt_timeout: Option<Duration>,
     ended: Option<&CancellationToken>,
+    nonce_floor: Option<NonceFloor>,
 ) -> Result<(ToppedUpPool, UnrecordedEscrow)> {
     let amount = to_pool_u64(additional, "top-up")?;
     // A caller with no handle holds the entries in one nobody reads.
     let escrows = escrows.cloned().unwrap_or_default();
-    let (pending, nonce) = send_top_up(contract, owner, pool_id, amount, &escrows, ended).await?;
+    let (pending, nonce) = send_top_up(
+        contract,
+        owner,
+        pool_id,
+        amount,
+        &escrows,
+        ended,
+        nonce_floor,
+    )
+    .await?;
     // Capture the hash before the wait consumes `pending`: past this point the
     // transaction is broadcast and may mine, so every receipt failure names it
     // (see [`TopUpUnconfirmed`]). A lapse does not cancel the transaction.

@@ -820,7 +820,7 @@ where
         self.funding.refuse_after_untracked()?;
         let deposit = self.working_deposit;
         refuse_open(self.open, deposit)?;
-        ensure_allowance(
+        let nonce_floor = ensure_allowance(
             self.rpc,
             self.token,
             self.owner,
@@ -840,6 +840,7 @@ where
             deposit,
             Some(self.funding.escrows()),
             Some(RECEIPT_TIMEOUT),
+            nonce_floor,
         )
         .await?;
         record_opened(self.store, &opened, unrecorded)?;
@@ -1526,7 +1527,7 @@ where
             .context("refusing a second topUp while an earlier one is unconfirmed"));
     }
     funding.refuse_after_untracked()?;
-    ensure_allowance(
+    let nonce_floor = ensure_allowance(
         contract.provider(),
         token,
         owner,
@@ -1542,6 +1543,7 @@ where
         Some(&funding.escrows),
         Some(RECEIPT_TIMEOUT),
         ended,
+        nonce_floor,
     )
     .await
 }
@@ -1819,7 +1821,8 @@ where
     // `max_approve` opts into an unlimited standing allowance; otherwise approve
     // exactly the deposit being escrowed.
     let approve_amount = if max_approve { None } else { Some(deposit) };
-    ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
+    let nonce_floor =
+        ensure_allowance(rpc, token, self_address, payment_pool_addr, approve_amount).await?;
     refuse_after_end(Some(ended))?;
     let (opened, unrecorded) = open_pool(
         contract,
@@ -1829,6 +1832,7 @@ where
         deposit,
         Some(funding.escrows()),
         Some(RECEIPT_TIMEOUT),
+        nonce_floor,
     )
     .await?;
     record_opened(store, &opened, unrecorded)?;

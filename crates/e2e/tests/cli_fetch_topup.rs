@@ -118,7 +118,7 @@ async fn run() -> anyhow::Result<()> {
     // Unlimited standing allowance: covers both the initial `openPool` deposit
     // and the later refill `topUp` without re-approving (a `--max-approve`
     // buyer). Passing `None` selects the max-approval path.
-    ensure_allowance(
+    let nonce_floor = ensure_allowance(
         &buyer_provider,
         chain.usdc(),
         buyer_addr,
@@ -142,6 +142,7 @@ async fn run() -> anyhow::Result<()> {
         deposit,
         None,
         None,
+        nonce_floor,
     )
     .await
     .context("open buyer pool")?;
@@ -197,7 +198,7 @@ async fn run() -> anyhow::Result<()> {
     // measured on-chain amount into the local record via `add_deposit`.
     let remaining = deposit - prior_amount; // == 1
     let additional = deposit - remaining; // restore to a full `deposit`
-    let (topped_up, _unrecorded) = top_up(&pool, buyer_addr, pool_id, additional, None, None)
+    let (topped_up, _unrecorded) = top_up(&pool, buyer_addr, pool_id, additional, None, None, None)
         .await
         .context("top_up")?;
     // The tx is the only handle an operator has to reconcile an escrow whose
@@ -501,7 +502,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         chain_id: chain.chain_id(),
         payment_pool: chain.addrs().payment_pool,
     };
-    ensure_allowance(
+    let nonce_floor = ensure_allowance(
         &chain.provider_for(&buyer),
         chain.usdc(),
         buyer_addr,
@@ -522,6 +523,7 @@ async fn run_multi_interval_topup() -> anyhow::Result<()> {
         working_deposit,
         None,
         None,
+        nonce_floor,
     )
     .await
     .context("open buyer pool")?;
@@ -810,7 +812,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         chain_id: chain.chain_id(),
         payment_pool: chain.addrs().payment_pool,
     };
-    ensure_allowance(
+    let nonce_floor = ensure_allowance(
         &chain.provider_for(&buyer),
         chain.usdc(),
         buyer_addr,
@@ -828,6 +830,7 @@ async fn run_deposit_short_fetch() -> anyhow::Result<()> {
         U256::from(DEPOSIT_SHORT_WORKING_MICRO_USDC),
         None,
         None,
+        nonce_floor,
     )
     .await
     .context("open buyer pool")?;

@@ -17,7 +17,7 @@ use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::Context as _;
 use decdn_client::buyer_pool::{
-    ToppedUpPool, UnconfirmedEscrows, ensure_allowance, escrowed_but_untracked,
+    NonceFloor, ToppedUpPool, UnconfirmedEscrows, ensure_allowance, escrowed_but_untracked,
     grade_deposit_credit, open_pool, top_up, topped_up_effect,
 };
 use decdn_common::admin::{AdminRpcClient as _, BuyerPoolsResponse};
@@ -211,14 +211,22 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
         .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
     let deposit = U256::from(args.deposit_micro_usdc);
 
-    ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(deposit)).await?;
+    let nonce_floor =
+        ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(deposit)).await?;
 
     // Watched from the open on: a Ctrl-C does not cancel a broadcast
     // `openPool`, so the command names it rather than dying with no hash.
     let escrows = UnconfirmedEscrows::default();
     let mut interrupt = Interrupt::watch(escrows.clone());
     let opened = open_and_record(
-        &contract, &store, deployment, token, owner, deposit, &escrows,
+        &contract,
+        &store,
+        deployment,
+        token,
+        owner,
+        deposit,
+        &escrows,
+        nonce_floor,
     );
     let result = tokio::select! {
         result = opened => result,
@@ -237,13 +245,15 @@ async fn open(args: &cli::PoolOpenArgs, config_path: Option<&Path>) -> anyhow::R
 /// Escrow `deposit` in a fresh pool (`openPool`) from `owner`, record it in
 /// `store`, and return its id. `escrows` names the open from before its submit
 /// until the record resolves, so a second Ctrl-C during the write still names
-/// it.
+/// it. The `openPool` pins no nonce below `nonce_floor`, the floor of the
+/// `approve` sent before it.
 ///
 /// # Errors
 ///
 /// The `openPool` fails or is not confirmed, or the record write fails after
 /// it mined: the deposit is then escrowed and untracked, and `escrows` holds
 /// it.
+#[allow(clippy::too_many_arguments)]
 async fn open_and_record<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &dyn BuyerPoolStore,
@@ -252,6 +262,7 @@ async fn open_and_record<P>(
     owner: Address,
     deposit: U256,
     escrows: &UnconfirmedEscrows,
+    nonce_floor: Option<NonceFloor>,
 ) -> anyhow::Result<PoolId>
 where
     P: alloy::providers::Provider + Clone,
@@ -264,6 +275,7 @@ where
         deposit,
         Some(escrows),
         Some(RECEIPT_TIMEOUT),
+        nonce_floor,
     )
     .await?;
     // The deposit is escrowed on-chain; a failed local record leaves it
@@ -315,7 +327,8 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         .call()
         .await
         .map_err(|e| anyhow::Error::new(e).context("read PaymentPool.usdc()"))?;
-    ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
+    let nonce_floor =
+        ensure_allowance(&rpc, token, owner, chain.payment_pool, Some(additional)).await?;
 
     // Watched from the `topUp` on: a Ctrl-C does not cancel a broadcast
     // `topUp`, so the command names it rather than dying with no hash.
@@ -329,6 +342,7 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
         pool_id,
         additional,
         &escrows,
+        nonce_floor,
     );
     let result = tokio::select! {
         result = topped_up => result,
@@ -342,12 +356,15 @@ async fn top_up_cmd(args: &cli::PoolTopUpArgs, config_path: Option<&Path>) -> an
 /// Add `additional` to `owner`'s pool `pool_id` (`topUp`), credit it in
 /// `store`, and return the credited amount with the new local deposit.
 /// `escrows` names the `topUp` from before its submit until the credit
-/// resolves, so a second Ctrl-C during the write still names it.
+/// resolves, so a second Ctrl-C during the write still names it. The `topUp`
+/// pins no nonce below `nonce_floor`, the floor of the `approve` sent before
+/// it.
 ///
 /// # Errors
 ///
 /// The `topUp` fails or is not confirmed, or the credit does not land after
 /// it mined: the USDC is then escrowed and untracked, and `escrows` holds it.
+#[allow(clippy::too_many_arguments)]
 async fn top_up_and_credit<P>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
     store: &dyn BuyerPoolStore,
@@ -356,6 +373,7 @@ async fn top_up_and_credit<P>(
     pool_id: PoolId,
     additional: U256,
     escrows: &UnconfirmedEscrows,
+    nonce_floor: Option<NonceFloor>,
 ) -> anyhow::Result<(U256, U256)>
 where
     P: alloy::providers::Provider + Clone,
@@ -367,6 +385,7 @@ where
         additional,
         Some(escrows),
         Some(RECEIPT_TIMEOUT),
+        nonce_floor,
     )
     .await?;
     // `add_deposit` reports a backend fault as `Err` and a committed-row

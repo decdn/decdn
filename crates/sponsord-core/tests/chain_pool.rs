@@ -53,7 +53,7 @@ async fn remaining_grows_after_topup() {
         .expect("mint usdc");
 
     let open_provider = chain.provider_for(&signer);
-    ensure_allowance(
+    let nonce_floor = ensure_allowance(
         &open_provider,
         chain.usdc(),
         owner,
@@ -78,6 +78,7 @@ async fn remaining_grows_after_topup() {
         U256::from(OPEN_DEPOSIT_MICRO_USDC),
         None,
         None,
+        nonce_floor,
     )
     .await
     .expect("open pool");

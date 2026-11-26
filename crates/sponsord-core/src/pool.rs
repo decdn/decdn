@@ -272,7 +272,7 @@ impl PoolChain for ChainPool {
 
     async fn top_up(&self, pool_id: B256, additional: MicroUsdc) -> anyhow::Result<MicroUsdc> {
         let amount = U256::from(additional.0);
-        ensure_allowance(
+        let nonce_floor = ensure_allowance(
             &self.provider,
             self.token,
             self.owner,
@@ -284,9 +284,17 @@ impl PoolChain for ChainPool {
         // No escrow handle and no receipt bound: the daemon keeps no local pool
         // record for decdn to reconcile, and the keeper holds further top-ups
         // on decdn's own `TopUpUnconfirmed` when the receipt read fails.
-        let (topped, unrecorded) = top_up(&self.contract, self.owner, pool_id, amount, None, None)
-            .await
-            .map_err(|e| redacted_top_up(format!("top up {pool_id}"), &e))?;
+        let (topped, unrecorded) = top_up(
+            &self.contract,
+            self.owner,
+            pool_id,
+            amount,
+            None,
+            None,
+            nonce_floor,
+        )
+        .await
+        .map_err(|e| redacted_top_up(format!("top up {pool_id}"), &e))?;
         // The credit is reported to the keeper, which is this daemon's record.
         unrecorded.recorded();
         Ok(MicroUsdc(

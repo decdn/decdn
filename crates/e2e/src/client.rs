@@ -447,6 +447,7 @@ impl ClientFixture {
             deposit,
             None,
             None,
+            None,
         )
         .await
         .context("open buyer pool")?;

@@ -73,7 +73,7 @@ async fn daemon_binary_serves_tops_up_and_shuts_down() {
         .unwrap();
     let provider = chain.provider_for(&signer);
     let pool_addr = chain.addrs().payment_pool;
-    ensure_allowance(
+    let nonce_floor = ensure_allowance(
         &provider,
         chain.usdc(),
         owner,
@@ -93,6 +93,7 @@ async fn daemon_binary_serves_tops_up_and_shuts_down() {
         U256::from(OPEN_DEPOSIT),
         None,
         None,
+        nonce_floor,
     )
     .await
     .unwrap();
