@@ -3649,7 +3649,7 @@ async fn a_failed_fetch_drops_a_stored_pool_the_chain_holds_no_record_of() {
 
     let (contract, asserter) = scripted_contract(vec![Some(no_record_on_chain())]);
     let retired = funding.retire_stale_pool(&contract, &store).await;
-    assert_eq!(retired, Some(StalePoolRetired { pool_id: id }));
+    assert_eq!(retired, Some(StalePool::Retired { pool_id: id }));
     assert!(asserter.read_q().is_empty(), "the step read the pool again");
     let err = anyhow::anyhow!("gave up").context(retired.unwrap());
     let text = format!("{err:#}");
@@ -3675,7 +3675,8 @@ async fn a_failed_fetch_drops_a_stored_pool_the_chain_holds_no_record_of() {
     );
 }
 
-/// The end read is the authoritative check. When it shows the pool, or fails,
+/// The end read is the authoritative check. When it shows the pool (this
+/// owner's or another's), or fails,
 /// the first read was a lagging RPC or cannot be told from one, so the row
 /// stays and the fetch error names no pool.
 #[tokio::test]
@@ -3742,6 +3743,7 @@ async fn a_pool_seen_live_or_read_open_is_never_retired() {
             None,
             "{case}"
         );
+        // The queued answer is still there: no read is made.
         assert!(!asserter.read_q().is_empty(), "{case}: no read is made");
         assert!(
             store.get_by_owner(DEPLOYMENT, owner).unwrap().is_some(),
@@ -3784,6 +3786,53 @@ async fn a_run_that_paid_for_bytes_never_retires_its_pool() {
         .unwrap();
     let (contract, asserter) = scripted_contract(vec![Some(no_record_on_chain())]);
     assert_eq!(funding.retire_stale_pool(&contract, &store).await, None);
+    assert!(!asserter.read_q().is_empty(), "no read is made");
+    assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_some());
+}
+
+/// The step drops only the row that still names the pool the first read
+/// found no record of. A row another run moved to a new pool survives, though
+/// the chain still holds no record of the old one.
+#[tokio::test]
+async fn a_row_that_names_another_pool_now_is_never_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Address::repeat_byte(0x11);
+    let id = B256::repeat_byte(0xCD);
+    let (store, funding) = run_that_read(&dir, owner, id, no_record_on_chain()).await;
+    let moved = B256::repeat_byte(0xCE);
+    store
+        .record(&BuyerPoolState::new(
+            moved,
+            DEPLOYMENT,
+            owner,
+            TOKEN,
+            U256::from(WORKING),
+        ))
+        .unwrap();
+    let (contract, asserter) = scripted_contract(vec![Some(no_record_on_chain())]);
+    assert_eq!(funding.retire_stale_pool(&contract, &store).await, None);
+    assert!(asserter.read_q().is_empty(), "the step read the pool");
+    assert_eq!(
+        store
+            .get_by_owner(DEPLOYMENT, owner)
+            .unwrap()
+            .map(|state| state.pool_id),
+        Some(moved)
+    );
+}
+
+/// A `topUp` of the command that has not confirmed can still mine on the
+/// pool, so the step keeps the row and reads nothing.
+#[tokio::test]
+async fn an_unconfirmed_top_up_keeps_the_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = Address::repeat_byte(0x11);
+    let id = B256::repeat_byte(0xCD);
+    let (store, funding) = run_that_read(&dir, owner, id, no_record_on_chain()).await;
+    funding.escrows().hold_pending_for_test(HELD);
+    let (contract, asserter) = scripted_contract(vec![Some(no_record_on_chain())]);
+    assert_eq!(funding.retire_stale_pool(&contract, &store).await, None);
+    // The queued answer is still there: no read is made.
     assert!(!asserter.read_q().is_empty(), "no read is made");
     assert!(store.get_by_owner(DEPLOYMENT, owner).unwrap().is_some());
 }

@@ -484,3 +484,16 @@ fn the_immediate_exit_names_untracked_escrows() {
     );
     assert!(exit_lines(&UnconfirmedEscrows::default()).is_empty());
 }
+
+/// A give-up prints only its stop line, so a stale stored pool the fetch
+/// dropped follows it as a note rather than vanishing with the error chain.
+#[test]
+fn a_give_up_names_a_stale_pool_it_dropped() {
+    let pool_id = alloy::primitives::B256::repeat_byte(0xCD);
+    let stale = StalePool::Retired { pool_id };
+    let line = stop_message(&gave_up().context(stale.clone())).unwrap();
+    assert_eq!(line, format!("{}\nnote: {stale}", gave_up()));
+    assert!(line.contains(&pool_id.to_string()), "{line}");
+    assert_eq!(stop_message(&gave_up()).unwrap(), gave_up().to_string());
+    assert!(stop_message(&anyhow::anyhow!("boom").context(stale)).is_none());
+}

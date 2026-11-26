@@ -43,7 +43,9 @@ use anyhow::Context as _;
 use decdn_client::ProvenSize;
 use decdn_client::bundle::{BundleManifest, MalformedManifest};
 use decdn_client::buyer_pool::{OwnedPayer, UnconfirmedEscrows};
-use decdn_client::funding::{PoolFunder, RunFunding, cached_pool_token, discovery_ctx};
+use decdn_client::funding::{
+    PoolFunder, RunFunding, StalePool, cached_pool_token, discovery_ctx, retire_allowed,
+};
 use decdn_client::lane_sources::{FaultContext, FirstLeg, LaneSources, discovery_span};
 use decdn_client::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use decdn_client::payer_window::PayAheadPolicy;
@@ -1657,6 +1659,10 @@ pub(crate) async fn fetch_on(
                 // this one and named another, are paid in that pool's pass.
                 // A file pass resumes from the store beside the output.
                 Some(next) => {
+                    // The error ends here, so its stale-pool note prints now.
+                    if let Some(stale) = err.downcast_ref::<StalePool>() {
+                        eprintln!("note: {stale}");
+                    }
                     tracing::info!(
                         failed_pool = %pass_pool.pool_account(),
                         next_pool = %next.pool_account(),
@@ -1676,11 +1682,13 @@ pub(crate) async fn fetch_on(
     }
 }
 
-/// `result`, the end of a fetch pass, with the stored pool it dropped named
-/// as context. A failed pass that paid for no byte drops a stored pool the
-/// chain holds no record of, which every node refuses `NotFound`, so the next
-/// run opens or adopts a pool ([`RunFunding::retire_stale_pool`], ADR 003 §
-/// Funding recovery). A pass a pool replacement ended drops nothing.
+/// `result`, the end of a fetch pass, with a stale stored pool named as
+/// context. A failed pass re-reads a stored pool every node refuses
+/// `NotFound` because the chain held no record of it, and drops its row if
+/// the chain still shows none, so the next run opens or adopts a pool
+/// ([`RunFunding::retire_stale_pool`], ADR 003 § Funding recovery). A pass
+/// that a pool replacement or an interrupt ended reads nothing
+/// ([`retire_allowed`]).
 async fn retire_on_failure<P>(
     result: anyhow::Result<()>,
     funding: &RunFunding,
@@ -1691,7 +1699,7 @@ where
     P: alloy::providers::Provider + Clone,
 {
     let err = match result {
-        Err(err) if err.downcast_ref::<PoolReplaced>().is_none() => err,
+        Err(err) if retire_allowed(&err) && err.downcast_ref::<Interrupted>().is_none() => err,
         other => return other,
     };
     match funding.retire_stale_pool(contract, store).await {
