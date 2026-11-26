@@ -1,11 +1,17 @@
 use std::net::{TcpListener, UdpSocket};
 
+// The daemon's own bind for its admin and metrics listeners.
+use decdn_node::net::bind_reuseaddr as node_listen;
+
 use super::*;
 
 /// How many ephemeral binds [`held_reservation_is_never_an_ephemeral_bind`]
-/// makes. Each one lands on a random port in the ephemeral range. With its 32
-/// ports released rather than held, a run this size lands on one of them about
-/// ten times on a default Linux range; with the ports held it never does.
+/// makes. A `SO_REUSEADDR` `bind(…:0)` searches the odd ports in the lower
+/// half of the ephemeral range first, and on an unexhausted range it lands
+/// there, on a random one. The reservations are such binds too, so they land
+/// in the same 7057 ports of the default Linux range (32768..60999). With its
+/// 32 ports released rather than held, a run this size lands on one of them
+/// about 23 times (5000 × 32 / 7057); with the ports held it never does.
 ///
 /// The test covers `bind(…:0)` only. Linux gives `bind(…:0)` odd ports and
 /// `connect()` even ones, so a reservation, itself a `bind(…:0)`, never meets
@@ -24,16 +30,6 @@ const EPHEMERAL_PICKS: usize = 5000;
 /// fixed 49152, so there the test checks that constant.
 const ZERO_BINDS: usize = 1000;
 
-/// The bind `decdn-node`'s `net::bind_reuseaddr` makes for its admin and
-/// metrics listeners: `SO_REUSEADDR`, an explicit address, then `listen`.
-fn node_style_listen(addr: SocketAddr) -> std::io::Result<Socket> {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-    socket.set_reuse_address(true)?;
-    socket.bind(&addr.into())?;
-    socket.listen(16)?;
-    Ok(socket)
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn held_reservation_is_never_an_ephemeral_bind() {
@@ -48,28 +44,30 @@ fn held_reservation_is_never_an_ephemeral_bind() {
     }
 }
 
-#[test]
-fn child_binds_a_reservation() {
+#[tokio::test]
+async fn child_binds_a_reservation() {
     let reservation = PortReservation::tcp().unwrap();
-    let node = node_style_listen(reservation.addr()).expect("node-style bind on a reserved port");
+    let node = node_listen(reservation.addr()).expect("the daemon's bind on a reserved port");
     drop(node);
     // `std` (and tokio) listeners, as the gateway and the dashboard bind them.
     let std_listener = TcpListener::bind(reservation.addr()).expect("std bind on a reserved port");
     assert_eq!(std_listener.local_addr().unwrap(), reservation.addr());
 }
 
-#[test]
-fn child_rebinds_a_reservation_after_a_restart() {
+#[tokio::test]
+async fn child_rebinds_a_reservation_after_a_restart() {
     let reservation = PortReservation::tcp().unwrap();
-    let first = node_style_listen(reservation.addr()).unwrap();
+    let first = node_listen(reservation.addr()).unwrap();
     // A served connection leaves a `TIME_WAIT` on the port when the server
     // side closes first, as a killed daemon's does.
-    let client = std::net::TcpStream::connect(reservation.addr()).unwrap();
-    let (served, _) = first.accept().unwrap();
+    let client = tokio::net::TcpStream::connect(reservation.addr())
+        .await
+        .unwrap();
+    let (served, _) = first.accept().await.unwrap();
     drop(served);
     drop(first);
     drop(client);
-    node_style_listen(reservation.addr()).expect("rebind after the first child exits");
+    node_listen(reservation.addr()).expect("rebind after the first child exits");
 }
 
 #[cfg(target_os = "linux")]
@@ -156,4 +154,43 @@ fn parse_ephemeral_low_reads_the_range_start() {
     assert_eq!(parse_ephemeral_low("49152\n").unwrap(), 49152);
     assert!(parse_ephemeral_low("").is_err());
     assert!(parse_ephemeral_low("high 60999").is_err());
+}
+
+#[test]
+fn read_ephemeral_low_reads_a_range_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ip_local_port_range");
+    std::fs::write(&path, "32768\t60999\n").unwrap();
+    assert_eq!(read_ephemeral_low(&path).unwrap(), 32768);
+}
+
+#[test]
+fn read_ephemeral_low_names_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ip_local_port_range");
+    let err = read_ephemeral_low(&path).unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(&format!("read {}", path.display())),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        err.root_cause()
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::NotFound)
+    );
+}
+
+#[test]
+fn read_ephemeral_low_names_an_unparsable_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ip_local_port_range");
+    std::fs::write(&path, "").unwrap();
+    let err = read_ephemeral_low(&path).unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with(&format!("parse {}", path.display())),
+        "unexpected error: {err:#}"
+    );
 }

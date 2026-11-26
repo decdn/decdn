@@ -44,7 +44,7 @@ pub mod fee_shares;
 pub mod handlers;
 pub mod load_shed;
 pub mod metrics;
-pub(crate) mod net;
+pub mod net;
 pub mod node_origin;
 pub mod onchain_tx;
 pub mod origin_seat_watcher;
