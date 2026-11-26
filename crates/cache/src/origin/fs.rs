@@ -489,7 +489,7 @@ fn is_swapped_symlink(err: &std::io::Error) -> bool {
 
 /// Without `O_NOFOLLOW` no open error marks a symlink.
 #[cfg(not(unix))]
-fn is_swapped_symlink(_err: &std::io::Error) -> bool {
+const fn is_swapped_symlink(_err: &std::io::Error) -> bool {
     false
 }
 
