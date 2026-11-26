@@ -38,7 +38,8 @@ pub(crate) const BUILD_RETRY_BASE: Duration = Duration::from_secs(1);
 pub(crate) const BUILD_RETRY_CAP: Duration = Duration::from_secs(30);
 /// The failed lane builds in a row at which the retry wait reaches
 /// [`BUILD_RETRY_CAP`]: [`BUILD_RETRY_BASE`] doubled five times is 32 s,
-/// held to 30 s. From this count on, a build failure logs at warn.
+/// held to 30 s. From this count on, a build failure logs at warn and a
+/// give-up names it ([`SourceSet::give_up`]).
 pub(crate) const BUILD_RETRY_WARN_AT: u32 = 6;
 /// The first wait between discoveries.
 pub(crate) const DISCOVERY_BASE: Duration = Duration::from_secs(5);
@@ -375,6 +376,15 @@ impl Backoff {
     }
 }
 
+/// The build state of a provider whose lane build failed.
+#[derive(Debug, Clone)]
+struct BuildRetry {
+    /// When the next build may run, and the failures in a row so far.
+    backoff: Backoff,
+    /// The last build's error chain, with URL fragments stripped.
+    fault: String,
+}
+
 /// The sources of one blob.
 #[doc(hidden)]
 pub struct SourceSet<'p, P: SourceProvider> {
@@ -383,10 +393,8 @@ pub struct SourceSet<'p, P: SourceProvider> {
     health: Arc<PeerHealth>,
     holders: Vec<Holder>,
     lanes: HashMap<Address, Arc<StreamCandidate<P::Source>>>,
-    build_retry: HashMap<Address, Backoff>,
-    /// The last lane build that failed, while its provider has built no lane
-    /// since. A give-up names it ([`Self::give_up`]).
-    last_build_fault: Option<LastBuildFault>,
+    /// Each provider whose lane build failed and has built no lane since.
+    build_retry: HashMap<Address, BuildRetry>,
     /// When each built lane that found no free stream may start again
     /// ([`Self::start_refused`]).
     start_retry: HashMap<Address, Instant>,
@@ -492,7 +500,6 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             holders: Vec::new(),
             lanes: HashMap::new(),
             build_retry: HashMap::new(),
-            last_build_fault: None,
             start_retry: HashMap::new(),
             absent: HashSet::new(),
             not_found: HashMap::new(),
@@ -564,7 +571,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             .filter(|h| {
                 self.build_retry
                     .get(&h.provider)
-                    .is_none_or(|b| now >= b.next_at)
+                    .is_none_or(|b| now >= b.backoff.next_at)
             })
             .filter(|h| {
                 self.start_retry
@@ -632,32 +639,24 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
                 let prior = self
                     .build_retry
                     .get(&provider)
-                    .copied()
-                    .unwrap_or(Backoff::new(now));
-                let next = prior.fail(now, BUILD_RETRY_BASE, BUILD_RETRY_CAP);
-                self.build_retry.insert(provider, next);
-                let err = anyhow::Error::new(LaneBuildFault(err));
-                self.last_build_fault = Some(LastBuildFault {
+                    .map_or(Backoff::new(now), |b| b.backoff);
+                let fault = decdn_common::redact::sanitize_err_chain(&err);
+                self.build_retry.insert(
                     provider,
-                    failures: next.attempts,
-                    fault: decdn_common::redact::sanitize_err_chain(&err),
-                });
-                Err(err)
+                    BuildRetry {
+                        backoff: prior.fail(now, BUILD_RETRY_BASE, BUILD_RETRY_CAP),
+                        fault,
+                    },
+                );
+                Err(anyhow::Error::new(LaneBuildFault(err)))
             }
         }
     }
 
     /// A lane for `provider` built: its build backoff ends, and a give-up no
-    /// longer names its last build fault.
+    /// longer names its build fault.
     fn build_ok(&mut self, provider: Address) {
         self.build_retry.remove(&provider);
-        if self
-            .last_build_fault
-            .as_ref()
-            .is_some_and(|last| last.provider == provider)
-        {
-            self.last_build_fault = None;
-        }
     }
 
     /// The failed lane builds in a row for `provider`, 0 once a lane built.
@@ -665,7 +664,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     pub(crate) fn build_failures(&self, provider: Address) -> u32 {
         self.build_retry
             .get(&provider)
-            .map_or(0, |backoff| backoff.attempts)
+            .map_or(0, |b| b.backoff.attempts)
     }
 
     /// Log `err`, the retryable fault [`Self::lane_built`] just returned for
@@ -680,22 +679,34 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         if failures >= BUILD_RETRY_WARN_AT {
             // This set's backoff holds the provider to one build per
             // `BUILD_RETRY_CAP`, so this line repeats at most once per 30 s
-            // per provider in this fetch. Each fetch keeps its own backoff,
-            // so concurrent fetches log independently.
+            // per provider in this set. Each set keeps its own backoff, so
+            // other sets log independently.
             tracing::warn!(%provider, failures, %error, "lane build failed");
         } else {
             tracing::debug!(%provider, failures, %error, "lane build failed");
         }
     }
 
-    /// The error a fetch over this set ends with when `gave_up` fires. While
-    /// a lane build is failing, the give-up carries that last build fault as
-    /// [`LastBuildFault`] context, so it names what kept failing. A
+    /// The error a fetch over this set ends with when `gave_up` fires. A
+    /// provider whose lane build failed at least [`BUILD_RETRY_WARN_AT`]
+    /// times in a row, with no lane built since, has a persistent fault: the
+    /// give-up carries the build fault of the provider with the most failures
+    /// as [`LastBuildFault`] context, so it names what kept failing. A tie
+    /// goes to the provider that failed last. A
     /// `downcast_ref::<GaveUp>()` still finds the give-up beneath it.
     pub(crate) fn give_up(&self, gave_up: crate::GaveUp) -> anyhow::Error {
         let err = anyhow::Error::new(gave_up);
-        match &self.last_build_fault {
-            Some(last) => err.context(last.clone()),
+        let persistent = self
+            .build_retry
+            .iter()
+            .filter(|(_, b)| b.backoff.attempts >= BUILD_RETRY_WARN_AT)
+            .max_by_key(|(_, b)| (b.backoff.attempts, b.backoff.next_at));
+        match persistent {
+            Some((&provider, b)) => err.context(LastBuildFault {
+                provider,
+                failures: b.backoff.attempts,
+                fault: b.fault.clone(),
+            }),
             None => err,
         }
     }
@@ -1378,7 +1389,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         let builds = self
             .build_retry
             .values()
-            .map(|b| b.next_at)
+            .map(|b| b.backoff.next_at)
             .chain(self.start_retry.values().copied())
             .filter(|t| *t > now);
         let discovery = self.discovery.map(|b| b.next_at).filter(|t| *t > now);

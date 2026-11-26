@@ -321,7 +321,7 @@ async fn a_give_up_while_builds_fail_names_the_last_build_fault() -> anyhow::Res
         .ok_or_else(|| anyhow::anyhow!("a build that always fails must give up"))?;
     assert_eq!(err.downcast_ref::<GaveUp>(), Some(&GaveUp { idle: limit }));
     let last = err
-        .downcast_ref::<crate::LastBuildFault>()
+        .downcast_ref::<crate::fault::LastBuildFault>()
         .ok_or_else(|| anyhow::anyhow!("the give-up names the build fault: {err:#}"))?;
     assert_eq!(last.provider, A);
     assert!(

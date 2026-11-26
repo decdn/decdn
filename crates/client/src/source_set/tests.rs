@@ -63,6 +63,8 @@ struct FakeProvider {
     discover: Mutex<Vec<anyhow::Result<Vec<Holder>>>>,
     faults: Mutex<Vec<Address>>,
     pool_declines: Mutex<Vec<(Address, Vec<decdn_protocol::PoolAccount>)>>,
+    /// The lane [`SourceProvider::built`] hands over once, for any provider.
+    prebuilt: Mutex<Option<StreamCandidate<ScriptedSource>>>,
 }
 
 impl SourceProvider for FakeProvider {
@@ -83,6 +85,9 @@ impl SourceProvider for FakeProvider {
     ) -> SourceFuture<'a, StreamCandidate<ScriptedSource>> {
         Box::pin(async { anyhow::bail!("tests call lane_built directly") })
     }
+    fn built(&self, _provider: Address) -> Option<StreamCandidate<ScriptedSource>> {
+        self.prebuilt.lock().ok().and_then(|mut b| b.take())
+    }
     fn on_source_fault(&self, holder: &Holder) {
         if let Ok(mut f) = self.faults.lock() {
             f.push(holder.provider);
@@ -100,6 +105,7 @@ fn provider(discover: Vec<anyhow::Result<Vec<Holder>>>) -> FakeProvider {
         discover: Mutex::new(discover),
         faults: Mutex::new(Vec::new()),
         pool_declines: Mutex::new(Vec::new()),
+        prebuilt: Mutex::new(None),
     }
 }
 
@@ -289,7 +295,7 @@ fn the_build_warn_threshold_is_where_the_backoff_reaches_its_cap() {
 }
 
 /// A lane build that keeps failing logs at debug below the backoff cap and
-/// at warn from the failure that reaches it, naming the provider and the
+/// at warn from the failure that reaches it on, naming the provider and the
 /// failures in a row. A lane that builds resets the count, so the next
 /// failure logs at debug again (#2371).
 #[tokio::test(start_paused = true)]
@@ -310,7 +316,7 @@ async fn a_lane_build_logs_warn_once_its_backoff_reaches_the_cap() -> anyhow::Re
         }
     };
     tracing::subscriber::with_default(subscriber, || -> anyhow::Result<()> {
-        for _ in 0..super::BUILD_RETRY_WARN_AT {
+        for _ in 0..=super::BUILD_RETRY_WARN_AT {
             fail(&mut set);
         }
         set.lane_built(A, candidate(), Instant::now())?;
@@ -323,16 +329,16 @@ async fn a_lane_build_logs_warn_once_its_backoff_reaches_the_cap() -> anyhow::Re
         .filter(|l| l.contains("lane build failed"))
         .collect();
     let warn_at = usize::try_from(super::BUILD_RETRY_WARN_AT)?;
-    assert_eq!(lines.len(), warn_at + 1, "one line per failure: {text}");
+    assert_eq!(lines.len(), warn_at + 2, "one line per failure: {text}");
     for (i, line) in lines.iter().enumerate() {
-        let failures = if i < warn_at { i + 1 } else { 1 };
+        let failures = if i <= warn_at { i + 1 } else { 1 };
         assert!(
             line.contains(&format!("failures={failures}")),
             "line {i} counts {failures}: {line}"
         );
         assert!(line.contains(&A.to_string()), "names the provider: {line}");
         assert!(line.contains("rpc timed out"), "names the fault: {line}");
-        let level = if i + 1 == warn_at {
+        let level = if failures >= warn_at {
             " WARN "
         } else {
             " DEBUG "
@@ -342,44 +348,108 @@ async fn a_lane_build_logs_warn_once_its_backoff_reaches_the_cap() -> anyhow::Re
     Ok(())
 }
 
-/// A give-up while a lane build is failing carries that last build fault, so
-/// "no progress" names what kept failing, and it still downcasts to the
+/// Fail `provider`'s lane build `times` times at `now`, with `msg`.
+fn fail_builds(set: &mut SourceSet<'_, FakeProvider>, provider: Address, times: u32, msg: &str) {
+    for _ in 0..times {
+        let _ = set.lane_built(provider, Err(anyhow::anyhow!("{msg}")), Instant::now());
+    }
+}
+
+fn gave_up() -> crate::GaveUp {
+    crate::GaveUp {
+        idle: Duration::from_mins(10),
+    }
+}
+
+/// The provider and failures of the build fault a give-up carries.
+fn named(err: &anyhow::Error) -> Option<(Address, u32)> {
+    err.downcast_ref::<crate::fault::LastBuildFault>()
+        .map(|last| (last.provider, last.failures))
+}
+
+/// A give-up while a lane build fails persistently carries that build fault,
+/// so "no progress" names what kept failing, and it still downcasts to the
 /// same [`crate::GaveUp`]. Once the provider builds a lane, a give-up carries
 /// no build fault (#2371).
 #[tokio::test(start_paused = true)]
-async fn a_give_up_names_the_last_build_fault_and_stays_a_gave_up() -> anyhow::Result<()> {
+async fn a_give_up_names_a_persistent_build_fault_and_stays_a_gave_up() -> anyhow::Result<()> {
     let p = provider(vec![]);
     let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
-    let gave_up = crate::GaveUp {
-        idle: Duration::from_mins(10),
-    };
-    let now = Instant::now();
-    for _ in 0..2 {
-        let _ = set.lane_built(
-            A,
-            Err(anyhow::anyhow!(
-                "error sending request for url (https://rpc.example/v3/secret)"
-            )),
-            now,
-        );
-    }
-    let err = set.give_up(gave_up);
-    assert_eq!(err.downcast_ref::<crate::GaveUp>(), Some(&gave_up));
-    assert_eq!(
-        err.downcast_ref::<crate::LastBuildFault>()
-            .map(|last| (last.provider, last.failures)),
-        Some((A, 2))
+    let warn_at = super::BUILD_RETRY_WARN_AT;
+    fail_builds(
+        &mut set,
+        A,
+        warn_at,
+        "error sending request for url (https://rpc.example/v3/secret)",
     );
+    let err = set.give_up(gave_up());
+    assert_eq!(err.downcast_ref::<crate::GaveUp>(), Some(&gave_up()));
+    assert_eq!(named(&err), Some((A, warn_at)));
     let text = format!("{err:#}");
     assert!(text.contains("error sending request"), "{text}");
+    assert!(
+        !text.contains("building the payment lane failed"),
+        "the wrapper's text is not repeated: {text}"
+    );
     assert!(text.contains("no progress for 10m"), "{text}");
     assert!(!text.contains("secret"), "the RPC URL is stripped: {text}");
 
-    set.lane_built(A, candidate(), now)?;
-    let err = set.give_up(gave_up);
-    assert_eq!(err.downcast_ref::<crate::GaveUp>(), Some(&gave_up));
-    assert!(err.downcast_ref::<crate::LastBuildFault>().is_none());
+    set.lane_built(A, candidate(), Instant::now())?;
+    let err = set.give_up(gave_up());
+    assert_eq!(err.downcast_ref::<crate::GaveUp>(), Some(&gave_up()));
+    assert_eq!(named(&err), None);
     assert_eq!(err.chain().count(), 1);
+    Ok(())
+}
+
+/// A build fault below the warn threshold is not persistent, so a give-up
+/// does not name it as what kept failing.
+#[tokio::test(start_paused = true)]
+async fn a_give_up_does_not_name_a_build_fault_below_the_threshold() {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+    fail_builds(&mut set, A, super::BUILD_RETRY_WARN_AT - 1, "rpc timed out");
+    let err = set.give_up(gave_up());
+    assert_eq!(named(&err), None);
+    assert_eq!(err.chain().count(), 1);
+}
+
+/// Each provider keeps its own build fault. Another provider's lane that
+/// builds, or that fails less often, does not hide a persistent fault: the
+/// give-up names the provider with the most failures in a row.
+#[tokio::test(start_paused = true)]
+async fn a_give_up_names_the_provider_with_the_most_build_failures() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0)],
+    );
+    let warn_at = super::BUILD_RETRY_WARN_AT;
+    fail_builds(&mut set, A, warn_at, "rpc timed out");
+    fail_builds(&mut set, B, 1, "nonce too low");
+    assert_eq!(named(&set.give_up(gave_up())), Some((A, warn_at)));
+    set.lane_built(B, candidate(), Instant::now())?;
+    let err = set.give_up(gave_up());
+    assert_eq!(named(&err), Some((A, warn_at)));
+    assert!(format!("{err:#}").contains("rpc timed out"), "{err:#}");
+    Ok(())
+}
+
+/// A lane the provider built before the set ends that provider's build
+/// backoff the way a build that succeeds does: its count and its fault go.
+#[tokio::test(start_paused = true)]
+async fn a_prebuilt_lane_clears_the_build_fault() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+    fail_builds(&mut set, A, super::BUILD_RETRY_WARN_AT, "rpc timed out");
+    if let Ok(mut prebuilt) = p.prebuilt.lock() {
+        *prebuilt = Some(candidate()?);
+    }
+    assert!(set.take_built(A).is_some());
+    assert_eq!(set.build_failures(A), 0);
+    assert_eq!(named(&set.give_up(gave_up())), None);
     Ok(())
 }
 

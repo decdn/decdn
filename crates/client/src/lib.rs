@@ -337,7 +337,7 @@ pub use decdn_bao_range::RangedStore;
 #[doc(hidden)]
 pub use driver::{LegNoProgress, PacingWait, SharedPool, WaitReason, drive, first_leg};
 #[doc(hidden)]
-pub use fault::{FatalScope, Fault, HealExhausted, LaneBuildFault, LastBuildFault, classify};
+pub use fault::{FatalScope, Fault, HealExhausted, LaneBuildFault, classify};
 #[doc(hidden)]
 pub use first_open::first_open;
 #[doc(hidden)]

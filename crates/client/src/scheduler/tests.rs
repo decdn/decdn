@@ -3612,6 +3612,77 @@ async fn a_lane_build_that_may_have_escrowed_ends_the_acquire() -> anyhow::Resul
     Ok(())
 }
 
+/// An acquire whose lane build keeps failing with a chain-side fault retries
+/// with backoff until the stop policy gives up. The give-up carries the
+/// persistent build fault and still downcasts to the same [`GaveUp`]
+/// (#2371).
+#[tokio::test(start_paused = true)]
+async fn an_acquire_whose_builds_keep_failing_gives_up_naming_the_fault() -> anyhow::Result<()> {
+    struct FailingBuild(StaticSources<ScriptedSource>);
+
+    impl crate::SourceProvider for FailingBuild {
+        type Source = ScriptedSource;
+
+        fn discover(&self, hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+            self.0.discover(hash)
+        }
+
+        fn connect<'a>(
+            &'a self,
+            _holder: &'a crate::Holder,
+            _ended: &'a tokio_util::sync::CancellationToken,
+        ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+            Box::pin(async { anyhow::bail!("rpc timed out") })
+        }
+    }
+
+    let la = Arc::new(PoolLedger::new(Cumulative::default()));
+    let a = ScriptedSource::new(blob(1024 * 1024))?.paying(Arc::clone(&la));
+    let (root, total) = (a.root(), a.total_bytes());
+    let (store, _dir) = fresh_store(root, total);
+    let provider = FailingBuild(StaticSources::new(vec![candidate(a, la, 0xA1, None)])?);
+    let mut set = SourceSet::new(&provider, root, Arc::default(), provider.0.holders());
+    let limit = Duration::from_mins(5);
+    let stop = StopPolicy::new(false, Some(limit), Arc::default());
+    let gate = recovery_gate();
+    let err = acquire(
+        AcquireTarget {
+            store: &store,
+            hash: root,
+            total_bytes: ProvenSize::assume_for_tests(total),
+            ranges: &[(0, total)],
+        },
+        &mut set,
+        &AcquireEnv {
+            pacer: &BudgetPacer::new(),
+            funder: &no_funding(),
+            recovery: &gate,
+            credentials: None,
+            max_lanes: 1,
+            stop: &stop,
+            on_progress: None,
+            ledgers: None,
+            pacing: None,
+            max_blob_bytes: 0,
+            run: None,
+        },
+    )
+    .await
+    .err()
+    .ok_or_else(|| anyhow::anyhow!("a build that always fails must give up"))?;
+    assert_eq!(err.downcast_ref::<GaveUp>(), Some(&GaveUp { idle: limit }));
+    let last = err
+        .downcast_ref::<crate::fault::LastBuildFault>()
+        .ok_or_else(|| anyhow::anyhow!("the give-up names the build fault: {err:#}"))?;
+    assert_eq!(last.provider, Address::repeat_byte(0xA1));
+    assert!(
+        last.failures >= crate::source_set::BUILD_RETRY_WARN_AT,
+        "{last:?}"
+    );
+    assert!(format!("{err:#}").contains("rpc timed out"), "{err:#}");
+    Ok(())
+}
+
 /// Acquire the whole `root` blob from `provider`'s holders through `funder`,
 /// under `gate`.
 async fn acquire_under<S: BlobSource>(

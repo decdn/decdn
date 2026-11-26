@@ -79,25 +79,26 @@ impl std::fmt::Display for LaneBuildFault {
 
 impl std::error::Error for LaneBuildFault {}
 
-/// The lane build fault a fetch saw last before it gave up, while that
-/// build's provider had built no lane since. It is context on a
-/// [`crate::GaveUp`], so the give-up names what kept failing; a
-/// `downcast_ref::<GaveUp>()` still finds the give-up beneath it.
+/// The lane build fault of a provider whose builds failed at least
+/// [`crate::source_set::BUILD_RETRY_WARN_AT`] times in a row, with no lane
+/// built since. It is context on a [`crate::GaveUp`], so the give-up names
+/// what kept failing; a `downcast_ref::<GaveUp>()` still finds the give-up
+/// beneath it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LastBuildFault {
+pub(crate) struct LastBuildFault {
     /// The provider whose lane build failed.
-    pub provider: alloy::primitives::Address,
+    pub(crate) provider: alloy::primitives::Address,
     /// The provider's failed lane builds in a row.
-    pub failures: u32,
-    /// The build's error chain, with URL fragments stripped.
-    pub fault: String,
+    pub(crate) failures: u32,
+    /// The last build's error chain, with URL fragments stripped.
+    pub(crate) fault: String,
 }
 
 impl std::fmt::Display for LastBuildFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "the lane build for {} failed {} time(s) in a row, last with: {}",
+            "lane builds for {} failed {} times in a row: {}",
             self.provider, self.failures, self.fault
         )
     }
