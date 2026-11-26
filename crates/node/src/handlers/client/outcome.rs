@@ -119,9 +119,8 @@ pub(super) enum ServeStop {
     /// The pool's remaining deposit fell to the refundable floor `M`
     /// (`PoolExhausted`).
     PoolExhausted,
-    /// The pool closed under the stream, or it is `Closing` and its dispute
-    /// deadline falls inside the node's redeem margin. The wire reason is
-    /// `PoolExhausted`.
+    /// The pool is `Closing`, or it closed under the stream. The wire reason
+    /// is `PoolExhausted`.
     PoolClosed,
     /// The signer's shared cap drained at other nodes (`SignerCapExhausted`).
     SignerCapExhausted,

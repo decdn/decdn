@@ -1619,7 +1619,7 @@ async fn pool_recheck_stops_a_drained_open_pool_as_exhausted() {
     assert_eq!(stop, Some(ServeStop::PoolExhausted));
 }
 
-/// A pool that is both `Closing` at its deadline AND drained stops as
+/// A pool that is both `Closing` AND drained stops as
 /// `PoolClosed`, not `PoolExhausted`: a closed pool's `remaining` pays nothing,
 /// so the close verdict wins and the owner's remedy is a new pool, not a top-up.
 #[tokio::test]
@@ -1662,33 +1662,19 @@ async fn pool_recheck_keeps_serving_an_open_funded_pool() {
     assert_eq!(stop, None);
 }
 
-/// A `Closing` pool whose dispute deadline has come stops as `PoolClosed`,
-/// although its `remaining` still funds the stream.
+/// A `Closing` pool stops as `PoolClosed` however far off its dispute deadline
+/// is, and although its `remaining` still funds the stream: the re-check holds
+/// the admission rule.
 #[tokio::test]
-async fn pool_recheck_stops_a_closing_pool_at_its_deadline() {
-    let stop = recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing { deadline: now }).await;
-    assert_eq!(stop, Some(ServeStop::PoolClosed));
-}
-
-/// The cutoff is the capability expiry margin before the deadline: a deadline
-/// one second inside the margin stops, one second outside it keeps serving.
-#[tokio::test]
-async fn pool_recheck_stops_a_closing_pool_inside_the_redeem_margin() {
-    let margin = decdn_common::config::capability_expiry_margin_secs(
-        decdn_common::config::DEFAULT_REDEEM_INTERVAL_SECS,
-    );
-    let inside = recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing {
-        deadline: now + margin - 1,
+async fn pool_recheck_stops_a_closing_pool() {
+    let at_deadline =
+        recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing { deadline: now }).await;
+    assert_eq!(at_deadline, Some(ServeStop::PoolClosed));
+    let days_off = recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing {
+        deadline: now + 2 * 86_400,
     })
     .await;
-    assert_eq!(inside, Some(ServeStop::PoolClosed));
-    // A wide gap outside the margin, so a coarse-clock tick between the two
-    // reads cannot move the deadline inside it.
-    let outside = recheck_stop_for(|now| crate::pool_view::Lifecycle::Closing {
-        deadline: now + margin + 60,
-    })
-    .await;
-    assert_eq!(outside, None);
+    assert_eq!(days_off, Some(ServeStop::PoolClosed));
 }
 
 /// Read `decdn_serve_pool_recheck_stale_total` from `metrics`.
