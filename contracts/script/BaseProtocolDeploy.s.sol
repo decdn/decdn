@@ -103,8 +103,8 @@ abstract contract BaseProtocolDeploy is Script {
     bytes32 internal constant GOVERNANCE_ROLE = keccak256("GOVERNANCE_ROLE");
     bytes32 internal constant DEFAULT_ADMIN_ROLE = 0x00;
 
-    /// @dev Ethereum mainnet, the governance chain the emergency-multisig checks
-    ///      apply to.
+    /// @dev Ethereum mainnet, the governance chain the emergency-multisig and
+    ///      bootstrap-multisig checks apply to.
     uint256 internal constant ETHEREUM_MAINNET_CHAIN_ID = 1;
 
     struct DeployConfig {
@@ -130,7 +130,8 @@ abstract contract BaseProtocolDeploy is Script {
         // voting is live from block one. A non-zero address instead seats THIS
         // multisig as the sole proposer and leaves the Governor without the role, so
         // only the multisig can schedule while the operator set is thin. Either way
-        // the Timelock holds GOVERNANCE_ROLE and imposes its 48-hour delay. Opt-in
+        // the Timelock holds GOVERNANCE_ROLE and imposes its 48-hour delay. Required
+        // on Ethereum mainnet (`BootstrapMultisigRequired`); optional on testnets,
         // because the initial testnet network runs a single controlled EOA and has
         // no multisig to seat (issue #1175).
         address bootstrapMultisig;
@@ -227,6 +228,13 @@ abstract contract BaseProtocolDeploy is Script {
     /// @notice On Ethereum mainnet, `DeployConfig.emergencyMultisig` holds no code, so
     ///         it cannot be the multisig ADR 009 § Emergency Multisig specifies.
     error EmergencyMultisigNotAContract(address account);
+    /// @notice On Ethereum mainnet, `DeployConfig.bootstrapMultisig` is unset. The
+    ///         deploy would seat `DecdnGovernor` as proposer at block one, when
+    ///         proposalThreshold and quorum are zero against an empty served-bytes
+    ///         window, so the first operator with any vote weight could pass a
+    ///         proposal alone. ADR 009
+    ///         § Bootstrap-multisig phase requires the multisig at launch.
+    error BootstrapMultisigRequired();
     /// @notice Post-deploy invariant — a phase-4 peer role (e.g. `BLACKLIST_ROLE`,
     ///         `PAUSER_ROLE`) was not actually granted to `grantee` on `target`.
     ///         OZ `grantRole` does not revert when the target address is wrong, so
@@ -289,6 +297,11 @@ abstract contract BaseProtocolDeploy is Script {
         if (block.chainid == ETHEREUM_MAINNET_CHAIN_ID) {
             if (cfg.emergencyMultisig == cfg.deployer) revert EmergencyMultisigIsDeployer(cfg.deployer);
             if (cfg.emergencyMultisig.code.length == 0) revert EmergencyMultisigNotAContract(cfg.emergencyMultisig);
+            // Without a bootstrap multisig the Governor is the Timelock's proposer
+            // at genesis, while proposalThreshold and quorum are zero against an
+            // empty served-bytes window. ADR 009 requires the bootstrap phase at
+            // launch.
+            if (cfg.bootstrapMultisig == address(0)) revert BootstrapMultisigRequired();
         }
         if (cfg.initialTokenHolder == address(0)) revert ZeroAddress("initialTokenHolder");
 
