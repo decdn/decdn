@@ -79,6 +79,32 @@ impl std::fmt::Display for LaneBuildFault {
 
 impl std::error::Error for LaneBuildFault {}
 
+/// The lane build fault a fetch saw last before it gave up, while that
+/// build's provider had built no lane since. It is context on a
+/// [`crate::GaveUp`], so the give-up names what kept failing; a
+/// `downcast_ref::<GaveUp>()` still finds the give-up beneath it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastBuildFault {
+    /// The provider whose lane build failed.
+    pub provider: alloy::primitives::Address,
+    /// The provider's failed lane builds in a row.
+    pub failures: u32,
+    /// The build's error chain, with URL fragments stripped.
+    pub fault: String,
+}
+
+impl std::fmt::Display for LastBuildFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the lane build for {} failed {} time(s) in a row, last with: {}",
+            self.provider, self.failures, self.fault
+        )
+    }
+}
+
+impl std::error::Error for LastBuildFault {}
+
 /// A voucher rejection whose watermark healed the lane ledger after the lane
 /// spent its resume budget ([`crate::MAX_RESUME_ATTEMPTS`]). The ledger and
 /// this source agree again, but the source kept rejecting after each heal, so

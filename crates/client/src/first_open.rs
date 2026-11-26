@@ -225,7 +225,7 @@ where
                         if let Fault::Fatal(_) = classify(&err) {
                             return Err(err);
                         }
-                        tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed");
+                        sources.log_build_fault(provider, &err);
                     }
                 }
             }
@@ -259,7 +259,7 @@ where
                 sources.discovery_done(found, Instant::now(), deposit);
             }
             () = sleep_until_opt(wake) => {}
-            gave_up = stop.expired() => return Err(anyhow::Error::new(gave_up)),
+            gave_up = stop.expired() => return Err(sources.give_up(gave_up)),
             halted = stop.halted() => return Err(anyhow::Error::new(halted)),
         }
     }

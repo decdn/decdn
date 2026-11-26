@@ -12,6 +12,36 @@ use tokio::time::{Duration, Instant};
 const A: Address = Address::repeat_byte(0xA1);
 const B: Address = Address::repeat_byte(0xB2);
 
+/// A `tracing_subscriber::fmt` writer that keeps every line it is handed.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    /// Everything written so far.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn holder(provider: Address, rtt_ms: f64) -> Holder {
     Holder {
         provider,
@@ -240,6 +270,116 @@ async fn a_lane_build_error_retries_later_without_cooling_the_source() -> anyhow
         &set.cached_lane(A)
             .ok_or_else(|| anyhow::anyhow!("cached"))?
     ));
+    Ok(())
+}
+
+/// The warn threshold is the failure count whose retry wait first reaches
+/// the cap, so a build logs at warn exactly once its backoff stops growing.
+#[test]
+fn the_build_warn_threshold_is_where_the_backoff_reaches_its_cap() {
+    let now = Instant::now();
+    let mut backoff = super::Backoff::new(now);
+    for _ in 1..super::BUILD_RETRY_WARN_AT {
+        backoff = backoff.fail(now, super::BUILD_RETRY_BASE, super::BUILD_RETRY_CAP);
+    }
+    assert!(backoff.next_at - now < super::BUILD_RETRY_CAP);
+    backoff = backoff.fail(now, super::BUILD_RETRY_BASE, super::BUILD_RETRY_CAP);
+    assert_eq!(backoff.attempts, super::BUILD_RETRY_WARN_AT);
+    assert_eq!(backoff.next_at - now, super::BUILD_RETRY_CAP);
+}
+
+/// A lane build that keeps failing logs at debug below the backoff cap and
+/// at warn from the failure that reaches it, naming the provider and the
+/// failures in a row. A lane that builds resets the count, so the next
+/// failure logs at debug again (#2371).
+#[tokio::test(start_paused = true)]
+async fn a_lane_build_logs_warn_once_its_backoff_reaches_the_cap() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+    let log = CapturedLog::default();
+    let sink = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    let fail = |set: &mut SourceSet<'_, FakeProvider>| {
+        let now = Instant::now();
+        if let Err(err) = set.lane_built(A, Err(anyhow::anyhow!("rpc timed out")), now) {
+            set.log_build_fault(A, &err);
+        }
+    };
+    tracing::subscriber::with_default(subscriber, || -> anyhow::Result<()> {
+        for _ in 0..super::BUILD_RETRY_WARN_AT {
+            fail(&mut set);
+        }
+        set.lane_built(A, candidate(), Instant::now())?;
+        fail(&mut set);
+        Ok(())
+    })?;
+    let text = log.text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("lane build failed"))
+        .collect();
+    let warn_at = usize::try_from(super::BUILD_RETRY_WARN_AT)?;
+    assert_eq!(lines.len(), warn_at + 1, "one line per failure: {text}");
+    for (i, line) in lines.iter().enumerate() {
+        let failures = if i < warn_at { i + 1 } else { 1 };
+        assert!(
+            line.contains(&format!("failures={failures}")),
+            "line {i} counts {failures}: {line}"
+        );
+        assert!(line.contains(&A.to_string()), "names the provider: {line}");
+        assert!(line.contains("rpc timed out"), "names the fault: {line}");
+        let level = if i + 1 == warn_at {
+            " WARN "
+        } else {
+            " DEBUG "
+        };
+        assert!(line.contains(level), "line {i} logs at{level}: {line}");
+    }
+    Ok(())
+}
+
+/// A give-up while a lane build is failing carries that last build fault, so
+/// "no progress" names what kept failing, and it still downcasts to the
+/// same [`crate::GaveUp`]. Once the provider builds a lane, a give-up carries
+/// no build fault (#2371).
+#[tokio::test(start_paused = true)]
+async fn a_give_up_names_the_last_build_fault_and_stays_a_gave_up() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(&p, [0; 32], Arc::default(), vec![holder(A, 10.0)]);
+    let gave_up = crate::GaveUp {
+        idle: Duration::from_mins(10),
+    };
+    let now = Instant::now();
+    for _ in 0..2 {
+        let _ = set.lane_built(
+            A,
+            Err(anyhow::anyhow!(
+                "error sending request for url (https://rpc.example/v3/secret)"
+            )),
+            now,
+        );
+    }
+    let err = set.give_up(gave_up);
+    assert_eq!(err.downcast_ref::<crate::GaveUp>(), Some(&gave_up));
+    assert_eq!(
+        err.downcast_ref::<crate::LastBuildFault>()
+            .map(|last| (last.provider, last.failures)),
+        Some((A, 2))
+    );
+    let text = format!("{err:#}");
+    assert!(text.contains("error sending request"), "{text}");
+    assert!(text.contains("no progress for 10m"), "{text}");
+    assert!(!text.contains("secret"), "the RPC URL is stripped: {text}");
+
+    set.lane_built(A, candidate(), now)?;
+    let err = set.give_up(gave_up);
+    assert_eq!(err.downcast_ref::<crate::GaveUp>(), Some(&gave_up));
+    assert!(err.downcast_ref::<crate::LastBuildFault>().is_none());
+    assert_eq!(err.chain().count(), 1);
     Ok(())
 }
 
@@ -1177,20 +1317,6 @@ async fn a_partial_holder_refusing_the_blob_as_too_large_loses_only_pull_through
 /// as the lane picked it (#2376).
 #[tokio::test(start_paused = true)]
 async fn the_lane_fault_line_names_the_holder_record() {
-    #[derive(Clone, Default)]
-    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for CapturedLog {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     let p = provider(vec![]);
     let mut set = SourceSet::new(
         &p,
@@ -1225,12 +1351,7 @@ async fn the_lane_fault_line_names_the_holder_record() {
         set.record_fault(A, &retry, None, now, U256::ZERO);
         set.record_fault(A, &retry, Some(block0()), now, U256::ZERO);
     });
-    let text = String::from_utf8_lossy(
-        &log.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
-    .into_owned();
+    let text = log.text();
     let mut lines = text.lines();
     let a_line = lines.next().unwrap_or_default();
     let b_line = lines.next().unwrap_or_default();

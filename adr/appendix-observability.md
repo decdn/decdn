@@ -392,6 +392,12 @@ An event inside a span also has `span` and `spans`. `span` is the current span. 
 
 **Peer-triggered warnings.** A remote peer can fire some `WARN` lines at any rate: a bad client binding, a request with no binding, a request on an unknown lane. Each of these lines passes a per-cause throttle. The throttle admits one line per window and counts the lines it drops. The admitted line carries `peer` and `suppressed`.
 
+**Provider-triggered warnings in the client.** The client (`decdn-client`) runs in the CLI and on the upstream leg of the node, so a remote provider can also fire client `WARN` lines. The client has no per-cause throttle. Its backoffs bound these lines:
+
+- A lane fault logs at `WARN` when the fault is a source fault or a fatal fault. A source fault cools its provider for 2 s. Each further fault in a row doubles the cooldown, up to 60 s. A cooling provider starts no new stream. A verified byte resets the streak, so a provider can fire a faster line only after it serves paid bytes.
+- A lane build fault is chain-side. It logs at `DEBUG` until the retry wait of its provider reaches the 30 s cap, at the sixth failure in a row. From then on it logs at `WARN` with `provider`, `failures`, and `error`. The backoff holds the provider to one build per 30 s, so the line repeats at most once per 30 s per provider. A lane that builds resets the count.
+- A fetch that gives up while a lane build fails carries the last build fault as context on its `GaveUp` error. The give-up then names what kept failing.
+
 ### Trace Spans
 
 The node exports spans over OTLP when `observability.otlp_endpoint` is set. The export filter is separate from the log filter, so a change to `log_level` does not change the traces. The filter admits `INFO` spans and events from the deCDN crates. From other crates it admits `WARN` and `ERROR` events only, so a dependency failure lands on the deCDN span it happened in. The filter admits no span from another crate at any level. iroh opens its periodic network-report spans at `WARN`. These spans are more numerous than all deCDN spans, and they are not deCDN work. The OTLP transport crates are always off. A span covers one stream, pull, lookup, or transaction. No span covers a single frame.
