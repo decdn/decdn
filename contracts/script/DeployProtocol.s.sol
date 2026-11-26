@@ -56,10 +56,13 @@ import { Ed25519Verifier } from "../src/Ed25519Verifier.sol";
 ///         than a tunable that could only ever be 7 days.
 ///
 ///         Optional env vars (defaults from ADR 026 / ADR 009 / 036):
-///           - `BOOTSTRAP_MULTISIG`         (default unset = DAO governance live at
-///                                            deploy). Set it to the 5-of-9 bootstrap
-///                                            multisig to launch into the ADR 009
-///                                            § Bootstrap-multisig phase instead: the
+///           - `BOOTSTRAP_MULTISIG`         (required on Ethereum mainnet, where the
+///                                            deploy reverts `BootstrapMultisigRequired`
+///                                            without it; on testnets, default unset =
+///                                            DAO governance live at deploy). Set it to
+///                                            the 5-of-9 bootstrap multisig to launch
+///                                            into the ADR 009
+///                                            § Bootstrap-multisig phase: the
 ///                                            multisig becomes the Timelock's sole
 ///                                            PROPOSER/CANCELLER and `DecdnGovernor`
 ///                                            gets neither, so every change still
@@ -179,9 +182,10 @@ contract DeployProtocol is BaseProtocolDeploy {
         if (cfg.timelockDelay < MIN_TIMELOCK_DELAY) {
             revert TimelockDelayTooShort(cfg.timelockDelay, MIN_TIMELOCK_DELAY);
         }
-        // ADR 009 § Bootstrap-multisig phase. Unset (the default) = DAO governance
-        // live at deploy. Set = seat this multisig as the Timelock's sole proposer
-        // and withhold the role from `DecdnGovernor` until the transition batch runs
+        // ADR 009 § Bootstrap-multisig phase. Unset (the testnet default) = DAO
+        // governance live at deploy; `_deployTargets` rejects unset on Ethereum
+        // mainnet. Set = seat this multisig as the Timelock's sole proposer and
+        // withhold the role from `DecdnGovernor` until the transition batch runs
         // (see `script/TransitionToGovernor.s.sol`, issue #1175).
         cfg.bootstrapMultisig = vm.envOr("BOOTSTRAP_MULTISIG", address(0));
         cfg.minBond = vm.envOr("MIN_BOND", DEFAULT_MIN_BOND);

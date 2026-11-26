@@ -47,7 +47,8 @@ contracts/
 
 `TransitionToGovernor` broadcasts nothing. It prints the Timelock calldata for a
 governance action to schedule, so it cannot transition anything itself. It ends the [ADR 009](../adr/009-governance.md#bootstrap-multisig-phase)
-bootstrap-multisig phase (only relevant if the deploy set `BOOTSTRAP_MULTISIG`):
+bootstrap-multisig phase. The deploy enters that phase when it sets `BOOTSTRAP_MULTISIG`,
+which `DeployProtocol` requires on Ethereum mainnet and leaves optional on testnets:
 
 ```bash
 GOVERNANCE_TIMELOCK=<timelock> DECDN_GOVERNOR=<governor> BOOTSTRAP_MULTISIG=<multisig> \
