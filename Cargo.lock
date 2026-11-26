@@ -2783,6 +2783,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-io",
  "iroh-metrics",
+ "libc",
  "positioned-io",
  "rand 0.10.4",
  "reqwest",

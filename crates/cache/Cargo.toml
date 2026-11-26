@@ -66,6 +66,12 @@ aws-credential-types = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
 aws-smithy-types = { workspace = true, optional = true }
 
+# The filesystem origin opens each read with `O_NONBLOCK | O_NOFOLLOW`, so a
+# FIFO or symlink swapped in after the path check cannot block the open or
+# leave the base. Constants only, no `unsafe`.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 default = ["s3"]
 # `CacheEngine::insert_blob` / `read_blob`: seed a store with whole blobs and

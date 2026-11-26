@@ -124,10 +124,9 @@ impl FilesystemOrigin {
     /// fails containment. The stat never opens the file, so it cannot
     /// block.
     ///
-    /// A path swapped between this stat and the caller's open is not
-    /// covered here. `fetch_outboard` re-checks the type on the opened file,
-    /// which catches a device but not a FIFO: the open blocks on a FIFO
-    /// first. `fetch_range_data` and `fetch_size_proof` do not re-check.
+    /// These checks fail fast; they do not bind the later open. A path
+    /// swapped between this stat and the open meets [`open_resolved`]
+    /// instead, which every read opens through.
     ///
     /// `Ok(None)` means nothing exists at the path: no leaf, or no shard
     /// directory. Each caller maps that to its own "absent" answer. A
@@ -176,10 +175,7 @@ impl FilesystemOrigin {
             }
         };
         if !meta.is_file() {
-            return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                "cache.origin.path entry {} is not a regular file",
-                canonical.display()
-            )));
+            return Err(not_regular_file(&canonical));
         }
         Ok(Some((canonical, meta)))
     }
@@ -260,8 +256,8 @@ async fn dangling_link(path: &Path) -> Option<&Path> {
 /// is `Ok(None)` from [`FilesystemOrigin::resolve_regular`], and each read
 /// maps that, and a `NotFound` open, to its own absent answer. A symlink
 /// escape, a dangling symlink and a non-regular file are not `io::Error`s
-/// either: `resolve_regular`, and the re-check on the opened file in
-/// `fetch_outboard`, emit `OriginPullError::Permanent` directly.
+/// either: `resolve_regular` and [`open_resolved`] emit
+/// `OriginPullError::Permanent` directly.
 fn classify_io_error(err: std::io::Error) -> OriginPullError {
     use std::io::ErrorKind;
     match err.kind() {
@@ -317,53 +313,7 @@ impl Origin for FilesystemOrigin {
             let Some((canonical, _)) = self.resolve_regular(&self.path_for(hash)).await? else {
                 return Ok(OriginRangeFetch::NotFound);
             };
-
-            let mut file = match tokio::fs::File::open(&canonical).await {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(OriginRangeFetch::NotFound);
-                }
-                Err(err) => {
-                    let msg = format!("cache.origin.path open failed for {}", canonical.display());
-                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-                }
-            };
-
-            // Empty span only arises for a zero-length blob; nothing to read.
-            if req.is_empty() {
-                return Ok(OriginRangeFetch::Ranged { data: Bytes::new() });
-            }
-
-            // Seek to the aligned start and read exactly `req.len()` bytes. A
-            // short read (the on-disk object is smaller than the aligned span
-            // the engine derived from the proven blob size) means the origin
-            // copy is stale or truncated: a permanent fault.
-            if let Err(err) = file.seek(std::io::SeekFrom::Start(req.fetch_start)).await {
-                let msg = format!("cache.origin.path seek failed for {}", canonical.display());
-                return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-            }
-            let want = usize::try_from(req.len()).unwrap_or(usize::MAX);
-            let mut data = vec![0u8; want];
-            if let Err(err) = file.read_exact(&mut data).await {
-                if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                        "cache.origin.path entry {} is shorter than the range [{}, {}); \
-                         re-run `decdn origin import` for the object",
-                        canonical.display(),
-                        req.fetch_start,
-                        req.fetch_end
-                    )));
-                }
-                let msg = format!(
-                    "cache.origin.path range read failed for {}",
-                    canonical.display()
-                );
-                return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-            }
-
-            Ok(OriginRangeFetch::Ranged {
-                data: Bytes::from(data),
-            })
+            read_range(&canonical, req).await
         })
     }
 
@@ -390,58 +340,7 @@ impl Origin for FilesystemOrigin {
                     outboard_max_bytes,
                 ));
             }
-            let file = match tokio::fs::File::open(&canonical).await {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(OutboardFetch::NotFound);
-                }
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path outboard open failed for {}",
-                        canonical.display()
-                    );
-                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-                }
-            };
-            // fstat the held fd: the path may have been swapped between the
-            // resolve and the open. The fstat re-checks the file type and the
-            // length of what was opened. It does not re-check containment, and
-            // it cannot catch a FIFO swapped in: the open blocks on it first.
-            let meta = file.metadata().await.map_err(|err| {
-                let msg = format!(
-                    "cache.origin.path outboard stat failed for {}",
-                    canonical.display()
-                );
-                classify_io_error(err).map_inner(|e| e.context(msg))
-            })?;
-            if !meta.is_file() {
-                return Err(OriginPullError::Permanent(anyhow::anyhow!(
-                    "cache.origin.path entry {} is not a regular file",
-                    canonical.display()
-                )));
-            }
-            if meta.len() > outboard_max_bytes {
-                return Err(oversize_outboard(
-                    &canonical,
-                    meta.len(),
-                    outboard_max_bytes,
-                ));
-            }
-            match read_capped(file, meta.len(), outboard_max_bytes).await {
-                Ok(Some(outboard)) => Ok(OutboardFetch::Found(Bytes::from(outboard))),
-                Ok(None) => Err(oversize_outboard(
-                    &canonical,
-                    outboard_max_bytes.saturating_add(1),
-                    outboard_max_bytes,
-                )),
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path outboard read failed for {}",
-                        canonical.display()
-                    );
-                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
-                }
-            }
+            read_outboard(&canonical, outboard_max_bytes).await
         })
     }
 
@@ -460,28 +359,7 @@ impl Origin for FilesystemOrigin {
             if meta.len() > max {
                 return Err(oversize_size_proof(&canonical, max));
             }
-            let file = match tokio::fs::File::open(&canonical).await {
-                Ok(f) => f,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path size proof open failed for {}",
-                        canonical.display()
-                    );
-                    return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
-                }
-            };
-            match read_capped(file, meta.len(), max).await {
-                Ok(Some(proof)) => Ok(Some(Bytes::from(proof))),
-                Ok(None) => Err(oversize_size_proof(&canonical, max)),
-                Err(err) => {
-                    let msg = format!(
-                        "cache.origin.path size proof read failed for {}",
-                        canonical.display()
-                    );
-                    Err(classify_io_error(err).map_inner(|e| e.context(msg)))
-                }
-            }
+            read_size_proof(&canonical).await
         })
     }
 
@@ -547,6 +425,174 @@ impl Origin for FilesystemOrigin {
             }
             Ok(out)
         })
+    }
+}
+
+/// Open `canonical`, a path [`FilesystemOrigin::resolve_regular`] passed,
+/// and confirm that the opened file is a regular file. `Ok(None)` means the
+/// path vanished after the resolve. `what` names the object in the error
+/// context.
+///
+/// The path can change between the resolve and this open. On unix the open
+/// carries two flags, so a swap cannot block the open or follow a link:
+///
+/// - `O_NONBLOCK` makes a read-only open of a FIFO return at once instead of
+///   waiting for a writer. A blocked open would pin a blocking-pool thread
+///   past every timeout, because dropping the future does not stop the
+///   thread. On a regular file the flag changes nothing.
+/// - `O_NOFOLLOW` fails the open with `ELOOP` when the leaf is a symlink.
+///   The resolved path holds no links, so a link there was swapped in, and
+///   it could point outside the base.
+///
+/// The fstat of the opened file then refuses anything that is not a regular
+/// file, for example a FIFO or a device that the open let through. The
+/// flags cover the leaf only: a shard directory swapped for a link after the
+/// resolve still redirects the open.
+async fn open_resolved(
+    canonical: &Path,
+    what: &str,
+) -> Result<Option<(tokio::fs::File, std::fs::Metadata)>, OriginPullError> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let file = match opts.open(canonical).await {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if is_swapped_symlink(&err) => return Err(not_regular_file(canonical)),
+        Err(err) => {
+            let msg = format!(
+                "cache.origin.path {what} open failed for {}",
+                canonical.display()
+            );
+            return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+        }
+    };
+    let meta = file.metadata().await.map_err(|err| {
+        let msg = format!(
+            "cache.origin.path {what} stat failed for {}",
+            canonical.display()
+        );
+        classify_io_error(err).map_inner(|e| e.context(msg))
+    })?;
+    if !meta.is_file() {
+        return Err(not_regular_file(canonical));
+    }
+    Ok(Some((file, meta)))
+}
+
+/// Whether `err` is the `ELOOP` an `O_NOFOLLOW` open returns on a symlink.
+#[cfg(unix)]
+fn is_swapped_symlink(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// Without `O_NOFOLLOW` no open error marks a symlink.
+#[cfg(not(unix))]
+fn is_swapped_symlink(_err: &std::io::Error) -> bool {
+    false
+}
+
+/// The permanent fault for an origin entry at `path` that is not a regular
+/// file.
+fn not_regular_file(path: &Path) -> OriginPullError {
+    OriginPullError::Permanent(anyhow::anyhow!(
+        "cache.origin.path entry {} is not a regular file",
+        path.display()
+    ))
+}
+
+/// Read the aligned range `req` of the data object at the resolved path
+/// `canonical`.
+async fn read_range(
+    canonical: &Path,
+    req: OriginRangeRequest,
+) -> Result<OriginRangeFetch, OriginPullError> {
+    let Some((mut file, _)) = open_resolved(canonical, "data").await? else {
+        return Ok(OriginRangeFetch::NotFound);
+    };
+
+    // Empty span only arises for a zero-length blob; nothing to read.
+    if req.is_empty() {
+        return Ok(OriginRangeFetch::Ranged { data: Bytes::new() });
+    }
+
+    // Seek to the aligned start and read exactly `req.len()` bytes. A short
+    // read (the on-disk object is smaller than the aligned span the engine
+    // derived from the proven blob size) means the origin copy is stale or
+    // truncated: a permanent fault.
+    if let Err(err) = file.seek(std::io::SeekFrom::Start(req.fetch_start)).await {
+        let msg = format!("cache.origin.path seek failed for {}", canonical.display());
+        return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+    }
+    let want = usize::try_from(req.len()).unwrap_or(usize::MAX);
+    let mut data = vec![0u8; want];
+    if let Err(err) = file.read_exact(&mut data).await {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(OriginPullError::Permanent(anyhow::anyhow!(
+                "cache.origin.path entry {} is shorter than the range [{}, {}); \
+                 re-run `decdn origin import` for the object",
+                canonical.display(),
+                req.fetch_start,
+                req.fetch_end
+            )));
+        }
+        let msg = format!(
+            "cache.origin.path range read failed for {}",
+            canonical.display()
+        );
+        return Err(classify_io_error(err).map_inner(|e| e.context(msg)));
+    }
+
+    Ok(OriginRangeFetch::Ranged {
+        data: Bytes::from(data),
+    })
+}
+
+/// Read the outboard at the resolved path `canonical`, up to `max` bytes.
+/// The length comes from the fstat of the opened file, so a file swapped in
+/// after the resolve meets the cap too.
+async fn read_outboard(canonical: &Path, max: u64) -> Result<OutboardFetch, OriginPullError> {
+    let Some((file, meta)) = open_resolved(canonical, "outboard").await? else {
+        return Ok(OutboardFetch::NotFound);
+    };
+    if meta.len() > max {
+        return Err(oversize_outboard(canonical, meta.len(), max));
+    }
+    match read_capped(file, meta.len(), max).await {
+        Ok(Some(outboard)) => Ok(OutboardFetch::Found(Bytes::from(outboard))),
+        Ok(None) => Err(oversize_outboard(canonical, max.saturating_add(1), max)),
+        Err(err) => {
+            let msg = format!(
+                "cache.origin.path outboard read failed for {}",
+                canonical.display()
+            );
+            Err(classify_io_error(err).map_inner(|e| e.context(msg)))
+        }
+    }
+}
+
+/// Read the size proof object at the resolved path `canonical`, up to
+/// [`MAX_SIZE_PROOF_OBJECT_BYTES`]. `Ok(None)` means the object vanished
+/// after the resolve.
+async fn read_size_proof(canonical: &Path) -> Result<Option<Bytes>, OriginPullError> {
+    let Some((file, meta)) = open_resolved(canonical, "size proof").await? else {
+        return Ok(None);
+    };
+    let max = MAX_SIZE_PROOF_OBJECT_BYTES as u64;
+    if meta.len() > max {
+        return Err(oversize_size_proof(canonical, max));
+    }
+    match read_capped(file, meta.len(), max).await {
+        Ok(Some(proof)) => Ok(Some(Bytes::from(proof))),
+        Ok(None) => Err(oversize_size_proof(canonical, max)),
+        Err(err) => {
+            let msg = format!(
+                "cache.origin.path size proof read failed for {}",
+                canonical.display()
+            );
+            Err(classify_io_error(err).map_inner(|e| e.context(msg)))
+        }
     }
 }
 

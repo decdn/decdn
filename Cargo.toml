@@ -124,6 +124,9 @@ iroh-io = { version = "0.6", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+# `O_NONBLOCK` / `O_NOFOLLOW` / `ELOOP` for the filesystem origin's open. The
+# constants only; nothing calls into libc, so `unsafe_code = "forbid"` holds.
+libc = "0.2"
 async-trait = "0.1"
 # Sharded concurrent map: the client handler's lane registry (#1731) so
 # independent lanes look up on different shards instead of one global mutex.
