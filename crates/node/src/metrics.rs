@@ -2147,10 +2147,8 @@ pub struct DecdnMetrics {
     /// `serve_stream_midstream_signer_cap_exhausted`.
     pub serve_stream_midstream_pool_exhausted: Counter,
     /// `decdn_serve_stream_midstream_pool_closed_total`: paying streams stopped
-    /// mid-delivery because their pool closed, or is `Closing` with its dispute
-    /// deadline inside the node's redeem margin. `redeemMany` reverts on a closed
-    /// pool, and on a `Closing` pool past its deadline; the margin stop runs
-    /// early so the last sweep can land. The wire reason is `PoolExhausted`; this
+    /// mid-delivery because their pool is `Closing` or closed: the node holds
+    /// the admission rule for the whole stream. The wire reason is `PoolExhausted`; this
     /// counter separates the close from a drained pool
     /// (`serve_stream_midstream_pool_exhausted`).
     pub serve_stream_midstream_pool_closed: Counter,
@@ -3374,8 +3372,8 @@ recorders! {
     config_reload_failure => config_reload_failures.inc();
     /// A paying stream stopped mid-delivery on `PoolExhausted`.
     serve_stream_midstream_pool_exhausted => serve_stream_midstream_pool_exhausted.inc();
-    /// A paying stream stopped mid-delivery because its pool closed, or closes
-    /// within the node's redeem margin.
+    /// A paying stream stopped mid-delivery because its pool is `Closing` or
+    /// closed.
     serve_stream_midstream_pool_closed => serve_stream_midstream_pool_closed.inc();
     /// A mid-stream pool-solvency re-check read a projection while the chain
     /// reads are stale.

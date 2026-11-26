@@ -1508,20 +1508,16 @@ impl ClientHandler {
     ///
     /// - No pool view wired (dev/test, no chain): `None`. There is nothing to
     ///   check, so the stream fails open.
-    /// - The view holds no status for the pool: [`ServeStop::PoolClosed`].
-    ///   Admission puts every admitted stream's pool in the view, and the
-    ///   view drops a live lane's pool only once a refresh read finds it
-    ///   closed or absent, so the pool closed under this stream. `redeemMany` reverts on a
-    ///   closed pool.
-    /// - The pool is `Closing` and its dispute deadline falls inside the
-    ///   capability expiry margin ([`Self::inside_expiry_margin`]):
-    ///   [`ServeStop::PoolClosed`]. `redeemMany` reverts past the deadline, and
-    ///   the margin leaves the redeemer one redeem interval to sweep the last
-    ///   voucher and the landing slack to land it.
+    /// - The pool is not `Open`: [`ServeStop::PoolClosed`]. This is the
+    ///   admission rule, held for the whole stream: a `Closing` pool takes no
+    ///   top-up, so its owner is winding it down, and a pool the view no
+    ///   longer holds closed under this stream (admission puts every admitted
+    ///   stream's pool in the view, and the view drops it only once a refresh
+    ///   read finds it closed or absent).
     /// - The pool's remaining deposit no longer sits above the refundable
     ///   floor `M` ([`Self::pool_funds_committed`]): [`ServeStop::PoolExhausted`].
     ///
-    /// The closed checks run first, because a closed pool's `remaining` pays
+    /// The lifecycle check runs first, because a closed pool's `remaining` pays
     /// nothing. The caller sends `PoolExhausted` on the wire for either stop: the
     /// client's recovery is the same funding step, and the stop keeps its own
     /// counter. The re-check logs a `warn!` for each stop, which names the
@@ -1540,23 +1536,15 @@ impl ClientHandler {
     async fn pool_recheck_stop(&self, lane_key: &LaneId, hash: &Hash) -> Option<ServeStop> {
         let view = self.pool_view(lane_key.deployment)?;
         self.count_stale_pool_recheck(lane_key, hash);
-        let Some(status) = view.cached_status(lane_key.pool_id).await else {
+        let status = view.cached_status(lane_key.pool_id).await;
+        let Some(status) = status.filter(|s| s.lifecycle == crate::pool_view::Lifecycle::Open)
+        else {
             tracing::warn!(
                 pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
-                "mid-stream pool closed: the pool view no longer holds this pool, which closed under a live stream; redeemMany reverts on a closed pool, so the node stops serving. The owner opens a new pool"
+                "mid-stream pool closed: this pool is Closing or closed, so the node stops serving it, as admission does. The owner opens a new pool"
             );
             return Some(ServeStop::PoolClosed);
         };
-        if let crate::pool_view::Lifecycle::Closing { deadline } = status.lifecycle
-            && self.inside_expiry_margin(deadline)
-        {
-            tracing::warn!(
-                pool_id = %lane_key.pool_id, stopped_signer = %lane_key.signer, %hash,
-                dispute_deadline = deadline,
-                "mid-stream pool closing: the pool's dispute deadline falls inside the node's redeem margin; redeemMany reverts past the deadline, so the node stops serving. The owner opens a new pool"
-            );
-            return Some(ServeStop::PoolClosed);
-        }
         if !self.pool_funds_committed(status.remaining) {
             // A paying in-flight download is being terminated, so make the stop
             // observable rather than silent.
