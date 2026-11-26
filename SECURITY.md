@@ -33,9 +33,10 @@ depth: it lives in the repository it is checking. Record the fingerprint above
 out of band the first time you verify a release, and compare against your copy
 afterwards.
 
-Each release carries eleven GPG signatures: the tag, the version-bump commit, the
-`SHA256SUMS` manifest covering every archive, and for each of the four container
-images its digest file and its SBOM. Individual archives carry no `.asc` of their
+Each release carries twelve GPG signatures: the tag, the version-bump commit, the
+`SHA256SUMS` manifest covering every archive, `source-commit.txt` naming the
+commit the release was built from, and for each of the four container images its
+digest file and its SBOM. Individual archives carry no `.asc` of their
 own — verify them through the signed manifest.
 
 `SHA256SUMS` carries one more signature, `SHA256SUMS.minisig`, made with
@@ -76,6 +77,14 @@ Verify the signed checksum manifest, then check your archive against it:
 ```bash
 gpg --verify SHA256SUMS.asc SHA256SUMS
 sha256sum --ignore-missing --check SHA256SUMS
+```
+
+The signed `source-commit.txt` names the commit every archive, image and SBOM of
+the release was built from. It must equal the commit the tag names:
+
+```bash
+gpg --verify source-commit.txt.asc source-commit.txt
+[ "$(cat source-commit.txt)" = "$(git rev-parse 'v0.1.0^{commit}')" ] && echo match
 ```
 
 The minisign signature verifies the same manifest with any maintainer's key

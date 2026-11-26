@@ -30,8 +30,10 @@ pytestmark = pytest.mark.skipif(
 # Answers every `gh` call the script makes after the key is chosen, and logs
 # each call's argv (one line per call) to $GH_LOG. `release download` stages a
 # minimal draft: two archives, their SHA256SUMS, and the image digest and SBOM
-# files the script insists on. $GH_BLANK_LINE appends a blank line to the
-# SHA256SUMS. $GH_RERUN also stages what an earlier run left on the draft: a
+# files the script insists on, and a source-commit.txt naming the tag's commit.
+# $GH_SOURCE_COMMIT=missing stages no source-commit.txt; any other value is
+# written into it in place of the tag's commit. $GH_BLANK_LINE appends a blank
+# line to the SHA256SUMS. $GH_RERUN also stages what an earlier run left on the draft: a
 # stale linux archive signature by key B, and a signature for an archive the
 # draft no longer carries. `release upload` refuses a signature file that does
 # not exist, as gh does, and logs each uploaded .minisig with its first line to
@@ -65,7 +67,12 @@ case "$1 $2" in
     echo "ghcr.io/$owner/sponsord-onramp@sha256:$zeros" > "$dir/sponsord-onramp-image-digest.txt"
     for img in decdn-node decdn sponsord sponsord-onramp; do
       echo '{}' > "$dir/$img-$version-sbom.spdx.json"
-    done ;;
+    done
+    case "${GH_SOURCE_COMMIT-tag}" in
+      missing) ;;
+      tag) git rev-parse "refs/tags/$tag^{commit}" > "$dir/source-commit.txt" ;;
+      *) printf '%s\n' "$GH_SOURCE_COMMIT" > "$dir/source-commit.txt" ;;
+    esac ;;
   "release upload")
     for f in "$@"; do
       case "$f" in
@@ -317,6 +324,9 @@ def test_a_stable_release_is_minisigned_uploaded_and_published(release):
     uploads = release.calls(release.gh_log, "release upload")
     assert len(uploads) == 1 and "SHA256SUMS.minisig" in uploads[0], uploads
     assert "SHA256SUMS.asc" in uploads[0]
+    # The commit binding is signed alongside the manifest.
+    assert "source-commit.txt.asc" in uploads[0], uploads
+    assert "==> Checking the draft was built from v0.0.0" in result.stdout
     assert "decdn-0.0.0-x86_64-unknown-linux-gnu.tar.gz.minisig" in uploads[0], uploads
     assert "decdn-0.0.0-x86_64-pc-windows-msvc.zip.minisig" in uploads[0], uploads
     # The uploaded archive signatures are the ones this run wrote.
@@ -482,6 +492,63 @@ def test_a_manifest_signature_no_committed_key_verifies_is_refused(release):
     assert "minisign said: shim: signature mismatch" in result.stderr, output(result)
     assert not release.calls(release.gh_log, "release upload")
     assert not release.calls(release.gh_log, "release edit")
+
+
+def head(release: Release) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=release.repo,
+        env=release.env(),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def assert_nothing_signed(release: Release, result: subprocess.CompletedProcess[str]) -> None:
+    assert result.returncode != 0
+    assert "signed SHA256SUMS" not in result.stdout, output(result)
+    assert not release.calls(release.minisign_log, "-S")
+    assert not release.calls(release.gh_log, "release upload")
+    assert not release.calls(release.gh_log, "release edit")
+
+
+def test_a_draft_built_from_another_commit_is_refused(release):
+    # The run built the first commit; the tag was then moved to the second,
+    # and the run that move queued has not replaced the assets yet.
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.git("commit", "-q", "--allow-empty", "-m", "built")
+    built = head(release)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", GH_SOURCE_COMMIT=built)
+
+    assert_nothing_signed(release, result)
+    assert f"the draft was built from '{built}', but v0.0.0 names {head(release)}" in (
+        result.stderr
+    ), output(result)
+
+
+def test_a_draft_without_a_source_commit_is_refused(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", GH_SOURCE_COMMIT="missing")
+
+    assert_nothing_signed(release, result)
+    assert "expected asset source-commit.txt is missing from the draft" in result.stderr, output(
+        result
+    )
+
+
+def test_a_source_commit_with_a_second_line_is_refused(release):
+    fpr = release.gen_key("Maintainer <me@decdn.org>", publish=True)
+    release.tag("v0.0.0", fpr)
+
+    result = release.publish("v0.0.0", GH_SOURCE_COMMIT=f"{head(release)}\n{'0' * 40}")
+
+    assert_nothing_signed(release, result)
+    assert "source-commit.txt has more than one line" in result.stderr, output(result)
 
 
 def test_a_failed_minisign_stops_before_any_upload(release):

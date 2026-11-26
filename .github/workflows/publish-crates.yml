@@ -26,6 +26,8 @@ name: Publish crates
 # - the release is out of draft;
 # - SHA256SUMS.asc is a good signature over a manifest of this version, by a
 #   live key in that same KEYS;
+# - source-commit.txt.asc is a good signature by such a key over a
+#   source-commit.txt that names the commit the tag names;
 # - SHA256SUMS.minisig and every archive's .minisig are attached.
 #
 # Two jobs, because `id-token: write` lets every step in its job request an
@@ -144,7 +146,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
-        run: .github/scripts/check-release-signed.sh "$TAG" KEYS
+          SHA: ${{ steps.signature.outputs.sha }}
+        run: .github/scripts/check-release-signed.sh "$TAG" KEYS "$SHA"
 
       # CI ran the guard on the PRs, not necessarily on the tagged commit.
       - name: Check the binstall metadata at the tag

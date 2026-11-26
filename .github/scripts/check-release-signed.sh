@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Refuses to let a release reach crates.io unless a maintainer has signed it.
 #
-# Usage:  .github/scripts/check-release-signed.sh <tag> <KEYS file>
+# Usage:  .github/scripts/check-release-signed.sh <tag> <KEYS file> <commit>
 #
 # A crates.io version can never be replaced, so the publish-crates workflow
 # uploads nothing that no maintainer signature vouches for. Leaving draft is
@@ -14,6 +14,9 @@
 #   <KEYS file> keyring, and nothing else, that has neither expired nor been
 #   revoked. The caller passes the KEYS from main, never the tag's own,
 #   so the tag cannot supply its own trust root;
+# - source-commit.txt.asc is a good signature over source-commit.txt by such a
+#   key, and source-commit.txt names <commit>, the commit the tag names. The
+#   signed archives were then built from the commit whose crates go out;
 # - every archive SHA256SUMS names carries this release's version, so the
 #   signed manifest of another release does not pass for this one;
 # - SHA256SUMS.minisig is attached. `decdn self-update` checks it, so a
@@ -29,6 +32,7 @@ set -euo pipefail
 TAG="${1:?tag required, e.g. v0.1.2}"
 VERSION="${TAG#v}"
 KEYS_FILE="${2:?KEYS file required}"
+COMMIT="${3:?commit the tag names required}"
 REPO="${GH_REPO:-${GITHUB_REPOSITORY:-decdn/decdn}}"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -60,31 +64,47 @@ if ! ASSETS=$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[
                 2>"$WORK/gh.err"); then
   die "cannot list the assets of release $TAG: $(cat "$WORK/gh.err")"
 fi
-for sig in SHA256SUMS SHA256SUMS.asc SHA256SUMS.minisig; do
+for sig in SHA256SUMS SHA256SUMS.asc SHA256SUMS.minisig source-commit.txt source-commit.txt.asc; do
   grep -qxF "$sig" <<<"$ASSETS" || die \
     "release $TAG carries no $sig, so no maintainer signature vouches for it.
 Run scripts/sign-release.sh $TAG."
 done
 
-for asset in SHA256SUMS SHA256SUMS.asc; do
+for asset in SHA256SUMS SHA256SUMS.asc source-commit.txt source-commit.txt.asc; do
   gh release download "$TAG" --repo "$REPO" --pattern "$asset" --dir "$WORK/assets" ||
     die "cannot download $asset from release $TAG"
 done
+
+# Dies unless <file>.asc is a good signature over <file> by a live key in KEYS.
 # `gpg --verify` exits 0 on a good signature by an expired or revoked key too,
 # so the status lines decide: a GOODSIG and a VALIDSIG, and no line that marks
 # the key or signature expired or revoked, or the signature bad. `git
 # verify-tag` refuses those keys, and this check must not be weaker than it.
 # The keyring holds nothing but KEYS.
-status=$(gpg --homedir "$WORK/gnupg" --batch --status-fd 1 --verify \
-  "$WORK/assets/SHA256SUMS.asc" "$WORK/assets/SHA256SUMS" 2>"$WORK/gpg.err") || true
-if ! grep -q '^\[GNUPG:\] GOODSIG ' <<<"$status" ||
-   ! grep -q '^\[GNUPG:\] VALIDSIG ' <<<"$status" ||
-   grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|KEYREVOKED|KEYEXPIRED) ' <<<"$status"
-then
-  die "SHA256SUMS.asc on release $TAG is not a good signature by a live key in KEYS.
+verify_signed() {
+  local file="$1" status
+  status=$(gpg --homedir "$WORK/gnupg" --batch --status-fd 1 --verify \
+    "$WORK/assets/$file.asc" "$WORK/assets/$file" 2>"$WORK/gpg.err") || true
+  if ! grep -q '^\[GNUPG:\] GOODSIG ' <<<"$status" ||
+     ! grep -q '^\[GNUPG:\] VALIDSIG ' <<<"$status" ||
+     grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG|KEYREVOKED|KEYEXPIRED) ' <<<"$status"
+  then
+    die "$file.asc on release $TAG is not a good signature by a live key in KEYS.
 Nothing goes to crates.io that no maintainer signature vouches for.
 $(cat "$WORK/gpg.err")"
-fi
+  fi
+}
+verify_signed SHA256SUMS
+verify_signed source-commit.txt
+
+# One line, and the commit the tag names: the archives the signatures cover
+# were built from the source the crates are packaged from.
+[[ $(grep -c '' "$WORK/assets/source-commit.txt") -le 1 ]] ||
+  die "source-commit.txt of release $TAG has more than one line"
+SOURCE_COMMIT=$(tr -d '\r' < "$WORK/assets/source-commit.txt" | head -n1)
+[[ "$SOURCE_COMMIT" == "$COMMIT" ]] || die \
+  "release $TAG was signed as built from '$SOURCE_COMMIT', but $TAG names $COMMIT.
+The signatures vouch for another commit's artifacts."
 
 NAMES=$(awk 'NF {print $2}' "$WORK/assets/SHA256SUMS") ||
   die "cannot read SHA256SUMS of release $TAG"
@@ -107,5 +127,6 @@ done
   "release $TAG carries no .minisig for: ${unsigned[*]}
 cargo binstall would refuse those archives. Run scripts/sign-release.sh $TAG."
 
-echo "release $TAG is signed: SHA256SUMS.asc verifies against KEYS, and" \
+echo "release $TAG is signed: SHA256SUMS.asc and source-commit.txt.asc ($COMMIT)" \
+     "verify against KEYS, and" \
      "SHA256SUMS.minisig and ${#ARCHIVES[@]} archive signatures are attached"
