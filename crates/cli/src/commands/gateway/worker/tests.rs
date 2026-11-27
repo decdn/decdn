@@ -15,7 +15,10 @@ use decdn_incentive::lane::{LaneKey, PoolId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{Notify, oneshot};
 
-use super::{Backend, DelegateLanes, Job, PoolSnapshot, PullWorker, StallLimit, read_pools};
+use super::{
+    Backend, Bounds, DelegateLanes, Job, PoolSnapshot, PullKind, PullWorker, Refused, StallLimit,
+    read_pools,
+};
 use crate::commands::fetch::{BlobFetch, Credential, Sink};
 
 /// The blob a [`Fake`] pull stalls on: it writes more than the pipe holds.
@@ -192,29 +195,51 @@ fn send_paid(
     tokio::io::DuplexStream,
     oneshot::Receiver<anyhow::Result<()>>,
 ) {
+    let (reader, result, _slotted) =
+        try_send(worker, kind, PullKind::Blob, paying, pipe).expect("the worker takes the job");
+    (reader, result)
+}
+
+/// What a test holds of a pull the worker took: the response's end of the
+/// pipe, the result, and the notice that the pull holds its slot.
+type Sent = (
+    tokio::io::DuplexStream,
+    oneshot::Receiver<anyhow::Result<()>>,
+    oneshot::Receiver<()>,
+);
+
+/// A pull of blob `kind` as a pull of `pull_kind`, or the worker's refusal.
+fn try_send(
+    worker: &PullWorker,
+    kind: u8,
+    pull_kind: PullKind,
+    paying: Credential,
+    pipe: usize,
+) -> Result<Sent, Refused> {
     let (writer, reader) = tokio::io::duplex(pipe);
     let (done, result) = oneshot::channel();
-    worker
-        .pull(Job {
-            blob: BlobFetch {
-                estimate: false,
-                progress: None,
-                hash: [kind; 32],
-                namespace: None,
-                output: PathBuf::from("-"),
-                common: common(),
-                read_ahead: None,
-                size_cap: None,
-                range: None,
-                size_only: false,
-            },
-            paying,
-            writer,
-            done,
-            listing: Box::new(()),
-        })
-        .expect("the worker takes the job");
-    (reader, result)
+    let (slotted_tx, slotted) = oneshot::channel();
+    worker.pull(Job {
+        blob: BlobFetch {
+            estimate: false,
+            progress: None,
+            hash: [kind; 32],
+            namespace: None,
+            output: PathBuf::from("-"),
+            common: common(),
+            read_ahead: None,
+            size_cap: None,
+            range: None,
+            size_only: false,
+        },
+        paying,
+        writer,
+        done,
+        listing: Box::new(()),
+        kind: pull_kind,
+        slotted: slotted_tx,
+    })?;
+    Ok((reader, result, slotted))
 }
 
 /// A stall limit no test reaches unless it means to.
@@ -228,6 +253,18 @@ async fn start_with(
     max_pulls: usize,
     stall: Duration,
 ) -> (PullWorker, Arc<Mutex<Log>>, Arc<Notify>) {
+    let bounds = Bounds {
+        pulls: max_pulls,
+        manifest_pulls: max_pulls,
+        queued: 64,
+    };
+    start_bounded(bounds, stall).await
+}
+
+async fn start_bounded(
+    bounds: Bounds,
+    stall: Duration,
+) -> (PullWorker, Arc<Mutex<Log>>, Arc<Notify>) {
     let log = Arc::new(Mutex::new(Log::default()));
     let release = Arc::new(Notify::new());
     let worker = PullWorker::start(
@@ -235,7 +272,7 @@ async fn start_with(
             log: Arc::clone(&log),
             release: Arc::clone(&release),
         },
-        max_pulls,
+        bounds,
         stall,
     )
     .await
@@ -277,6 +314,66 @@ async fn pulls_past_the_bound_wait_for_a_slot() {
     assert!(waited.is_err(), "the second pull waits for the only slot");
     release.notify_one();
     held_done.await.unwrap().unwrap();
+    assert_eq!(read_all(reader).await, b"hello");
+    done.await.unwrap().unwrap();
+    worker.stop().await;
+}
+
+/// Manifest pulls past their cap are refused at once, while a blob pull still
+/// runs on the other slots; a manifest pull that ends frees its place.
+#[tokio::test]
+async fn manifest_pulls_past_their_cap_are_refused() {
+    let bounds = Bounds {
+        pulls: 2,
+        manifest_pulls: 1,
+        queued: 4,
+    };
+    let (worker, _log, release) = start_bounded(bounds, LONG_STALL).await;
+    let paying = credential(&Arc::new(PrivateKeySigner::random()));
+    let (_held, held_done, slotted) =
+        try_send(&worker, HOLD, PullKind::Manifest, paying.clone(), 1024).unwrap();
+    slotted.await.expect("the held manifest pull takes a slot");
+    let refused = try_send(&worker, HELLO, PullKind::Manifest, paying.clone(), 1024);
+    assert_eq!(refused.err(), Some(Refused::Busy));
+    let (reader, done, _) = try_send(&worker, HELLO, PullKind::Blob, paying.clone(), 1024).unwrap();
+    let bytes = tokio::time::timeout(Duration::from_secs(10), read_all(reader))
+        .await
+        .expect("a blob pull runs beside the held manifest pull");
+    assert_eq!(bytes, b"hello");
+    done.await.unwrap().unwrap();
+    release.notify_one();
+    held_done.await.unwrap().unwrap();
+    let (reader, done, _) = try_send(&worker, HELLO, PullKind::Manifest, paying, 1024)
+        .expect("the ended manifest pull frees its place");
+    assert_eq!(read_all(reader).await, b"hello");
+    done.await.unwrap().unwrap();
+    worker.stop().await;
+}
+
+/// With every slot held and the queue at its bound, a further pull is
+/// refused at once. A queued pull is not told it holds a slot until it does,
+/// so its caller allocates no read buffer while it waits.
+#[tokio::test]
+async fn a_pull_past_the_queue_is_refused_at_once() {
+    let bounds = Bounds {
+        pulls: 1,
+        manifest_pulls: 1,
+        queued: 1,
+    };
+    let (worker, _log, release) = start_bounded(bounds, LONG_STALL).await;
+    let paying = credential(&Arc::new(PrivateKeySigner::random()));
+    let (_held, held_done, slotted) =
+        try_send(&worker, HOLD, PullKind::Blob, paying.clone(), 1024).unwrap();
+    slotted.await.expect("the held pull takes the slot");
+    let (reader, done, mut queued) =
+        try_send(&worker, HELLO, PullKind::Blob, paying.clone(), 1024).unwrap();
+    let refused = try_send(&worker, STALL, PullKind::Blob, paying.clone(), 1024);
+    assert_eq!(refused.err(), Some(Refused::Busy));
+    let waited = tokio::time::timeout(Duration::from_millis(200), &mut queued).await;
+    assert!(waited.is_err(), "the queued pull waits for the only slot");
+    release.notify_one();
+    held_done.await.unwrap().unwrap();
+    queued.await.expect("the queued pull takes the freed slot");
     assert_eq!(read_all(reader).await, b"hello");
     done.await.unwrap().unwrap();
     worker.stop().await;
@@ -523,7 +620,12 @@ async fn a_host_that_cannot_be_built_fails_the_start() {
         }
         async fn close(&self, (): ()) {}
     }
-    let Err(err) = PullWorker::start(Broken, 1, LONG_STALL).await else {
+    let bounds = Bounds {
+        pulls: 1,
+        manifest_pulls: 1,
+        queued: 1,
+    };
+    let Err(err) = PullWorker::start(Broken, bounds, LONG_STALL).await else {
         panic!("a broken host starts no worker");
     };
     assert!(format!("{err:#}").contains("no endpoint"), "{err:#}");

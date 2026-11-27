@@ -196,7 +196,25 @@ async fn test_gateway_in(
     public: Option<Public>,
     worker_slots: usize,
 ) -> Arc<Gateway> {
-    test_gateway_cached(backend, common, sites, public, worker_slots, None).await
+    test_gateway_cached(backend, common, sites, public, slots(worker_slots), None).await
+}
+
+/// Worker bounds of `n` slots, which every kind may fill, and the gateway's
+/// queue.
+const fn slots(n: usize) -> Bounds {
+    Bounds {
+        pulls: n,
+        manifest_pulls: n,
+        queued: MAX_QUEUED_PULLS,
+    }
+}
+
+/// A loopback gateway on `backend` whose worker holds `bounds`.
+async fn test_gateway_bounded(backend: impl worker::Backend, bounds: Bounds) -> Arc<Gateway> {
+    let sites = SiteDomain::Loopback {
+        listen: "127.0.0.1:8484".parse().unwrap(),
+    };
+    test_gateway_cached(backend, flags(&[]), sites, None, bounds, None).await
 }
 
 /// [`test_gateway_in`] serving repeat requests out of `cache`.
@@ -205,7 +223,7 @@ async fn test_gateway_cached(
     common: cli::ClientFetchArgs,
     sites: SiteDomain,
     public: Option<Public>,
-    worker_slots: usize,
+    bounds: Bounds,
     cache: Option<CacheEngine>,
 ) -> Arc<Gateway> {
     assert_eq!(matches!(sites, SiteDomain::Public { .. }), public.is_some());
@@ -226,13 +244,9 @@ async fn test_gateway_cached(
         common,
         chain,
         delegates: std::sync::Mutex::default(),
-        pulls: PullWorker::start(
-            backend,
-            worker_slots,
-            Duration::from_secs(GIVE_UP_AFTER_SECS),
-        )
-        .await
-        .unwrap(),
+        pulls: PullWorker::start(backend, bounds, Duration::from_secs(GIVE_UP_AFTER_SECS))
+            .await
+            .unwrap(),
         cache,
         manifests: std::sync::Mutex::new(ManifestCache::default()),
         not_manifests: std::sync::Mutex::new(NotManifests::default()),
@@ -3148,6 +3162,133 @@ async fn an_active_pull_is_listed_until_the_worker_ends_it() {
     assert_eq!(gateway.metrics.snapshot().pulls_active, 0);
 }
 
+/// A gateway on [`Recording`] that answers each blob in `replies`, knows the
+/// verified `sizes`, and whose worker holds `bounds`, holding a capability
+/// that pays.
+async fn bounded_gateway(
+    replies: HashMap<[u8; 32], Reply>,
+    sizes: HashMap<[u8; 32], u64>,
+    bounds: Bounds,
+) -> Arc<Gateway> {
+    let backend = Recording {
+        caps: Arc::default(),
+        size_caps: Arc::default(),
+        ranges: Arc::default(),
+        proofs: Arc::default(),
+        replies,
+        sizes: std::sync::Mutex::new(sizes),
+        proves: HashMap::new(),
+    };
+    let gateway = test_gateway_bounded(backend, bounds).await;
+    hold_capability(&gateway, 0);
+    gateway
+}
+
+/// Wait until `n` pulls are listed as in flight.
+async fn await_listed(gateway: &Arc<Gateway>, n: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while gateway.active_pulls().len() < n {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the held pulls are listed");
+}
+
+/// A request the gateway refuses as busy answers 429 with a retry hint, at
+/// once.
+async fn assert_busy(gateway: &Arc<Gateway>, path: &str) {
+    let answer = tokio::time::timeout(Duration::from_secs(5), loopback_get(gateway, path))
+        .await
+        .expect("a refusal answers at once");
+    assert_eq!(
+        answer.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        answer.body
+    );
+    assert_eq!(answer.body, BUSY);
+    let retry = BUSY_RETRY_SECS.to_string();
+    assert_eq!(answer.header(header::RETRY_AFTER), Some(retry.as_str()));
+}
+
+/// With the manifest pulls at their cap, held, a further manifest request is
+/// refused at once, and a raw-blob request still answers.
+#[tokio::test]
+async fn a_raw_blob_answers_while_manifest_pulls_hold_their_cap() {
+    let (held, other, blob) = ([0xa1; 32], [0xa2; 32], [0xb1; 32]);
+    let replies = HashMap::from([
+        (held, Reply::Hold),
+        (other, Reply::Hold),
+        (blob, Reply::Bytes(b"raw".to_vec())),
+    ]);
+    let bounds = Bounds {
+        pulls: 2,
+        manifest_pulls: 1,
+        queued: 0,
+    };
+    let gateway = bounded_gateway(replies, HashMap::new(), bounds).await;
+    let index = format!("/{}/", alloy::hex::encode(held));
+    let pending = tokio::spawn({
+        let gateway = Arc::clone(&gateway);
+        async move { loopback_get(&gateway, &index).await }
+    });
+    await_listed(&gateway, 1).await;
+    assert_busy(&gateway, &format!("/{}/", alloy::hex::encode(other))).await;
+    let answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        loopback_get(&gateway, &format!("/{}", alloy::hex::encode(blob))),
+    )
+    .await
+    .expect("the raw blob finds a slot");
+    assert_eq!(
+        (answer.status, answer.body.as_str()),
+        (StatusCode::OK, "raw")
+    );
+    pending.abort();
+}
+
+/// With every slot held and the queue at its bound, a further request for
+/// another blob is refused at once. The refusal comes from the worker's
+/// admission, before [`first_chunk`], so it allocates no read buffer; the
+/// queued request allocates none either until it holds a slot.
+#[tokio::test]
+async fn a_request_past_the_queue_is_refused_at_once() {
+    let (running, queued, refused) = ([0xc1; 32], [0xc2; 32], [0xc3; 32]);
+    let replies = HashMap::from([
+        (running, Reply::Hold),
+        (queued, Reply::Hold),
+        (refused, Reply::Bytes(b"late".to_vec())),
+    ]);
+    let bounds = Bounds {
+        pulls: 1,
+        manifest_pulls: 1,
+        queued: 1,
+    };
+    // Known sizes, so each request streams with no size lookup first.
+    let sizes = HashMap::from([(running, 4), (queued, 4), (refused, 4)]);
+    let gateway = bounded_gateway(replies, sizes, bounds).await;
+    let mut pending = Vec::new();
+    for hash in [running, queued] {
+        let gateway = Arc::clone(&gateway);
+        let path = format!("/{}", alloy::hex::encode(hash));
+        pending.push(tokio::spawn(
+            async move { loopback_get(&gateway, &path).await },
+        ));
+    }
+    await_listed(&gateway, 2).await;
+    assert_busy(&gateway, &format!("/{}", alloy::hex::encode(refused))).await;
+    assert_eq!(
+        gateway.active_pulls().len(),
+        2,
+        "the refused request lists no pull"
+    );
+    assert_eq!(gateway.metrics.snapshot().requests_refused, 1);
+    for task in pending {
+        task.abort();
+    }
+}
+
 /// `GET path` on the loopback host, with no browser headers.
 async fn loopback_get(gateway: &Arc<Gateway>, path: &str) -> Answer {
     send(gateway, Method::GET, "127.0.0.1:8484", path, &[]).await
@@ -3594,8 +3735,8 @@ async fn trickling_fills_block_no_other_manifest() {
     }
 }
 
-/// A fill that would pass the buffer budget fails at once instead of
-/// waiting, and the next fill runs once the budget frees.
+/// A fill that would pass the buffer budget is refused as busy at once
+/// instead of waiting, and the next fill runs once the budget frees.
 #[tokio::test]
 async fn a_spent_buffer_budget_fails_a_fill_fast() {
     let replies = HashMap::from([(BLOB, Reply::Bytes(noindex_manifest()))]);
@@ -3603,13 +3744,7 @@ async fn a_spent_buffer_budget_fails_a_fill_fast() {
     let spent = u32::try_from(MANIFEST_BUFFER_BYTES - 1).unwrap();
     let taken = gateway.manifest_buffer.try_acquire_many(spent).unwrap();
     let blob = alloy::hex::encode(BLOB);
-    let (status, body) = tokio::time::timeout(Duration::from_secs(10), async {
-        get(&gateway, &format!("/{blob}/")).await
-    })
-    .await
-    .expect("a fill past the budget does not wait");
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert!(body.contains("manifest buffer is full"), "{body}");
+    assert_busy(&gateway, &format!("/{blob}/")).await;
     drop(taken);
     let (status, body) = get(&gateway, &format!("/{blob}/")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3785,7 +3920,15 @@ async fn cached_public_gateway(cache: CacheEngine, pointers_dir: &Path) -> Arc<G
         origin: "https://decdn.test".parse().unwrap(),
     };
     let public = public_with(pointers_dir);
-    test_gateway_cached(NoPulls, flags(&[]), sites, Some(public), 1, Some(cache)).await
+    test_gateway_cached(
+        NoPulls,
+        flags(&[]),
+        sites,
+        Some(public),
+        slots(1),
+        Some(cache),
+    )
+    .await
 }
 
 /// A blob the cache holds whole is served from it with its length, and with
@@ -3927,7 +4070,8 @@ async fn a_gateway_with_no_capability_serves_a_cached_blob() {
     let sites = SiteDomain::Loopback {
         listen: "127.0.0.1:8484".parse().unwrap(),
     };
-    let gateway = test_gateway_cached(NoPulls, flags(&[]), sites, None, 1, Some(cache)).await;
+    let gateway =
+        test_gateway_cached(NoPulls, flags(&[]), sites, None, slots(1), Some(cache)).await;
 
     let (status, body) = get(&gateway, &format!("/{}", alloy::hex::encode(hash))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
