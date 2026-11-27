@@ -1161,6 +1161,9 @@ async fn run_e2e() -> anyhow::Result<()> {
     // The settlement ledger (#2598): one row per landed `redeemMany`, in chain
     // order, decoded from each receipt. The redeemer writes the row after the
     // receipt lands (one header read in between), so poll for the second one.
+    // Each delivery can settle over several redemptions, since a hint redeems
+    // once the lane clears the floor, so the ledger holds at least two rows,
+    // and its first two are the first two redeems on the lane.
     let rows = poll_until(Duration::from_secs(10), || {
         let store = Arc::clone(&concrete_store);
         async move {
@@ -1170,7 +1173,12 @@ async fn run_e2e() -> anyhow::Result<()> {
     })
     .await
     .ok_or_else(|| anyhow::anyhow!("the settlement ledger did not record both redeems"))?;
-    anyhow::ensure!(rows.len() == 2, "one ledger row per redeemMany: {rows:?}");
+    anyhow::ensure!(
+        rows.windows(2)
+            .all(|pair| (pair[0].block_number, pair[0].log_index)
+                < (pair[1].block_number, pair[1].log_index)),
+        "the ledger rows are in chain order, one per redeemMany: {rows:?}"
+    );
     let (first, second) = (&rows[0], &rows[1]);
     anyhow::ensure!(
         first.tx_hash == tx_first && first.block_number == block_first,
