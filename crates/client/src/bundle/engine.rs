@@ -74,7 +74,7 @@ use super::{
 use crate::buyer_pool::{EscrowUnconfirmed, OwnedPayer, UnconfirmedEscrows, UntrackedEscrow};
 use crate::discovery::{self, NodeCandidate};
 use crate::fault::{carries_untracked_escrow, fold_escrow};
-use crate::funding::RunFunding;
+use crate::funding::{RunFunding, StalePool, retire_allowed};
 use crate::lane_sources::{FirstLeg, LaneSources, discovery_span};
 use crate::lanes::{LaneDeps, LanePayer, STALL_WINDOW, SettleOnDrop};
 use crate::ordered_writes::OrderedWrites;
@@ -1033,6 +1033,36 @@ fn manifest_fetch_error(err: anyhow::Error) -> anyhow::Error {
     err.context("fetch bundle manifest blob")
 }
 
+/// Whether a pull may retire a stale stored pool
+/// ([`RunFunding::retire_stale_pool`]): it `failed` ([`leaves_work`], so an
+/// interrupted pull never does), paid for no byte, and no pool replacement
+/// reran it, since that rerun pays from a pool the run opened.
+fn retires_stale_pools(
+    failed: bool,
+    paid: alloy::primitives::U256,
+    rerun: Option<PoolReplaced>,
+) -> bool {
+    failed && paid.is_zero() && rerun.is_none()
+}
+
+/// `stopped`, the fault that ended a failed pull, with each `stale` pool as
+/// context on it. A pull that no fault stopped takes each one as a warning
+/// instead, so the report names it.
+fn fold_stale_pools(
+    mut stopped: Option<anyhow::Error>,
+    stale: Vec<StalePool>,
+    warnings: &mut Vec<String>,
+) -> Option<anyhow::Error> {
+    for note in stale {
+        if let Some(err) = stopped {
+            stopped = Some(err.context(note));
+        } else {
+            warnings.push(note.to_string());
+        }
+    }
+    stopped
+}
+
 /// How a pull that ended with `stopped` ends, once every pass ran.
 /// `rerun` is the pool replacement a second pass ran against, `pending` the
 /// `openPool` and `topUp` transactions the puller's handle holds with no
@@ -1921,10 +1951,20 @@ impl<P: Provider + Clone> PullCtx<P> {
         let bytes = if let Some(cached) = cached {
             cached
         } else {
-            let fetched = self
-                .fetch_manifest_bytes(hash, out_root)
-                .await
-                .map_err(manifest_fetch_error)?;
+            let fetched = match self.fetch_manifest_bytes(hash, out_root).await {
+                Ok(fetched) => fetched,
+                Err(err) => {
+                    let err = if retire_allowed(&err) {
+                        self.retire_stale_pools()
+                            .await
+                            .into_iter()
+                            .fold(err, anyhow::Error::context)
+                    } else {
+                        err
+                    };
+                    return Err(manifest_fetch_error(err));
+                }
+            };
             if let Some(warning) = manifest_cache::store(out_root, hash, &fetched) {
                 self.warn(&warning);
             }
@@ -1950,6 +1990,24 @@ impl<P: Provider + Clone> PullCtx<P> {
             .chain(self.parked.values())
             .flat_map(|pass| pass.recovery.replacements())
             .collect()
+    }
+
+    /// Read again each pass's stored pool that its first lane build found no
+    /// record of, once a manifest fetch or a pull failed, and drop its buyer
+    /// row if the chain still shows none. Only a pool none of whose lanes paid
+    /// for a byte qualifies ([`RunFunding::retire_stale_pool`]).
+    async fn retire_stale_pools(&self) -> Vec<StalePool> {
+        let mut retired = Vec::new();
+        for pass in std::iter::once(&self.pass).chain(self.parked.values()) {
+            if let Some(stale) = pass
+                .funding
+                .retire_stale_pool(&pass.contract, self.store.as_ref())
+                .await
+            {
+                retired.push(stale);
+            }
+        }
+        retired
     }
 
     /// The warning for a wallet seen to hold too little USDC to top a pool
@@ -2117,14 +2175,23 @@ impl<P: Provider + Clone> PullCtx<P> {
             paid,
             wire,
         } = pass;
+        let failed = leaves_work(&run);
         let PullRun {
             outcomes,
             mut warnings,
             transfer,
             interrupted,
-            stopped,
+            mut stopped,
         } = run;
         warnings.extend(self.funding_shortfalls());
+        // A failed pull re-reads a stored pool every node refuses `NotFound`
+        // because the chain held no record of it, and drops its row if the
+        // chain still shows none, so the next run opens or adopts a pool (ADR
+        // 003 § Funding recovery).
+        if retires_stale_pools(failed, paid, rerun) {
+            let stale = self.retire_stale_pools().await;
+            stopped = fold_stale_pools(stopped, stale, &mut warnings);
+        }
         let mut report = bundle_report(&outcomes, transfer, warnings);
         report.paid_bytes = u64::try_from(paid).unwrap_or(u64::MAX);
         report.wire_bytes = wire;

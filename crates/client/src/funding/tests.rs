@@ -262,3 +262,30 @@ fn an_unreadable_lane_salt_fails_the_payer_as_a_local_fault() {
         "{err:#}"
     );
 }
+
+/// A store that cannot drop a stale pool's row yields `StalePool::Kept`, which
+/// names the pool and the store's fault, so the command does not end looking
+/// like a plain miss while every later run reuses the row.
+#[test]
+fn a_store_that_cannot_drop_a_stale_row_names_the_fault() {
+    let pool_id = B256::repeat_byte(0xCD);
+    let stored = StoredPool {
+        deployment: Deployment {
+            chain_id: 1,
+            payment_pool: Address::repeat_byte(0x9c),
+        },
+        owner: Address::repeat_byte(0x11),
+        pool_id,
+    };
+    let note = RunFunding::forget_stale_pool(&UnreadableSalt, stored);
+    assert_eq!(
+        note,
+        Some(StalePool::Kept {
+            pool_id,
+            error: StoreError::Backend("unused".into()).to_string(),
+        })
+    );
+    let text = note.map(|note| note.to_string()).unwrap_or_default();
+    assert!(text.contains(&pool_id.to_string()), "{text}");
+    assert!(text.contains("retry the drop"), "{text}");
+}

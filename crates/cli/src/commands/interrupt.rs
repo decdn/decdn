@@ -23,6 +23,7 @@ use decdn_client::GaveUp;
 use decdn_client::buyer_pool::{
     EscrowUnconfirmed, OpenUnconfirmed, TopUpUnconfirmed, UnconfirmedEscrows, UntrackedEscrow,
 };
+use decdn_client::funding::StalePool;
 
 /// The error a command returns when Ctrl-C stopped it. `main` prints
 /// [`stop_message`] and exits with status 130 (128 + SIGINT), the shell
@@ -202,9 +203,21 @@ fn in_flight(err: &anyhow::Error) -> Option<String> {
 /// error. The advice to run the command again, after a Ctrl-C or a give-up,
 /// names the [`ResumeFrom`] directory when the error carries one. An
 /// `openPool` or `topUp` in flight or untracked replaces that advice, because a
-/// re-run before it is reconciled escrows again.
+/// re-run before it is reconciled escrows again. A stale stored pool the
+/// error names ([`StalePool`]) follows as a `note:` line.
 #[must_use]
 pub fn stop_message(err: &anyhow::Error) -> Option<String> {
+    let line = stop_line(err)?;
+    // The stop line stands in for the error chain, so a stale stored pool
+    // the fetch named rides along as a note.
+    Some(match err.downcast_ref::<StalePool>() {
+        Some(stale) => format!("{line}\nnote: {stale}"),
+        None => line,
+    })
+}
+
+/// The stop line for an interrupt or a give-up ([`stop_message`]).
+fn stop_line(err: &anyhow::Error) -> Option<String> {
     let in_flight = in_flight(err);
     if err.downcast_ref::<Interrupted>().is_some() {
         return Some(match (in_flight, err.downcast_ref::<ResumeFrom>()) {

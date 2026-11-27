@@ -3351,3 +3351,56 @@ fn a_manifest_fetch_runs_under_the_manifest_cap() {
     assert_eq!(manifest_cap_bytes(0), manifest_cap);
     assert_eq!(manifest_cap_bytes(1 << 20), 1 << 20);
 }
+
+fn stale(byte: u8) -> StalePool {
+    StalePool::Retired {
+        pool_id: alloy::primitives::B256::repeat_byte(byte),
+    }
+}
+
+/// A pull that no fault stopped names each stale pool in its warnings, so the
+/// report shows the dropped row. A stopped pull carries each as context on its
+/// fault, which stays the fault it was.
+#[test]
+fn a_stale_pool_is_a_warning_or_context_on_the_stop() {
+    let mut warnings = Vec::new();
+    let stopped = fold_stale_pools(None, vec![stale(1), stale(2)], &mut warnings);
+    assert!(stopped.is_none());
+    assert_eq!(warnings, vec![stale(1).to_string(), stale(2).to_string()]);
+
+    let mut warnings = Vec::new();
+    let stopped = fold_stale_pools(Some(give_up()), vec![stale(1)], &mut warnings)
+        .expect("the pull stays stopped");
+    assert!(warnings.is_empty());
+    assert!(stopped.downcast_ref::<crate::GaveUp>().is_some());
+    assert_eq!(stopped.downcast_ref::<StalePool>(), Some(&stale(1)));
+}
+
+/// Only a failed pull that paid for no byte and that no replacement reran
+/// reads a stale pool again.
+#[test]
+fn only_a_failed_unpaid_pull_with_no_rerun_retires_a_stale_pool() {
+    use alloy::primitives::U256;
+    assert!(retires_stale_pools(true, U256::ZERO, None));
+    assert!(!retires_stale_pools(false, U256::ZERO, None), "not failed");
+    assert!(!retires_stale_pools(true, U256::from(1u64), None), "paid");
+    assert!(
+        !retires_stale_pools(true, U256::ZERO, Some(replacement(1, 2))),
+        "rerun on a replacement"
+    );
+}
+
+/// A stale pool's note on a manifest fetch error keeps the manifest fetch's
+/// own context, and `retire_allowed` skips a pool replacement however deep
+/// in the chain it sits.
+#[test]
+fn a_manifest_fetch_error_keeps_its_stale_pool_note() {
+    let err = manifest_fetch_error(anyhow!("every node refused").context(stale(3)));
+    let text = format!("{err:#}");
+    assert!(text.starts_with("fetch bundle manifest blob: "), "{text}");
+    assert!(text.contains(&stale(3).pool_id().to_string()), "{text}");
+
+    assert!(retire_allowed(&anyhow!("every node refused")));
+    let replaced = anyhow::Error::new(replacement(1, 2)).context("the pass ended");
+    assert!(!retire_allowed(&replaced));
+}
