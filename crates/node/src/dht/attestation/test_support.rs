@@ -1,13 +1,16 @@
-use std::sync::{Arc, LazyLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{B256, U256, address};
+use alloy::primitives::{Address, B256, U256, address};
 use alloy::signers::local::PrivateKeySigner;
 use decdn_protocol::{DEFAULT_ATTESTATION_TTL_SEC, OriginAttestation};
 
-use super::{AttestationVerifier, sign_attestation};
+use super::{AttestationVerifier, RegisteredOperators, sign_attestation};
 use crate::content_deny::ContentDenylist;
+use crate::dht::routing::NodeId;
 use crate::dht::seated_origins::SeatedOriginSet;
+use crate::dht::staker_set::ConfigStakerSet;
 
 /// The fixture origin's key. Fixed so every test signs alike.
 pub static ORIGIN: LazyLock<PrivateKeySigner> = LazyLock::new(|| {
@@ -27,11 +30,33 @@ pub fn domain() -> Eip712Domain {
     )
 }
 
+/// A registered set holding exactly `operators`, each bound to an active
+/// `NodeId` taken from its address bytes.
+#[must_use]
+pub fn registered(operators: impl IntoIterator<Item = Address>) -> RegisteredOperators {
+    let bindings: HashMap<Address, NodeId> = operators
+        .into_iter()
+        .map(|operator| {
+            let mut id = [0u8; 32];
+            if let Some(head) = id.get_mut(..20) {
+                head.copy_from_slice(operator.as_slice());
+            }
+            (operator, NodeId::from_bytes(id))
+        })
+        .collect();
+    let active: HashSet<NodeId> = bindings.values().copied().collect();
+    RegisteredOperators::new(
+        Arc::new(RwLock::new(bindings)),
+        Arc::new(ConfigStakerSet::new(active)),
+    )
+}
+
 /// A verifier that admits [`ORIGIN`] in [`NAMESPACE`] and nobody else.
 #[must_use]
 pub fn verifier() -> AttestationVerifier {
     AttestationVerifier::new(
         Arc::new(SeatedOriginSet::from_seats([(NAMESPACE, ORIGIN.address())])),
+        registered([ORIGIN.address()]),
         Arc::new(ContentDenylist::empty()),
         domain(),
     )

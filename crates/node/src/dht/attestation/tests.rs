@@ -7,7 +7,7 @@ use decdn_protocol::{
     MIN_ATTESTATION_TTL_SEC,
 };
 
-use super::test_support::{NAMESPACE, ORIGIN, attest, attest_at, domain, verifier};
+use super::test_support::{NAMESPACE, ORIGIN, attest, attest_at, domain, registered, verifier};
 use super::*;
 use crate::dht::seated_origins::SeatedOriginSet;
 
@@ -54,6 +54,41 @@ fn an_unseated_signer_attests_nothing() {
     assert_eq!(verifier().verify_at(hash, &att, NOW), None);
 }
 
+/// A seat outlives its operator's registration until someone prunes it, so
+/// a seated signer outside the registered set attests nothing (#2851), and
+/// one that leaves the registered set stops attesting at the next check.
+#[test]
+fn a_seated_signer_outside_the_registered_set_attests_nothing() {
+    let seated = Arc::new(SeatedOriginSet::from_seats([(NAMESPACE, ORIGIN.address())]));
+    let unregistered = AttestationVerifier::new(
+        seated.clone(),
+        registered([]),
+        Arc::new(ContentDenylist::empty()),
+        domain(),
+    );
+    let att = sign(NAMESPACE, NOW, DEFAULT_ATTESTATION_TTL_SEC);
+    assert_eq!(unregistered.verify_at([7; 32], &att, NOW), None);
+    assert_eq!(unregistered.attesting_namespace(&ORIGIN.address()), None);
+
+    // Bound to a NodeId the staker set no longer reports active.
+    let node = NodeId::from_bytes([9; 32]);
+    let stakers = Arc::new(crate::dht::staker_set::ConfigStakerSet::empty());
+    let inactive = AttestationVerifier::new(
+        seated,
+        RegisteredOperators::new(
+            Arc::new(RwLock::new(HashMap::from([(ORIGIN.address(), node)]))),
+            stakers,
+        ),
+        Arc::new(ContentDenylist::empty()),
+        domain(),
+    );
+    assert_eq!(inactive.verify_at([7; 32], &att, NOW), None);
+    assert_eq!(
+        verifier().verify_at([7; 32], &att, NOW),
+        Some(ORIGIN.address())
+    );
+}
+
 #[test]
 fn a_seat_in_another_namespace_attests_nothing_here() {
     let att = sign(U256::from(2), NOW, DEFAULT_ATTESTATION_TTL_SEC);
@@ -67,6 +102,7 @@ fn namespace_zero_attests_nothing() {
             U256::ZERO,
             ORIGIN.address(),
         )])),
+        registered([ORIGIN.address()]),
         Arc::new(ContentDenylist::empty()),
         domain(),
     );
@@ -80,7 +116,12 @@ fn unseating_the_signer_from_its_namespace_cancels_its_attestation() {
         (NAMESPACE, ORIGIN.address()),
         (U256::from(2), ORIGIN.address()),
     ]));
-    let v = AttestationVerifier::new(seated.clone(), Arc::new(ContentDenylist::empty()), domain());
+    let v = AttestationVerifier::new(
+        seated.clone(),
+        registered([ORIGIN.address()]),
+        Arc::new(ContentDenylist::empty()),
+        domain(),
+    );
     let att = sign(NAMESPACE, NOW, DEFAULT_ATTESTATION_TTL_SEC);
     assert!(v.verify_at([7; 32], &att, NOW).is_some());
     seated.unseat(NAMESPACE, ORIGIN.address());
@@ -135,6 +176,7 @@ fn the_attesting_namespace_is_the_lowest_seat() {
             (U256::from(9), ORIGIN.address()),
             (U256::from(4), ORIGIN.address()),
         ])),
+        registered([ORIGIN.address()]),
         Arc::new(ContentDenylist::empty()),
         domain(),
     );

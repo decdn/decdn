@@ -123,9 +123,9 @@
 //! lookups come out of a budget per minute (`POINTER_LOOKUPS_PER_MINUTE`),
 //! so an anonymous flood of pointers costs the operator's RPC no more than
 //! that; a signer the gateway stored a pointer from before draws on a budget
-//! of its own per namespace (`KNOWN_SIGNER_LOOKUPS_PER_MINUTE`), which a
-//! stranger's keys cannot spend, so the flood does not keep a publisher from
-//! updating. A first pointer, or a new owner's, waits for the shared budget;
+//! of its own per namespace (`KNOWN_SIGNER_LOOKUPS_PER_MINUTE`), which neither
+//! a stranger's keys nor a former owner's can spend, so the flood does not
+//! keep a publisher from updating. A first pointer, or a new owner's, waits for the shared budget;
 //! limits per client belong on the proxy, which knows the client. Pointer
 //! writes run one at a time, lookup included, so a stale owner read never
 //! overtakes a fresher one. `decdn publish point` signs and sends one.
@@ -779,7 +779,8 @@ struct Public {
     registry: Address,
     /// The owner lookups made this minute: the shared budget against
     /// [`POINTER_LOOKUPS_PER_MINUTE`], and each namespace's budget for its
-    /// known signers against [`KNOWN_SIGNER_LOOKUPS_PER_MINUTE`].
+    /// known signers against [`KNOWN_SIGNER_LOOKUPS_PER_MINUTE`], one per
+    /// (namespace, signer).
     lookups: std::sync::Mutex<Budgets>,
     /// Held from a pointer's owner lookup through its store, so two pointers
     /// for one namespace resolve in the order their owners were read, and a
@@ -810,31 +811,51 @@ impl Lookups {
     }
 }
 
-/// The lookup budgets: one shared by every stranger, one per namespace for
-/// the signers the gateway stored a pointer from before.
+/// The most (namespace, signer) budgets [`Budgets::known`] holds in one
+/// minute. Past it a known signer draws on the shared budget, so the map
+/// stays bounded however many former owners write in a minute.
+const MAX_KNOWN_SIGNER_BUDGETS: usize = 1024;
+
+/// The lookup budgets: one shared by every stranger, one per (namespace,
+/// signer) for the signers the gateway stored a pointer from before.
 #[derive(Debug, Default)]
 struct Budgets {
     shared: Lookups,
-    known: HashMap<u64, Lookups>,
+    /// The minute `known` counts.
+    minute: u64,
+    /// Each known signer's lookups this minute, keyed by namespace and
+    /// signer, so a former owner's key spends only its own budget, never the
+    /// current owner's. Cleared when the minute turns.
+    known: HashMap<(u64, Address), Lookups>,
 }
 
 impl Public {
-    /// Take one owner lookup from this minute's budget: the namespace's own
-    /// when `known` names the namespace the signer is known on, else the
-    /// shared one. `Err` is the seconds until the minute turns and one is
-    /// free again.
-    fn take_lookup(&self, known: Option<u64>, now_secs: u64) -> Result<(), u64> {
+    /// Take one owner lookup from this minute's budget: the signer's own on
+    /// the namespace when `known` names the (namespace, signer) it is known
+    /// on, else the shared one. `Err` is the seconds until the minute turns
+    /// and one is free again.
+    fn take_lookup(&self, known: Option<(u64, Address)>, now_secs: u64) -> Result<(), u64> {
         let mut budgets = self
             .lookups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let minute = now_secs / 60;
+        if budgets.minute != minute {
+            budgets.minute = minute;
+            budgets.known.clear();
+        }
         match known {
-            Some(ns) => budgets
-                .known
-                .entry(ns)
-                .or_default()
-                .take(KNOWN_SIGNER_LOOKUPS_PER_MINUTE, now_secs),
-            None => budgets.shared.take(POINTER_LOOKUPS_PER_MINUTE, now_secs),
+            Some(key)
+                if budgets.known.contains_key(&key)
+                    || budgets.known.len() < MAX_KNOWN_SIGNER_BUDGETS =>
+            {
+                budgets
+                    .known
+                    .entry(key)
+                    .or_default()
+                    .take(KNOWN_SIGNER_LOOKUPS_PER_MINUTE, now_secs)
+            }
+            _ => budgets.shared.take(POINTER_LOOKUPS_PER_MINUTE, now_secs),
         }
     }
 
@@ -842,7 +863,7 @@ impl Public {
     /// spent.
     fn take_lookup_or_refuse(
         &self,
-        known: Option<u64>,
+        known: Option<(u64, Address)>,
         now_secs: u64,
     ) -> Result<(), Box<Response<Body>>> {
         self.take_lookup(known, now_secs).map_err(|retry_after| {
@@ -1348,12 +1369,13 @@ impl Gateway {
         {
             return stale_pointer(current);
         }
-        // A signer stored before was the owner once: it has the namespace's
-        // own budget. The budget is taken before the lock, so a caller past
-        // it waits on nothing. One pointer at a time from here: the owner
-        // read and the store are one step, so a read from before a transfer
-        // cannot land after one from after it.
-        let known = high_water.map(|_| ns);
+        // A signer stored before was the owner once: it has a budget of its
+        // own on the namespace, which no other signer spends. The budget is
+        // taken before the lock, so a caller past it waits on nothing. One
+        // pointer at a time from here: the owner read and the store are one
+        // step, so a read from before a transfer cannot land after one from
+        // after it.
+        let known = high_water.map(|_| (ns, signer));
         if let Err(response) = public.take_lookup_or_refuse(known, now_secs()) {
             return *response;
         }

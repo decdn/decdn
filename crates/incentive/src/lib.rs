@@ -129,7 +129,7 @@ pub use origin_attestation::{
 pub use pool_open_error::{
     PoolLifecycleRevert, PoolOpenFailureReason, is_erc20_allowance_shortfall, is_pool_not_open,
 };
-pub use rate::{BYTES_PER_MB, DEFAULT_TOLERANCE_BPS, RateError, min_payment, verify_rate};
+pub use rate::{BYTES_PER_MB, RateError, min_payment, verify_rate};
 pub use store::{
     MemoryPoolStateStore, MemorySettlementLedger, PoolStateStore, SettlementKey, SettlementLedger,
     SettlementRecord, StoreError,

@@ -1327,6 +1327,73 @@ fn inbound_failure_reasons_hold_no_duplicate() {
     assert_eq!(unique.len(), INBOUND_FAILURE_REASONS.len());
 }
 
+#[test]
+fn loopback_hosts_are_the_loopback_names_on_any_port() {
+    for host in [
+        "127.0.0.1",
+        "127.0.0.1:9090",
+        "127.1.2.3:1",
+        "localhost",
+        "LOCALHOST:9090",
+        "[::1]",
+        "[::1]:9090",
+        "[::ffff:127.0.0.1]:9090",
+    ] {
+        assert!(is_loopback_host(host), "{host}");
+    }
+    for host in [
+        "",
+        "evil.example",
+        "evil.example:9090",
+        "localhost.evil.example",
+        "10.0.0.1:9090",
+        "[::2]:9090",
+        "[::1]x",
+        "[::1",
+    ] {
+        assert!(!is_loopback_host(host), "{host}");
+    }
+}
+
+/// Send one `GET /metrics` with `host` as its `Host` header (none when
+/// `None`) and return the status line.
+async fn status_for_host(addr: std::net::SocketAddr, host: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let host = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+    let request = format!("GET /metrics HTTP/1.1\r\n{host}Connection: close\r\n\r\n");
+    client.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// On a loopback listener a request answers only under a loopback `Host`, so
+/// a DNS-rebinding page, which reaches the listener under its own domain,
+/// cannot read the scrape (#2851).
+#[tokio::test]
+async fn a_loopback_metrics_listener_refuses_a_foreign_host() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, shutdown) = oneshot::channel();
+    let server = tokio::spawn(serve(listener, Arc::new(Metrics::new()), shutdown));
+
+    for host in [Some("evil.example"), Some("evil.example:9090"), None] {
+        let status = status_for_host(addr, host).await;
+        assert!(status.contains(" 403 "), "{host:?}: {status}");
+    }
+    for host in ["127.0.0.1", "localhost:9090", &addr.to_string()] {
+        let status = status_for_host(addr, Some(host)).await;
+        assert!(status.contains(" 200 "), "{host}: {status}");
+    }
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
 /// A peer that connects and sends no request loses its connection, and so
 /// its permit, once the header read timeout passes.
 #[tokio::test(start_paused = true)]

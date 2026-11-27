@@ -1711,7 +1711,7 @@ async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
         while public.take_lookup(None, now).is_ok() {}
         let shared_spent = put(7, 2).await;
         let mut seq = 3;
-        while public.take_lookup(Some(7), now).is_ok() {
+        while public.take_lookup(Some((7, owner.address())), now).is_ok() {
             seq += 1;
         }
         let known_spent = put(7, seq).await;
@@ -1739,6 +1739,49 @@ async fn a_known_signer_has_its_own_lookup_budget_per_namespace() {
         StatusCode::BAD_GATEWAY,
         "{}",
         other_namespace.body
+    );
+}
+
+/// The known-signer budget is per (namespace, signer): a former owner whose
+/// key the gateway still holds a `seq` for spends only its own budget, so it
+/// cannot keep the current owner's `PUT /_pointer` at 429 (#2851).
+#[tokio::test]
+async fn a_former_owner_cannot_spend_the_current_owners_lookup_budget() {
+    let (gateway, _logs, _) = public_gateway().await;
+    let domain = pointer_domain(gateway.chain.governance.chain_id, REGISTRY);
+    let former = PrivateKeySigner::random();
+    let current = PrivateKeySigner::random();
+    let public = gateway.public.as_ref().unwrap();
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), former.address());
+    hold(&gateway, unsigned_pointer(7, BLOB, 1), current.address());
+    let put = |signer: &PrivateKeySigner, seq: u64| {
+        let pointer = SignedPointer::sign(signer, 7, OTHER, seq, &domain).unwrap();
+        let body = serde_json::to_string(&pointer).unwrap();
+        let gateway = Arc::clone(&gateway);
+        async move { send_body(&gateway, Method::PUT, "decdn.test", "/_pointer", &body).await }
+    };
+    let (former_spent, current_answer) = loop {
+        let now = now_secs();
+        while public.take_lookup(None, now).is_ok() {}
+        while public.take_lookup(Some((7, former.address())), now).is_ok() {}
+        let former_spent = put(&former, 2).await;
+        let current_answer = put(&current, 2).await;
+        if now_secs() / 60 == now / 60 {
+            break (former_spent, current_answer);
+        }
+    };
+    assert_eq!(
+        former_spent.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "{}",
+        former_spent.body
+    );
+    // The current owner's update reached the chain.
+    assert_eq!(
+        current_answer.status,
+        StatusCode::BAD_GATEWAY,
+        "{}",
+        current_answer.body
     );
 }
 

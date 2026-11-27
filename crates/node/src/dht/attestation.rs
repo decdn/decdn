@@ -5,31 +5,85 @@
 //!
 //! - its namespace is not 0, and its signature recovers to an operator that
 //!   holds an origin seat in that namespace now;
+//! - the operator's `NodeId` is in the node's current registered set: the
+//!   `CapacityBond` registry snapshot binds the operator to a `NodeId`, and
+//!   the staker set reports that `NodeId` active. A seat outlives its
+//!   operator's registration until someone prunes it, so the seat alone does
+//!   not admit;
 //! - this node's deny-set does not name the operator;
 //! - its lifetime lies in `[MIN_ATTESTATION_TTL_SEC, MAX_ATTESTATION_TTL_SEC]`;
 //! - it is live: `now − ttl < timestamp ≤ now + MAX_ATTESTATION_FUTURE_SKEW_US`.
 //!
 //! So an attestation expires on its own, and unseating its signer from its
-//! namespace cancels it at the next check.
+//! namespace, or its leaving the registered set, cancels it at the next check.
 //!
 //! [`AttestationVerifier`] is the one check every caller shares: the DHT
 //! receiver before it stores a record and before it answers with one, the
 //! lookup before it opens a provider, the pull leg before it keeps an
 //! upstream's attestation, and the serve gate before it serves a hash.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use alloy::dyn_abi::Eip712Domain;
 use alloy::primitives::{Address, U256};
 use decdn_protocol::OriginAttestation;
 
 use crate::content_deny::ContentDenylist;
+use crate::dht::routing::NodeId;
 use crate::dht::seated_origins::SeatedOrigins;
+use crate::dht::staker_set::StakerSet;
 
-/// Verifies origin attestations against the seated-origin set.
+/// The node's current registered set, read per operator: the registry
+/// snapshot's `operator → NodeId` binding and the staker set's liveness. Both
+/// halves are live, so a registry refresh takes effect at the next check.
+#[derive(Clone)]
+pub struct RegisteredOperators {
+    operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
+    staker_set: Arc<dyn StakerSet>,
+}
+
+impl std::fmt::Debug for RegisteredOperators {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredOperators")
+            .field("active", &self.staker_set.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RegisteredOperators {
+    /// The registered set over the registry snapshot's reverse projection and
+    /// the shared staker set.
+    #[must_use]
+    pub fn new(
+        operator_to_node: Arc<RwLock<HashMap<Address, NodeId>>>,
+        staker_set: Arc<dyn StakerSet>,
+    ) -> Self {
+        Self {
+            operator_to_node,
+            staker_set,
+        }
+    }
+
+    /// Whether `operator` is bound to a `NodeId` the staker set reports
+    /// active. An operator with no binding is not registered.
+    #[must_use]
+    pub fn is_registered(&self, operator: &Address) -> bool {
+        crate::dht::chain_projection::with_read(
+            &self.operator_to_node,
+            "chain operator reverse map",
+            |rev| rev.get(operator).copied(),
+        )
+        .is_some_and(|node_id| self.staker_set.is_active(&node_id))
+    }
+}
+
+/// Verifies origin attestations against the seated-origin set and the
+/// registered set.
 #[derive(Clone)]
 pub struct AttestationVerifier {
     seated: Arc<dyn SeatedOrigins>,
+    registered: RegisteredOperators,
     deny: Arc<ContentDenylist>,
     domain: Eip712Domain,
 }
@@ -38,21 +92,25 @@ impl std::fmt::Debug for AttestationVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AttestationVerifier")
             .field("seated", &self.seated.len())
+            .field("registered", &self.registered)
             .finish_non_exhaustive()
     }
 }
 
 impl AttestationVerifier {
-    /// Build a verifier over the seated-origin set, the node's origin
-    /// deny-set and the `CapacityBond` EIP-712 domain the signatures use.
+    /// Build a verifier over the seated-origin set, the registered set, the
+    /// node's origin deny-set and the `CapacityBond` EIP-712 domain the
+    /// signatures use.
     #[must_use]
     pub fn new(
         seated: Arc<dyn SeatedOrigins>,
+        registered: RegisteredOperators,
         deny: Arc<ContentDenylist>,
         domain: Eip712Domain,
     ) -> Self {
         Self {
             seated,
+            registered,
             deny,
             domain,
         }
@@ -89,11 +147,13 @@ impl AttestationVerifier {
     }
 
     /// Whether `signer` may attest in `namespace` now: the namespace is not
-    /// 0, `signer` holds a seat in it, and the deny-set does not name it.
+    /// 0, `signer` holds a seat in it, `signer` is in the registered set, and
+    /// the deny-set does not name it.
     #[must_use]
     pub fn admits(&self, namespace: U256, signer: &Address) -> bool {
         !namespace.is_zero()
             && self.seated.is_seated_in(namespace, signer)
+            && self.registered.is_registered(signer)
             && !self.deny.is_origin_denied(signer)
     }
 
