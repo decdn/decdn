@@ -617,7 +617,7 @@ Full parameter table with safety bounds is in [ADR 009](009-governance.md#govern
 - Can add emergency blacklist entries (hashes and origins)
 - Can suspend regional governance bodies
 - **Cannot** withdraw treasury funds, modify fee parameters, or grant roles
-- **Capability-split sunset:** the protocol-wide `pause()` reverts after each contract's own `pauseDeadline`, fixed at construction as `block.timestamp + 365 days` (immutable, per-contract, via the shared `SunsettingPausable` base). The narrow unlawful-content-removal functions — `emergencyAdd()`, `emergencyAddOrigin()`, and `suspendRegionalBody()` — do **not** sunset, because they discharge a permanent, time-critical legal duty and touch no economic, treasury, or governance lever ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig))
+- **Capability-split sunset:** the protocol-wide `pause()` reverts after each contract's own `pauseDeadline`, fixed at construction as `block.timestamp + 365 days` (immutable, per-contract, via the shared `SunsettingPausable` base). After that deadline `paused()` returns false, so a pause in force ends at the sunset. The narrow unlawful-content-removal functions — `emergencyAdd()`, `emergencyAddOrigin()`, and `suspendRegionalBody()` — do **not** sunset, because they discharge a permanent, time-critical legal duty and touch no economic, treasury, or governance lever ([ADR 009 § Emergency Multisig](009-governance.md#emergency-multisig))
 - Emergency blacklist entries expire after 14 days unless ratified by governance
 
 ### Reentrancy Analysis
