@@ -195,6 +195,7 @@ The answers:
 |--------|------|---------|
 | 503 | No capability that the gateway holds can pay, and the cache does not hold the response. | `Retry-After: 60`, `Link: <decdn:…>; rel="alternate"`, JSON `{"error", "uri", "retry_after_secs"}` |
 | 502 | The upstream pull failed. | A bare body. The detail is in the log. |
+| 429 | The pull would pass a bound of the gateway (see [Pull slots](#pull-slots)). | `Retry-After: 2`, a text body. |
 
 A paying client continues from the `decdn:` URI on its own. A loopback
 gateway answers 402 with a text body when no capability can pay.
@@ -380,7 +381,22 @@ pulls can pay for the same chunk group once each.
 ## Pull slots
 
 The gateway runs at most 16 pulls at once. Each pull holds a slot. A request
-that finds no free slot waits for one. A pull gives up after
+that finds no free slot waits for one. At most 64 pulls wait at once. A
+waiting pull holds no read buffer. The gateway takes the 256 KiB buffer for
+the first frame only when the pull has its slot.
+
+Manifest pulls have a cap of their own: at most 4 at once, waiting or
+running. This is a quarter of the slots, and the count of full manifest
+buffers that the manifest buffer budget holds. Thus a request for a raw blob
+or a bundle entry always finds the other 12 slots.
+
+The gateway refuses a request at once when its pull would pass a bound: the
+manifest cap, the waiting pulls, or the manifest buffer budget. The answer is
+429 with `Retry-After: 2` and a text body. The request starts no pull. A
+client retries after the wait.
+
+A pull has no overall deadline and no floor on its byte rate. A large blob
+from slow holders is a valid pull. A pull gives up after
 `--give-up-after-secs` (120 by default) with no verified byte. The fetch
 stops this clock while verified bytes wait for the response to read them.
 Thus a response that does not read can keep its slot with no end. A second
@@ -426,7 +442,7 @@ start.
 | `decdn_gateway_bytes_served_total` | counter | Content bytes handed to responses. A node counts bao wire bytes in `decdn_bytes_served_total`, for every requester. For one whole-blob pull, the node counts about 0.4% more than this counter. For a range, the node counts the wire bytes of the chunk-group-aligned span. The node also counts manifest pulls. |
 | `decdn_gateway_requests_ok_total` | counter | Answers with success or a redirect. |
 | `decdn_gateway_requests_not_found_total` | counter | Answers 404. |
-| `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a refused browser request, a bad URI, a method, a range past the end. |
+| `decdn_gateway_requests_refused_total` | counter | Answers refused before a pull: an unknown host, a refused browser request, a bad URI, a method, a range past the end, a pull past a bound (429). |
 | `decdn_gateway_requests_payment_required_total` | counter | Answers 402: a loopback gateway holds no capability that can pay. |
 | `decdn_gateway_pull_failures_funding_total` | counter | Answers 503: a public gateway holds no capability that can pay. |
 | `decdn_gateway_pull_failures_other_total` | counter | Answers 502. |

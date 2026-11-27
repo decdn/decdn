@@ -210,7 +210,7 @@ use pointer::{Pointers, SetError, SignedPointer, pointer_domain};
 use rewrite::Rewrite;
 use scope::{Scope, SignedScope, scope_domain};
 use site::{Route, Site, SiteDomain};
-use worker::{FetchBackend, Job, PullWorker};
+use worker::{Bounds, FetchBackend, Job, PullKind, PullWorker, Refused};
 
 /// The capability expiry margin nodes apply at the default redeem interval
 /// (ADR 003 § Revocation): inside it a node accepts no voucher under the
@@ -246,11 +246,28 @@ const OWNER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// frees its slot.
 const GIVE_UP_AFTER_SECS: u64 = 120;
 
-/// The most pulls that run at once; a request past it waits for a slot. Each
-/// pull stripes across up to `--max-sources` holders, so this also bounds the
-/// streams the gateway opens on one node's connection. A public gateway sees
-/// its proxy, not the client, so a per-client limit belongs on the proxy.
+/// The most pulls that run at once; a request past it waits for a slot, up to
+/// [`MAX_QUEUED_PULLS`]. Each pull stripes across up to `--max-sources`
+/// holders, so this also bounds the streams the gateway opens on one node's
+/// connection. A public gateway sees its proxy, not the client, so a
+/// per-client limit belongs on the proxy. A pull has no overall deadline and
+/// no byte-rate floor: a large blob from slow holders is a legitimate pull.
 const MAX_PULLS: usize = 16;
+
+/// The most manifest fills admitted at once, running or waiting for a slot:
+/// a quarter of [`MAX_PULLS`], the fills [`MANIFEST_BUFFER_BYTES`] holds at
+/// full size, so raw-blob requests always find the other slots. A manifest
+/// request past it is refused at once ([`busy`]).
+const MAX_MANIFEST_PULLS: usize = MAX_PULLS / 4;
+
+/// The most pulls that wait for a slot while every slot runs one. A waiting
+/// pull holds no read buffer ([`first_chunk`] waits for its slot), only its
+/// pipe and listing. A request past it is refused at once ([`busy`]).
+const MAX_QUEUED_PULLS: usize = 4 * MAX_PULLS;
+
+/// The seconds a client waits before it retries a request the gateway
+/// refused as busy: about the time a slot takes to turn over.
+const BUSY_RETRY_SECS: u64 = 2;
 
 /// The most parsed manifests the gateway keeps.
 const MAX_CACHED_MANIFESTS: usize = 16;
@@ -263,7 +280,8 @@ const MANIFEST_CACHE_BYTES: usize = 64 << 20;
 const MAX_NOT_MANIFESTS: usize = 1024;
 
 /// The manifest bytes the gateway buffers at once over every fill in flight:
-/// four buffers at the manifest cap ([`MAX_MANIFEST_BYTES`]). A fill takes
+/// [`MAX_MANIFEST_PULLS`] buffers at the manifest cap ([`MAX_MANIFEST_BYTES`]),
+/// which a fill whose pull has ended can still hold as it parses. A fill takes
 /// budget for its buffer as the buffer grows, so a pull still looking for a
 /// holder, or one whose bytes trickle in, holds only what it has buffered. A
 /// fill that would pass the budget fails at once instead of waiting: a fill
@@ -271,7 +289,7 @@ const MAX_NOT_MANIFESTS: usize = 1024;
 /// each hold part of the budget would wait on each other. The budget counts
 /// manifest buffers only: a fill's worker slot and its first-chunk read
 /// buffer fall outside it.
-const MANIFEST_BUFFER_BYTES: usize = 4 * MAX_MANIFEST_BYTES;
+const MANIFEST_BUFFER_BYTES: usize = MAX_MANIFEST_PULLS * MAX_MANIFEST_BYTES;
 
 /// The most bytes of text a not-manifest verdict keeps. A parse error quotes
 /// the publisher's paths and hash strings, which a manifest under the cap can
@@ -280,6 +298,13 @@ const MAX_VERDICT_TEXT: usize = 1024;
 
 /// The duplex buffer between a pull and its HTTP response.
 const PIPE_BYTES: usize = 1 << 20;
+
+/// The pull worker's bounds.
+const PULL_BOUNDS: Bounds = Bounds {
+    pulls: MAX_PULLS,
+    manifest_pulls: MAX_MANIFEST_PULLS,
+    queued: MAX_QUEUED_PULLS,
+};
 
 /// The read size for response chunks.
 const CHUNK_BYTES: usize = 256 * 1024;
@@ -345,7 +370,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
             config_path: config_path.map(Path::to_path_buf),
             cache: cache.clone().map(CacheStores::new),
         },
-        MAX_PULLS,
+        PULL_BOUNDS,
         stall,
     )
     .await
@@ -1022,7 +1047,19 @@ enum PullError {
     /// The blob cannot be read as a bundle manifest: it is over the manifest
     /// cap, or its bytes do not parse as one. Nothing upstream failed.
     NotManifest(anyhow::Error),
+    /// The gateway holds as many pulls as it takes, of the request's kind or
+    /// in all, or as many manifest bytes as it buffers. Nothing was pulled.
+    Busy,
     Other(anyhow::Error),
+}
+
+impl From<Refused> for PullError {
+    fn from(refused: Refused) -> Self {
+        match refused {
+            Refused::Busy => Self::Busy,
+            Refused::Stopped => Self::Other(anyhow::anyhow!("the gateway is shutting down")),
+        }
+    }
 }
 
 /// How a response presents what it serves.
@@ -1915,27 +1952,27 @@ impl Gateway {
         // pipe never reads as closed.
         let (writer, _reader) = tokio::io::duplex(1);
         let (done, ended) = oneshot::channel();
-        self.pulls
-            .pull(Job {
-                blob: BlobFetch {
-                    estimate: false,
-                    progress: None,
-                    hash: uri.hash,
-                    output: PathBuf::from("-"),
-                    namespace: uri.namespace,
-                    common: self.common.clone(),
-                    read_ahead: None,
-                    size_cap: None,
-                    range: None,
-                    size_only: true,
-                },
-                paying: paying.clone(),
-                writer,
-                done,
-                // A size lookup is not a pull in flight.
-                listing: Box::new(()),
-            })
-            .map_err(PullError::Other)?;
+        self.pulls.pull(Job {
+            blob: BlobFetch {
+                estimate: false,
+                progress: None,
+                hash: uri.hash,
+                output: PathBuf::from("-"),
+                namespace: uri.namespace,
+                common: self.common.clone(),
+                read_ahead: None,
+                size_cap: None,
+                range: None,
+                size_only: true,
+            },
+            paying: paying.clone(),
+            writer,
+            done,
+            // A size lookup is not a pull in flight.
+            listing: Box::new(()),
+            kind: PullKind::Blob,
+            slotted: oneshot::channel().0,
+        })?;
         match ended.await {
             Ok(Ok(())) => Ok(self.pulls.size(uri.hash).await),
             Ok(Err(e)) => Err(classify(e)),
@@ -2154,7 +2191,7 @@ impl Gateway {
         {
             return Err(PullError::Other(anyhow::anyhow!("{cause}")));
         }
-        let pulled = self.pull_manifest(hash, namespace, paying, cap_mb).await;
+        let pulled = self.pull_manifest(hash, namespace, paying).await;
         *failed = match &pulled {
             Err(ManifestStop::Pull(PullError::Other(cause))) if self.public() => {
                 Some(format!("{cause:#}"))
@@ -2190,29 +2227,24 @@ impl Gateway {
     }
 
     /// `n` bytes of the manifest buffer budget ([`MANIFEST_BUFFER_BYTES`]),
-    /// or an error at once when the budget is spent.
+    /// or [`PullError::Busy`] at once when the budget is spent.
     fn manifest_buffer_bytes(&self, n: usize) -> Result<SemaphorePermit<'_>, PullError> {
         u32::try_from(n)
             .ok()
             .and_then(|n| self.manifest_buffer.try_acquire_many(n).ok())
-            .ok_or_else(|| {
-                PullError::Other(anyhow::anyhow!(
-                    "the gateway's manifest buffer is full; retry the request"
-                ))
-            })
+            .ok_or(PullError::Busy)
     }
 
-    /// Pull `hash` under the manifest cap of `cap_mb` and parse it. Returns
-    /// the manifest and its JSON length, the weight the manifest cache counts.
+    /// Pull `hash` under the manifest cap and parse it. Returns the manifest
+    /// and its JSON length, the weight the manifest cache counts.
     async fn pull_manifest(
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
         paying: &Credential,
-        cap_mb: u64,
     ) -> Result<(Arc<BundleManifest>, usize), ManifestStop> {
         let (first, mut reader, done, _delivered) = self
-            .start_pull(hash, namespace, paying, cap_mb, None, None)
+            .start_pull(hash, namespace, paying, PullKind::Manifest, None, None)
             .await
             .map_err(|e| over_manifest_cap(e.into()))?;
         // The buffer's capacity, held against the budget until the fill ends.
@@ -2279,7 +2311,7 @@ impl Gateway {
                 hash,
                 namespace,
                 paying,
-                self.common.max_blob_mb,
+                PullKind::Blob,
                 extent.size,
                 extent.window,
             )
@@ -2472,18 +2504,24 @@ impl Gateway {
         head_response(&content_type, length, entry.hash, Present::Site)
     }
 
-    /// Hand the pull of `hash` to the worker, capped at `max_blob_mb` and at
-    /// `size_cap` bytes when the blob's size is known, over the byte window
-    /// `range` or the whole blob, and wait for its first verified bytes. The
-    /// pull writes into a pipe the response reads from. It is listed as in
-    /// flight until the worker's pull ends; the last value returned is its
-    /// listing's count of delivered bytes.
+    /// Hand the pull of `hash` to the worker as a pull of `kind`, capped at
+    /// `--max-blob-mb` (at the manifest cap for a manifest) and at `size_cap`
+    /// bytes when the blob's size is known, over the byte window `range` or
+    /// the whole blob, and wait for its first verified bytes. The pull writes
+    /// into a pipe the response reads from. It is listed as in flight until
+    /// the worker's pull ends; the last value returned is its listing's count
+    /// of delivered bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`PullError::Busy`] at once when the worker refuses the pull, or what
+    /// ends the pull before its first byte.
     async fn start_pull(
         self: &Arc<Self>,
         hash: [u8; 32],
         namespace: Option<u64>,
         paying: &Credential,
-        max_blob_mb: u64,
+        kind: PullKind,
         size_cap: Option<u64>,
         range: Option<(u64, u64)>,
     ) -> Result<
@@ -2497,32 +2535,38 @@ impl Gateway {
     > {
         let (writer, mut reader) = tokio::io::duplex(PIPE_BYTES);
         let (done_tx, done_rx) = oneshot::channel();
+        let (slotted_tx, slotted_rx) = oneshot::channel();
         let mut common = self.common.clone();
-        common.max_blob_mb = max_blob_mb;
+        if kind == PullKind::Manifest {
+            common.max_blob_mb = manifest_cap_mb(self.common.max_blob_mb);
+        }
         // Listed before the worker has the job, so a pull waiting for its
         // slot shows as in flight.
         let guard = PullGuard::new(Arc::clone(self), paying, hash, namespace, range);
         let delivered = Arc::clone(&guard.delivered);
-        self.pulls
-            .pull(Job {
-                blob: BlobFetch {
-                    estimate: false,
-                    progress: None,
-                    hash,
-                    output: PathBuf::from("-"),
-                    namespace,
-                    common,
-                    read_ahead: self.public().then_some(PUBLIC_READ_AHEAD_BYTES),
-                    size_cap,
-                    range,
-                    size_only: false,
-                },
-                paying: paying.clone(),
-                writer,
-                done: done_tx,
-                listing: Box::new(guard),
-            })
-            .map_err(PullError::Other)?;
+        self.pulls.pull(Job {
+            blob: BlobFetch {
+                estimate: false,
+                progress: None,
+                hash,
+                output: PathBuf::from("-"),
+                namespace,
+                common,
+                read_ahead: self.public().then_some(PUBLIC_READ_AHEAD_BYTES),
+                size_cap,
+                range,
+                size_only: false,
+            },
+            paying: paying.clone(),
+            writer,
+            done: done_tx,
+            listing: Box::new(guard),
+            kind,
+            slotted: slotted_tx,
+        })?;
+        // A pull waiting for its slot holds no read buffer. A pull that ends
+        // without a slot drops the sender, and its pipe reads as closed.
+        let _ = slotted_rx.await;
         let (first, done_rx) = first_chunk(&mut reader, done_rx).await?;
         Ok((first, reader, done_rx, delivered))
     }
@@ -3029,13 +3073,15 @@ fn pull_error_text(e: &PullError) -> String {
         PullError::Funding(e) | PullError::NotManifest(e) | PullError::Other(e) => {
             format!("{e:#}")
         }
+        PullError::Busy => BUSY.trim_end().to_owned(),
     }
 }
 
 /// The response headers a page on another origin may read from a public
 /// gateway: the body's length and type, the hash (`ETag`), the window
-/// (`Content-Range`, `Accept-Ranges`) and, on a 503, when to retry and
-/// where to fetch instead (`Retry-After`, `Link`). `Content-Encoding` tells the
+/// (`Content-Range`, `Accept-Ranges`), on a 429 or 503 when to retry
+/// (`Retry-After`), and on a 503 where to fetch instead (`Link`).
+/// `Content-Encoding` tells the
 /// page that a proxy in front encoded the body, so `Content-Length` counts the
 /// encoded bytes rather than the decoded body.
 const PUBLIC_EXPOSED: header::HeaderValue = header::HeaderValue::from_static(
@@ -3354,6 +3400,7 @@ fn pull_failed(e: PullError, uri: &DecdnUri, public: bool) -> Response<Body> {
             tracing::warn!(error = %e, "the gateway's capability cannot pay");
             cannot_pay(uri)
         }
+        PullError::Busy => busy(),
         PullError::Other(e) if public => {
             tracing::warn!(error = format!("{e:#}"), %uri, "an upstream pull failed");
             text(StatusCode::BAD_GATEWAY, "the upstream pull failed\n")
@@ -3372,6 +3419,20 @@ fn stale_pointer(current: u64) -> Response<Body> {
             "seq": current,
         }),
     )
+}
+
+/// The body of [`busy`].
+const BUSY: &str = "the gateway is busy; retry the request\n";
+
+/// The `429` when the gateway holds as many pulls as it takes: the request
+/// started no pull, and a retry after [`BUSY_RETRY_SECS`] finds a slot as
+/// pulls end.
+fn busy() -> Response<Body> {
+    let mut response = text(StatusCode::TOO_MANY_REQUESTS, BUSY);
+    if let Ok(retry) = header::HeaderValue::from_str(&BUSY_RETRY_SECS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, retry);
+    }
+    response
 }
 
 /// The seconds a client waits before it retries a request the gateway

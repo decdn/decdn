@@ -3,7 +3,10 @@
 //! store and the connections to nodes are built once, and runs every pull as
 //! a local task on it (a fetch future is not `Send`).
 //!
-//! Pulls run at once, up to a bound. Each one streams into its own pipe, so a
+//! Pulls run at once, up to a bound ([`Bounds`]). The worker admits a bounded
+//! number of pulls beyond those running, and manifest pulls up to a cap of
+//! their own; it refuses a pull past either bound at once ([`Refused::Busy`]).
+//! Each pull streams into its own pipe, so a
 //! response whose reader stops holds only its own pull, and only until its
 //! pipe write has waited for the stall limit ([`StallLimit`]). The pulls under one
 //! capability that overlap share one [`Payer`], and with it each lane's voucher
@@ -28,6 +31,7 @@ use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -40,7 +44,7 @@ use decdn_incentive::buyer_pool::{BuyerPoolStore, lane_snapshot};
 use decdn_incentive::lane::{LaneKey, PoolId};
 use serde::Serialize;
 use tokio::io::{AsyncWrite, DuplexStream};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::super::fetch::{BlobFetch, CacheStores, Credential, FetchHost, Payer, Sink, fetch_on};
@@ -63,6 +67,49 @@ pub(super) struct Job {
     /// ends, before it sends `done`, so a caller that has the result no
     /// longer counts the pull.
     pub(super) listing: Box<dyn Send>,
+    /// What the pull serves, for the slots its kind may hold.
+    pub(super) kind: PullKind,
+    /// Sent once the pull holds its worker slot, before it writes; dropped
+    /// unsent when the pull ends without one.
+    pub(super) slotted: oneshot::Sender<()>,
+}
+
+/// What a pull serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PullKind {
+    /// A blob a response streams, or a size lookup for one.
+    Blob,
+    /// A bundle manifest the gateway reads, capped at
+    /// [`Bounds::manifest_pulls`].
+    Manifest,
+}
+
+/// How many pulls the worker holds.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Bounds {
+    /// The pulls that run at once, each on a worker slot.
+    pub(super) pulls: usize,
+    /// The manifest pulls admitted at once, running or waiting for a slot.
+    pub(super) manifest_pulls: usize,
+    /// The pulls admitted beyond `pulls`, which wait for a slot.
+    pub(super) queued: usize,
+}
+
+/// Why the worker refused a pull.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Refused {
+    /// The pull's kind is at its cap, or the queue is at its bound.
+    Busy,
+    /// The worker has stopped.
+    Stopped,
+}
+
+/// A pull the worker admitted, with the permits it holds until it ends: one
+/// of the admitted pulls, and for a manifest one of the manifest pulls.
+struct Admitted {
+    job: Job,
+    permit: OwnedSemaphorePermit,
+    kind_permit: Option<OwnedSemaphorePermit>,
 }
 
 /// What the worker's buyer-pool store holds.
@@ -151,7 +198,7 @@ fn narrow(value: U256) -> u64 {
 /// What the gateway sends the worker.
 enum Request {
     /// A pull to run.
-    Pull(Box<Job>),
+    Pull(Box<Admitted>),
     /// Read the store: its pools, and the lanes of each `(contract, pool,
     /// signer)`.
     Pools {
@@ -315,14 +362,23 @@ pub(super) fn read_pools(
 
 /// The handle the gateway holds on its worker thread.
 pub(super) struct PullWorker {
+    /// The requests to the worker. The worker takes each at once and runs a
+    /// pull as a task that waits for its slot, so the channel holds nothing
+    /// for long: `admitted` bounds the pulls waiting.
     jobs: mpsc::UnboundedSender<Request>,
+    /// The pulls admitted and not yet ended, running or waiting: one permit
+    /// each, out of [`Bounds::pulls`] plus [`Bounds::queued`].
+    admitted: Arc<Semaphore>,
+    /// The manifest pulls admitted and not yet ended, out of
+    /// [`Bounds::manifest_pulls`].
+    manifests: Arc<Semaphore>,
     stop: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl PullWorker {
     /// Start the worker thread, build `backend`'s host on it, and run up to
-    /// `max_pulls` pulls at once. A pull whose write to its response waits
+    /// `bounds.pulls` pulls at once. A pull whose write to its response waits
     /// for `stall` ends ([`StallLimit`]).
     ///
     /// # Errors
@@ -330,9 +386,12 @@ impl PullWorker {
     /// The thread or its runtime cannot start, or the host cannot be built.
     pub(super) async fn start<B: Backend>(
         backend: B,
-        max_pulls: usize,
+        bounds: Bounds,
         stall: Duration,
     ) -> anyhow::Result<Self> {
+        let max_pulls = bounds.pulls.max(1);
+        let admitted = Arc::new(Semaphore::new(max_pulls.saturating_add(bounds.queued)));
+        let manifests = Arc::new(Semaphore::new(bounds.manifest_pulls));
         let (jobs_tx, jobs_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -352,7 +411,7 @@ impl PullWorker {
                 let local = tokio::task::LocalSet::new();
                 local.block_on(
                     &runtime,
-                    run(backend, max_pulls.max(1), stall, jobs_rx, stop_rx, ready_tx),
+                    run(backend, max_pulls, stall, jobs_rx, stop_rx, ready_tx),
                 );
             })?;
         ready_rx
@@ -360,20 +419,40 @@ impl PullWorker {
             .map_err(|_| anyhow::anyhow!("the pull worker ended before it started"))??;
         Ok(Self {
             jobs: jobs_tx,
+            admitted,
+            manifests,
             stop: std::sync::Mutex::new(Some(stop_tx)),
             thread: std::sync::Mutex::new(Some(thread)),
         })
     }
 
-    /// Hand `job` to the worker.
+    /// Hand `job` to the worker, or refuse it at once: a manifest pull past
+    /// [`Bounds::manifest_pulls`], or any pull past the running and queued
+    /// bound, never waits.
     ///
     /// # Errors
     ///
-    /// The worker has stopped.
-    pub(super) fn pull(&self, job: Job) -> anyhow::Result<()> {
+    /// [`Refused::Busy`] past a bound, [`Refused::Stopped`] once the worker
+    /// has stopped.
+    pub(super) fn pull(&self, job: Job) -> Result<(), Refused> {
+        let kind = match job.kind {
+            PullKind::Manifest => Some(
+                Arc::clone(&self.manifests)
+                    .try_acquire_owned()
+                    .map_err(|_| Refused::Busy)?,
+            ),
+            PullKind::Blob => None,
+        };
+        let admitted = Arc::clone(&self.admitted)
+            .try_acquire_owned()
+            .map_err(|_| Refused::Busy)?;
         self.jobs
-            .send(Request::Pull(Box::new(job)))
-            .map_err(|_| anyhow::anyhow!("the gateway is shutting down"))
+            .send(Request::Pull(Box::new(Admitted {
+                job,
+                permit: admitted,
+                kind_permit: kind,
+            })))
+            .map_err(|_| Refused::Stopped)
     }
 
     /// What the store holds: its pools, and the lanes of each
@@ -463,14 +542,14 @@ async fn run<B: Backend>(
     loop {
         tokio::select! {
             request = jobs.recv() => match request {
-                Some(Request::Pull(job)) => {
+                Some(Request::Pull(admitted)) => {
                     tasks.spawn_local(pull(
                         Rc::clone(&backend),
                         Rc::clone(&host),
                         Rc::clone(&slots),
                         Rc::clone(&payers),
                         stall,
-                        *job,
+                        *admitted,
                     ));
                 }
                 Some(Request::Pools { delegates, reply }) => {
@@ -511,30 +590,39 @@ async fn run<B: Backend>(
 
 /// One job, holding a pull slot while it runs. Its writer fails a write the
 /// response leaves waiting for `stall`, so a response nobody reads frees the
-/// slot.
+/// slot. Its admission permits drop with its listing, before `done`.
 async fn pull<B: Backend>(
     backend: Rc<B>,
     host: Rc<B::Host>,
     slots: Rc<Semaphore>,
     payers: Payers<B::Payer>,
     stall: Duration,
-    job: Job,
+    admitted: Admitted,
 ) {
-    let Job {
-        blob,
-        paying,
-        writer,
-        done,
-        listing,
-    } = job;
+    let Admitted {
+        job:
+            Job {
+                blob,
+                paying,
+                writer,
+                done,
+                listing,
+                kind: _,
+                slotted,
+            },
+        permit,
+        kind_permit,
+    } = admitted;
+    let admission = (permit, kind_permit, listing);
     let Ok(_slot) = slots.acquire().await else {
         return;
     };
+    let _ = slotted.send(());
     let id = payer_id(&paying);
     let payer = match payer_for(&*backend, &payers, id, paying) {
         Ok(payer) => payer,
         Err(e) => {
-            drop(listing);
+            drop(admission);
             let _ = done.send(Err(e));
             return;
         }
@@ -545,7 +633,7 @@ async fn pull<B: Backend>(
     drop(sink);
     release(&payers, id, &payer);
     drop(payer);
-    drop(listing);
+    drop(admission);
     let _ = done.send(result);
 }
 

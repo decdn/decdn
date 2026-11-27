@@ -160,7 +160,7 @@ impl Metrics {
                 "decdn_gateway_requests_refused_total",
                 "counter",
                 "Requests refused before any pull: an unknown host, a missing token, a bad URI, a \
-                 method, a range past the end.",
+                 method, a range past the end, a pull past a bound.",
                 requests_refused,
             ),
             (
