@@ -96,7 +96,18 @@ pub trait Gate: Send + Sync {
 Build the onramp around yours the way its `main.rs` does: load an
 `OnrampConfig` with `ONRAMP_GATE=custom` (which drops the Turnstile settings
 from what is required), build `state::build(&cfg, daemon, Arc::new(YourGate))`,
-and serve `http::router(state)`. The stock `sponsord-onramp` binary refuses
+and serve the router with the peer address attached:
+
+```rust
+let app = http::router(state).into_make_service_with_connect_info::<SocketAddr>();
+axum::serve(listener, app).await?;
+```
+
+The rate limits and the gate read the client address from that peer address,
+or from `ONRAMP_CLIENT_IP_HEADER` behind a proxy. A request with neither goes
+unlimited, and the onramp logs a warning the first time it sees one.
+
+The stock `sponsord-onramp` binary refuses
 `custom`, since it has no gate of yours to run. Everything else (installers, the
 hand-off, rate limits) stays as it is. `TurnstileGate`
 (`crates/sponsord-onramp/src/gate/turnstile.rs`) is a complete example.

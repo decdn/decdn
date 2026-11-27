@@ -67,25 +67,55 @@ fn an_ipv4_mapped_address_counts_as_its_ipv4_address() {
     );
 }
 
-#[test]
-fn clients_past_the_cap_share_one_overflow_budget() {
-    let limiter = RateLimiter::new(2);
-    let ip = |n: u32| Some(IpAddr::from(n.to_be_bytes()));
-    let max = u32::try_from(MAX_TRACKED).unwrap();
-    for n in 0..max {
-        assert!(limiter.allow(ip(n), 60));
+/// A limiter of `per_minute` with its map full of clients `0..MAX_TRACKED`.
+fn full_limiter(per_minute: u32) -> RateLimiter {
+    let limiter = RateLimiter::new(per_minute);
+    for n in 0..u32::try_from(MAX_TRACKED).unwrap() {
+        assert!(limiter.allow(Some(IpAddr::from(n.to_be_bytes())), 60));
     }
-    assert!(limiter.allow(ip(max), 60));
-    assert!(limiter.allow(ip(max + 1), 60));
+    limiter
+}
+
+/// The first untracked client after `first` whose overflow window is (or,
+/// with `same == false`, is not) the one `first` counts in.
+fn untracked_peer(limiter: &RateLimiter, first: u32, same: bool) -> u32 {
+    let slot = |n: u32| limiter.overflow_slot(IpAddr::from(n.to_be_bytes()));
+    (first + 1..u32::MAX)
+        .find(|&n| (slot(n) == slot(first)) == same)
+        .unwrap()
+}
+
+#[test]
+fn untracked_clients_in_one_overflow_window_share_its_budget() {
+    let limiter = full_limiter(2);
+    let ip = |n: u32| Some(IpAddr::from(n.to_be_bytes()));
+    let first = u32::try_from(MAX_TRACKED).unwrap();
+    let peer = untracked_peer(&limiter, first, true);
+    assert!(limiter.allow(ip(first), 60));
+    assert!(limiter.allow(ip(peer), 60));
     assert!(
-        !limiter.allow(ip(max + 2), 60),
-        "untracked clients share the overflow budget"
+        !limiter.allow(ip(first), 60),
+        "clients in one overflow window share its budget"
     );
     assert!(limiter.allow(ip(0), 60), "a tracked client keeps its own");
     assert!(!limiter.allow(ip(0), 60));
     assert_eq!(limiter.windows.lock().unwrap().counts.len(), MAX_TRACKED);
 
     // A new minute sweeps the stale windows, and a new client is tracked.
-    assert!(limiter.allow(ip(max + 2), 120));
+    assert!(limiter.allow(ip(first), 120));
     assert_eq!(limiter.windows.lock().unwrap().counts.len(), 1);
+}
+
+#[test]
+fn untracked_clients_in_different_overflow_windows_do_not_share_a_budget() {
+    let limiter = full_limiter(1);
+    let ip = |n: u32| Some(IpAddr::from(n.to_be_bytes()));
+    let first = u32::try_from(MAX_TRACKED).unwrap();
+    let other = untracked_peer(&limiter, first, false);
+    assert!(limiter.allow(ip(first), 60));
+    assert!(!limiter.allow(ip(first), 60), "its own window is spent");
+    assert!(
+        limiter.allow(ip(other), 60),
+        "a client in another overflow window keeps its budget"
+    );
 }
