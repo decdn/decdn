@@ -2773,6 +2773,7 @@ dependencies = [
  "aws-smithy-types",
  "bao-tree",
  "bytes",
+ "cap-std",
  "dashmap",
  "decdn-bao-range",
  "decdn-cache",

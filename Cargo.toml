@@ -124,8 +124,8 @@ iroh-io = { version = "0.6", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-# `O_NONBLOCK` / `O_NOFOLLOW` / `ELOOP` for the filesystem origin's open. The
-# constants only; nothing calls into libc, so `unsafe_code = "forbid"` holds.
+# `O_NONBLOCK` for the filesystem origin's open. The constant only; nothing
+# calls into libc, so `unsafe_code = "forbid"` holds.
 libc = "0.2"
 async-trait = "0.1"
 # Sharded concurrent map: the client handler's lane registry (#1731) so
@@ -204,8 +204,9 @@ fs4 = "1.1"
 
 # Misc
 bytes = "1"
-# Beneath-root landing of bundle entries: `decdn-client` resolves every
-# destination through the output directory's handle (#2439).
+# Beneath-root paths: `decdn-client` lands every bundle entry through the
+# output directory's handle (#2439), and `decdn-cache`'s filesystem origin
+# opens every read through its base's handle (#2802).
 cap-std = "4"
 # Bundle manifest path collisions compare NFC-normalized paths (#2691). Already
 # in the graph through `url` → `idna`.

@@ -35,6 +35,10 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
+# The filesystem origin opens every read beneath a handle on its base, so a
+# directory swapped for a symlink after the path check cannot move the open
+# out of the base (#2802). Same crate as `decdn-client`'s bundle landing.
+cap-std = { workspace = true }
 reqwest = { workspace = true }
 # reqwest is built with `rustls-no-provider`; `HttpOrigin` installs ring as the
 # process-wide provider before it builds its client.
@@ -66,9 +70,8 @@ aws-credential-types = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
 aws-smithy-types = { workspace = true, optional = true }
 
-# The filesystem origin opens each read with `O_NONBLOCK | O_NOFOLLOW`, so a
-# FIFO or symlink swapped in after the path check cannot block the open or
-# leave the base. Constants only, no `unsafe`.
+# The filesystem origin opens each read with `O_NONBLOCK`, so a FIFO swapped in
+# after the path check cannot block the open. The constant only, no `unsafe`.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 

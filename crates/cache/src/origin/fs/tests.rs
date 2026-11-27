@@ -760,21 +760,25 @@ async fn seed_and_resolve(origin: &FilesystemOrigin) -> anyhow::Result<[PathBuf;
 /// Drive the open-and-read half of all three reads on paths resolved before
 /// a swap. Each must refuse with `needle` within five seconds.
 #[cfg(unix)]
-async fn ensure_every_read_refuses(paths: &[PathBuf; 3], needle: &str) -> anyhow::Result<()> {
+async fn ensure_every_read_refuses(
+    base: &Path,
+    paths: &[PathBuf; 3],
+    needle: &str,
+) -> anyhow::Result<()> {
     use std::time::Duration;
     use tokio::time::timeout;
 
     let limit = Duration::from_secs(5);
     let [data, outboard, proof] = paths;
-    let range = timeout(limit, read_range(data, first_bytes(1024)))
+    let range = timeout(limit, read_range(base, data, first_bytes(1024)))
         .await
         .map_err(|_| anyhow::anyhow!("read_range blocked on the swapped path"))?;
     ensure_permanent("read_range", range.err(), needle)?;
-    let outboard = timeout(limit, read_outboard(outboard, 1 << 20))
+    let outboard = timeout(limit, read_outboard(base, outboard, 1 << 20))
         .await
         .map_err(|_| anyhow::anyhow!("read_outboard blocked on the swapped path"))?;
     ensure_permanent("read_outboard", outboard.err(), needle)?;
-    let proof = timeout(limit, read_size_proof(proof))
+    let proof = timeout(limit, read_size_proof(base, proof))
         .await
         .map_err(|_| anyhow::anyhow!("read_size_proof blocked on the swapped path"))?;
     ensure_permanent("read_size_proof", proof.err(), needle)
@@ -803,15 +807,15 @@ fn a_fifo_swapped_in_after_resolve_is_refused_without_blocking() -> anyhow::Resu
             make_fifo(&fifo)?;
             tokio::fs::rename(&fifo, path).await?;
         }
-        ensure_every_read_refuses(&paths, "not a regular file").await
+        ensure_every_read_refuses(origin.base(), &paths, "not a regular file").await
     });
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     result
 }
 
 /// A symlink out of the base put in place of a path after the resolve is
-/// not followed: the open refuses the link itself, so no byte of the target
-/// is read.
+/// not followed: the open beneath the base handle refuses it, so no byte of
+/// the target is read.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_symlink_swapped_in_after_resolve_is_refused() -> anyhow::Result<()> {
@@ -826,7 +830,35 @@ async fn a_symlink_swapped_in_after_resolve_is_refused() -> anyhow::Result<()> {
         tokio::fs::remove_file(path).await?;
         tokio::fs::symlink(&secret, path).await?;
     }
-    ensure_every_read_refuses(&paths, "changed to a symlink").await
+    ensure_every_read_refuses(origin.base(), &paths, "leads outside base").await
+}
+
+/// A shard directory swapped for a symlink out of the base after the resolve
+/// does not redirect the open: every component resolves beneath the base
+/// handle, not only the leaf. The outside directory holds copies of the
+/// shard's files under the same names, so a redirected open would succeed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shard_directory_swapped_in_after_resolve_is_refused() -> anyhow::Result<()> {
+    let outside = tempfile::tempdir()?;
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let paths = seed_and_resolve(&origin).await?;
+    let [data, _, _] = &paths;
+    let shard = data
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no shard directory", data.display()))?;
+    let decoy = outside.path().join("shard");
+    tokio::fs::create_dir(&decoy).await?;
+    for path in &paths {
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+        tokio::fs::copy(path, decoy.join(name)).await?;
+    }
+    tokio::fs::remove_dir_all(shard).await?;
+    tokio::fs::symlink(&decoy, shard).await?;
+    ensure_every_read_refuses(origin.base(), &paths, "leads outside base").await
 }
 
 /// A path removed after the resolve and before the open is an absence, not
@@ -841,22 +873,23 @@ async fn a_file_removed_after_resolve_reads_as_absent() -> anyhow::Result<()> {
         tokio::fs::remove_file(path).await?;
     }
     let [data, outboard, proof] = &paths;
+    let base = origin.base();
     anyhow::ensure!(
         matches!(
-            read_range(data, first_bytes(1024)).await?,
+            read_range(base, data, first_bytes(1024)).await?,
             OriginRangeFetch::NotFound
         ),
         "read_range: expected NotFound"
     );
     anyhow::ensure!(
         matches!(
-            read_outboard(outboard, 1 << 20).await?,
+            read_outboard(base, outboard, 1 << 20).await?,
             OutboardFetch::NotFound
         ),
         "read_outboard: expected NotFound"
     );
     anyhow::ensure!(
-        read_size_proof(proof).await?.is_none(),
+        read_size_proof(base, proof).await?.is_none(),
         "read_size_proof: expected None"
     );
     Ok(())
