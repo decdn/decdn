@@ -240,6 +240,7 @@ async fn test_gateway_cached(
         manifest_buffer: Semaphore::new(MANIFEST_BUFFER_BYTES),
         hosts: allowed_hosts("127.0.0.1:8484".parse().unwrap()),
         sites,
+        consents: Consents::default(),
         metrics: Metrics::default(),
         active: std::sync::Mutex::new(HashMap::new()),
         next_pull: AtomicU64::new(0),
@@ -846,6 +847,18 @@ async fn send(
     path: &str,
     headers: &[(&str, &str)],
 ) -> Answer {
+    send_with(gateway, method, host, path, headers, "").await
+}
+
+/// [`send`] with `body`.
+async fn send_with(
+    gateway: &Arc<Gateway>,
+    method: Method,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Answer {
     let mut req = Request::builder()
         .method(method)
         .uri(path)
@@ -854,7 +867,7 @@ async fn send(
         req = req.header(*name, *value);
     }
     let response = Arc::clone(gateway)
-        .handle(req.body(Full::new(Bytes::new())).unwrap())
+        .handle(req.body(Full::new(Bytes::from(body.to_owned()))).unwrap())
         .await;
     let status = response.status();
     let headers = response.headers().clone();
@@ -902,6 +915,12 @@ const RSS: &str = "<rss version=\"2.0\"><script xmlns=\"http://www.w3.org/1999/x
 /// `css/site.css`, `docs/index.html`, `feed.rss` and the empty `empty.rss`,
 /// the blob [`OTHER`], and the host of that site.
 async fn site_gateway() -> (Arc<Gateway>, String) {
+    let (gateway, host, _) = site_gateway_logged().await;
+    (gateway, host)
+}
+
+/// [`site_gateway`], and the cap of every pull it starts.
+async fn site_gateway_logged() -> (Arc<Gateway>, String, Arc<std::sync::Mutex<Vec<u64>>>) {
     let other = alloy::hex::encode(OTHER);
     let manifest = serde_json::json!({"version": 1, "entries": [
         {"path": "index.html", "hash": alloy::hex::encode(PAGE)},
@@ -925,12 +944,12 @@ async fn site_gateway() -> (Arc<Gateway>, String) {
         (FEED, Reply::Bytes(RSS.as_bytes().to_vec())),
         (OTHER, Reply::Bytes(b"other bytes".to_vec())),
     ]);
-    let (gateway, _) = recording_gateway_of(replies, &[]).await;
+    let (gateway, caps) = recording_gateway_of(replies, &[]).await;
     let host = gateway.sites.site_host(&Site {
         hash: BLOB,
         namespace: None,
     });
-    (gateway, host)
+    (gateway, host, caps)
 }
 
 #[tokio::test]
@@ -1139,11 +1158,169 @@ async fn other_pages_cannot_make_a_site_spend() {
         ("sec-fetch-dest", "document"),
     ];
     let deep = request(&gateway, &host, "/docs/", &link).await;
+    assert_eq!(deep.status, StatusCode::OK);
+    assert!(deep.body.contains("Open this decdn site?"), "{}", deep.body);
+}
+
+/// A link on another site, and one on a sibling site.
+const LINKED: &[&[(&str, &str)]] = &[
+    &[
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ],
+    &[
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ],
+];
+
+/// The token in an interstitial's Continue form.
+fn form_token(page: &str) -> String {
+    let start = page.find("name=\"token\" value=\"").unwrap() + "name=\"token\" value=\"".len();
+    page[start..].split('"').next().unwrap().to_owned()
+}
+
+/// The browser headers of the interstitial's own Continue post.
+fn continue_headers(origin: &str) -> [(&str, &str); 5] {
+    [
+        ("sec-fetch-site", "same-origin"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+        ("origin", origin),
+        ("content-type", "application/x-www-form-urlencoded"),
+    ]
+}
+
+/// A link on another site opens a site's interstitial, which names the site,
+/// may not be framed, and pays for nothing: the site serves no entry for
+/// that navigation until the user continues.
+#[tokio::test]
+async fn a_link_from_another_site_opens_the_interstitial_and_pays_nothing() {
+    for linked in LINKED {
+        let (gateway, host, caps) = site_gateway_logged().await;
+        let page = request(&gateway, &host, "/docs/?tab=2", linked).await;
+        assert_eq!(page.status, StatusCode::OK, "{linked:?}");
+        assert!(page.body.contains(&host), "{}", page.body);
+        assert!(
+            page.body.contains(&alloy::hex::encode(BLOB)),
+            "{}",
+            page.body
+        );
+        assert!(!page.body.contains("<p>docs</p>"), "{}", page.body);
+        let policy = page.header(header::CONTENT_SECURITY_POLICY).unwrap();
+        assert_eq!(policy, consent::POLICY);
+        assert_eq!(page.header(header::X_FRAME_OPTIONS), Some("DENY"));
+        assert_eq!(page.header(header::CACHE_CONTROL), Some("no-store"));
+        assert!(caps.lock().unwrap().is_empty(), "{linked:?}");
+        // A second link still asks.
+        let again = request(&gateway, &host, "/", linked).await;
+        assert!(again.body.contains("Open this decdn site?"));
+    }
+}
+
+/// After Continue, the site serves the link's page and its pages spend, and
+/// a later link from another site opens it directly.
+#[tokio::test]
+async fn continue_lets_a_linked_site_serve_and_spend() {
+    let (gateway, host) = site_gateway().await;
+    let origin = gateway.sites.origin(&host);
+    let linked = LINKED[0];
+    let page = request(&gateway, &host, "/docs/?tab=2", linked).await;
+    let token = form_token(&page.body);
+    let posted = send_with(
+        &gateway,
+        Method::POST,
+        &host,
+        "/docs/?tab=2",
+        &continue_headers(&origin),
+        &format!("token={token}"),
+    )
+    .await;
+    assert_eq!(posted.status, StatusCode::SEE_OTHER, "{}", posted.body);
+    let back = format!("{origin}/docs/?tab=2");
+    assert_eq!(posted.header(header::LOCATION), Some(back.as_str()));
+    let docs = request(&gateway, &host, "/docs/", linked).await;
     assert_eq!(
-        deep.status,
-        StatusCode::OK,
-        "a link opens a site at any path"
+        (docs.status, docs.body.as_str()),
+        (StatusCode::OK, "<p>docs</p>")
     );
+    let style = request(&gateway, &host, "/css/site.css", SAME_ORIGIN).await;
+    assert_eq!(style.status, StatusCode::OK);
+
+    // The consent is the site's alone: the same bundle under a namespace is
+    // another origin, and asks.
+    let other = gateway.sites.site_host(&Site {
+        hash: BLOB,
+        namespace: Some(7),
+    });
+    let asked = request(&gateway, &other, "/docs/", linked).await;
+    assert!(
+        asked.body.contains("Open this decdn site?"),
+        "{}",
+        asked.body
+    );
+    assert!(asked.body.contains("<code>7</code>"), "{}", asked.body);
+}
+
+/// Only the interstitial's own post, from the site's origin with the site's
+/// token, continues: another page's post, or a wrong token, is refused, and
+/// the site still asks.
+#[tokio::test]
+async fn only_the_sites_own_interstitial_continues() {
+    let (gateway, host, caps) = site_gateway_logged().await;
+    let origin = gateway.sites.origin(&host);
+    let page = request(&gateway, &host, "/", LINKED[0]).await;
+    let token = form_token(&page.body);
+    let other = gateway.sites.site_host(&Site {
+        hash: OTHER,
+        namespace: None,
+    });
+    let other_origin = gateway.sites.origin(&other);
+    // The token the other site's interstitial carries.
+    let other_token = form_token(&request(&gateway, &other, "/", LINKED[0]).await.body);
+    let cross = [
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+        ("origin", "http://evil.example"),
+    ];
+    let sibling = continue_headers(&other_origin);
+    let sibling = [sibling[0], sibling[1], sibling[2], sibling[3]];
+    let refused: [(&[(&str, &str)], String); 5] = [
+        (&cross, format!("token={token}")),
+        (&sibling, format!("token={token}")),
+        (&continue_headers(&origin), format!("token={other_token}")),
+        (&continue_headers(&origin), "token=00".to_owned()),
+        (&[], format!("token={token}")),
+    ];
+    for (headers, body) in &refused {
+        let answer = send_with(&gateway, Method::POST, &host, "/", headers, body).await;
+        assert_eq!(answer.status, StatusCode::FORBIDDEN, "{headers:?} {body}");
+    }
+    let still = request(&gateway, &host, "/", LINKED[0]).await;
+    assert!(
+        still.body.contains("Open this decdn site?"),
+        "{}",
+        still.body
+    );
+    assert!(caps.lock().unwrap().is_empty());
+}
+
+/// A typed URL, a bookmark and the site's own navigation open a site with
+/// no interstitial.
+#[tokio::test]
+async fn typed_and_own_navigation_open_a_site_directly() {
+    let (gateway, host) = site_gateway().await;
+    for headers in [TYPED, CLICK] {
+        let docs = request(&gateway, &host, "/docs/", headers).await;
+        assert_eq!(
+            (docs.status, docs.body.as_str()),
+            (StatusCode::OK, "<p>docs</p>"),
+            "{headers:?}"
+        );
+    }
 }
 
 /// A client outside a browser sends no `Sec-Fetch-Site`, and a site spends
