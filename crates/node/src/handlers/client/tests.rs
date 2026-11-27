@@ -2047,6 +2047,7 @@ async fn midstream_signer_recheck_trips_when_the_refresh_reads_a_drain() -> anyh
             ProviderBuilder::new().connect_mocked_client(asserter.clone()),
         ),
         projection.clone(),
+        Arc::default(),
         Arc::clone(&metrics),
     ));
     let (handler, _dir) = handler_with_pool_view(&metrics, Arc::clone(&view) as _).await;

@@ -275,7 +275,12 @@ fn mocked_getpool_view(
     let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
     let contract = PaymentPool::new(Address::ZERO, provider);
     let projection = PoolProjection::new();
-    let view = ResolvingPoolView::new(contract, projection.clone(), Arc::new(Metrics::new()));
+    let view = ResolvingPoolView::new(
+        contract,
+        projection.clone(),
+        Arc::default(),
+        Arc::new(Metrics::new()),
+    );
     (view, projection, asserter)
 }
 
@@ -675,7 +680,12 @@ fn mocked_getauth_view(
     }
     let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
     let contract = PaymentPool::new(Address::ZERO, provider);
-    let view = ResolvingPoolView::new(contract, PoolProjection::new(), Arc::new(Metrics::new()));
+    let view = ResolvingPoolView::new(
+        contract,
+        PoolProjection::new(),
+        Arc::default(),
+        Arc::new(Metrics::new()),
+    );
     (view, asserter)
 }
 
@@ -946,6 +956,7 @@ fn counting_hanging_view() -> (
     let view = ResolvingPoolView::new(
         PaymentPool::new(Address::ZERO, provider),
         PoolProjection::new(),
+        Arc::default(),
         Arc::new(Metrics::new()),
     );
     (view, calls)
@@ -1264,7 +1275,7 @@ async fn a_peer_over_its_read_budget_is_refused_without_a_read() {
     );
 }
 
-/// #2770: the node-wide bucket refuses a read every peer bucket would admit,
+/// #2770: the chain-wide bucket refuses a read every peer bucket would admit,
 /// and a read one peer's bucket refuses spends nothing of it.
 #[tokio::test(start_paused = true)]
 async fn the_node_wide_read_budget_caps_every_peer_together() {
@@ -1292,7 +1303,7 @@ async fn the_node_wide_read_budget_caps_every_peer_together() {
         _ = &mut second => panic!("a hung read cannot answer"),
         answer = view.admit_status(nth_pool(4), &c) => answer,
     };
-    assert!(over_global.is_none(), "the node-wide bucket is empty");
+    assert!(over_global.is_none(), "the chain-wide bucket is empty");
     assert_eq!(
         calls.load(Ordering::Relaxed),
         2,
@@ -1330,6 +1341,45 @@ async fn a_request_that_waits_on_a_read_is_not_charged() {
         text.contains("decdn_serve_admit_read_rate_limited_per_peer_total 0"),
         "the waiter was not refused:\n{text}"
     );
+}
+
+/// A budget built from a chain's configured rates is one budget for every
+/// pool view on that chain: reads through two pool views draw on the same
+/// chain-wide burst.
+#[tokio::test(start_paused = true)]
+async fn pool_views_on_one_chain_share_its_read_budget() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let budget = Arc::new(AdmitReadBudget::from_rates(&AdmitReadRates {
+        per_sec: 1,
+        burst: 2,
+        per_peer_per_sec: 100,
+        burst_per_peer: 100,
+    }));
+    let (provider, calls) = crate::chain_events::test_support::counting_hanging_provider();
+    let view = |pool: u8| {
+        ResolvingPoolView::new(
+            PaymentPool::new(Address::repeat_byte(pool), provider.clone()),
+            PoolProjection::new(),
+            Arc::clone(&budget),
+            Arc::new(Metrics::new()),
+        )
+    };
+    let (first, second) = (view(1), view(2));
+    let requester = peer(1);
+    let held = futures_util::future::join(
+        first.admit_status(nth_pool(1), &requester),
+        second.admit_status(nth_pool(2), &requester),
+    );
+    tokio::pin!(held);
+    let refused = tokio::select! {
+        biased;
+        _ = &mut held => panic!("hung reads cannot answer"),
+        answer = first.admit_status(nth_pool(3), &requester) => answer,
+    };
+    assert!(refused.is_none(), "the chain's burst of two is spent");
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
 
 /// #2770: the per-peer map stays bounded. Past the cap, a read prunes the

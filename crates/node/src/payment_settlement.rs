@@ -77,7 +77,9 @@ use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use anyhow::{Context, Result};
-use decdn_common::config::{REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs};
+use decdn_common::config::{
+    AdmitReadRates, REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs,
+};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
@@ -176,33 +178,12 @@ const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
 /// the 10 s read timeout, so a refused request waits less than one read could.
 const ADMIT_CHAIN_READ_SLOT_WAIT: Duration = Duration::from_secs(5);
 
-/// Node-wide sustained rate of admit-path chain reads, in reads per second.
-/// Ten reads a second is half of a free-tier RPC quota of about twenty
-/// `eth_call`s a second, so a flood of fresh pools or signers leaves the other
-/// half to the chain watchers and the redeemer on the same endpoint.
-const ADMIT_READ_GLOBAL_PER_SEC: NonZeroU32 = nonzero(10);
-
-/// Node-wide burst of admit-path chain reads: two seconds at the sustained
-/// rate, so a short spike of honest first requests is not refused.
-const ADMIT_READ_GLOBAL_BURST: NonZeroU32 = nonzero(20);
-
-/// Sustained admit-path chain reads one requesting peer may cause, in reads
-/// per second. An honest client names one pool and one signer, and its first
-/// request costs at most two reads, so one read a second keeps a flooding peer
-/// to a tenth of the node-wide rate.
-const ADMIT_READ_PER_PEER_PER_SEC: NonZeroU32 = nonzero(1);
-
-/// Burst of admit-path chain reads for one requesting peer: room for two
-/// first requests (a `getPool` and a `getAuthorization` each) at once.
-const ADMIT_READ_PER_PEER_BURST: NonZeroU32 = nonzero(4);
-
 /// How many peers the per-peer read bucket tracks before an over-cap read
 /// prunes the buckets that have refilled. A refilled bucket is the same as a
 /// new one, so the prune changes no answer.
 const ADMIT_READ_TRACKED_PEERS_MAX: usize = 4096;
 
-/// `n` as a [`NonZeroU32`], or `1` for `0`. Lets the budget constants above
-/// stay `const` without a panicking unwrap.
+/// `n` as a [`NonZeroU32`], or `1` for `0`. The resolver already rejects `0`.
 const fn nonzero(n: u32) -> NonZeroU32 {
     match NonZeroU32::new(n) {
         Some(n) => n,
@@ -210,13 +191,15 @@ const fn nonzero(n: u32) -> NonZeroU32 {
     }
 }
 
-/// Token buckets on admit-path chain reads (#2770): one per requesting peer
-/// and one node-wide. The slot cap ([`ADMIT_CHAIN_READ_CONCURRENCY`]) bounds
-/// reads in flight; these buckets bound reads per second, which is what an RPC
-/// quota counts. The peer bucket is charged first, so a read one peer's bucket
-/// refuses spends nothing of the node-wide one.
-struct AdmitReadBudget {
-    /// The node-wide bucket.
+/// Token buckets on admit-path chain reads against one payment chain's RPC
+/// endpoint (#2770): one per requesting peer and one chain-wide, at the rates
+/// of that chain's `[[blockchain.payment_chains]]` entry. Every pool on the
+/// chain shares one budget. The slot cap (`ADMIT_CHAIN_READ_CONCURRENCY`)
+/// bounds reads in flight; these buckets bound reads per second, which is what
+/// an RPC quota counts. The peer bucket is charged first, so a read one peer's
+/// bucket refuses spends nothing of the chain-wide one.
+pub struct AdmitReadBudget {
+    /// The chain-wide bucket.
     global: DefaultDirectRateLimiter,
     /// One bucket per requesting peer. Bounded by
     /// [`ADMIT_READ_TRACKED_PEERS_MAX`] and the prune in [`Self::charge`].
@@ -225,11 +208,29 @@ struct AdmitReadBudget {
     pruning: AtomicBool,
 }
 
+impl std::fmt::Debug for AdmitReadBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmitReadBudget")
+            .field("tracked_peers", &self.per_peer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for AdmitReadBudget {
+    /// A budget at the default rates of a payment chain entry.
+    fn default() -> Self {
+        Self::from_rates(&AdmitReadRates::default())
+    }
+}
+
 impl AdmitReadBudget {
-    fn new() -> Self {
+    /// A budget at `rates`, one payment chain's resolved read rates.
+    #[must_use]
+    pub fn from_rates(rates: &AdmitReadRates) -> Self {
         Self::with_quotas(
-            Quota::per_second(ADMIT_READ_GLOBAL_PER_SEC).allow_burst(ADMIT_READ_GLOBAL_BURST),
-            Quota::per_second(ADMIT_READ_PER_PEER_PER_SEC).allow_burst(ADMIT_READ_PER_PEER_BURST),
+            Quota::per_second(nonzero(rates.per_sec)).allow_burst(nonzero(rates.burst)),
+            Quota::per_second(nonzero(rates.per_peer_per_sec))
+                .allow_burst(nonzero(rates.burst_per_peer)),
         )
     }
 
@@ -241,7 +242,7 @@ impl AdmitReadBudget {
         }
     }
 
-    /// Charge one read to `requester` (when known) and to the node-wide
+    /// Charge one read to `requester` (when known) and to the chain-wide
     /// bucket. Returns `false`, and counts the refusal on the layer that
     /// refused, when either bucket is empty.
     fn charge(&self, requester: Option<&PublicKey>, metrics: &Metrics) -> bool {
@@ -939,7 +940,7 @@ impl ClosedPools {
 /// are coalesced per pair the same way.
 ///
 /// Every read, of either kind, is first charged to the requesting peer's
-/// token bucket and the node-wide one (`AdmitReadBudget`), then takes one of
+/// token bucket and the chain-wide one ([`AdmitReadBudget`]), then takes one of
 /// `ADMIT_CHAIN_READ_CONCURRENCY` node-wide slots. A request that finds a
 /// bucket empty, or no slot within `ADMIT_CHAIN_READ_SLOT_WAIT`, is refused
 /// and nothing is cached. A request that waits on another request's read is
@@ -970,8 +971,9 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     auth_inflight: InflightReads<(B256, Address), Option<SignerAuthorization>>,
     /// Slots for admit-path chain reads; see [`ADMIT_CHAIN_READ_CONCURRENCY`].
     chain_reads: tokio::sync::Semaphore,
-    /// Per-peer and node-wide read rate; see [`AdmitReadBudget`].
-    read_budget: AdmitReadBudget,
+    /// Per-peer and chain-wide read rate, shared with every pool view on the
+    /// same payment chain; see [`AdmitReadBudget`].
+    read_budget: Arc<AdmitReadBudget>,
     /// Throttle for the `warn!` on a failed admit-path `getPool` or
     /// `getAuthorization`. One window for both: they share one remedy, the
     /// chain endpoint. Each fault also counts on `decdn_rpc_requests_total`.
@@ -991,11 +993,13 @@ impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
 
 impl<P: Provider + Clone> ResolvingPoolView<P> {
     /// Wrap `projection` with admit-path `getPool` and `getAuthorization`
-    /// reads against `contract`.
+    /// reads against `contract`, charged to `read_budget`, the budget of the
+    /// pool's payment chain.
     #[must_use]
     pub fn new(
         contract: PaymentPool::PaymentPoolInstance<P>,
         projection: PoolProjection,
+        read_budget: Arc<AdmitReadBudget>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -1006,7 +1010,7 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             auth_cache: Mutex::new(HashMap::new()),
             auth_inflight: Mutex::new(HashMap::new()),
             chain_reads: tokio::sync::Semaphore::new(ADMIT_CHAIN_READ_CONCURRENCY),
-            read_budget: AdmitReadBudget::new(),
+            read_budget,
             read_fault_warn: WarnThrottle::new(ADMIT_READ_FAULT_WARN_INTERVAL),
             metrics,
         }
@@ -1015,7 +1019,7 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
     /// Test seam: replace the read budget's quotas.
     #[cfg(test)]
     fn set_read_quotas(&mut self, global: Quota, per_peer: Quota) {
-        self.read_budget = AdmitReadBudget::with_quotas(global, per_peer);
+        self.read_budget = Arc::new(AdmitReadBudget::with_quotas(global, per_peer));
     }
 
     /// A slot for one admit-path chain read on behalf of `requester`, or
@@ -1191,7 +1195,7 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
 
 impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     /// The admit `getPool` answer for `pool_id`, a read charged to
-    /// `requester` (or to the node-wide bucket alone with no requester).
+    /// `requester` (or to the chain-wide bucket alone with no requester).
     async fn status_charged(
         &self,
         pool_id: B256,
@@ -1238,7 +1242,7 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     }
 
     /// The admit signer confirm for `(pool_id, signer)`, a read charged to
-    /// `requester` (or to the node-wide bucket alone with no requester).
+    /// `requester` (or to the chain-wide bucket alone with no requester).
     async fn authorization_charged(
         &self,
         pool_id: B256,

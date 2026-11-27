@@ -154,6 +154,12 @@ pub fn write_validate_summary<W: std::io::Write>(
         for pool in &chain.payment_pools {
             writeln!(w, "    payment_pool:           {pool}")?;
         }
+        let reads = chain.admit_reads;
+        writeln!(
+            w,
+            "    admit_reads:            {}/s burst {}, per peer {}/s burst {}",
+            reads.per_sec, reads.burst, reads.per_peer_per_sec, reads.burst_per_peer
+        )?;
     }
     writeln!(
         w,
@@ -1008,6 +1014,10 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rpc_url = ""                       # REQUIRED: payment-chain JSON-RPC URL
 # chain_id = 84532                   # REQUIRED: payment-chain EIP-155 id (voucher and capability domains)
 # payment_pools = [""]               # REQUIRED: one or more 0x-prefixed PaymentPool addresses
+# admit_reads_per_sec = 20           # admission getPool/getAuthorization reads per second on this rpc_url, all requesters together; lower it to fit a tight RPC quota; default 20, min 1
+# admit_read_burst = 40              # burst of those reads, all requesters together; default 40, min 1
+# admit_reads_per_peer_per_sec = 2   # admission reads per second one requesting peer may cause; default 2, min 1
+# admit_read_burst_per_peer = 8      # burst of admission reads for one requesting peer; default 8, min 1
 
 [cache]
 # cache_dir = "~/.decdn/cache"

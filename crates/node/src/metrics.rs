@@ -788,8 +788,8 @@ pub struct DecdnMetrics {
     /// request refuses as a slot timeout does. Operator-visible name:
     /// `decdn_serve_admit_read_rate_limited_per_peer_total`.
     pub serve_admit_read_rate_limited_per_peer: Counter,
-    /// Sibling of `serve_admit_read_rate_limited_per_peer` for the node-wide
-    /// read bucket. Operator-visible name:
+    /// Sibling of `serve_admit_read_rate_limited_per_peer` for the chain-wide
+    /// read bucket of each payment chain. Operator-visible name:
     /// `decdn_serve_admit_read_rate_limited_global_total`.
     pub serve_admit_read_rate_limited_global: Counter,
     /// Lanes dropped because their capability expired before they carried a
@@ -2735,7 +2735,7 @@ recorders! {
     /// An admission chain read found its peer's read bucket empty.
     serve_admit_read_rate_limited_per_peer => serve_admit_read_rate_limited_per_peer.inc();
 
-    /// An admission chain read found the node-wide read bucket empty.
+    /// An admission chain read found its payment chain's read bucket empty.
     serve_admit_read_rate_limited_global => serve_admit_read_rate_limited_global.inc();
 
     /// `n` lanes were dropped because their capability expired before they

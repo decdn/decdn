@@ -358,6 +358,7 @@ fn build_config(
                 rpc_url: rpc_url.clone(),
                 chain_id: CHAIN_ID,
                 payment_pools: vec![addrs.payment_pool],
+                admit_reads: decdn_common::config::AdmitReadRates::default(),
             }],
             cctp_sweep_receiver_address: None,
             rpc_url,

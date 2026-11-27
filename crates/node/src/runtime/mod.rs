@@ -444,6 +444,9 @@ struct PoolInfra {
     /// Providers on the pool's payment chain. Every pool read and every pool
     /// transaction goes through them, never through the governance chain's.
     providers: ProviderFactory,
+    /// The admission read budget of the pool's payment chain, shared with
+    /// every other pool on that chain.
+    admit_reads: Arc<crate::payment_settlement::AdmitReadBudget>,
     /// The pool's seller view over the shared store files.
     store: Arc<PersistentPoolStateStore>,
 }
@@ -496,15 +499,15 @@ async fn build_infra(
     // typo'd chain id or contract address aborts bring-up before any row is
     // written under a deployment that does not exist.
     let pool_chains = accepted_pools(cfg, &node_metrics)?;
-    for (deployment, providers) in &pool_chains {
-        check_rpc_reachability(providers.url.as_str())
+    for pool in &pool_chains {
+        check_rpc_reachability(pool.providers.url.as_str())
             .await
-            .with_context(|| format!("payment chain of pool {}", deployment.pool_account()))?;
+            .with_context(|| format!("payment chain of pool {}", pool.deployment.pool_account()))?;
         check_deployment_preflight(
-            providers.read_only(Duration::from_millis(
+            pool.providers.read_only(Duration::from_millis(
                 cfg.blockchain.receipt_poll_interval_ms,
             )),
-            *deployment,
+            pool.deployment,
             &BootRetry::new(DEPLOYMENT_PREFLIGHT_BUDGET, Arc::clone(&node_metrics)),
         )
         .await?;
@@ -521,10 +524,8 @@ async fn build_infra(
     // `Database` handle to one file, so the files open once and back every
     // view, the settlement ledger and the buyer tables.
     let pool_store_data_dir = cfg.identity.data_dir.clone();
-    let deployments: Vec<crate::pool_store::Deployment> = pool_chains
-        .iter()
-        .map(|(deployment, _)| *deployment)
-        .collect();
+    let deployments: Vec<crate::pool_store::Deployment> =
+        pool_chains.iter().map(|pool| pool.deployment).collect();
     let (store_files, views) = tokio::task::spawn_blocking(move || {
         let files = crate::pool_store::PoolStoreFiles::open(&pool_store_data_dir)?;
         let views = deployments
@@ -541,9 +542,10 @@ async fn build_infra(
     let pools: Vec<PoolInfra> = pool_chains
         .into_iter()
         .zip(views)
-        .map(|((deployment, providers), store)| PoolInfra {
-            deployment,
-            providers,
+        .map(|(pool, store)| PoolInfra {
+            deployment: pool.deployment,
+            providers: pool.providers,
+            admit_reads: pool.admit_reads,
             store,
         })
         .collect();
@@ -1260,6 +1262,7 @@ async fn build_chain_and_handlers(
                 wallet_provider.clone(),
             ),
             projection.clone(),
+            Arc::clone(&pool.admit_reads),
             Arc::clone(&infra.node_metrics),
         ));
         // Lane owner lookup for `admin_v1_lanes`. Its own binding and reads,
@@ -3595,8 +3598,20 @@ enum RpcProbe {
     Fatal(String),
 }
 
+/// One accepted payment pool and the per-chain handles it shares with every
+/// other pool on its payment chain.
+struct AcceptedPool {
+    /// The pool: payment chain id and contract address.
+    deployment: crate::pool_store::Deployment,
+    /// Providers on the pool's payment chain.
+    providers: ProviderFactory,
+    /// The admission read budget of the pool's payment chain.
+    admit_reads: Arc<crate::payment_settlement::AdmitReadBudget>,
+}
+
 /// Every accepted payment pool, in configuration order, with providers on its
-/// payment chain. One [`ProviderFactory`] serves every pool of one chain.
+/// payment chain. One [`ProviderFactory`] and one admission read budget serve
+/// every pool of one chain.
 ///
 /// # Errors
 ///
@@ -3606,7 +3621,7 @@ enum RpcProbe {
 fn accepted_pools(
     cfg: &ResolvedConfig,
     node_metrics: &Arc<metrics::Metrics>,
-) -> anyhow::Result<Vec<(crate::pool_store::Deployment, ProviderFactory)>> {
+) -> anyhow::Result<Vec<AcceptedPool>> {
     let mut pools = Vec::new();
     for chain in &cfg.blockchain.payment_chains {
         let url: HttpUrl = chain.rpc_url.parse().with_context(|| {
@@ -3617,19 +3632,23 @@ fn accepted_pools(
             )
         })?;
         let providers = ProviderFactory::new(url, chain.chain_id, Arc::clone(node_metrics));
+        let admit_reads = Arc::new(crate::payment_settlement::AdmitReadBudget::from_rates(
+            &chain.admit_reads,
+        ));
         for &payment_pool in &chain.payment_pools {
             anyhow::ensure!(
                 !payment_pool.is_zero(),
                 "blockchain.payment_chains names the zero address as a payment pool on chain {}",
                 chain.chain_id
             );
-            pools.push((
-                crate::pool_store::Deployment {
+            pools.push(AcceptedPool {
+                deployment: crate::pool_store::Deployment {
                     chain_id: chain.chain_id,
                     payment_pool,
                 },
-                providers.clone(),
-            ));
+                providers: providers.clone(),
+                admit_reads: Arc::clone(&admit_reads),
+            });
         }
     }
     anyhow::ensure!(
