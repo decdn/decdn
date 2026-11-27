@@ -336,10 +336,29 @@ cannot change them. Thus a page that the user visits can make the gateway
 pay only for content that the browser opens as a whole page, and the page
 reads no answer. A browser that sends no `Sec-Fetch-Site` is refused. On a site origin,
 a request from a page also must be the site's own (`same-origin`), the
-user's (`none`), or a top-level navigation. On the bare host, a browser's
+user's (`none`), or a top-level navigation that the user lets through (see
+below). On the bare host, a browser's
 navigation (`Sec-Fetch-Mode: navigate`) to a bundle or an entry redirects to
 the bundle's site. A loopback gateway sends no CORS headers, so a page on
 another origin reads no answer.
+
+A site page spends the gateway's capabilities on the content that it loads.
+Thus a loopback gateway asks the user before a link on another site opens a
+site. A top-level navigation to a site origin with `Sec-Fetch-Site:
+cross-site` or `same-site` gets an interstitial page. The page names the site
+host, the bundle hash and the namespace. It tells the user that the site
+spends the gateway's capabilities. The site serves nothing for that
+navigation until the user selects Continue. Continue is a form that posts to
+the same URL with a token. The token is a keyed BLAKE3 hash of the site host.
+The gateway makes the key at start. The gateway accepts the post only with
+`Sec-Fetch-Site: same-origin` and an `Origin` that is the site origin, so no
+other page can submit it. The interstitial has `frame-ancestors 'none'` and
+`X-Frame-Options: DENY`, so no other page can frame it. After the post, the
+gateway redirects (303) to the URL, and the site serves it. The consent
+applies to that site origin until the gateway stops. The gateway keeps it in
+memory only. A typed URL or a bookmark (`none`), the site's own navigation
+(`same-origin`) and a client outside a browser get no interstitial. A public
+gateway shows no interstitial.
 
 ## Cache
 

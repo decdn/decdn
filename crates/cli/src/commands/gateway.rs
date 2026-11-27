@@ -21,8 +21,11 @@
 //! requests and redirects a navigation to the other bundle's site. The
 //! browser's `Sec-Fetch-*` headers decide what may spend on a site origin
 //! (`site::may_spend`), and a site pays with the capabilities the gateway
-//! holds, as a content request does. The API paths answer on the gateway
-//! origin only.
+//! holds, as a content request does. On a loopback gateway, a top-level
+//! navigation to a site from a page on another site gets an interstitial
+//! that names the site, and the site serves nothing until the user
+//! continues; a typed URL, a bookmark and the site's own links open it
+//! directly (`consent`). The API paths answer on the gateway origin only.
 //!
 //! **Capabilities.** A capability (ADR 003 § Capability delegation) lets a
 //! delegate key the gateway holds spend from a pool, so a pool owner funds a
@@ -61,6 +64,8 @@
 //! `Origin`, or a `User-Agent` that starts `Mozilla/`) gets 403. A client
 //! outside a browser sends none of these and passes. So another page can
 //! make the gateway pay only for content the browser opens as a whole page.
+//! A link on another site opens a site's pages, which spend on what they
+//! load, only once the user continues past its interstitial (`consent`).
 //! It answers nothing cross-origin, so a page reads no response. The gateway listens on loopback only and checks
 //! `Host` against DNS rebinding: it answers its own loopback names and
 //! well-formed site names on its port, nothing else.
@@ -195,6 +200,7 @@ use super::fetch::{
 use super::local_http::{Body, allowed_hosts, full, host_header, json, private_dir, text, typed};
 use crate::known_chains;
 
+mod consent;
 mod delegates;
 mod metrics;
 pub(crate) mod pointer;
@@ -204,6 +210,7 @@ mod site;
 mod status;
 mod worker;
 
+use consent::Consents;
 use delegates::{Capability, Delegates};
 use metrics::Metrics;
 use pointer::{Pointers, SetError, SignedPointer, pointer_domain};
@@ -362,6 +369,7 @@ pub async fn gateway(args: &GatewayArgs, config_path: Option<&Path>) -> anyhow::
         manifest_buffer: Semaphore::new(MANIFEST_BUFFER_BYTES),
         hosts: allowed_hosts(args.listen),
         sites,
+        consents: Consents::default(),
         metrics: Metrics::default(),
         active: std::sync::Mutex::new(HashMap::new()),
         next_pull: AtomicU64::new(0),
@@ -755,6 +763,8 @@ struct Gateway {
     hosts: Vec<String>,
     /// Where site origins live, and what a `Host` names.
     sites: SiteDomain,
+    /// The sites the user continued to from another site's link (`consent`).
+    consents: Consents,
     /// What it served, refused and failed, for `/_status` and
     /// `--metrics-listen`.
     metrics: Metrics,
@@ -1208,12 +1218,15 @@ impl Gateway {
             && path == "/_status"
     }
 
-    /// The site policy on `response`.
+    /// The site policy on `response`, unless it carries its own (the
+    /// interstitial's, `consent::POLICY`).
     fn with_policy(mut response: Response<Body>) -> Response<Body> {
-        response.headers_mut().insert(
-            header::CONTENT_SECURITY_POLICY,
-            header::HeaderValue::from_static(site::CONTENT_SECURITY_POLICY),
-        );
+        response
+            .headers_mut()
+            .entry(header::CONTENT_SECURITY_POLICY)
+            .or_insert(header::HeaderValue::from_static(
+                site::CONTENT_SECURITY_POLICY,
+            ));
         response
     }
 
@@ -1227,7 +1240,14 @@ impl Gateway {
         req: Request<B>,
         site: Site,
         pointer: Option<u64>,
-    ) -> Response<Body> {
+    ) -> Response<Body>
+    where
+        B: HttpBody<Data = Bytes>,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        if req.method() == Method::POST && !self.public() {
+            return self.consent(req, site).await;
+        }
         let path = req.uri().path();
         if matches!(
             path,
@@ -1247,10 +1267,13 @@ impl Gateway {
         let headers = req.headers();
         // A public gateway serves anyone: the browser's headers decide
         // nothing there, and `curl` sends none.
-        if !self.public()
-            && let Err((status, why)) = site::may_spend(headers)
-        {
-            return text(status, why);
+        if !self.public() {
+            if consent::asks(headers) && !self.consents.given(&site) {
+                return self.consents.page(&site, &self.sites.site_host(&site));
+            }
+            if let Err((status, why)) = site::may_spend(headers) {
+                return text(status, why);
+            }
         }
         let target = req.uri().path_and_query().map_or(path, |pq| pq.as_str());
         // The pointer's own bundle, which a capability scoped to it pays for.
@@ -1298,6 +1321,47 @@ impl Gateway {
         };
         self.paid(pointer, &uri, Present::Site, Ask::Get { range, query })
             .await
+    }
+
+    /// A `POST` on a loopback site origin: the interstitial's Continue
+    /// (`consent`). From the site's own page with its token, it records the
+    /// user's consent and sends the browser back to the page it asked for.
+    async fn consent<B>(&self, req: Request<B>, site: Site) -> Response<Body>
+    where
+        B: HttpBody<Data = Bytes>,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let host = self.sites.site_host(&site);
+        let origin = self.sites.origin(&host);
+        if !consent::from_own_page(req.headers(), &origin) {
+            return text(
+                StatusCode::FORBIDDEN,
+                "only the site's own interstitial may continue to it\n",
+            );
+        }
+        // The origin prefix keeps a target such as `//elsewhere` on the site.
+        let back = format!(
+            "{origin}{}",
+            req.uri().path_and_query().map_or("/", |pq| pq.as_str())
+        );
+        let form = match Limited::new(req.into_body(), MAX_BODY_BYTES)
+            .collect()
+            .await
+        {
+            Ok(body) => body.to_bytes(),
+            Err(_) => return text(StatusCode::PAYLOAD_TOO_LARGE, "body too large\n"),
+        };
+        if !self.consents.give(site, &host, &form) {
+            return text(StatusCode::FORBIDDEN, "the interstitial's token is wrong\n");
+        }
+        let mut response = text(StatusCode::SEE_OTHER, "");
+        match header::HeaderValue::from_str(&back) {
+            Ok(location) => {
+                response.headers_mut().insert(header::LOCATION, location);
+            }
+            Err(_) => *response.status_mut() = StatusCode::BAD_REQUEST,
+        }
+        response
     }
 
     /// `PUT /_pointer`: store a namespace pointer signed by the namespace's

@@ -19,7 +19,8 @@
 //!
 //! The browser's `Sec-Fetch-*` headers and `Origin`, which page scripts
 //! cannot set, decide what a request to a loopback gateway may spend
-//! ([`browser_gate`], [`may_spend`]).
+//! ([`browser_gate`], [`may_spend`], and the user's consent to a site another
+//! site links to, `consent`).
 
 use std::net::SocketAddr;
 
@@ -138,7 +139,7 @@ impl SiteDomain {
 
 /// A bundle served as a website, by its manifest hash and namespace hint.
 /// Its host is [`SiteDomain::site_host`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Site {
     pub(super) hash: [u8; 32],
     pub(super) namespace: Option<u64>,
@@ -225,9 +226,10 @@ pub(super) fn browser_gate(
 /// Whether a request that passed [`browser_gate`] may spend on a site
 /// origin: in a browser, the site's own requests (`same-origin`), the user's
 /// own (`none`: a typed URL, a bookmark), and a top-level navigation from
-/// anywhere, so a link opens a site at any path. Every other request from a
-/// page is refused, so no other page can make the gateway pay. A client
-/// outside a browser sends no `Sec-Fetch-Site` and may.
+/// anywhere, so a link opens a site at any path once the user consents to a
+/// site another site links to (`consent`). Every other request from a page
+/// is refused, so no other page can make the gateway pay. A client outside a
+/// browser sends no `Sec-Fetch-Site` and may.
 pub(super) fn may_spend(headers: &HeaderMap) -> Result<(), (StatusCode, &'static str)> {
     let Some(fetch_site) = header(headers, "sec-fetch-site") else {
         return Ok(());
