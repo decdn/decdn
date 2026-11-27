@@ -129,17 +129,28 @@ fn turnstile_expected_hostname_is_the_public_url_host() {
 }
 
 #[test]
-fn a_turnstile_template_without_the_action_is_refused() {
+fn a_turnstile_template_without_the_action_or_cdata_is_refused() {
     let dir = std::env::temp_dir().join(format!("onramp-template-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let without = dir.join("without.html");
     let with = dir.join("with.html");
     std::fs::write(&without, r#"<div data-sitekey="{{SITEKEY}}"></div>"#).unwrap();
-    std::fs::write(&with, r#"<div data-action="{{ACTION}}"></div>"#).unwrap();
+    let no_cdata = dir.join("no_cdata.html");
+    std::fs::write(&without, r#"<div data-sitekey="{{SITEKEY}}"></div>"#).unwrap();
+    std::fs::write(
+        &with,
+        r#"<div data-action="{{ACTION}}" data-cdata="{{CDATA}}"></div>"#,
+    )
+    .unwrap();
+    std::fs::write(&no_cdata, r#"<div data-action="{{ACTION}}"></div>"#).unwrap();
 
     let refused = args(&["--gate-template", without.to_str().unwrap()]).unwrap();
     let err = OnrampConfig::from_args(refused).unwrap_err();
     assert!(err.to_string().contains("{{ACTION}}"), "{err}");
+
+    let refused = args(&["--gate-template", no_cdata.to_str().unwrap()]).unwrap();
+    let err = OnrampConfig::from_args(refused).unwrap_err();
+    assert!(err.to_string().contains("{{CDATA}}"), "{err}");
 
     let accepted = args(&["--gate-template", with.to_str().unwrap()]).unwrap();
     assert!(OnrampConfig::from_args(accepted).is_ok());

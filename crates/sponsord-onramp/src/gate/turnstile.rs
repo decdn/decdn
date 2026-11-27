@@ -10,8 +10,8 @@ use sponsord_api::secret::Secret;
 use super::{Gate, html_escape};
 
 /// The built-in page: the Turnstile widget, which posts its token as the
-/// proof. `{{SITEKEY}}`, `{{ACTION}}`, `{{CLIENT}}` and `{{BRAND_NAME}}` are
-/// substituted.
+/// proof. `{{SITEKEY}}`, `{{ACTION}}`, `{{CDATA}}`, `{{CLIENT}}` and
+/// `{{BRAND_NAME}}` are substituted.
 pub const DEFAULT_TEMPLATE: &str = include_str!("../../assets/turnstile.html");
 
 const SITEVERIFY: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
@@ -53,6 +53,8 @@ struct SiteVerify {
     hostname: Option<String>,
     #[serde(default)]
     action: Option<String>,
+    #[serde(default)]
+    cdata: Option<String>,
     #[serde(default, rename = "error-codes")]
     error_codes: Vec<String>,
 }
@@ -105,16 +107,20 @@ impl Gate for TurnstileGate {
     fn page(&self, client: Address) -> String {
         // `client` is a parsed address, so its text is hex and escaping it
         // changes nothing; the call is what CodeQL's rust/xss recognises.
+        // As `0x` and 40 hex digits it also fits Turnstile's cdata limit
+        // (255 letters, digits, `_` and `-`).
+        let client = html_escape(&client.to_string());
         self.template
             .replace("{{SITEKEY}}", &self.sitekey)
             .replace("{{ACTION}}", TURNSTILE_ACTION)
             .replace("{{BRAND_NAME}}", &html_escape(&self.brand_name))
-            .replace("{{CLIENT}}", &html_escape(&client.to_string()))
+            .replace("{{CDATA}}", &client)
+            .replace("{{CLIENT}}", &client)
     }
 
     async fn verify(
         &self,
-        _client: Address,
+        client: Address,
         proof: &str,
         client_ip: Option<IpAddr>,
     ) -> anyhow::Result<bool> {
@@ -156,6 +162,21 @@ impl Gate for TurnstileGate {
                 action = ?resp.action,
                 expected = %TURNSTILE_ACTION,
                 "turnstile token refused: minted for another action"
+            );
+            return Ok(false);
+        }
+        // The page sets the widget's cdata to its client key, so a token
+        // solved on a page for one key cannot fund another.
+        if resp
+            .cdata
+            .as_deref()
+            .and_then(|c| c.parse::<Address>().ok())
+            != Some(client)
+        {
+            tracing::warn!(
+                cdata = ?resp.cdata,
+                expected = %client,
+                "turnstile token refused: minted for another client"
             );
             return Ok(false);
         }
