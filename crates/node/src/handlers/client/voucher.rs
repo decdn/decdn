@@ -17,10 +17,10 @@
 
 use super::proof_wait::ChunkProofs;
 use super::{
-    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, DEFAULT_TOLERANCE_BPS,
-    LaneDeliveryState, LaneId, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream,
-    SendStream, SignedVoucher, U256, VoucherRejectReason, VoucherStop, WatermarkBundle,
-    verify_rate, voucher_reject_reason, wire_voucher_to_signed,
+    Arc, B256, BufferedProofReader, CHUNK_BYTES, ClientHandler, Connection, LaneDeliveryState,
+    LaneId, LaneKey, LaneState, Mutex, Ordering, Proof, RateError, RecvStream, SendStream,
+    SignedVoucher, U256, VoucherRejectReason, VoucherStop, WatermarkBundle, verify_rate,
+    voucher_reject_reason, wire_voucher_to_signed,
 };
 use decdn_incentive::{PoolError, VoucherError};
 
@@ -684,12 +684,7 @@ impl ClientHandler {
                 //
                 // Advertised-rate check (ADR 003 §Voucher withholding). Match every
                 // `RateError` arm (#845) so a future variant is a build failure here.
-                match verify_rate(
-                    applied.amount_delta(),
-                    applied.bytes_delta(),
-                    rate_per_mb,
-                    DEFAULT_TOLERANCE_BPS,
-                ) {
+                match verify_rate(applied.amount_delta(), applied.bytes_delta(), rate_per_mb) {
                     Ok(()) => {}
                     Err(RateError::Underpayment { .. }) => {
                         // `state` is the pre-advance lane, so the bundle reports the

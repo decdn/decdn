@@ -13,45 +13,33 @@ fn err_of<T: std::fmt::Debug, E>(r: Result<T, E>) -> anyhow::Result<E> {
 #[test]
 fn exact_rate_accepted() -> anyhow::Result<()> {
     // 1 MB at rate 100 µUSDC/MB → 100 µUSDC
-    verify_rate(U256::from(100u64), one_mb(), 100, DEFAULT_TOLERANCE_BPS)?;
+    verify_rate(U256::from(100u64), one_mb(), 100)?;
     Ok(())
 }
 
 #[test]
 fn overpayment_accepted() -> anyhow::Result<()> {
     // 1 MB at rate 100 → 200 µUSDC paid (client overpaid; that's fine)
-    verify_rate(U256::from(200u64), one_mb(), 100, DEFAULT_TOLERANCE_BPS)?;
+    verify_rate(U256::from(200u64), one_mb(), 100)?;
     Ok(())
 }
 
+/// A voucher 1% short of the quoted rate is refused (#2851): the check has no
+/// slack, so a payer cannot shave a percent off every span.
 #[test]
-fn within_tolerance_accepted() -> anyhow::Result<()> {
-    // 1 MB at rate 1000 → required 1000 µUSDC, paid 991 (0.9% under)
-    verify_rate(U256::from(991u64), one_mb(), 1000, DEFAULT_TOLERANCE_BPS)?;
-    Ok(())
-}
-
-#[test]
-fn underpayment_beyond_tolerance_rejected() -> anyhow::Result<()> {
-    // 1 MB at rate 1000 → required 1000 µUSDC, paid 980 (2% under, default tol 1%)
-    let err = err_of(verify_rate(
-        U256::from(980u64),
-        one_mb(),
-        1000,
-        DEFAULT_TOLERANCE_BPS,
-    ))?;
+fn one_percent_short_rejected() -> anyhow::Result<()> {
+    // 1 MB at rate 1000 → required 1000 µUSDC, paid 990 (1% under).
+    let err = err_of(verify_rate(U256::from(990u64), one_mb(), 1000))?;
+    anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
+    // One base unit short is refused too.
+    let err = err_of(verify_rate(U256::from(999u64), one_mb(), 1000))?;
     anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
     Ok(())
 }
 
 #[test]
 fn zero_bytes_rejected() -> anyhow::Result<()> {
-    let err = err_of(verify_rate(
-        U256::from(1u64),
-        U256::ZERO,
-        100,
-        DEFAULT_TOLERANCE_BPS,
-    ))?;
+    let err = err_of(verify_rate(U256::from(1u64), U256::ZERO, 100))?;
     anyhow::ensure!(matches!(err, RateError::ZeroBytes), "{err:?}");
     Ok(())
 }
@@ -59,15 +47,10 @@ fn zero_bytes_rejected() -> anyhow::Result<()> {
 #[test]
 fn zero_amount_with_bytes_rejected_unless_rate_is_zero() -> anyhow::Result<()> {
     // Free serving (rate 0) makes any payment legal.
-    verify_rate(U256::ZERO, one_mb(), 0, DEFAULT_TOLERANCE_BPS)?;
+    verify_rate(U256::ZERO, one_mb(), 0)?;
 
     // Rate > 0 with amount 0 underpays.
-    let err = err_of(verify_rate(
-        U256::ZERO,
-        one_mb(),
-        100,
-        DEFAULT_TOLERANCE_BPS,
-    ))?;
+    let err = err_of(verify_rate(U256::ZERO, one_mb(), 100))?;
     anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
     Ok(())
 }
@@ -75,79 +58,28 @@ fn zero_amount_with_bytes_rejected_unless_rate_is_zero() -> anyhow::Result<()> {
 #[test]
 fn sub_megabyte_proportional() -> anyhow::Result<()> {
     // 0.5 MB at rate 1000 → required 500 µUSDC, paid 500.
-    verify_rate(
-        U256::from(500u64),
-        U256::from(BYTES_PER_MB / 2),
-        1000,
-        DEFAULT_TOLERANCE_BPS,
-    )?;
+    verify_rate(U256::from(500u64), U256::from(BYTES_PER_MB / 2), 1000)?;
     Ok(())
 }
 
 #[test]
 fn multi_mb_proportional() -> anyhow::Result<()> {
     // 10 MB at rate 1000 → required 10_000.
-    verify_rate(
-        U256::from(10_000u64),
-        U256::from(10 * BYTES_PER_MB),
-        1000,
-        DEFAULT_TOLERANCE_BPS,
-    )?;
+    verify_rate(U256::from(10_000u64), U256::from(10 * BYTES_PER_MB), 1000)?;
     Ok(())
 }
 
+/// Byte inflation is refused: 1 `µUSDC` stamped against 2^200 bytes passes only
+/// at rate 0, and one byte over the per-µUSDC budget is refused at rate 1.
 #[test]
-fn zero_tolerance_strict() -> anyhow::Result<()> {
-    // With 0 bps tolerance, 999/1000 is rejected.
-    let err = err_of(verify_rate(U256::from(999u64), one_mb(), 1000, 0))?;
-    anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
-    // Exact match still passes.
-    verify_rate(U256::from(1_000u64), one_mb(), 1000, 0)?;
-    Ok(())
-}
-
-#[test]
-fn full_tolerance_accepts_anything() -> anyhow::Result<()> {
-    // 10_000 bps tolerance == 100% — any non-zero delta passes the rate
-    // check (the underpayment lower bound becomes zero).
-    verify_rate(
-        U256::from(1u64),
-        U256::from(10u64.pow(15)),
-        1_000_000,
-        10_000,
-    )?;
-    Ok(())
-}
-
-#[test]
-fn tolerance_above_100_percent_clamped() -> anyhow::Result<()> {
-    // Tolerance values above 10_000 bps should be clamped to 100%
-    // tolerance, never wrap or trigger spurious overflow.
-    verify_rate(U256::ZERO, one_mb(), 1_000, 50_000)?;
-    Ok(())
-}
-
-/// `verify_rate` at zero tolerance is the hard price floor the serving node
-/// applies after the advertised-rate check (#846): a positive `floor`
-/// rejects byte inflation with no slack, while a `floor` of `0` is inert
-/// (the default / free-serving config, where the always-`>= 1` on-chain
-/// floor is the authoritative enforcement instead).
-#[test]
-fn price_floor_rejects_byte_inflation() -> anyhow::Result<()> {
-    let floor = 1u64;
-
-    // The headline attack shape: 1 µUSDC stamped against 2^200 bytes. A zero
-    // floor accepts it (inert); a positive floor at zero tolerance rejects.
+fn byte_inflation_rejected() -> anyhow::Result<()> {
     let inflated = U256::ONE << 200;
-    verify_rate(U256::ONE, inflated, 0, 0)?; // floor 0: inert, passes
-    let err = err_of(verify_rate(U256::ONE, inflated, floor, 0))?; // floor 1: rejects
+    verify_rate(U256::ONE, inflated, 0)?;
+    let err = err_of(verify_rate(U256::ONE, inflated, 1))?;
     anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
 
-    // Exactly at the floor (1 µUSDC for 1 MB) passes with zero tolerance.
-    verify_rate(U256::ONE, one_mb(), floor, 0)?;
-    // One byte over the per-µUSDC budget for that amount is rejected — no
-    // tolerance headroom, unlike the advertised-rate check's 1%.
-    let err = err_of(verify_rate(U256::ONE, one_mb() + U256::ONE, floor, 0))?;
+    verify_rate(U256::ONE, one_mb(), 1)?;
+    let err = err_of(verify_rate(U256::ONE, one_mb() + U256::ONE, 1))?;
     anyhow::ensure!(matches!(err, RateError::Underpayment { .. }), "{err:?}");
     Ok(())
 }
@@ -192,18 +124,20 @@ fn min_payment_large_blob_no_overflow() {
     );
 }
 
-/// The deposit-guard contract (#856): `min_payment` is the lower bound a
-/// zero-tolerance `verify_rate` accepts, so paying exactly `min_payment`
-/// for the bytes always clears the rate floor.
+/// The honest-payer contract: `min_payment` is the round-up price the client
+/// signs, so paying exactly `min_payment` for any byte count clears the exact
+/// `verify_rate`.
 #[test]
-fn min_payment_clears_zero_tolerance_rate() -> anyhow::Result<()> {
+fn min_payment_clears_rate_check() -> anyhow::Result<()> {
     for &(bytes, rate) in &[
         (BYTES_PER_MB, 1000u64),
         (BYTES_PER_MB / 3, 777),
         (3 * BYTES_PER_MB + 17, 100),
+        (1, 1),
+        (BYTES_PER_MB - 1, 3),
     ] {
         let amount = min_payment(bytes, rate);
-        verify_rate(amount, U256::from(bytes), rate, 0)?;
+        verify_rate(amount, U256::from(bytes), rate)?;
     }
     Ok(())
 }

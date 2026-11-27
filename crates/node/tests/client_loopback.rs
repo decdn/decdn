@@ -2273,7 +2273,7 @@ impl StalledDelivery {
             signer: signer.address(),
             provider: operator_addr(),
             // Exactly the advertised-rate minimum for the bytes served, which
-            // clears the handler's per-delta `verify_rate` (1% tolerance). The
+            // clears the handler's exact per-delta `verify_rate`. The
             // node applies no cumulative rate-floor check — the delivery floor
             // is a redemption-time credit clamp only.
             amount: settled.amount,
@@ -8205,6 +8205,7 @@ async fn unseating_the_attesting_origin_mid_stream_terminates_the_delivery() -> 
     let attestations = Arc::new(decdn_node::attestations::Attestations::in_memory(
         decdn_node::dht::AttestationVerifier::new(
             Arc::clone(&seats) as Arc<dyn SeatedOrigins>,
+            decdn_node::dht::attestation::test_support::registered([ORIGIN.address()]),
             Arc::new(decdn_node::content_deny::ContentDenylist::empty()),
             domain(),
         ),

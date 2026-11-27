@@ -1075,6 +1075,10 @@ async fn build_chain_and_handlers(
         };
     let attestation_verifier = crate::dht::AttestationVerifier::new(
         Arc::clone(&seated_origins) as Arc<dyn crate::dht::SeatedOrigins>,
+        crate::dht::attestation::RegisteredOperators::new(
+            Arc::clone(&operator_to_node),
+            Arc::clone(&staker_set),
+        ),
         reload_state.content_denylist(),
         stream_domain.clone(),
     );

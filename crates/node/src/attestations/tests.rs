@@ -8,7 +8,7 @@ use super::*;
 use crate::content_deny::ContentDenylist;
 use crate::dht::attestation::sign_attestation;
 use crate::dht::attestation::test_support::{
-    NAMESPACE, ORIGIN, attest, attest_at, domain, verifier,
+    NAMESPACE, ORIGIN, attest, attest_at, domain, registered, verifier,
 };
 use crate::dht::seated_origins::SeatedOriginSet;
 
@@ -93,7 +93,12 @@ fn keep_offered_reports_whether_the_node_can_serve() {
 #[test]
 fn a_held_attestation_stops_being_live_once_its_origin_is_unseated() {
     let seated = Arc::new(SeatedOriginSet::from_seats([(NAMESPACE, ORIGIN.address())]));
-    let v = AttestationVerifier::new(seated.clone(), Arc::new(ContentDenylist::empty()), domain());
+    let v = AttestationVerifier::new(
+        seated.clone(),
+        registered([ORIGIN.address()]),
+        Arc::new(ContentDenylist::empty()),
+        domain(),
+    );
     let store = Attestations::in_memory(v, None);
     assert!(store.keep([1; 32], attest([1; 32])));
     seated.unseat(NAMESPACE, ORIGIN.address());
@@ -223,6 +228,7 @@ fn keep_replaces_a_later_expiring_attestation_whose_signer_lost_its_seat() {
     ]));
     let v = AttestationVerifier::new(
         Arc::clone(&seats) as Arc<dyn crate::dht::seated_origins::SeatedOrigins>,
+        registered([ORIGIN.address(), other.address()]),
         Arc::new(ContentDenylist::empty()),
         domain(),
     );
@@ -384,6 +390,7 @@ fn another_namespaces_seat_does_not_self_sign_here() {
             U256::from(5),
             ORIGIN.address(),
         )])),
+        registered([ORIGIN.address()]),
         Arc::new(ContentDenylist::empty()),
         domain(),
     );

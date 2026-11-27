@@ -3444,6 +3444,14 @@ pub fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
 /// deliberate choice: tracking an unbounded `JoinSet` alongside the accept
 /// loop would add complexity without a consumer that cares about the
 /// guarantee.
+///
+/// On a loopback listener the server answers a request only when its `Host`
+/// names a loopback address or `localhost`, on any port. A
+/// DNS-rebinding page reaches the loopback listener under its own domain,
+/// which it cannot make one of these, so it cannot read the scrape. A
+/// listener bound to another address is one the operator exposed on purpose,
+/// and a scraper there names the host by its own address, so that listener
+/// takes any `Host`.
 #[allow(clippy::cognitive_complexity)] // Accept+permit+spawn reads linearly.
 pub async fn serve(
     listener: TcpListener,
@@ -3451,6 +3459,9 @@ pub async fn serve(
     mut shutdown: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let limiter = Arc::new(Semaphore::new(MAX_METRICS_CONNECTIONS));
+    let loopback_only = listener
+        .local_addr()
+        .map_or(true, |addr| addr.ip().to_canonical().is_loopback());
 
     loop {
         let (stream, peer) = tokio::select! {
@@ -3484,7 +3495,7 @@ pub async fn serve(
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
                 let metrics = Arc::clone(&metrics);
-                async move { handle(req, metrics) }
+                async move { handle(req, metrics, loopback_only) }
             });
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
@@ -3503,7 +3514,20 @@ pub async fn serve(
 fn handle(
     req: Request<hyper::body::Incoming>,
     metrics: Arc<Metrics>,
+    loopback_only: bool,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if loopback_only
+        && !req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .is_some_and(is_loopback_host)
+    {
+        return Ok(Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Full::new(Bytes::from_static(b"host not allowed\n")))
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))));
+    }
     if req.uri().path() != "/metrics" {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -3528,6 +3552,25 @@ fn handle(
                 .unwrap_or_else(|_| Response::new(Full::new(Bytes::new()))))
         }
     }
+}
+
+/// Whether a `Host` header value names this machine: `localhost` or a
+/// loopback IP (`127.0.0.0/8`, `[::1]`), on any port, so an SSH tunnel or a
+/// container port mapping onto another local port still reaches the server.
+fn is_loopback_host(host: &str) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // `[v6]` or `[v6]:port`.
+        match rest.split_once(']') {
+            Some((v6, tail)) if tail.is_empty() || tail.starts_with(':') => v6,
+            _ => return false,
+        }
+    } else {
+        host.split_once(':').map_or(host, |(name, _)| name)
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 /// RAII guard for the `active_connections` gauge.
