@@ -83,6 +83,8 @@ use decdn_incentive::{Deployment, LaneKey, LaneState, PoolId, PoolStateStore, Se
 use futures_util::StreamExt as _;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+
+use crate::warn_throttle::WarnThrottle;
 use tokio::time::Instant;
 use tracing::{Instrument as _, debug, error, info, warn};
 
@@ -168,6 +170,11 @@ const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
 /// so it is not negative-cached: the next request reads again. Shorter than
 /// the 10 s read timeout, so a refused request waits less than one read could.
 const ADMIT_CHAIN_READ_SLOT_WAIT: Duration = Duration::from_secs(5);
+
+/// Minimum gap between `warn!` lines for a failed admit-path chain read. A
+/// remote peer drives one read per fresh pool id or signer, so a failing
+/// endpoint would otherwise log once per request.
+const ADMIT_READ_FAULT_WARN_INTERVAL: Duration = Duration::from_mins(1);
 
 /// One `getAuthorization` read held in the signer-auth cache.
 ///
@@ -850,6 +857,10 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     auth_inflight: InflightReads<(B256, Address), Option<SignerAuthorization>>,
     /// Slots for admit-path chain reads; see [`ADMIT_CHAIN_READ_CONCURRENCY`].
     chain_reads: tokio::sync::Semaphore,
+    /// Throttle for the `warn!` on a failed admit-path `getPool` or
+    /// `getAuthorization`. One window for both: they share one remedy, the
+    /// chain endpoint. Each fault also counts on `decdn_rpc_requests_total`.
+    read_fault_warn: WarnThrottle,
     /// Counts each signer confirm by what the cache held for it.
     metrics: Arc<Metrics>,
 }
@@ -880,6 +891,7 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             auth_cache: Mutex::new(HashMap::new()),
             auth_inflight: Mutex::new(HashMap::new()),
             chain_reads: tokio::sync::Semaphore::new(ADMIT_CHAIN_READ_CONCURRENCY),
+            read_fault_warn: WarnThrottle::new(ADMIT_READ_FAULT_WARN_INTERVAL),
             metrics,
         }
     }
@@ -997,12 +1009,16 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
         let pool = match timed(None, "admit getPool", self.contract.getPool(pool_id).call()).await {
             Ok(pool) => pool,
             Err(err) => {
-                warn!(
-                    error = %sanitize_err_chain(&err),
-                    %pool_id,
-                    suppressed_for = ?RESOLVE_FAULT_TTL,
-                    "admit getPool failed; refusing this pool until the negative cache lapses"
-                );
+                if let Some(suppressed) = self.read_fault_warn.admit() {
+                    warn!(
+                        error = %sanitize_err_chain(&err),
+                        %pool_id,
+                        suppressed_for = ?RESOLVE_FAULT_TTL,
+                        suppressed,
+                        interval = ?self.read_fault_warn.interval(),
+                        "admit getPool failed; refusing this pool until the negative cache lapses"
+                    );
+                }
                 remember_negative(&mut self.negative_cache(), pool_id, NegativeReason::Fault);
                 return None;
             }
@@ -1161,12 +1177,16 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
         {
             Ok(auth) => SignerAuthorization::from_onchain(&auth),
             Err(err) => {
-                warn!(
-                    error = %sanitize_err_chain(&err),
-                    %pool_id,
-                    %signer,
-                    "admit getAuthorization failed; refusing this signer"
-                );
+                if let Some(suppressed) = self.read_fault_warn.admit() {
+                    warn!(
+                        error = %sanitize_err_chain(&err),
+                        %pool_id,
+                        %signer,
+                        suppressed,
+                        interval = ?self.read_fault_warn.interval(),
+                        "admit getAuthorization failed; refusing this signer"
+                    );
+                }
                 return None;
             }
         };

@@ -221,8 +221,9 @@ impl ClientHandler {
     /// The funding gates up to the deposit gate, for a request that names
     /// `lane_key` on the accepted pool `deployment` (ADR 003 § Pool solvency,
     /// § Capability delegation): the pool status, the signer's authorization,
-    /// the funder deny, capability intake, the lane, a closing pool and a
-    /// capability inside the expiry margin.
+    /// the funder deny, capability verification, a closing pool, then the
+    /// grant's lane registration, the lane, and the expiry margin of the lane
+    /// or, with no lane, of the grant. A refused request registers no lane.
     /// Returns what they read, or the refusal.
     ///
     /// With no pool view wired for `deployment` (dev/test) the pool gates pass
@@ -277,13 +278,40 @@ impl ClientHandler {
         }
 
         // Capability intake (ADR 003 § Capability delegation): a capability
-        // whose owner signature verifies against the pool owner registers the
-        // lane and persists the grant. It runs only with a confirmed pool, so
-        // the owner is known.
-        if let (Some(signer), Some(capability), Some(status)) =
-            (verified_client, ext.capability.as_ref(), pool_status)
+        // whose owner signature verifies against the pool owner authorizes a
+        // lane. It runs only with a confirmed pool, so the owner is known. The
+        // grant registers its lane only after the closing and expiry gates
+        // below, so a refused request leaves no lane behind.
+        let grant = match (verified_client, ext.capability.as_ref(), pool_status) {
+            (Some(signer), Some(capability), Some(status)) => {
+                self.verify_capability(deployment, pool_id, signer, status.owner, capability)
+            }
+            _ => None,
+        };
+
+        // A `Closing` pool takes no top-up, and its redemption ends at the
+        // dispute deadline, so this node does not serve on it. A requester that
+        // holds a lane, or presents a verified grant for one, hears `Unfunded`;
+        // anyone else `NotFound`.
+        if let Some(status) = pool_status
+            && matches!(status.lifecycle, Lifecycle::Closing { .. })
         {
-            self.intake_capability(deployment, pool_id, signer, status.owner, capability);
+            let holds_lane = lane_key.is_some_and(|key| self.lanes.contains_key(&key));
+            return Err(ServeRejectReason::PoolClosing {
+                proven: grant.is_some() || holds_lane,
+            });
+        }
+
+        // A grant inside the expiry margin cannot pay for a voucher, so it
+        // registers no lane. The request still runs on a lane this node already
+        // holds, under that lane's own expiry check below.
+        let expiring_grant = grant
+            .as_ref()
+            .is_some_and(|lane| self.inside_expiry_margin(lane.expiry));
+        if let Some(lane) = grant
+            && !expiring_grant
+        {
+            self.register_grant(deployment, lane);
         }
 
         // The request's one lane read, after intake, so a lane its own
@@ -296,23 +324,18 @@ impl ClientHandler {
         #[cfg(any(test, feature = "test-support"))]
         self.fire_lane_after_resolution();
 
-        // A `Closing` pool takes no top-up, and its redemption ends at the
-        // dispute deadline, so this node does not serve on it. A requester that
-        // holds a lane hears `Unfunded`, anyone else `NotFound`.
-        if let Some(status) = pool_status
-            && matches!(status.lifecycle, Lifecycle::Closing { .. })
-        {
-            return Err(ServeRejectReason::PoolClosing {
-                proven: known_lane.is_some(),
-            });
-        }
         // A lane whose capability is inside the expiry margin cannot pay for a
-        // voucher, so admitting it would only stop at the first one.
-        if let Some(lane) = known_lane.as_ref() {
-            let expiry = lane.lock().await.state.expiry;
-            if self.inside_expiry_margin(expiry) {
-                return Err(ServeRejectReason::CapabilityExpired);
+        // voucher, so admitting it would only stop at the first one. With no
+        // lane, a request whose grant is inside the margin refuses the same way.
+        match known_lane.as_ref() {
+            Some(lane) => {
+                let expiry = lane.lock().await.state.expiry;
+                if self.inside_expiry_margin(expiry) {
+                    return Err(ServeRejectReason::CapabilityExpired);
+                }
             }
+            None if expiring_grant => return Err(ServeRejectReason::CapabilityExpired),
+            None => {}
         }
         Ok(Funding {
             pool_status,
