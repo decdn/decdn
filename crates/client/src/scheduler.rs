@@ -3919,7 +3919,7 @@ where
                                     }
                                     return Err(err);
                                 }
-                                sources.log_build_fault(provider, &err);
+                                sources.log_build_fault(provider);
                             }
                         }
                     }

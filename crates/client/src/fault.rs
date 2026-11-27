@@ -83,7 +83,8 @@ impl std::error::Error for LaneBuildFault {}
 /// [`crate::source_set::BUILD_RETRY_WARN_AT`] times in a row, with no lane
 /// built since. It is context on a [`crate::GaveUp`], so the give-up names
 /// what kept failing; a `downcast_ref::<GaveUp>()` still finds the give-up
-/// beneath it.
+/// beneath it. Its text ends with the give-up's own, so the outermost layer
+/// alone still says the fetch stopped and a rerun resumes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LastBuildFault {
     /// The provider whose lane build failed.
@@ -92,14 +93,16 @@ pub(crate) struct LastBuildFault {
     pub(crate) failures: u32,
     /// The last build's error chain, with URL fragments stripped.
     pub(crate) fault: String,
+    /// The give-up this context names the fault for.
+    pub(crate) gave_up: crate::GaveUp,
 }
 
 impl std::fmt::Display for LastBuildFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "lane builds for {} failed {} times in a row: {}",
-            self.provider, self.failures, self.fault
+            "lane builds for {} failed {} times in a row ({}); {}",
+            self.provider, self.failures, self.fault, self.gave_up
         )
     }
 }

@@ -660,6 +660,7 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
     }
 
     /// The failed lane builds in a row for `provider`, 0 once a lane built.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn build_failures(&self, provider: Address) -> u32 {
         self.build_retry
@@ -667,15 +668,18 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
             .map_or(0, |b| b.backoff.attempts)
     }
 
-    /// Log `err`, the retryable fault [`Self::lane_built`] just returned for
+    /// Log the retryable fault [`Self::lane_built`] just recorded for
     /// `provider`. A build fault is chain-side, so one failure logs at debug.
     /// Once the failures in a row reach [`BUILD_RETRY_WARN_AT`], the retry
     /// wait is at [`BUILD_RETRY_CAP`] and the fault persists, so the line
     /// logs at warn: a monitor that filters on warn sees an RPC outage
     /// instead of a silent stall.
-    pub(crate) fn log_build_fault(&self, provider: Address, err: &anyhow::Error) {
-        let failures = self.build_failures(provider);
-        let error = decdn_common::redact::sanitize_err_chain(err);
+    pub(crate) fn log_build_fault(&self, provider: Address) {
+        let Some(retry) = self.build_retry.get(&provider) else {
+            return;
+        };
+        let failures = retry.backoff.attempts;
+        let error = &retry.fault;
         if failures >= BUILD_RETRY_WARN_AT {
             // This set's backoff holds the provider to one build per
             // `BUILD_RETRY_CAP`, so this line repeats at most once per 30 s
@@ -687,28 +691,45 @@ impl<'p, P: SourceProvider> SourceSet<'p, P> {
         }
     }
 
-    /// The error a fetch over this set ends with when `gave_up` fires. A
-    /// provider whose lane build failed at least [`BUILD_RETRY_WARN_AT`]
-    /// times in a row, with no lane built since, has a persistent fault: the
-    /// give-up carries the build fault of the provider with the most failures
-    /// as [`LastBuildFault`] context, so it names what kept failing. A tie
-    /// goes to the provider that failed last. A
-    /// `downcast_ref::<GaveUp>()` still finds the give-up beneath it.
+    /// The error a fetch over this set ends with when `gave_up` fires.
+    ///
+    /// A persistent build fault explains the stall only while no lane can
+    /// serve. So when every built lane's provider left this blob (declined
+    /// or absent), and a provider still in the set failed its lane build at
+    /// least [`BUILD_RETRY_WARN_AT`] times in a row with no lane built
+    /// since, the give-up carries the build fault of such a provider with
+    /// the most failures as [`LastBuildFault`] context. A tie goes to the
+    /// provider that failed last. The context's text ends with the give-up's
+    /// own, so a plain `{}` of the error still says the fetch stopped and a
+    /// rerun resumes. A `downcast_ref::<GaveUp>()` still finds the give-up
+    /// beneath it.
     pub(crate) fn give_up(&self, gave_up: crate::GaveUp) -> anyhow::Error {
         let err = anyhow::Error::new(gave_up);
+        if self.lanes.keys().any(|&provider| !self.left(provider)) {
+            return err;
+        }
         let persistent = self
             .build_retry
             .iter()
-            .filter(|(_, b)| b.backoff.attempts >= BUILD_RETRY_WARN_AT)
+            .filter(|&(&provider, b)| {
+                b.backoff.attempts >= BUILD_RETRY_WARN_AT && !self.left(provider)
+            })
             .max_by_key(|(_, b)| (b.backoff.attempts, b.backoff.next_at));
         match persistent {
             Some((&provider, b)) => err.context(LastBuildFault {
                 provider,
                 failures: b.backoff.attempts,
                 fault: b.fault.clone(),
+                gave_up,
             }),
             None => err,
         }
+    }
+
+    /// Whether `provider` left this blob for this set: it declined the
+    /// fetch or answered `NotFound` until marked absent.
+    fn left(&self, provider: Address) -> bool {
+        self.declined.contains(&provider) || self.absent.contains(&provider)
     }
 
     /// Hold `provider`'s built lane back until `until`: it found no free

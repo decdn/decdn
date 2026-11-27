@@ -225,7 +225,7 @@ where
                         if let Fault::Fatal(_) = classify(&err) {
                             return Err(err);
                         }
-                        sources.log_build_fault(provider, &err);
+                        sources.log_build_fault(provider);
                     }
                 }
             }

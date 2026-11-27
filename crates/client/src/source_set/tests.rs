@@ -11,6 +11,7 @@ use tokio::time::{Duration, Instant};
 
 const A: Address = Address::repeat_byte(0xA1);
 const B: Address = Address::repeat_byte(0xB2);
+const C: Address = Address::repeat_byte(0xC3);
 
 /// A `tracing_subscriber::fmt` writer that keeps every line it is handed.
 #[derive(Clone, Default)]
@@ -311,8 +312,11 @@ async fn a_lane_build_logs_warn_once_its_backoff_reaches_the_cap() -> anyhow::Re
         .finish();
     let fail = |set: &mut SourceSet<'_, FakeProvider>| {
         let now = Instant::now();
-        if let Err(err) = set.lane_built(A, Err(anyhow::anyhow!("rpc timed out")), now) {
-            set.log_build_fault(A, &err);
+        if set
+            .lane_built(A, Err(anyhow::anyhow!("rpc timed out")), now)
+            .is_err()
+        {
+            set.log_build_fault(A);
         }
     };
     tracing::subscriber::with_default(subscriber, || -> anyhow::Result<()> {
@@ -393,6 +397,17 @@ async fn a_give_up_names_a_persistent_build_fault_and_stays_a_gave_up() -> anyho
     );
     assert!(text.contains("no progress for 10m"), "{text}");
     assert!(!text.contains("secret"), "the RPC URL is stripped: {text}");
+    let plain = err.to_string();
+    assert!(
+        plain.contains("error sending request") && plain.ends_with(&gave_up().to_string()),
+        "the outermost layer alone still says the fetch stopped: {plain}"
+    );
+    let chain = decdn_common::redact::sanitize_err_chain(&err);
+    assert_eq!(
+        chain.matches("no progress").count(),
+        1,
+        "the logged chain names the give-up once: {chain}"
+    );
 
     set.lane_built(A, candidate(), Instant::now())?;
     let err = set.give_up(gave_up());
@@ -414,11 +429,11 @@ async fn a_give_up_does_not_name_a_build_fault_below_the_threshold() {
     assert_eq!(err.chain().count(), 1);
 }
 
-/// Each provider keeps its own build fault. Another provider's lane that
-/// builds, or that fails less often, does not hide a persistent fault: the
-/// give-up names the provider with the most failures in a row.
+/// Each provider keeps its own build fault. Another provider that fails
+/// less often does not hide a persistent fault: the give-up names the
+/// provider with the most failures in a row.
 #[tokio::test(start_paused = true)]
-async fn a_give_up_names_the_provider_with_the_most_build_failures() -> anyhow::Result<()> {
+async fn a_give_up_names_the_provider_with_the_most_build_failures() {
     let p = provider(vec![]);
     let mut set = SourceSet::new(
         &p,
@@ -429,11 +444,54 @@ async fn a_give_up_names_the_provider_with_the_most_build_failures() -> anyhow::
     let warn_at = super::BUILD_RETRY_WARN_AT;
     fail_builds(&mut set, A, warn_at, "rpc timed out");
     fail_builds(&mut set, B, 1, "nonce too low");
-    assert_eq!(named(&set.give_up(gave_up())), Some((A, warn_at)));
-    set.lane_built(B, candidate(), Instant::now())?;
     let err = set.give_up(gave_up());
     assert_eq!(named(&err), Some((A, warn_at)));
     assert!(format!("{err:#}").contains("rpc timed out"), "{err:#}");
+}
+
+/// A build fault explains a stall only while no lane can serve. Once
+/// another provider holds a built lane, the stall is that lane's, so a
+/// give-up names no build fault, however often the other builds failed.
+#[tokio::test(start_paused = true)]
+async fn a_give_up_names_no_build_fault_while_a_lane_is_built() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0)],
+    );
+    fail_builds(&mut set, A, super::BUILD_RETRY_WARN_AT, "rpc timed out");
+    set.lane_built(B, candidate(), Instant::now())?;
+    let err = set.give_up(gave_up());
+    assert_eq!(named(&err), None);
+    assert_eq!(err.chain().count(), 1);
+    Ok(())
+}
+
+/// A provider that left the blob (declined it) no longer explains the
+/// stall: a give-up names the persistent fault of a provider still in the
+/// set, and nothing once none is. A lane built by a provider that left does
+/// not count as one that can serve.
+#[tokio::test(start_paused = true)]
+async fn a_give_up_does_not_name_a_provider_that_left() -> anyhow::Result<()> {
+    let p = provider(vec![]);
+    let mut set = SourceSet::new(
+        &p,
+        [0; 32],
+        Arc::default(),
+        vec![holder(A, 10.0), holder(B, 20.0), holder(C, 30.0)],
+    );
+    let warn_at = super::BUILD_RETRY_WARN_AT;
+    fail_builds(&mut set, A, warn_at, "rpc timed out");
+    fail_builds(&mut set, B, warn_at + 1, "nonce too low");
+    set.lane_built(C, candidate(), Instant::now())?;
+    set.record_declined(C, super::DeclineReason::Refused, None);
+    assert_eq!(named(&set.give_up(gave_up())), Some((B, warn_at + 1)));
+    set.record_declined(B, super::DeclineReason::Refused, None);
+    assert_eq!(named(&set.give_up(gave_up())), Some((A, warn_at)));
+    set.record_declined(A, super::DeclineReason::Refused, None);
+    assert_eq!(named(&set.give_up(gave_up())), None);
     Ok(())
 }
 
