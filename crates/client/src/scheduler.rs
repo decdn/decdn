@@ -3919,7 +3919,7 @@ where
                                     }
                                     return Err(err);
                                 }
-                                tracing::debug!(%provider, error = %decdn_common::redact::sanitize_err_chain(&err), "lane build failed");
+                                sources.log_build_fault(provider);
                             }
                         }
                     }
@@ -3976,7 +3976,7 @@ where
                     }
                 }
                 gave_up = env.stop.expired() => {
-                    return Err(anyhow::Error::new(gave_up));
+                    return Err(sources.give_up(gave_up));
                 }
                 halted = env.stop.halted() => {
                     return Err(anyhow::Error::new(halted));

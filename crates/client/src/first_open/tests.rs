@@ -279,6 +279,61 @@ async fn it_gives_up_after_the_limit_without_an_answer() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A holder whose lane build always fails with a chain-side error.
+struct FailingBuilds;
+
+impl crate::SourceProvider for FailingBuilds {
+    type Source = ScriptedSource;
+
+    fn discover(&self, _hash: [u8; 32]) -> crate::SourceFuture<'_, Vec<crate::Holder>> {
+        Box::pin(async { Ok(vec![failing_holder()]) })
+    }
+
+    fn connect<'a>(
+        &'a self,
+        _holder: &'a crate::Holder,
+        _ended: &'a tokio_util::sync::CancellationToken,
+    ) -> crate::SourceFuture<'a, StreamCandidate<ScriptedSource>> {
+        Box::pin(async { anyhow::bail!("rpc timed out") })
+    }
+}
+
+fn failing_holder() -> crate::Holder {
+    crate::Holder {
+        provider: A,
+        coverage: None,
+        rtt_ms: 10.0,
+        discovered_holder: true,
+    }
+}
+
+/// An open whose lane build keeps failing gives up with the last build
+/// fault as context: the give-up names what kept failing, and it still
+/// downcasts to the same [`GaveUp`] (#2371).
+#[tokio::test(start_paused = true)]
+async fn a_give_up_while_builds_fail_names_the_last_build_fault() -> anyhow::Result<()> {
+    let sources = FailingBuilds;
+    let mut set = SourceSet::new(&sources, [0; 32], Arc::default(), vec![failing_holder()]);
+    let limit = Duration::from_mins(3);
+    let err = open_first(&mut set, &policy(Some(limit)), |_lane| async { Ok(()) })
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("a build that always fails must give up"))?;
+    assert_eq!(err.downcast_ref::<GaveUp>(), Some(&GaveUp { idle: limit }));
+    let last = err
+        .downcast_ref::<crate::fault::LastBuildFault>()
+        .ok_or_else(|| anyhow::anyhow!("the give-up names the build fault: {err:#}"))?;
+    assert_eq!(last.provider, A);
+    assert!(
+        last.failures >= crate::source_set::BUILD_RETRY_WARN_AT,
+        "{last:?}"
+    );
+    let text = format!("{err:#}");
+    assert!(text.contains("rpc timed out"), "{text}");
+    assert!(text.contains("no progress for 3m"), "{text}");
+    Ok(())
+}
+
 fn unfunded() -> anyhow::Error {
     anyhow::Error::new(UpstreamRefused::mid_stream(StreamError::Unfunded))
 }
