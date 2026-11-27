@@ -108,8 +108,9 @@ declare -A DOCKERHUB_IMAGE=(
 # The files a GPG signature covers. SHA256SUMS transitively covers every
 # archive, so the archives carry no individual .asc. Each archive does carry a
 # .minisig, for `cargo binstall`, which never reads SHA256SUMS (see ARCHIVES
-# below).
-SIGN_TARGETS=( "SHA256SUMS" )
+# below). source-commit.txt names the commit the release run built, and its
+# signature binds every other signed file to that commit.
+SIGN_TARGETS=( "SHA256SUMS" "source-commit.txt" )
 for img in "${IMAGES[@]}"; do
   SIGN_TARGETS+=( "${img}-image-digest.txt" "${img}-${VERSION}-sbom.spdx.json" )
 done
@@ -450,9 +451,24 @@ for f in "${SIGN_TARGETS[@]}"; do
   [[ -f "$f" ]] || die "expected asset $f is missing from the draft.
 The release workflow's \`attach\` job uploads each *-image-digest.txt and
 *-sbom.spdx.json, after \`Docker image (<stage>)\` pushes the image and
-\`SBOM (<stage>)\` scans it; \`upload-assets\` uploads SHA256SUMS. Re-run the
-failed jobs, then retry."
+\`SBOM (<stage>)\` scans it; \`upload-assets\` uploads SHA256SUMS and
+source-commit.txt. Re-run the failed jobs, then retry."
 done
+
+# The release run writes the commit it built into source-commit.txt. The tag
+# checks above prove which commit $TAG names now, not which commit the draft's
+# assets came from: a tag moved after its run filled the draft passes them
+# while the assets are still the old commit's. One line, equal to the tag's
+# commit, or nothing is signed.
+echo "==> Checking the draft was built from $TAG ($LOCAL_TAG)"
+[[ $(grep -c '' source-commit.txt) -le 1 ]] ||
+  die "source-commit.txt has more than one line"
+SOURCE_COMMIT=$(tr -d '\r' < source-commit.txt | head -n1)
+[[ "$SOURCE_COMMIT" == "$LOCAL_TAG" ]] || die \
+  "the draft was built from '$SOURCE_COMMIT', but $TAG names $LOCAL_TAG.
+Signing now would vouch for another commit's artifacts under $TAG. If $TAG was
+moved, wait for the release run it queued to replace the draft's assets, then
+retry."
 
 # --strict, because without it a malformed line is only a warning: a truncated
 # or mangled entry would scroll past amid a wall of OK lines and that archive

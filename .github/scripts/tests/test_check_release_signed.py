@@ -27,10 +27,13 @@ pytestmark = pytest.mark.skipif(
 
 TAR = "decdn-0.0.0-x86_64-unknown-linux-gnu.tar.gz"
 ZIP = "decdn-0.0.0-x86_64-pc-windows-msvc.zip"
+COMMIT = "a" * 40
 SIGNED = [
     "SHA256SUMS",
     "SHA256SUMS.asc",
     "SHA256SUMS.minisig",
+    "source-commit.txt",
+    "source-commit.txt.asc",
     TAR,
     f"{TAR}.minisig",
     ZIP,
@@ -75,6 +78,7 @@ class Release:
         self.files = root / "files"
         self.files.mkdir()
         (self.files / "SHA256SUMS").write_text(f"{'0' * 64}  {TAR}\n{'0' * 64}  {ZIP}\n")
+        (self.files / "source-commit.txt").write_text(f"{COMMIT}\n")
 
     def env(self, **extra: str) -> dict[str, str]:
         env = {k: v for k, v in os.environ.items() if not k.startswith(("GH_", "GNUPG"))}
@@ -123,16 +127,20 @@ class Release:
         return keys
 
     def sign_sums(self, uid: str, *gpg_args: str) -> None:
-        asc = self.files / "SHA256SUMS.asc"
-        asc.unlink(missing_ok=True)
-        self.gpg(
-            *gpg_args, "--local-user", uid, "--armor", "--detach-sign",
-            "--output", str(asc), str(self.files / "SHA256SUMS"),
-        )
+        """Signs SHA256SUMS and source-commit.txt, as sign-release.sh does."""
+        for name in ("SHA256SUMS", "source-commit.txt"):
+            asc = self.files / f"{name}.asc"
+            asc.unlink(missing_ok=True)
+            self.gpg(
+                *gpg_args, "--local-user", uid, "--armor", "--detach-sign",
+                "--output", str(asc), str(self.files / name),
+            )
 
-    def check(self, keys: Path, assets: list[str], **env: str) -> subprocess.CompletedProcess[str]:
+    def check(
+        self, keys: Path, assets: list[str], commit: str = COMMIT, **env: str
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(SCRIPT), "v0.0.0", str(keys)],
+            ["bash", str(SCRIPT), "v0.0.0", str(keys), commit],
             env=self.env(GH_ASSETS="\n".join(assets), **env),
             capture_output=True,
             text=True,
@@ -189,7 +197,16 @@ def test_a_manifest_signed_by_a_key_outside_keys_is_refused(release):
     assert "not a good signature by a live key in KEYS" in result.stderr, output(result)
 
 
-@pytest.mark.parametrize("missing", ["SHA256SUMS", "SHA256SUMS.asc", "SHA256SUMS.minisig"])
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "SHA256SUMS",
+        "SHA256SUMS.asc",
+        "SHA256SUMS.minisig",
+        "source-commit.txt",
+        "source-commit.txt.asc",
+    ],
+)
 def test_a_missing_manifest_signature_is_refused(release, missing):
     keys = release.publish_keys("me@decdn.org")
     release.sign_sums("me@decdn.org")
@@ -256,6 +273,44 @@ def test_a_tampered_manifest_is_refused(release):
 
     assert result.returncode != 0
     assert "not a good signature by a live key in KEYS" in result.stderr, output(result)
+
+
+def test_a_release_built_from_another_commit_is_refused(release):
+    keys = release.publish_keys("me@decdn.org")
+    release.sign_sums("me@decdn.org")
+
+    result = release.check(keys, SIGNED, commit="b" * 40)
+
+    assert result.returncode != 0
+    assert f"signed as built from '{COMMIT}', but v0.0.0 names {'b' * 40}" in (
+        result.stderr
+    ), output(result)
+
+
+def test_a_tampered_source_commit_is_refused(release):
+    keys = release.publish_keys("me@decdn.org")
+    release.sign_sums("me@decdn.org")
+    (release.files / "source-commit.txt").write_text(f"{'b' * 40}\n")
+
+    result = release.check(keys, SIGNED, commit="b" * 40)
+
+    assert result.returncode != 0
+    assert "source-commit.txt.asc on release v0.0.0 is not a good signature" in (
+        result.stderr
+    ), output(result)
+
+
+def test_a_source_commit_with_a_second_line_is_refused(release):
+    (release.files / "source-commit.txt").write_text(f"{COMMIT}\n{'b' * 40}\n")
+    keys = release.publish_keys("me@decdn.org")
+    release.sign_sums("me@decdn.org")
+
+    result = release.check(keys, SIGNED)
+
+    assert result.returncode != 0
+    assert "source-commit.txt of release v0.0.0 has more than one line" in result.stderr, output(
+        result
+    )
 
 
 @pytest.mark.parametrize(

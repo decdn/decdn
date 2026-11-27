@@ -195,7 +195,8 @@ write with `.github/scripts/check-workflow-hardening.sh`. The workflow:
    Linux targets) with `--locked`, one job per target, failing a Linux target
    whose binaries need glibc newer than the 2.31 floor
    ([ADR 000](adr/000-language.md)). Once verification passes it uploads them
-   with a `SHA256SUMS` manifest, asserting all fifteen are present;
+   with a `SHA256SUMS` manifest, asserting all fifteen are present, and a
+   `source-commit.txt` naming the commit the run built;
 7. once the archives are uploaded, assembles four multi-arch images from the
    same Linux archives — `decdn-node` (the daemon, with the `decdn` CLI beside
    it), `decdn` (the CLI only), `sponsord` and `sponsord-onramp` (one server
@@ -227,14 +228,17 @@ refused, not guessed between — and confirms `KEYS` publishes it and does not
 mark it revoked or expired; force-fetches tags and checks your local tag matches `origin`'s;
 verifies the tag signature; downloads the draft's assets; checks `SHA256SUMS`
 strictly against them **and** that every published archive appears in the
-manifest; signs `SHA256SUMS` and each image's digest file and SBOM; verifies
+manifest; checks that the draft's `source-commit.txt`, which the release run
+writes, names the commit the tag names, so a tag moved after its run filled the
+draft stops here; signs `SHA256SUMS`, `source-commit.txt` and each image's
+digest file and SBOM; verifies
 each signature against a keyring built only from `KEYS`; signs `SHA256SUMS` a
 second time with minisign and verifies that against the
 `crates/cli/minisign-*.pub` in the tag's tree, the maintainers' keys the
 released binary embeds; in the same minisign run (one password prompt) signs
 every archive for `cargo binstall` and verifies each `<archive>.minisig` against
 the `pubkey` the crates name at the tag, and that its signed trusted comment
-names that archive; uploads the nine `.asc` files,
+names that archive; uploads the ten `.asc` files,
 `SHA256SUMS.minisig` and the archives' `.minisig` files; promotes `:latest`, `:<version>` and `:<major>.<minor>` from each
 signed digest on GHCR; mirrors those same digests to Docker Hub; for a stable
 release, pushes each Docker Hub overview; checks that every promoted repository
@@ -432,7 +436,9 @@ The `prepare` job uploads nothing. It:
    tag's signature against `KEYS` **from `main`**, as `release.yml` does;
 2. runs `.github/scripts/check-release-signed.sh`. The release must be out of
    draft. `SHA256SUMS.asc` must be a good signature, against that same `KEYS`,
-   by a key that has neither expired nor been revoked. Every archive
+   by a key that has neither expired nor been revoked, and so must
+   `source-commit.txt.asc`, over a `source-commit.txt` that names the commit
+   the tag names. Every archive
    `SHA256SUMS` names must carry this version, and must be attached with its
    `.minisig`, as must `SHA256SUMS.minisig`. Leaving draft does not by itself
    prove anything was signed, so `SHA256SUMS.asc` is verified again;

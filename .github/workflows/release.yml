@@ -759,6 +759,15 @@ jobs:
           sha256sum -- "${archives[@]#./}" > SHA256SUMS
           cat SHA256SUMS
 
+      # The commit every job of this run built. A tag can move after the run
+      # fills the draft, so the tag alone does not say which commit the assets
+      # came from. sign-release.sh refuses unless this equals the commit the
+      # tag names when it signs, then signs this file too.
+      - name: Record the source commit
+        working-directory: artifacts
+        shell: bash
+        run: printf '%s\n' "$GITHUB_SHA" > source-commit.txt
+
       # A re-run of this job after the release is published must not replace
       # assets a maintainer has signed.
       - name: Upload to draft release
