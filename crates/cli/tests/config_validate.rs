@@ -355,6 +355,7 @@ fn sample_resolved(overrides: impl FnOnce(&mut ResolvedConfig)) -> ResolvedConfi
                 rpc_url: "https://payment.example/SECRET_TOKEN_def456".to_string(),
                 chain_id: 84_532,
                 payment_pools: vec![alloy::primitives::Address::with_last_byte(1)],
+                admit_reads: decdn_common::config::AdmitReadRates::default(),
             }],
             cctp_sweep_receiver_address: None,
             capacity_bond_address: "0x0000000000000000000000000000000000000002".to_string(),

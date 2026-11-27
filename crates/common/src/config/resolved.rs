@@ -181,6 +181,36 @@ pub struct ResolvedPaymentChain {
     /// The accepted `PaymentPool` contracts on this chain, in configured
     /// order, none twice.
     pub payment_pools: Vec<alloy::primitives::Address>,
+    /// The token buckets on admission chain reads against this chain's
+    /// `rpc_url`, shared by every pool listed here.
+    pub admit_reads: AdmitReadRates,
+}
+
+/// Token-bucket rates on admission chain reads (`getPool`,
+/// `getAuthorization`) against one payment chain's RPC endpoint (#2770). The
+/// node charges each read to the requesting peer's bucket, then to the
+/// chain-wide one. Every field is at least 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmitReadRates {
+    /// Chain-wide sustained reads per second.
+    pub per_sec: u32,
+    /// Chain-wide burst.
+    pub burst: u32,
+    /// Sustained reads per second for one requesting peer.
+    pub per_peer_per_sec: u32,
+    /// Burst for one requesting peer.
+    pub burst_per_peer: u32,
+}
+
+impl Default for AdmitReadRates {
+    fn default() -> Self {
+        Self {
+            per_sec: super::DEFAULT_ADMIT_READS_PER_SEC,
+            burst: super::DEFAULT_ADMIT_READ_BURST,
+            per_peer_per_sec: super::DEFAULT_ADMIT_READS_PER_PEER_PER_SEC,
+            burst_per_peer: super::DEFAULT_ADMIT_READ_BURST_PER_PEER,
+        }
+    }
 }
 
 /// Resolved cache fields.

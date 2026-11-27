@@ -20,10 +20,10 @@ use crate::redact::redact_userinfo;
 
 pub use errors::{ConfigDiagnostics, ConfigNotice, ConfigNoticeLevel};
 pub use resolved::{
-    LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig, ResolvedContent,
-    ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity, ResolvedLoadShed,
-    ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment, ResolvedPaymentChain,
-    ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServe,
+    AdmitReadRates, LoadShedPolicyKind, ResolvedBlockchain, ResolvedCache, ResolvedConfig,
+    ResolvedContent, ResolvedDht, ResolvedDiscovery, ResolvedDiscoveryPeer, ResolvedIdentity,
+    ResolvedLoadShed, ResolvedNetwork, ResolvedObservability, ResolvedOrigin, ResolvedPayment,
+    ResolvedPaymentChain, ResolvedS3Config, ResolvedS3Credentials, ResolvedSecurity, ResolvedServe,
     ResolvedServeEconomics, ResolvedTinyLfu,
 };
 pub use types::FileConfig;
@@ -400,6 +400,25 @@ pub const DEFAULT_CONTENT_BLACKLIST_POLL_INTERVAL_SEC: u64 = 300;
 /// stops serving well before an outage-hidden takedown takes effect, while
 /// short RPC blips never take the node dark.
 pub const DEFAULT_CHAIN_STALENESS_GRACE_SEC: u64 = 1800;
+
+/// Default chain-wide admission chain reads per second on one payment chain
+/// (#2770). Generous on purpose: it caps a flood of fresh pools or signers
+/// far below the hundreds of `eth_call`s a second the read slots alone allow,
+/// and an operator on a tighter RPC quota lowers it per chain.
+pub const DEFAULT_ADMIT_READS_PER_SEC: u32 = 20;
+
+/// Default chain-wide admission read burst: two seconds at the default rate,
+/// so a spike of honest first requests is not refused.
+pub const DEFAULT_ADMIT_READ_BURST: u32 = 40;
+
+/// Default admission chain reads per second one requesting peer may cause.
+/// An honest first request costs at most two reads (`getPool` and
+/// `getAuthorization`), so this admits one such request a second.
+pub const DEFAULT_ADMIT_READS_PER_PEER_PER_SEC: u32 = 2;
+
+/// Default admission read burst for one requesting peer: four first
+/// requests at once.
+pub const DEFAULT_ADMIT_READ_BURST_PER_PEER: u32 = 8;
 
 /// Default providers a node-to-node cache-miss pull opens a voucher-less
 /// discovery stream on before ranking (#831). Five is enough to find a
@@ -1157,6 +1176,46 @@ fn resolve_rpc_url(
     }
 }
 
+/// Resolve the admission read rates of payment chain entry `i`: each field
+/// takes its default when absent and must be at least 1. Problems record
+/// under `blockchain.payment_chains[i].<field>`.
+fn resolve_admit_reads(
+    i: usize,
+    entry: &types::PaymentChainConfig,
+    bag: &mut ConfigDiagnostics,
+) -> AdmitReadRates {
+    let mut rate = |field: &str, value: Option<u32>, default: u32| -> u32 {
+        let value = value.unwrap_or(default);
+        let path = format!("blockchain.payment_chains[{i}].{field}");
+        bag.check_with(value >= 1, path.as_str(), || {
+            format!("{path} must be at least 1")
+        });
+        value.max(1)
+    };
+    AdmitReadRates {
+        per_sec: rate(
+            "admit_reads_per_sec",
+            entry.admit_reads_per_sec,
+            DEFAULT_ADMIT_READS_PER_SEC,
+        ),
+        burst: rate(
+            "admit_read_burst",
+            entry.admit_read_burst,
+            DEFAULT_ADMIT_READ_BURST,
+        ),
+        per_peer_per_sec: rate(
+            "admit_reads_per_peer_per_sec",
+            entry.admit_reads_per_peer_per_sec,
+            DEFAULT_ADMIT_READS_PER_PEER_PER_SEC,
+        ),
+        burst_per_peer: rate(
+            "admit_read_burst_per_peer",
+            entry.admit_read_burst_per_peer,
+            DEFAULT_ADMIT_READ_BURST_PER_PEER,
+        ),
+    }
+}
+
 /// Resolve the `[[blockchain.payment_chains]]` entries. At least one entry;
 /// each names an http(s) `rpc_url`, a nonzero `chain_id` no other entry
 /// names, and at least one nonzero, checksummed `PaymentPool` address no
@@ -1238,6 +1297,7 @@ fn resolve_payment_chains(
             rpc_url,
             chain_id,
             payment_pools,
+            admit_reads: resolve_admit_reads(i, entry, bag),
         });
     }
     // Every stream answer lists the pools a node accepts, and a receiver keeps

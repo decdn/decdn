@@ -691,6 +691,7 @@ async fn run_e2e() -> anyhow::Result<()> {
     let pool_view = Arc::new(decdn_node::payment_settlement::ResolvingPoolView::new(
         PaymentPool::new(payment_pool, node_provider.clone()),
         decdn_node::pool_view::PoolProjection::new(),
+        Arc::default(),
         Arc::clone(&metrics),
     ));
     let handler = {

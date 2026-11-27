@@ -227,9 +227,12 @@ impl ClientHandler {
     /// Returns what they read, or the refusal.
     ///
     /// With no pool view wired for `deployment` (dev/test) the pool gates pass
-    /// and no lane registers from a capability.
+    /// and no lane registers from a capability. A chain read the gates make is
+    /// charged to `peer`, the requester.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn funding_gates(
         &self,
+        peer: &PublicKey,
         req: &StreamRequest,
         ext: &StreamRequestExt,
         deployment: Deployment,
@@ -246,7 +249,7 @@ impl ClientHandler {
         // faulted, so the node refuses rather than serve a pool it cannot
         // confirm.
         let pool_status = match pool_view {
-            Some(view) => view.status(pool_id).await,
+            Some(view) => view.admit_status(pool_id, peer).await,
             None => None,
         };
         if pool_view.is_some() && pool_status.is_none() {
@@ -259,7 +262,7 @@ impl ClientHandler {
         // cap.
         if let (Some(view), Some(signer)) = (pool_view, verified_client) {
             let floor_micro = decdn_incentive::min_payment(CHUNK_BYTES, rate_per_mb);
-            let auth = view.signer_authorization(pool_id, signer).await;
+            let auth = view.admit_signer_authorization(pool_id, signer, peer).await;
             let now = self.coarse_clock.unix_seconds();
             if let Some(reason) = super::dispatch::signer_refusal(auth, floor_micro, now) {
                 return Err(reason);
@@ -381,6 +384,7 @@ impl ClientHandler {
         };
         let funding = self
             .funding_gates(
+                &adm.peer,
                 &adm.req,
                 &adm.ext,
                 adm.deployment,

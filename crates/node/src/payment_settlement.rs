@@ -67,6 +67,8 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -75,12 +77,16 @@ use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use anyhow::{Context, Result};
-use decdn_common::config::{REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs};
+use decdn_common::config::{
+    AdmitReadRates, REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs,
+};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
 use decdn_incentive::{Deployment, LaneKey, LaneState, PoolId, PoolStateStore, SettlementLedger};
 use futures_util::StreamExt as _;
+use governor::{DefaultDirectRateLimiter, DefaultKeyedRateLimiter, Quota};
+use iroh::PublicKey;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -94,6 +100,7 @@ use crate::handlers::client::ClientHandler;
 use crate::metrics::Metrics;
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
 use crate::pool_view::{Lifecycle, POOL_REFRESH_INTERVAL, PoolProjection, PoolStatus};
+use crate::prune_guard::PruneGuard;
 use crate::settlement_ledger::SettlementRecorder;
 use decdn_incentive::payment_pool::SignerAuthorization;
 
@@ -170,6 +177,110 @@ const ADMIT_CHAIN_READ_CONCURRENCY: usize = 16;
 /// so it is not negative-cached: the next request reads again. Shorter than
 /// the 10 s read timeout, so a refused request waits less than one read could.
 const ADMIT_CHAIN_READ_SLOT_WAIT: Duration = Duration::from_secs(5);
+
+/// How many peers the per-peer read bucket tracks before an over-cap read
+/// prunes the buckets that have refilled. A refilled bucket is the same as a
+/// new one, so the prune changes no answer.
+const ADMIT_READ_TRACKED_PEERS_MAX: usize = 4096;
+
+/// `n` as a [`NonZeroU32`], or `1` for `0`. The resolver already rejects `0`.
+const fn nonzero(n: u32) -> NonZeroU32 {
+    match NonZeroU32::new(n) {
+        Some(n) => n,
+        None => NonZeroU32::MIN,
+    }
+}
+
+/// Token buckets on admit-path chain reads against one payment chain's RPC
+/// endpoint (#2770): one per requesting peer and one chain-wide, at the rates
+/// of that chain's `[[blockchain.payment_chains]]` entry. Every pool on the
+/// chain shares one budget. The slot cap (`ADMIT_CHAIN_READ_CONCURRENCY`)
+/// bounds reads in flight; these buckets bound reads per second, which is what
+/// an RPC quota counts. The peer bucket is charged first, so a read one peer's
+/// bucket refuses spends nothing of the chain-wide one.
+pub struct AdmitReadBudget {
+    /// The chain-wide bucket.
+    global: DefaultDirectRateLimiter,
+    /// One bucket per requesting peer. Bounded by
+    /// [`ADMIT_READ_TRACKED_PEERS_MAX`] and the prune in [`Self::charge`].
+    per_peer: DefaultKeyedRateLimiter<PublicKey>,
+    /// Single-flight flag for the per-peer prune.
+    pruning: AtomicBool,
+}
+
+impl std::fmt::Debug for AdmitReadBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmitReadBudget")
+            .field("tracked_peers", &self.per_peer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for AdmitReadBudget {
+    /// A budget at the default rates of a payment chain entry.
+    fn default() -> Self {
+        Self::from_rates(&AdmitReadRates::default())
+    }
+}
+
+impl AdmitReadBudget {
+    /// A budget at `rates`, one payment chain's resolved read rates.
+    #[must_use]
+    pub fn from_rates(rates: &AdmitReadRates) -> Self {
+        Self::with_quotas(
+            Quota::per_second(nonzero(rates.per_sec)).allow_burst(nonzero(rates.burst)),
+            Quota::per_second(nonzero(rates.per_peer_per_sec))
+                .allow_burst(nonzero(rates.burst_per_peer)),
+        )
+    }
+
+    fn with_quotas(global: Quota, per_peer: Quota) -> Self {
+        Self {
+            global: governor::RateLimiter::direct(global),
+            per_peer: governor::RateLimiter::keyed(per_peer),
+            pruning: AtomicBool::new(false),
+        }
+    }
+
+    /// Charge one read to `requester` (when known) and to the chain-wide
+    /// bucket. Returns `false`, and counts the refusal on the layer that
+    /// refused, when either bucket is empty.
+    fn charge(&self, requester: Option<&PublicKey>, metrics: &Metrics) -> bool {
+        if let Some(peer) = requester {
+            let admitted = self.per_peer.check_key(peer).is_ok();
+            self.prune_peers();
+            if !admitted {
+                metrics.serve_admit_read_rate_limited_per_peer();
+                return false;
+            }
+        }
+        if self.global.check().is_err() {
+            metrics.serve_admit_read_rate_limited_global();
+            return false;
+        }
+        true
+    }
+
+    /// Drop the refilled peer buckets once the map passes
+    /// [`ADMIT_READ_TRACKED_PEERS_MAX`]. One caller sweeps at a time.
+    fn prune_peers(&self) {
+        if self.per_peer.len() > ADMIT_READ_TRACKED_PEERS_MAX
+            && self
+                .pruning
+                .compare_exchange(
+                    false,
+                    true,
+                    AtomicOrdering::Acquire,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_ok()
+        {
+            let _guard = PruneGuard(&self.pruning);
+            self.per_peer.retain_recent();
+            self.per_peer.shrink_to_fit();
+        }
+    }
+}
 
 /// Minimum gap between `warn!` lines for a failed admit-path chain read. A
 /// remote peer drives one read per fresh pool id or signer, so a failing
@@ -828,9 +939,12 @@ impl ClosedPools {
 /// keeps the answer for [`POOL_REFRESH_INTERVAL`] (see `AuthRead`). Those reads
 /// are coalesced per pair the same way.
 ///
-/// Every read, of either kind, first takes one of
-/// `ADMIT_CHAIN_READ_CONCURRENCY` node-wide slots; a request that finds none
-/// within `ADMIT_CHAIN_READ_SLOT_WAIT` is refused and nothing is cached.
+/// Every read, of either kind, is first charged to the requesting peer's
+/// token bucket and the chain-wide one ([`AdmitReadBudget`]), then takes one of
+/// `ADMIT_CHAIN_READ_CONCURRENCY` node-wide slots. A request that finds a
+/// bucket empty, or no slot within `ADMIT_CHAIN_READ_SLOT_WAIT`, is refused
+/// and nothing is cached. A request that waits on another request's read is
+/// not charged.
 pub struct ResolvingPoolView<P: Provider + Clone> {
     /// The wallet/RPC-backed `PaymentPool` binding for the admit-path reads
     /// (`getPool`, `getAuthorization`).
@@ -857,6 +971,9 @@ pub struct ResolvingPoolView<P: Provider + Clone> {
     auth_inflight: InflightReads<(B256, Address), Option<SignerAuthorization>>,
     /// Slots for admit-path chain reads; see [`ADMIT_CHAIN_READ_CONCURRENCY`].
     chain_reads: tokio::sync::Semaphore,
+    /// Per-peer and chain-wide read rate, shared with every pool view on the
+    /// same payment chain; see [`AdmitReadBudget`].
+    read_budget: Arc<AdmitReadBudget>,
     /// Throttle for the `warn!` on a failed admit-path `getPool` or
     /// `getAuthorization`. One window for both: they share one remedy, the
     /// chain endpoint. Each fault also counts on `decdn_rpc_requests_total`.
@@ -876,11 +993,13 @@ impl<P: Provider + Clone> std::fmt::Debug for ResolvingPoolView<P> {
 
 impl<P: Provider + Clone> ResolvingPoolView<P> {
     /// Wrap `projection` with admit-path `getPool` and `getAuthorization`
-    /// reads against `contract`.
+    /// reads against `contract`, charged to `read_budget`, the budget of the
+    /// pool's payment chain.
     #[must_use]
     pub fn new(
         contract: PaymentPool::PaymentPoolInstance<P>,
         projection: PoolProjection,
+        read_budget: Arc<AdmitReadBudget>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -891,17 +1010,31 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
             auth_cache: Mutex::new(HashMap::new()),
             auth_inflight: Mutex::new(HashMap::new()),
             chain_reads: tokio::sync::Semaphore::new(ADMIT_CHAIN_READ_CONCURRENCY),
+            read_budget,
             read_fault_warn: WarnThrottle::new(ADMIT_READ_FAULT_WARN_INTERVAL),
             metrics,
         }
     }
 
-    /// A slot for one admit-path chain read, or `None` when none frees up
-    /// within [`ADMIT_CHAIN_READ_SLOT_WAIT`]. A wait that runs out counts on
+    /// Test seam: replace the read budget's quotas.
+    #[cfg(test)]
+    fn set_read_quotas(&mut self, global: Quota, per_peer: Quota) {
+        self.read_budget = Arc::new(AdmitReadBudget::with_quotas(global, per_peer));
+    }
+
+    /// A slot for one admit-path chain read on behalf of `requester`, or
+    /// `None` when the read budget refuses it or no slot frees up within
+    /// [`ADMIT_CHAIN_READ_SLOT_WAIT`]. A wait that runs out counts on
     /// `serve_admit_read_slot_timeouts`, so an operator can tell a busy node
     /// from pools that fail to resolve. The semaphore is never closed, so the
-    /// only `None` is a wait that ran out.
-    async fn read_slot(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    /// only other `None` is a wait that ran out.
+    async fn read_slot(
+        &self,
+        requester: Option<&PublicKey>,
+    ) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        if !self.read_budget.charge(requester, &self.metrics) {
+            return None;
+        }
         let slot = tokio::time::timeout(ADMIT_CHAIN_READ_SLOT_WAIT, self.chain_reads.acquire())
             .await
             .ok()
@@ -996,12 +1129,13 @@ impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     /// pool's read in the projection ([`PoolProjection::record_read`]), or
     /// negative-cache
     /// an absent / `Closed` pool as a [`NegativeReason::Verdict`] and a failed
-    /// read as a [`NegativeReason::Fault`]. A read that finds no admit-read slot
-    /// within [`ADMIT_CHAIN_READ_SLOT_WAIT`] caches nothing and answers `None`.
+    /// read as a [`NegativeReason::Fault`]. A read that `requester`'s budget
+    /// refuses, or that finds no admit-read slot within
+    /// [`ADMIT_CHAIN_READ_SLOT_WAIT`], caches nothing and answers `None`.
     /// The caller holds the pool's [`ReadSlot::Lead`].
-    async fn resolve(&self, pool_id: B256) -> Option<PoolStatus> {
-        let Some(_slot) = self.read_slot().await else {
-            debug!(%pool_id, "admit getPool: no read slot free; refusing without caching");
+    async fn resolve(&self, pool_id: B256, requester: Option<&PublicKey>) -> Option<PoolStatus> {
+        let Some(_slot) = self.read_slot(requester).await else {
+            debug!(%pool_id, "admit getPool: over the read budget or no read slot free; refusing without caching");
             return None;
         };
         // Bounded: the alloy HTTP provider sets no timeout of its own, so a hung
@@ -1059,9 +1193,14 @@ impl<P: Provider + Clone> ResolvingPoolView<P> {
     }
 }
 
-#[async_trait::async_trait]
-impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPoolView<P> {
-    async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
+impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
+    /// The admit `getPool` answer for `pool_id`, a read charged to
+    /// `requester` (or to the chain-wide bucket alone with no requester).
+    async fn status_charged(
+        &self,
+        pool_id: B256,
+        requester: Option<&PublicKey>,
+    ) -> Option<PoolStatus> {
         loop {
             // Fast path: a read younger than the refresh interval — no chain call.
             if let Some(status) = self.projection.fresh(pool_id) {
@@ -1086,7 +1225,7 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
             }
             match claim_read(&self.inflight, pool_id) {
                 ReadSlot::Lead(read) => {
-                    let status = self.resolve(pool_id).await;
+                    let status = self.resolve(pool_id, requester).await;
                     read.finish(status);
                     return status;
                 }
@@ -1100,6 +1239,54 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
                 }
             }
         }
+    }
+
+    /// The admit signer confirm for `(pool_id, signer)`, a read charged to
+    /// `requester` (or to the chain-wide bucket alone with no requester).
+    async fn authorization_charged(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        requester: Option<&PublicKey>,
+    ) -> Option<SignerAuthorization> {
+        match self.lookup_auth(pool_id, signer) {
+            CachedAuth::Fresh(auth) => {
+                self.metrics.serve_signer_auth_cached();
+                return Some(auth);
+            }
+            CachedAuth::Absent => self.metrics.serve_signer_auth_first_read(),
+            CachedAuth::Lapsed => self.metrics.serve_signer_auth_reread(),
+        }
+        loop {
+            match claim_read(&self.auth_inflight, (pool_id, signer)) {
+                ReadSlot::Lead(read) => {
+                    let auth = self.read_authorization(pool_id, signer, requester).await;
+                    read.finish(auth);
+                    return auth;
+                }
+                // A read that ends with no answer was cancelled: take the
+                // cache's answer if it landed one, else take the read over.
+                ReadSlot::Wait(mut done) => {
+                    if done.changed().await.is_ok() {
+                        return *done.borrow();
+                    }
+                    if let CachedAuth::Fresh(auth) = self.lookup_auth(pool_id, signer) {
+                        return Some(auth);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPoolView<P> {
+    async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
+        self.status_charged(pool_id, None).await
+    }
+
+    async fn admit_status(&self, pool_id: B256, requester: &PublicKey) -> Option<PoolStatus> {
+        self.status_charged(pool_id, Some(requester)).await
     }
 
     async fn cached_status(&self, pool_id: B256) -> Option<PoolStatus> {
@@ -1123,48 +1310,33 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
         pool_id: B256,
         signer: Address,
     ) -> Option<SignerAuthorization> {
-        match self.lookup_auth(pool_id, signer) {
-            CachedAuth::Fresh(auth) => {
-                self.metrics.serve_signer_auth_cached();
-                return Some(auth);
-            }
-            CachedAuth::Absent => self.metrics.serve_signer_auth_first_read(),
-            CachedAuth::Lapsed => self.metrics.serve_signer_auth_reread(),
-        }
-        loop {
-            match claim_read(&self.auth_inflight, (pool_id, signer)) {
-                ReadSlot::Lead(read) => {
-                    let auth = self.read_authorization(pool_id, signer).await;
-                    read.finish(auth);
-                    return auth;
-                }
-                // A read that ends with no answer was cancelled: take the
-                // cache's answer if it landed one, else take the read over.
-                ReadSlot::Wait(mut done) => {
-                    if done.changed().await.is_ok() {
-                        return *done.borrow();
-                    }
-                    if let CachedAuth::Fresh(auth) = self.lookup_auth(pool_id, signer) {
-                        return Some(auth);
-                    }
-                }
-            }
-        }
+        self.authorization_charged(pool_id, signer, None).await
+    }
+
+    async fn admit_signer_authorization(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        requester: &PublicKey,
+    ) -> Option<SignerAuthorization> {
+        self.authorization_charged(pool_id, signer, Some(requester))
+            .await
     }
 }
 
 impl<P: Provider + Clone + 'static> ResolvingPoolView<P> {
     /// Read `getAuthorization` for `(pool_id, signer)` and cache the answer. A
     /// fault (an error or a timeout) caches nothing and answers `None`, which
-    /// refuses the signer as unconfirmed. The caller holds the pair's
-    /// [`ReadSlot::Lead`].
+    /// refuses the signer as unconfirmed, as does a read that `requester`'s
+    /// budget refuses. The caller holds the pair's [`ReadSlot::Lead`].
     async fn read_authorization(
         &self,
         pool_id: B256,
         signer: Address,
+        requester: Option<&PublicKey>,
     ) -> Option<SignerAuthorization> {
-        let Some(_slot) = self.read_slot().await else {
-            debug!(%pool_id, %signer, "admit getAuthorization: no read slot free; refusing");
+        let Some(_slot) = self.read_slot(requester).await else {
+            debug!(%pool_id, %signer, "admit getAuthorization: over the read budget or no read slot free; refusing");
             return None;
         };
         // Bounded: a hung read times out here and takes the fault path below.
@@ -1370,8 +1542,9 @@ async fn read_pools<P: Provider + Clone>(
 const LIVE_LANE_WINDOW: Duration = Duration::from_secs(2 * POOL_REFRESH_INTERVAL.as_secs());
 
 /// Re-read every pool and signer with a live lane on `deployment` each
-/// [`POOL_REFRESH_INTERVAL`], and forget the lanes of pools a read found
-/// `Closed`. The loop exists because the serve path's mid-stream solvency and
+/// [`POOL_REFRESH_INTERVAL`], forget the lanes of pools a read found
+/// `Closed`, and drop the expired lanes that never carried a voucher
+/// ([`ClientHandler::forget_voucherless_expired_lanes`]). The loop exists because the serve path's mid-stream solvency and
 /// signer-cap re-checks read only held reads, so a live stream's reads must
 /// stay at most one interval old.
 async fn pool_refresh_loop<P: Provider + Clone + 'static>(
@@ -1388,6 +1561,7 @@ async fn pool_refresh_loop<P: Provider + Clone + 'static>(
         let live = handler.live_lanes(deployment, LIVE_LANE_WINDOW).await;
         view.refresh_live(&live).await;
         closed.drain(view.projection()).await;
+        handler.forget_voucherless_expired_lanes(deployment).await;
     }
 }
 

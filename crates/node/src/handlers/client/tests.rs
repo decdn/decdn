@@ -1097,6 +1097,7 @@ async fn funding_gates_with_capability(
     };
     handler
         .funding_gates(
+            &iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
             &req,
             &ext,
             TEST_DEPLOYMENT,
@@ -1177,6 +1178,69 @@ async fn an_expiring_capability_is_refused_before_its_lane_registers() {
     assert!(
         stored(),
         "an admitted grant records its lane in the pool store"
+    );
+}
+
+/// #2770: the lane GC drops an expired lane that never carried a voucher,
+/// from the live map and the pool store, and keeps a lane that carried a
+/// voucher or whose capability is still live.
+#[tokio::test]
+async fn expired_voucherless_lanes_are_dropped() {
+    let metrics = Arc::new(Metrics::new());
+    let (handler, _dir) = handler_with_capability_intake(&metrics, Address::ZERO).await;
+    let provider = handler.eth_signer.address();
+    let pool_id = B256::repeat_byte(0x79);
+    let now = handler.coarse_clock.unix_seconds();
+    let lane = |signer: u8, expiry: u64, voucher: Option<[u8; 65]>| {
+        LaneState::hydrate(
+            pool_id,
+            Address::repeat_byte(signer),
+            provider,
+            U256::from(1_000_000u64),
+            expiry,
+            U256::from(u64::from(voucher.is_some())),
+            U256::ZERO,
+            voucher,
+            decdn_incentive::LaneChain::NONE,
+        )
+    };
+    let expired_unused = lane(1, 1, None);
+    let expired_paid = lane(2, 1, Some([9u8; 65]));
+    let live_unused = lane(3, now + 3_600, None);
+    for state in [&expired_unused, &expired_paid, &live_unused] {
+        handler
+            .register_lane(TEST_DEPLOYMENT, state.clone())
+            .expect("register lane");
+    }
+
+    let dropped = handler
+        .forget_voucherless_expired_lanes(TEST_DEPLOYMENT)
+        .await;
+
+    assert_eq!(dropped, 1);
+    let live = |state: &LaneState| handler.lanes.contains_key(&tid(state.key()));
+    assert!(!live(&expired_unused), "the expired unused lane is dropped");
+    assert!(live(&expired_paid), "a lane with a voucher holds a claim");
+    assert!(live(&live_unused), "a live capability can still pay");
+    let store = handler
+        .pool_route(TEST_DEPLOYMENT)
+        .map(|route| Arc::clone(&route.store))
+        .expect("route");
+    let stored: Vec<Address> = store
+        .load_all()
+        .expect("load lanes")
+        .iter()
+        .map(|lane| lane.signer)
+        .collect();
+    assert!(
+        !stored.contains(&expired_unused.signer),
+        "the dropped lane leaves the pool store"
+    );
+    assert_eq!(stored.len(), 2);
+    let text = metrics.encode().expect("metrics encode");
+    assert!(
+        text.contains("decdn_lanes_dropped_voucherless_total 1"),
+        "the drop is counted:\n{text}"
     );
 }
 
@@ -1983,6 +2047,7 @@ async fn midstream_signer_recheck_trips_when_the_refresh_reads_a_drain() -> anyh
             ProviderBuilder::new().connect_mocked_client(asserter.clone()),
         ),
         projection.clone(),
+        Arc::default(),
         Arc::clone(&metrics),
     ));
     let (handler, _dir) = handler_with_pool_view(&metrics, Arc::clone(&view) as _).await;

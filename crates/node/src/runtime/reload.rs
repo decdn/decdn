@@ -984,6 +984,7 @@ impl RuntimeReloadState {
                     rpc_url: "http://localhost:8545".into(),
                     chain_id: decdn_common::config::DEFAULT_CHAIN_ID,
                     payment_pools: vec![alloy::primitives::Address::with_last_byte(1)],
+                    admit_reads: decdn_common::config::AdmitReadRates::default(),
                 }],
                 cctp_sweep_receiver_address: None,
                 capacity_bond_address: "0x0000000000000000000000000000000000000002".into(),

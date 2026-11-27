@@ -181,7 +181,7 @@ Two things shape how a defense reads in its home ADR. First: most defenses are *
 | Pool oversubscription | Contract pays `min(desired, capRoom, remaining)`; refundable floor `M` (protocol) | [ADR 003 § Pool oversubscription](003-payments.md#pool-oversubscription-one-deposit-backs-many-nodes) |
 | Owner reclaims before a node redeems | Grace window + periodic redeem sweep capped well inside it (protocol + node policy) | [ADR 003 § Owner reclaims before a node redeems](003-payments.md#owner-reclaims-before-a-node-redeems) |
 | Discovery-open load / resource exhaustion | Layered per-peer + global token bucket; no upstream work without `pull_through`; a per-connection cap on unadmitted streams (node policy) | [ADR 003 § Discovery-open load](003-payments.md#discovery-open-load) |
-| Unpaid request flood (signatures, origin `{H}.sizeproof` reads, chain reads) | Layered per-peer + global token bucket before the request is read; a node-wide cap on admission chain reads (node policy) | [ADR 005 § Request rate limiting](005-protocol.md#request-rate-limiting) |
+| Unpaid request flood (signatures, origin `{H}.sizeproof` reads, chain reads) | Layered per-peer + global token bucket before the request is read; a node-wide cap on admission chain reads in flight, and per-peer + chain-wide token buckets on their rate, set per payment chain (node policy) | [ADR 005 § Request rate limiting](005-protocol.md#request-rate-limiting) |
 
 **Malicious serving node** — wants payment without honest service, or to cheat pricing, region, or takedown.
 

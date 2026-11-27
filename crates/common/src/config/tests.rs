@@ -1135,6 +1135,7 @@ pub(super) fn test_payment_chain() -> types::PaymentChainConfig {
         rpc_url: Some("https://payment.example/rpc".to_owned()),
         chain_id: Some(84_532),
         payment_pools: vec![ALT_ADDR_1.to_owned()],
+        ..Default::default()
     }
 }
 
@@ -1200,11 +1201,13 @@ fn split_config_resolves_governance_and_payment_chains() -> anyhow::Result<()> {
                     rpc_url: "https://base.example/rpc".to_owned(),
                     chain_id: 84_532,
                     payment_pools: vec![one, two],
+                    admit_reads: AdmitReadRates::default(),
                 },
                 ResolvedPaymentChain {
                     rpc_url: "https://arb.example/rpc".to_owned(),
                     chain_id: 421_614,
                     payment_pools: vec![one],
+                    admit_reads: AdmitReadRates::default(),
                 },
             ],
         "{:?}",
@@ -1316,6 +1319,79 @@ fn a_repeated_payment_chain_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Each payment chain carries its own admission read rates: a chain that sets
+/// them keeps its values, and one that omits them takes the defaults.
+#[test]
+fn admit_read_rates_resolve_per_chain() -> anyhow::Result<()> {
+    let resolved = resolve_blockchain_toml(&blockchain_toml(&format!(
+        "[[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = [\"{ALT_ADDR_1}\"]\n\
+         admit_reads_per_sec = 200\n\
+         admit_read_burst = 400\n\
+         admit_reads_per_peer_per_sec = 5\n\
+         admit_read_burst_per_peer = 10\n\
+         [[blockchain.payment_chains]]\n\
+         rpc_url = \"https://arb.example/rpc\"\n\
+         chain_id = 421614\n\
+         payment_pools = [\"{ALT_ADDR_2}\"]\n"
+    )))?;
+    let rates: Vec<AdmitReadRates> = resolved
+        .payment_chains
+        .iter()
+        .map(|chain| chain.admit_reads)
+        .collect();
+    anyhow::ensure!(
+        rates
+            == vec![
+                AdmitReadRates {
+                    per_sec: 200,
+                    burst: 400,
+                    per_peer_per_sec: 5,
+                    burst_per_peer: 10,
+                },
+                AdmitReadRates {
+                    per_sec: DEFAULT_ADMIT_READS_PER_SEC,
+                    burst: DEFAULT_ADMIT_READ_BURST,
+                    per_peer_per_sec: DEFAULT_ADMIT_READS_PER_PEER_PER_SEC,
+                    burst_per_peer: DEFAULT_ADMIT_READ_BURST_PER_PEER,
+                },
+            ],
+        "{rates:?}"
+    );
+    Ok(())
+}
+
+/// A zero admission read rate or burst would refuse every admission read,
+/// so it does not resolve; each is named by its indexed path.
+#[test]
+fn a_zero_admit_read_rate_is_refused() -> anyhow::Result<()> {
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(&format!(
+        "[[blockchain.payment_chains]]\n\
+         rpc_url = \"https://base.example/rpc\"\n\
+         chain_id = 84532\n\
+         payment_pools = [\"{ALT_ADDR_1}\"]\n\
+         admit_reads_per_sec = 0\n\
+         admit_read_burst = 0\n\
+         admit_reads_per_peer_per_sec = 0\n\
+         admit_read_burst_per_peer = 0\n"
+    ))) else {
+        anyhow::bail!("a zero admit read rate must not resolve");
+    };
+    let msg = format!("{err:#}");
+    for field in [
+        "admit_reads_per_sec",
+        "admit_read_burst",
+        "admit_reads_per_peer_per_sec",
+        "admit_read_burst_per_peer",
+    ] {
+        let path = format!("blockchain.payment_chains[0].{field} must be at least 1");
+        anyhow::ensure!(msg.contains(&path), "missing {path}: {msg}");
+    }
+    Ok(())
+}
+
 /// Every missing or malformed payment-chain field is reported, each under
 /// its own indexed path.
 #[test]
@@ -1360,6 +1436,7 @@ fn payment_chain_fields_expand_env() -> anyhow::Result<()> {
                 rpc_url: Some("${HOME}/rpc".to_owned()),
                 chain_id: Some(84_532),
                 payment_pools: vec!["${HOME}/pool".to_owned()],
+                ..Default::default()
             }],
             ..Default::default()
         }),

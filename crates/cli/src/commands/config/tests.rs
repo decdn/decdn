@@ -100,6 +100,10 @@ fn default_config_template_covers_every_wired_field() {
         rpc_url: payment_rpc_url,
         chain_id: payment_chain_id,
         payment_pools,
+        admit_reads_per_sec,
+        admit_read_burst,
+        admit_reads_per_peer_per_sec,
+        admit_read_burst_per_peer,
     } = &config::types::PaymentChainConfig::default();
     let blockchain = [
         ("rpc_url =", rpc_url.is_none()),
@@ -108,6 +112,16 @@ fn default_config_template_covers_every_wired_field() {
         ("payment_pools =", payment_pools.is_empty()),
         ("rpc_url =", payment_rpc_url.is_none()),
         ("chain_id =", payment_chain_id.is_none()),
+        ("admit_reads_per_sec =", admit_reads_per_sec.is_none()),
+        ("admit_read_burst =", admit_read_burst.is_none()),
+        (
+            "admit_reads_per_peer_per_sec =",
+            admit_reads_per_peer_per_sec.is_none(),
+        ),
+        (
+            "admit_read_burst_per_peer =",
+            admit_read_burst_per_peer.is_none(),
+        ),
         (
             "cctp_sweep_receiver_address =",
             cctp_sweep_receiver_address.is_none(),

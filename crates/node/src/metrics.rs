@@ -783,6 +783,19 @@ pub struct DecdnMetrics {
     /// signer failed to resolve. Operator-visible name:
     /// `decdn_serve_admit_read_slot_timeouts_total`.
     pub serve_admit_read_slot_timeouts: Counter,
+    /// Admission chain reads (`getPool`, `getAuthorization`) refused without a
+    /// read because the requesting peer's read bucket was empty (#2770). The
+    /// request refuses as a slot timeout does. Operator-visible name:
+    /// `decdn_serve_admit_read_rate_limited_per_peer_total`.
+    pub serve_admit_read_rate_limited_per_peer: Counter,
+    /// Sibling of `serve_admit_read_rate_limited_per_peer` for the chain-wide
+    /// read bucket of each payment chain. Operator-visible name:
+    /// `decdn_serve_admit_read_rate_limited_global_total`.
+    pub serve_admit_read_rate_limited_global: Counter,
+    /// Lanes dropped because their capability expired before they carried a
+    /// voucher (#2770). Such a lane holds no claim, so dropping it loses
+    /// nothing. Operator-visible name: `decdn_lanes_dropped_voucherless_total`.
+    pub lanes_dropped_voucherless: Counter,
     /// Lanes with value owed that the redeemer skipped because the signer's
     /// capability has expired, or expires within the redeemer's landing slack
     /// (ADR 003 §Revocation). The contract pays 0 for an expired capability, so
@@ -2718,6 +2731,16 @@ recorders! {
 
     /// An admission chain read found no free read slot within its wait.
     serve_admit_read_slot_timeout => serve_admit_read_slot_timeouts.inc();
+
+    /// An admission chain read found its peer's read bucket empty.
+    serve_admit_read_rate_limited_per_peer => serve_admit_read_rate_limited_per_peer.inc();
+
+    /// An admission chain read found its payment chain's read bucket empty.
+    serve_admit_read_rate_limited_global => serve_admit_read_rate_limited_global.inc();
+
+    /// `n` lanes were dropped because their capability expired before they
+    /// carried a voucher.
+    lanes_dropped_voucherless_by(n: u64) => lanes_dropped_voucherless.inc_by(n);
 
     /// `n` lanes were dropped from a redeem batch by the pre-submit on-chain
     /// watermark reconciliation because the chain already shows them settled to

@@ -328,6 +328,20 @@ pub struct PaymentChainConfig {
     /// At least one.
     #[serde(default)]
     pub payment_pools: Vec<String>,
+    /// Sustained admission chain reads (`getPool`, `getAuthorization`) per
+    /// second on this chain's `rpc_url`, across every requester. Absent =>
+    /// [`super::DEFAULT_ADMIT_READS_PER_SEC`]. At least 1.
+    pub admit_reads_per_sec: Option<u32>,
+    /// Burst of admission chain reads on this chain, across every requester.
+    /// Absent => [`super::DEFAULT_ADMIT_READ_BURST`]. At least 1.
+    pub admit_read_burst: Option<u32>,
+    /// Sustained admission chain reads per second that one requesting peer
+    /// may cause on this chain. Absent =>
+    /// [`super::DEFAULT_ADMIT_READS_PER_PEER_PER_SEC`]. At least 1.
+    pub admit_reads_per_peer_per_sec: Option<u32>,
+    /// Burst of admission chain reads for one requesting peer on this chain.
+    /// Absent => [`super::DEFAULT_ADMIT_READ_BURST_PER_PEER`]. At least 1.
+    pub admit_read_burst_per_peer: Option<u32>,
 }
 
 /// Cache section of the config file.
