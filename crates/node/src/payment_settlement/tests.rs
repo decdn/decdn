@@ -1173,6 +1173,187 @@ async fn a_signer_confirm_that_finds_no_slot_is_refused_uncached() {
     );
 }
 
+/// A distinct pool id for each `i`.
+fn nth_pool(i: u8) -> B256 {
+    let mut id = [0u8; 32];
+    id[0] = 0xB0;
+    id[31] = i;
+    B256::from(id)
+}
+
+/// A distinct requesting peer for each `seed`.
+fn peer(seed: u8) -> iroh::PublicKey {
+    iroh::SecretKey::from_bytes(&[seed; 32]).public()
+}
+
+/// A quota that does not refill within a test: `burst` reads, then none.
+fn spent_after(burst: u32) -> Quota {
+    Quota::per_hour(nonzero(1)).allow_burst(nonzero(burst))
+}
+
+/// #2770: once a peer's read bucket is empty, its next read is refused at
+/// once: no slot wait, no chain read, nothing cached, counted on the per-peer
+/// counter. Another peer's read still goes out.
+#[tokio::test(start_paused = true)]
+async fn a_peer_over_its_read_budget_is_refused_without_a_read() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (mut view, calls) = counting_hanging_view();
+    view.set_read_quotas(spent_after(100), spent_after(2));
+    let (flooder, honest) = (peer(1), peer(2));
+    let held = futures_util::future::join(
+        view.admit_status(nth_pool(1), &flooder),
+        view.admit_status(nth_pool(2), &flooder),
+    );
+    tokio::pin!(held);
+    let started = tokio::time::Instant::now();
+    let refused = tokio::select! {
+        biased;
+        _ = &mut held => panic!("hung reads cannot answer"),
+        answer = view.admit_status(nth_pool(3), &flooder) => answer,
+    };
+    assert!(
+        refused.is_none(),
+        "the third read is over the peer's budget"
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO, "no slot wait");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "the refused read sent nothing"
+    );
+    assert!(
+        !view
+            .negative
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&nth_pool(3)),
+        "a budget refusal is not cached as a pool fault"
+    );
+
+    // The signer confirm draws on the same bucket.
+    let signer = Address::from([0xB1; 20]);
+    let refused = tokio::select! {
+        biased;
+        _ = &mut held => panic!("hung reads cannot answer"),
+        answer = view.admit_signer_authorization(nth_pool(4), signer, &flooder) => answer,
+    };
+    assert!(
+        refused.is_none(),
+        "the signer confirm is over the same budget"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    // Another peer's read is still sent.
+    tokio::select! {
+        biased;
+        _ = &mut held => panic!("hung reads cannot answer"),
+        _ = view.admit_status(nth_pool(5), &honest) => panic!("a hung read cannot answer"),
+        () = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        3,
+        "the honest peer's read went out"
+    );
+    let text = view.metrics.encode().unwrap_or_default();
+    assert!(
+        text.contains("decdn_serve_admit_read_rate_limited_per_peer_total 2"),
+        "both refusals count on the per-peer counter:\n{text}"
+    );
+}
+
+/// #2770: the node-wide bucket refuses a read every peer bucket would admit,
+/// and a read one peer's bucket refuses spends nothing of it.
+#[tokio::test(start_paused = true)]
+async fn the_node_wide_read_budget_caps_every_peer_together() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (mut view, calls) = counting_hanging_view();
+    view.set_read_quotas(spent_after(2), spent_after(1));
+    let (a, b, c) = (peer(1), peer(2), peer(3));
+    let first = view.admit_status(nth_pool(1), &a);
+    tokio::pin!(first);
+    // `a`'s second read is refused by its own bucket and spends no global
+    // token, so `b` still gets the second one.
+    let over_peer = tokio::select! {
+        biased;
+        _ = &mut first => panic!("a hung read cannot answer"),
+        answer = view.admit_status(nth_pool(2), &a) => answer,
+    };
+    assert!(over_peer.is_none());
+    let second = view.admit_status(nth_pool(3), &b);
+    tokio::pin!(second);
+    let over_global = tokio::select! {
+        biased;
+        _ = &mut first => panic!("a hung read cannot answer"),
+        _ = &mut second => panic!("a hung read cannot answer"),
+        answer = view.admit_status(nth_pool(4), &c) => answer,
+    };
+    assert!(over_global.is_none(), "the node-wide bucket is empty");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        2,
+        "only the two admitted reads went out"
+    );
+    let text = view.metrics.encode().unwrap_or_default();
+    assert!(
+        text.contains("decdn_serve_admit_read_rate_limited_per_peer_total 1")
+            && text.contains("decdn_serve_admit_read_rate_limited_global_total 1"),
+        "each refusal counts on its own layer:\n{text}"
+    );
+}
+
+/// #2770: a request that waits on another request's read of the same pool
+/// sends no read, so it is not charged and not refused.
+#[tokio::test(start_paused = true)]
+async fn a_request_that_waits_on_a_read_is_not_charged() {
+    use crate::pool_view::PoolView;
+    use std::sync::atomic::Ordering;
+
+    let (mut view, calls) = counting_hanging_view();
+    view.set_read_quotas(spent_after(100), spent_after(1));
+    let flooder = peer(1);
+    let lead = view.admit_status(nth_pool(1), &flooder);
+    tokio::pin!(lead);
+    tokio::select! {
+        biased;
+        _ = &mut lead => panic!("a hung read cannot answer"),
+        _ = view.admit_status(nth_pool(1), &flooder) => panic!("the waiter takes the lead's answer, not a refusal"),
+        () = tokio::time::sleep(Duration::from_millis(1)) => {}
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "one read for both");
+    let text = view.metrics.encode().unwrap_or_default();
+    assert!(
+        text.contains("decdn_serve_admit_read_rate_limited_per_peer_total 0"),
+        "the waiter was not refused:\n{text}"
+    );
+}
+
+/// #2770: the per-peer map stays bounded. Past the cap, a read prunes the
+/// buckets that have refilled.
+#[test]
+fn the_per_peer_read_buckets_stay_bounded() {
+    let budget = AdmitReadBudget::with_quotas(
+        Quota::per_second(nonzero(u32::MAX)),
+        Quota::per_second(nonzero(u32::MAX)),
+    );
+    let metrics = Metrics::new();
+    for i in 0..=ADMIT_READ_TRACKED_PEERS_MAX.saturating_mul(2) {
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        let key = iroh::SecretKey::from_bytes(&seed).public();
+        assert!(budget.charge(Some(&key), &metrics));
+    }
+    assert!(
+        budget.per_peer.len() <= ADMIT_READ_TRACKED_PEERS_MAX.saturating_add(1),
+        "the map was pruned: {}",
+        budget.per_peer.len()
+    );
+}
+
 /// With the negative cache full of in-window entries, the read's fault is
 /// not cached; its waiters still take the read's answer instead of each
 /// starting a read of its own in turn.

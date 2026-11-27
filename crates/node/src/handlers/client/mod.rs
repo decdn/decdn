@@ -2003,6 +2003,53 @@ impl ClientHandler {
             .map_err(|e| StoreError::Backend(format!("forget_lane join: {e}")))?
     }
 
+    /// Drop every lane of `deployment` that never carried a voucher and whose
+    /// capability has expired, from the live map and the lane store (#2770).
+    /// Returns how many it dropped.
+    ///
+    /// Capability intake registers a lane before its first voucher, and a pool
+    /// owner can sign a fresh signer for every request, so without this pass
+    /// such lanes would grow without bound. A voucherless lane holds no claim,
+    /// so dropping it loses nothing. The voucher path refuses a voucher inside
+    /// the capability's expiry margin, so a lane past its expiry takes no
+    /// further voucher, and the check under the lane's lock cannot race one.
+    /// A later request that presents a live capability for the same signer
+    /// registers the lane again.
+    pub async fn forget_voucherless_expired_lanes(&self, deployment: Deployment) -> usize {
+        let now = self.coarse_clock.unix_seconds();
+        let handles: Vec<(LaneId, Arc<Mutex<LaneDeliveryState>>)> = self
+            .lanes
+            .iter()
+            .filter(|e| e.key().deployment == deployment)
+            .map(|e| (*e.key(), Arc::clone(e.value())))
+            .collect();
+        let mut dropped = 0usize;
+        for (lane, state) in handles {
+            let expired_unused = {
+                let guard = state.lock().await;
+                guard.state.last_signature().is_none() && guard.state.expiry <= now
+            };
+            if !expired_unused {
+                continue;
+            }
+            match self.forget_lane(lane).await {
+                Ok(()) => dropped = dropped.saturating_add(1),
+                Err(e) => tracing::warn!(
+                    pool_id = %lane.key.pool_id,
+                    signer = %lane.key.signer,
+                    error = %e,
+                    "failed to drop an expired lane that carried no voucher"
+                ),
+            }
+        }
+        if dropped > 0 {
+            self.metrics
+                .lanes_dropped_voucherless_by(u64::try_from(dropped).unwrap_or(u64::MAX));
+            tracing::info!(dropped, "dropped expired lanes that carried no voucher");
+        }
+        dropped
+    }
+
     /// Minimum gap between insufficient-deposit `warn!` lines (#1520).
     ///
     /// A module const, not a config field: a log cadence does not justify the five

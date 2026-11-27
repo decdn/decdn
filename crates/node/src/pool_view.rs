@@ -42,6 +42,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, U256};
 use arc_swap::ArcSwap;
 use decdn_incentive::payment_pool::SignerAuthorization;
+use iroh::PublicKey;
 use tokio::time::Instant;
 
 /// Wall-clock cadence for the serve loops' mid-stream pool-solvency re-check
@@ -104,6 +105,15 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     /// pool it still cannot confirm rather than failing open.
     async fn status(&self, pool_id: B256) -> Option<PoolStatus>;
 
+    /// [`Self::status`] for a stream that `requester` opened. Admission calls
+    /// this form. A view that reads the chain charges each read to the
+    /// requester's read budget and refuses (`None`) a read the budget cannot
+    /// pay. The default ignores the requester.
+    async fn admit_status(&self, pool_id: B256, requester: &PublicKey) -> Option<PoolStatus> {
+        let _ = requester;
+        self.status(pool_id).await
+    }
+
     /// A read that MUST NOT block: it returns `None` rather than doing any slow or
     /// remote work. The mid-stream serve re-check calls it at a voucher boundary,
     /// on the wall-clock re-check cadence, where a blocking read would stall
@@ -139,6 +149,19 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
     ) -> Option<SignerAuthorization> {
         let _ = (pool_id, signer);
         Some(SignerAuthorization::Unregistered)
+    }
+
+    /// [`Self::signer_authorization`] for a stream that `requester` opened.
+    /// Admission calls this form, and a chain read it makes is charged as in
+    /// [`Self::admit_status`]. The default ignores the requester.
+    async fn admit_signer_authorization(
+        &self,
+        pool_id: B256,
+        signer: Address,
+        requester: &PublicKey,
+    ) -> Option<SignerAuthorization> {
+        let _ = requester;
+        self.signer_authorization(pool_id, signer).await
     }
 
     /// The mid-stream signer-drain read: a `signer`'s total on-chain `spent` across

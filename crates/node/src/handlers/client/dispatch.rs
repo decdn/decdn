@@ -940,6 +940,7 @@ impl ClientHandler {
             drop(unadmitted_slot.take());
             let funding = match self
                 .funding_gates(
+                    &peer,
                     &req,
                     &ext,
                     deployment,
