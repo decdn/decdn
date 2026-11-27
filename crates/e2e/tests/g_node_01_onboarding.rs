@@ -125,9 +125,9 @@ async fn run_journey() -> anyhow::Result<()> {
     let chain = ChainFixture::launch().await?;
 
     // 2 MiB at the fixture's `rate_per_mb = 10` is a 20 µUSDC claim, above the
-    // rendered `redeem_threshold_micro_usdc = 10`. That is what makes the seller
-    // actually redeem, so the on-chain served-bytes assertion at the end has
-    // something to observe; a smaller blob silently never settles.
+    // fixture's redeem floor (`REDEEM_FLOOR_MICRO_USDC`). That is what makes the
+    // seller actually redeem, so the on-chain served-bytes assertion at the end
+    // has something to observe.
     let payload = vec![0x5Au8; 2 * MIB];
     let (node, hash) = NodeFixture::launch_bare(&chain, "US", &payload).await?;
     let operator = node.operator_addr();

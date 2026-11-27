@@ -221,9 +221,10 @@ impl ClientHandler {
     /// The funding gates up to the deposit gate, for a request that names
     /// `lane_key` on the accepted pool `deployment` (ADR 003 § Pool solvency,
     /// § Capability delegation): the pool status, the signer's authorization,
-    /// the funder deny, capability verification, a closing pool, then the
-    /// grant's lane registration, the lane, and the expiry margin of the lane
-    /// or, with no lane, of the grant. A refused request registers no lane.
+    /// the funder deny, capability verification, a closing pool, a pool over
+    /// its stranded-value cap for a new lane, then the grant's lane
+    /// registration, the lane, and the expiry margin of the lane or, with no
+    /// lane, of the grant. A refused request registers no lane.
     /// Returns what they read, or the refusal.
     ///
     /// With no pool view wired for `deployment` (dev/test) the pool gates pass
@@ -300,6 +301,18 @@ impl ClientHandler {
             return Err(ServeRejectReason::PoolClosing {
                 proven: grant.is_some() || holds_lane,
             });
+        }
+
+        // A pool whose expired lanes left more than one redeem floor unredeemed
+        // on this node takes no new lane (ADR 003 § Redemption floor): each
+        // further sub-floor capability costs its owner a new pool. A lane this
+        // node already holds keeps its service. The grant verified against
+        // the pool owner, so the requester is proven and hears `Unfunded`.
+        if grant.is_some()
+            && pool_view.is_some_and(|view| view.refuses_new_lanes(pool_id))
+            && !lane_key.is_some_and(|key| self.lanes.contains_key(&key))
+        {
+            return Err(ServeRejectReason::InsufficientDeposit);
         }
 
         // A grant inside the expiry margin cannot pay for a voucher, so it

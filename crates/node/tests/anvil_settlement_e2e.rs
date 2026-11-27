@@ -127,9 +127,12 @@ const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f46
 const RATE_PER_MB: u64 = 10; // µUSDC per MiB (within deliveryFloor/ceiling)
 const MIB: usize = 1024 * 1024;
 
-// The redeem threshold sits below the seller stream's ~15 µUSDC claim so the
-// delivered voucher crosses it and the redeemer submits `redeem`.
-const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
+// 1 µUSDC per gas token prices anvil's gas at a fraction of a µUSDC, so every
+// redeem floor rounds up to `REDEEM_FLOOR_MICRO_USDC`, below the seller
+// stream's ~15 µUSDC claim: the delivered voucher crosses it and the redeemer
+// submits `redeem`.
+const GAS_TOKEN_PRICE_MICRO_USDC: u64 = 1;
+const REDEEM_FLOOR_MICRO_USDC: u64 = 1;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer path
@@ -729,7 +732,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&store),
         Arc::clone(&ledger),
         Arc::clone(&handler),
-        U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        GAS_TOKEN_PRICE_MICRO_USDC,
         300,
         Duration::from_secs(300),
         Arc::clone(&metrics),
@@ -950,11 +953,11 @@ async fn run_e2e() -> anyhow::Result<()> {
     // symmetrically. Pinning `amount` against a value derived from the payment
     // side — not from another decode — is what makes the swap observable.
     anyhow::ensure!(
-        watermark_after_first.amount >= REDEEM_THRESHOLD_MICRO_USDC
+        watermark_after_first.amount >= REDEEM_FLOOR_MICRO_USDC
             && watermark_after_first.amount < watermark_after_first.bytesDelivered,
-        "Lane.amount must be the micro-USDC paid (>= the redeem threshold {}), well below the \
+        "Lane.amount must be the micro-USDC paid (>= the redeem floor {}), well below the \
          byte count: amount={} bytesDelivered={}",
-        REDEEM_THRESHOLD_MICRO_USDC,
+        REDEEM_FLOOR_MICRO_USDC,
         watermark_after_first.amount,
         watermark_after_first.bytesDelivered
     );
@@ -1158,6 +1161,9 @@ async fn run_e2e() -> anyhow::Result<()> {
     // The settlement ledger (#2598): one row per landed `redeemMany`, in chain
     // order, decoded from each receipt. The redeemer writes the row after the
     // receipt lands (one header read in between), so poll for the second one.
+    // Each delivery can settle over several redemptions, since a hint redeems
+    // once the lane clears the floor, so the ledger holds at least two rows,
+    // and its first two are the first two redeems on the lane.
     let rows = poll_until(Duration::from_secs(10), || {
         let store = Arc::clone(&concrete_store);
         async move {
@@ -1167,7 +1173,12 @@ async fn run_e2e() -> anyhow::Result<()> {
     })
     .await
     .ok_or_else(|| anyhow::anyhow!("the settlement ledger did not record both redeems"))?;
-    anyhow::ensure!(rows.len() == 2, "one ledger row per redeemMany: {rows:?}");
+    anyhow::ensure!(
+        rows.windows(2)
+            .all(|pair| (pair[0].block_number, pair[0].log_index)
+                < (pair[1].block_number, pair[1].log_index)),
+        "the ledger rows are in chain order, one per redeemMany: {rows:?}"
+    );
     let (first, second) = (&rows[0], &rows[1]);
     anyhow::ensure!(
         first.tx_hash == tx_first && first.block_number == block_first,

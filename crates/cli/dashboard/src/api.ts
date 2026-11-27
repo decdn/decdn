@@ -291,12 +291,10 @@ export interface LaneSnapshot {
   deposit_micro_usdc: number;
   /** Null when no voucher arrived since the node started. */
   seconds_since_last_voucher: number | null;
-  settlement_eligible: boolean;
 }
 
 export interface LanesResponse {
   lanes: LaneSnapshot[];
-  redeem_threshold_micro_usdc: number;
 }
 
 export interface EarningsPeriod {

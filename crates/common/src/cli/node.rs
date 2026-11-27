@@ -47,9 +47,8 @@ pub enum NodeCommand {
     Status(StatusArgs),
     /// Print a live snapshot of the running node's lanes via
     /// `admin_v1_lanes` (issue #749): per lane the outstanding accrued
-    /// claim (micro-USDC), time since the last voucher, and whether the
-    /// accrued claim has reached the configured redemption threshold.
-    /// Lets operators spot lanes approaching settlement, stale lanes, or
+    /// claim (micro-USDC), the part still unredeemed, and the time since the
+    /// last voucher. Lets operators spot lanes approaching settlement, stale lanes, or
     /// unusually high outstanding balances before they become a
     /// liquidity risk — without scraping metrics or reading logs. Same
     /// admin-URL resolution and timeout semantics as `decdn node health`.

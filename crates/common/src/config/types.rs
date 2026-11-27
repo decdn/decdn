@@ -254,15 +254,6 @@ pub struct BlockchainConfig {
     /// [`super::DEFAULT_GET_LOGS_MAX_BLOCK_SPAN`] (10 000). Must not be `0`.
     /// The node reads no event log and ignores it.
     pub get_logs_max_block_span: Option<u64>,
-    /// Per-chunk redemption floor (base units, `µUSDC`, ADR 003 § Operator
-    /// early withdrawal). The node submits an on-chain redemption
-    /// transaction for a chunk of lanes only once the aggregate un-redeemed
-    /// value across that chunk's lanes reaches this floor; every lane in a
-    /// submitted chunk settles, so a small (dust) lane rides alongside the
-    /// larger lanes that cleared the floor. Larger values amortize gas
-    /// across more delivery; smaller values bound unsettled exposure.
-    /// Absent => default (0.05 USDC = `50_000` `µUSDC`).
-    pub redeem_threshold_micro_usdc: Option<u64>,
     /// Maximum vouchers packed into one `redeemMany` transaction. The redeemer
     /// splits a sweep across this many vouchers per transaction so a high-fan-out
     /// node stays under the block gas limit; a chunk that still fails to send
@@ -328,6 +319,15 @@ pub struct PaymentChainConfig {
     /// At least one.
     #[serde(default)]
     pub payment_pools: Vec<String>,
+    /// The price of one whole gas token of this chain (ETH on Arbitrum) in
+    /// `µUSDC`. The redeemer multiplies a `redeemMany`'s gas by the live gas
+    /// price and by this price to get its cost in USDC, and redeems a claim
+    /// only when the claim pays more than its gas (ADR 003 § Redemption
+    /// floor). Set it at or above the token's market price: a high price
+    /// raises the floor, and a low one lets a claim redeem at a loss. Absent
+    /// => [`super::DEFAULT_GAS_TOKEN_PRICE_MICRO_USDC`] (5,000 USDC). Must
+    /// not be `0`.
+    pub gas_token_price_micro_usdc: Option<u64>,
 }
 
 /// Cache section of the config file.

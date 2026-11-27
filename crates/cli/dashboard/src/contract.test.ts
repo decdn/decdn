@@ -298,7 +298,6 @@ const METRICS: Keys<NodeMetrics> = {
 const RATES: Keys<NodeRates> = { hits: true, misses: true, bytes: true };
 const LANES: Keys<LanesResponse> = {
   lanes: true,
-  redeem_threshold_micro_usdc: true,
 };
 const LANE_SNAPSHOT: Keys<LaneSnapshot> = {
   pool: true,
@@ -309,7 +308,6 @@ const LANE_SNAPSHOT: Keys<LaneSnapshot> = {
   unredeemed_micro_usdc: true,
   deposit_micro_usdc: true,
   seconds_since_last_voucher: true,
-  settlement_eligible: true,
 };
 const EARNINGS: Keys<EarningsResponse> = {
   operator_address: true,

@@ -1180,6 +1180,73 @@ async fn an_expiring_capability_is_refused_before_its_lane_registers() {
     );
 }
 
+/// #2836: a pool over its stranded-value cap refuses a new signer with
+/// `InsufficientDeposit` (wire `Unfunded`) and registers no lane for it. A
+/// signer whose lane the node already holds keeps its service.
+#[tokio::test]
+async fn a_pool_over_its_stranded_cap_refuses_a_new_signer() {
+    let metrics = Arc::new(Metrics::new());
+    let owner = PrivateKeySigner::random();
+    let (handler, projection, _dir) = handler_with_projection_view(&metrics).await;
+    let pool_id = B256::repeat_byte(0x79);
+    projection.record_read(
+        pool_id,
+        crate::pool_view::PoolStatus {
+            owner: owner.address(),
+            remaining: U256::MAX,
+            lifecycle: crate::pool_view::Lifecycle::Open,
+        },
+    );
+    let expiry =
+        handler.coarse_clock.unix_seconds() + handler.capability_expiry_margin_secs + 3_600;
+    let grant = |signer: Address| -> decdn_protocol::client::WireCapability {
+        let spending_cap = 1_000_000u64;
+        let signed_cap = Capability {
+            signer,
+            spending_cap,
+            pool_id,
+            expiry,
+        }
+        .sign(&owner, &TEST_DEPLOYMENT.voucher_domain())
+        .expect("sign capability");
+        decdn_protocol::client::WireCapability {
+            spending_cap,
+            expiry,
+            owner_signature: signed_cap.signature.as_bytes().to_vec(),
+        }
+    };
+    let held = Address::repeat_byte(0x13);
+    let fresh = Address::repeat_byte(0x14);
+    funding_gates_with_capability(&handler, pool_id, held, grant(held))
+        .await
+        .expect("a signer on a pool under its cap is admitted");
+
+    projection.set_stranded(std::iter::once(pool_id).collect());
+
+    let refused = funding_gates_with_capability(&handler, pool_id, fresh, grant(fresh))
+        .await
+        .err();
+    assert_eq!(refused, Some(ServeRejectReason::InsufficientDeposit));
+    assert_eq!(
+        refused.map(ServeRejectReason::wire_error),
+        Some(decdn_protocol::StreamError::Unfunded)
+    );
+    let fresh_lane = LaneKey {
+        pool_id,
+        signer: fresh,
+        provider: handler.eth_signer.address(),
+    };
+    assert!(
+        !handler.lanes.contains_key(&tid(fresh_lane)),
+        "a refused signer registers no lane"
+    );
+    let kept = funding_gates_with_capability(&handler, pool_id, held, grant(held)).await;
+    assert!(
+        kept.is_ok_and(|funding| funding.known_lane.is_some()),
+        "a held lane keeps its service"
+    );
+}
+
 /// Every `reason` label of `decdn_capability_intake_dropped_total`.
 const INTAKE_DROP_LABELS: [&str; 6] = [
     "expiry_zero",

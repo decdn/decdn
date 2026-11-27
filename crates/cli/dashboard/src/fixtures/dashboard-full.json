@@ -302,11 +302,9 @@
             "outstanding_micro_usdc": 3200,
             "unredeemed_micro_usdc": 41000,
             "deposit_micro_usdc": 5000000,
-            "seconds_since_last_voucher": 12,
-            "settlement_eligible": true
+            "seconds_since_last_voucher": 12
           }
-        ],
-        "redeem_threshold_micro_usdc": 100000
+        ]
       }
     },
     "earnings": {

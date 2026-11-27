@@ -1360,7 +1360,7 @@ async fn build_chain_and_handlers(
     // self-checks the contract via `usdc()`; the service re-reads every pool
     // with a live lane so the serve path reads pool solvency in-memory, and
     // forgets a closed pool's lanes. Redemption is purely periodic: a self-tick
-    // flushes the lane store then sweeps every above-threshold lane.
+    // flushes the lane store then sweeps every lane that clears the floors.
     // Simple (re-fetch-each-send) nonce management, not alloy's default cached
     // manager (#904). The cached manager advances its in-memory nonce when it
     // *prepares* a tx; if that send then fails (e.g. its `eth_estimateGas`
@@ -1375,6 +1375,16 @@ async fn build_chain_and_handlers(
     // read and transaction rides the pool's own payment chain.
     let mut payment_services = Vec::with_capacity(infra.pools.len());
     for (pool, wiring) in infra.pools.iter().zip(settlement_wiring) {
+        // The pool's chain prices its redemptions' gas.
+        let gas_token_price_micro_usdc = cfg
+            .blockchain
+            .payment_chains
+            .iter()
+            .find(|chain| chain.chain_id == pool.deployment.chain_id)
+            .map_or(
+                decdn_common::config::DEFAULT_GAS_TOKEN_PRICE_MICRO_USDC,
+                |chain| chain.gas_token_price_micro_usdc,
+            );
         let payment_service = PoolSettlementService::bootstrap(
             wiring.wallet_provider,
             pool.deployment,
@@ -1382,7 +1392,7 @@ async fn build_chain_and_handlers(
             pool.lane_store(),
             Arc::clone(&infra.settlement_ledger),
             Arc::clone(&client_handler),
-            U256::from(cfg.blockchain.redeem_threshold_micro_usdc),
+            gas_token_price_micro_usdc,
             usize::try_from(cfg.blockchain.redeem_max_vouchers_per_tx).unwrap_or(usize::MAX),
             Duration::from_secs(cfg.blockchain.redeem_interval_secs),
             Arc::clone(&infra.node_metrics),
@@ -2207,7 +2217,6 @@ async fn spawn_background_tasks<P: Provider + Clone + 'static>(
         .with_lanes(admin::LaneStatusHandles {
             pools: ch.admin_pools.clone(),
             lane_activity: ch.client_handler.lane_activity_clock(),
-            redeem_threshold_micro_usdc: cfg.blockchain.redeem_threshold_micro_usdc,
         })
         // Earnings for `admin_v1_earnings` (#2598): the settlement ledger every
         // pool's settlement service writes, the lane stores for the pending

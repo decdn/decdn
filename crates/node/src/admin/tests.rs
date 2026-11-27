@@ -1,4 +1,5 @@
 use super::*;
+use alloy::primitives::U256;
 use decdn_cache::{Hash, Origin};
 use decdn_incentive::buyer_pool::BuyerPoolState;
 
@@ -900,21 +901,19 @@ fn mk_lane(pool_byte: u8, signer_byte: u8, last_amount: u64) -> LaneState {
     )
 }
 
-/// `build_lane_snapshots` maps each [`LaneState`] to its wire DTO:
-/// hex ids, narrowed amounts, and threshold-based eligibility. A lane
-/// at/above the threshold is eligible; one below is not. In the shared-pool
-/// model the per-lane deposit and nonce are not tracked, so both report 0.
-/// The counterparty is the pool owner from the pool view, distinct from the
-/// lane signer; a pool the view has not seen reports `None`, never the signer.
+/// `build_lane_snapshots` maps each [`LaneState`] to its wire DTO: hex ids
+/// and narrowed amounts. In the shared-pool model the per-lane deposit and
+/// nonce are not tracked, so both report 0. The counterparty is the pool owner
+/// from the pool view, distinct from the lane signer; a pool the view has not
+/// seen reports `None`, never the signer.
 #[test]
-fn build_lane_snapshots_maps_fields_and_eligibility() {
+fn build_lane_snapshots_maps_fields() {
     let owner = Address::repeat_byte(0x0F);
     let states = vec![mk_lane(1, 0xAA, 2_500_000), mk_lane(2, 0xBB, 500_000)];
     let ages = HashMap::new();
-    let threshold = U256::from(1_000_000u64);
     // Only pool 1's owner resolved; pool 2's read failed.
     let owners = pools_owned_by(&[(1, owner)]);
-    let snaps = build_lane_snapshots(ADMIN_DEPLOYMENT, &states, threshold, &ages, &owners);
+    let snaps = build_lane_snapshots(ADMIN_DEPLOYMENT, &states, &ages, &owners);
     assert_eq!(snaps.len(), 2);
     assert!(
         snaps
@@ -945,44 +944,16 @@ fn build_lane_snapshots_maps_fields_and_eligibility() {
         "voucher_signer must be the lane signer"
     );
     assert_eq!(first.seconds_since_last_voucher, None);
-    assert!(
-        first.settlement_eligible,
-        "2.5 USDC claim >= 1 USDC threshold → eligible"
-    );
     let second = snaps.get(1).expect("second snapshot");
     assert_eq!(second.outstanding_micro_usdc, 500_000);
     assert_eq!(second.counterparty, None, "an unresolved owner is unknown");
-    assert!(
-        !second.settlement_eligible,
-        "0.5 USDC claim < 1 USDC threshold → not eligible"
-    );
-}
-
-/// Threshold boundary: outstanding exactly equal to the threshold is
-/// eligible (`>=`), matching the redeemer's `< threshold` short-circuit.
-#[test]
-fn build_lane_snapshots_threshold_is_inclusive() {
-    let states = vec![mk_lane(1, 0xAA, 1_000_000)];
-    let ages = HashMap::new();
-    let snaps = build_lane_snapshots(
-        ADMIN_DEPLOYMENT,
-        &states,
-        U256::from(1_000_000u64),
-        &ages,
-        &HashMap::new(),
-    );
-    assert!(
-        snaps.first().expect("snapshot").settlement_eligible,
-        "outstanding == threshold must be eligible (>=)"
-    );
 }
 
 /// A hash-chain lane reports what it is owed, not its signed anchor. Its
 /// root voucher signs at the watermark and every chunk after pays with a
 /// preimage, which moves only the verified frontier. The redeemer submits
-/// anchor + frontier, so the snapshot and its eligibility follow their sum:
-/// a first-epoch lane (anchor `0`) and a rolled-over one (anchor `100`) alike
-/// (#2337).
+/// anchor + frontier, so the snapshot follows their sum: a first-epoch lane
+/// (anchor `0`) and a rolled-over one (anchor `100`) alike (#2337).
 #[test]
 fn build_lane_snapshots_report_the_verified_chain_frontier() {
     let lane = |anchor: u64, verified_index: u8| {
@@ -1005,38 +976,23 @@ fn build_lane_snapshots_report_the_verified_chain_frontier() {
             },
         )
     };
-    let snapshot = |state: LaneState, threshold: u64| {
-        build_lane_snapshots(
-            ADMIN_DEPLOYMENT,
-            &[state],
-            U256::from(threshold),
-            &HashMap::new(),
-            &HashMap::new(),
-        )
-        .into_iter()
-        .next()
-        .expect("snapshot")
+    let snapshot = |state: LaneState| {
+        build_lane_snapshots(ADMIN_DEPLOYMENT, &[state], &HashMap::new(), &HashMap::new())
+            .into_iter()
+            .next()
+            .expect("snapshot")
     };
 
-    let below = snapshot(lane(0, 3), 40);
+    let first_epoch = snapshot(lane(0, 3));
     assert_eq!(
-        below.outstanding_micro_usdc, 30,
+        first_epoch.outstanding_micro_usdc, 30,
         "3 verified chunks at 10 each"
     );
-    assert!(!below.settlement_eligible, "30 < 40 threshold");
-    let at = snapshot(lane(0, 4), 40);
-    assert_eq!(
-        at.outstanding_micro_usdc, 40,
-        "4 verified chunks at 10 each"
-    );
-    assert!(at.settlement_eligible, "40 >= 40 threshold");
-
-    let rolled = snapshot(lane(100, 2), 120);
+    let rolled = snapshot(lane(100, 2));
     assert_eq!(
         rolled.outstanding_micro_usdc, 120,
         "anchor 100 + 2 chunks at 10"
     );
-    assert!(rolled.settlement_eligible, "120 >= 120 threshold");
 }
 
 /// A lane with recorded voucher activity sorts ahead of one with
@@ -1049,13 +1005,7 @@ fn build_lane_snapshots_orders_active_lanes_first() {
     // `idle` has a much larger outstanding, but no activity — the active
     // lane must still sort first (recency beats size).
     let ages = HashMap::from([(active.key(), 3u64)]);
-    let snaps = build_lane_snapshots(
-        ADMIN_DEPLOYMENT,
-        &[idle, active],
-        U256::from(1_000_000u64),
-        &ages,
-        &HashMap::new(),
-    );
+    let snaps = build_lane_snapshots(ADMIN_DEPLOYMENT, &[idle, active], &ages, &HashMap::new());
     let first = snaps.first().expect("first snapshot");
     assert!(
         first.seconds_since_last_voucher.is_some(),
@@ -1065,22 +1015,16 @@ fn build_lane_snapshots_orders_active_lanes_first() {
 }
 
 /// `admin_v1_lanes` with no lane handles wired returns an empty
-/// list and a zero threshold (not an error) — a node with no payment
-/// surface legitimately has nothing to report.
+/// list (not an error) — a node with no payment surface legitimately has
+/// nothing to report.
 #[tokio::test]
 async fn lanes_without_handles_returns_empty() {
     let (state, _tmp) = state_with().await;
     let rpc = AdminRpcImpl::new(state);
     let resp = rpc.lanes().await.expect("lanes ok");
     assert!(resp.lanes.is_empty());
-    assert_eq!(resp.redeem_threshold_micro_usdc, 0);
 }
 
-/// End-to-end through the RPC method: a store seeded with two lanes
-/// surfaces both, with the configured threshold echoed and eligibility
-/// computed against it. Pool 1's owner comes from the pool view; pool 2 is
-/// not in it, as a lane carried across a restart is not, so its owner comes
-/// from the chain read.
 /// The one pool the admin lane tests read.
 const ADMIN_DEPLOYMENT: decdn_incentive::Deployment = decdn_incentive::Deployment {
     chain_id: 31_337,
@@ -1096,6 +1040,10 @@ fn admin_pool(store: Arc<dyn PoolStateStore>, owners: PoolOwners) -> AdminPool {
     }
 }
 
+/// End-to-end through the RPC method: a store seeded with two lanes surfaces
+/// both. Pool 1's owner comes from the pool view; pool 2 is not in it, as a
+/// lane carried across a restart is not, so its owner comes from the chain
+/// read.
 #[tokio::test]
 async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
     let store = Arc::new(MemoryPoolStateStore::new());
@@ -1120,20 +1068,16 @@ async fn lanes_rpc_reports_seeded_store() -> anyhow::Result<()> {
             PoolOwners::new(projection, Some(Arc::new(OneOwner(chain_owner)))),
         )],
         lane_activity: LaneActivityClock::empty(),
-        redeem_threshold_micro_usdc: 1_000_000,
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
-    assert_eq!(resp.redeem_threshold_micro_usdc, 1_000_000);
     assert_eq!(resp.lanes.len(), 2);
     // Both have no activity → ordered by descending outstanding.
     let first = resp.lanes.first().expect("first");
     assert_eq!(first.outstanding_micro_usdc, 2_000_000);
-    assert!(first.settlement_eligible);
     assert_eq!(first.counterparty, Some(owner.to_string()));
     let second = resp.lanes.get(1).expect("second");
     assert_eq!(second.outstanding_micro_usdc, 100_000);
-    assert!(!second.settlement_eligible);
     assert_eq!(
         second.counterparty,
         Some(chain_owner.to_string()),
@@ -1261,7 +1205,6 @@ async fn lanes_rpc_reflects_stamped_lane_through_activity_clock() -> anyhow::Res
             deployment: ADMIN_DEPLOYMENT,
             key: active_id,
         }]),
-        redeem_threshold_micro_usdc: 1_000_000,
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let resp = rpc.lanes().await.expect("lanes ok");
@@ -1312,7 +1255,6 @@ async fn lanes_rpc_surfaces_store_load_failure() {
             PoolOwners::new(PoolProjection::new(), None),
         )],
         lane_activity: LaneActivityClock::empty(),
-        redeem_threshold_micro_usdc: 1_000_000,
     };
     let rpc = AdminRpcImpl::new(state.with_lanes(handles));
     let err = rpc.lanes().await.expect_err("expected store-load error");
@@ -1375,7 +1317,6 @@ fn build_lane_snapshots_report_the_unredeemed_part() {
     let snapshots = build_lane_snapshots(
         ADMIN_DEPLOYMENT,
         &[partly_paid, over_paid],
-        U256::MAX,
         &HashMap::new(),
         &HashMap::new(),
     );

@@ -19,7 +19,7 @@
 //!    delivery paid for before the rotation still settles on-chain after it.
 //!
 //! **What the settlement leg does and does not pin.** The node redeems on its
-//! own schedule once a claim passes `redeem_threshold_micro_usdc`, so whether
+//! own schedule once a claim passes its gas-priced redeem floor, so whether
 //! the pre-rotation voucher settles before or after the rebinding is a race this
 //! journey does not try to win. The journey stops the daemon before the real
 //! rotation, as the runbook's "Stop" step does, so the graceful shutdown's final

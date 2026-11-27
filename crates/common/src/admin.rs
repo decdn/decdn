@@ -391,9 +391,8 @@ pub struct PullThroughStatus {
 /// (serializes) and `decdn node lanes` (deserializes via the generated
 /// client).
 ///
-/// Money amounts are reported in **micro-USDC** (`u64`) — the same base
-/// unit `blockchain.redeem_threshold_micro_usdc` is configured in. The
-/// underlying `LaneState` carries them as `U256`; the server narrows with
+/// Money amounts are reported in **micro-USDC** (`u64`), the base unit of
+/// the `PaymentPool` counters. The underlying `LaneState` carries them as `U256`; the server narrows with
 /// `u64::try_from(...).unwrap_or(u64::MAX)`, so a value that somehow
 /// exceeded `u64::MAX` micro-USDC (~1.8e13 USDC — unreachable for a real
 /// pool) saturates rather than wraps.
@@ -433,8 +432,7 @@ pub struct LaneSnapshot {
     /// What the node is owed on this lane, in micro-USDC
     /// (`LaneState::owed`): the cumulative amount of the last signed voucher
     /// plus the chain frontier verified under it. This is the node's total
-    /// accrued claim on this lane — the value the redeemer submits and the
-    /// figure [`Self::settlement_eligible`] compares against the threshold.
+    /// accrued claim on this lane — the value the redeemer submits.
     /// It is cumulative: it includes value already redeemed on-chain and never
     /// decreases. A hash-chain lane pays with preimages, which move only the
     /// frontier, so the signed amount alone understates the claim by up to
@@ -459,16 +457,6 @@ pub struct LaneSnapshot {
     /// wall-clock. Operators use this to spot stale lanes (high
     /// `outstanding` but no recent payment).
     pub seconds_since_last_voucher: Option<u64>,
-    /// `true` when the accrued claim (`outstanding_micro_usdc`) has
-    /// reached the node's configured redemption threshold
-    /// (`blockchain.redeem_threshold_micro_usdc`). This is an
-    /// **upper-bound** signal, not a prediction of the next redemption: it
-    /// compares the full cumulative claim, not the unredeemed part, against
-    /// the threshold, while the redeemer gates on the unredeemed value summed
-    /// across the lanes of one `redeemMany`. The claim never decreases, so a
-    /// lane stays `true` once it reaches the threshold, including after it is
-    /// redeemed in full.
-    pub settlement_eligible: bool,
 }
 
 /// Response body for `admin_v1_lanes` (issue #749). Shared between the
@@ -482,12 +470,6 @@ pub struct LanesResponse {
     /// on-call use case is "which lanes are closest to a settlement /
     /// liquidity event?".
     pub lanes: Vec<LaneSnapshot>,
-    /// The node's configured redemption threshold in micro-USDC
-    /// (`blockchain.redeem_threshold_micro_usdc`). Echoed once at the top
-    /// level — rather than repeated per lane — so the renderer can show
-    /// the bar each [`LaneSnapshot::settlement_eligible`] is measured
-    /// against without the operator cross-referencing the config.
-    pub redeem_threshold_micro_usdc: u64,
 }
 
 /// Request body for `admin_v1_earnings` (#2598).
@@ -623,9 +605,9 @@ pub struct PendingRedeem {
     /// [`LaneSnapshot::unredeemed_micro_usdc`] over the lanes this operator
     /// provides whose capability has not expired. The redeemer also skips a
     /// lane whose pool cannot pay (closed, past its grace window, or
-    /// insolvent) and sweeps nothing while the total is under
-    /// `blockchain.redeem_threshold_micro_usdc`; this figure applies neither,
-    /// so it is an upper bound on the next sweep.
+    /// insolvent) and sweeps nothing while the total is under its gas-priced
+    /// redemption floor; this figure applies neither, so it is an upper bound
+    /// on the next sweep.
     pub micro_usdc: u64,
     /// How many lanes count into [`Self::micro_usdc`].
     pub lanes: u64,
@@ -897,10 +879,9 @@ pub trait AdminRpc {
     async fn status(&self) -> RpcResult<StatusResponse>;
 
     /// Return a live snapshot of every lane this node provides against a
-    /// `PaymentPool` (issue #749): per lane the outstanding accrued claim,
-    /// time since the last voucher or preimage (in-memory, `None` after a
-    /// restart until the next one), and whether the accrued claim has reached
-    /// the redemption threshold. Backs `decdn node lanes`, giving
+    /// `PaymentPool` (issue #749): per lane the outstanding accrued claim, the
+    /// part still unredeemed, and the time since the last voucher or preimage
+    /// (in-memory, `None` after a restart until the next one). Backs `decdn node lanes`, giving
     /// operators a single view to spot lanes approaching settlement,
     /// stale lanes, or unusually high outstanding balances before they
     /// become a liquidity risk — without scraping metrics or logs.

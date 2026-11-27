@@ -270,13 +270,11 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
             owners: PoolOwners::new(pool_view, None),
         }],
         lane_activity: LaneActivityClock::empty(),
-        redeem_threshold_micro_usdc: 1_000_000,
     });
     let (url, stop_tx, join) = spawn_admin(state).await?;
 
     let client = HttpClientBuilder::default().build(&url)?;
     let resp = client.lanes().await?;
-    assert_eq!(resp.redeem_threshold_micro_usdc, 1_000_000);
     assert_eq!(resp.lanes.len(), 2);
     // No activity → ordered by descending outstanding.
     let first = resp
@@ -284,7 +282,6 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("missing first lane"))?;
     assert_eq!(first.outstanding_micro_usdc, 2_000_000);
-    assert!(first.settlement_eligible, "2 USDC >= 1 USDC threshold");
     assert!(first.pool_id.starts_with("0x"));
     assert_eq!(
         first.counterparty,
@@ -301,7 +298,6 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
         .get(1)
         .ok_or_else(|| anyhow::anyhow!("missing second lane"))?;
     assert_eq!(second.outstanding_micro_usdc, 100_000);
-    assert!(!second.settlement_eligible, "0.1 USDC < 1 USDC threshold");
     assert_eq!(
         second.counterparty, None,
         "an unseen pool's owner is unknown, never the signer"
@@ -313,8 +309,8 @@ async fn lanes_round_trips_seeded_store() -> anyhow::Result<()> {
 }
 
 /// `admin_v1_lanes` on a node with no lane handles wired returns
-/// an empty list and a zero threshold over the wire — exercising the
-/// `with_lanes`-absent path end-to-end.
+/// an empty list over the wire — exercising the `with_lanes`-absent path
+/// end-to-end.
 #[tokio::test]
 async fn lanes_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
     let (cache, _tmp) = test_cache().await?;
@@ -331,7 +327,6 @@ async fn lanes_without_handles_returns_empty_over_http() -> anyhow::Result<()> {
     let client = HttpClientBuilder::default().build(&url)?;
     let resp = client.lanes().await?;
     assert!(resp.lanes.is_empty());
-    assert_eq!(resp.redeem_threshold_micro_usdc, 0);
 
     let _ = stop_tx.send(());
     join.await?;

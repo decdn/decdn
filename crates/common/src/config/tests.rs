@@ -1135,6 +1135,7 @@ pub(super) fn test_payment_chain() -> types::PaymentChainConfig {
         rpc_url: Some("https://payment.example/rpc".to_owned()),
         chain_id: Some(84_532),
         payment_pools: vec![ALT_ADDR_1.to_owned()],
+        gas_token_price_micro_usdc: None,
     }
 }
 
@@ -1186,7 +1187,8 @@ fn split_config_resolves_governance_and_payment_chains() -> anyhow::Result<()> {
          [[blockchain.payment_chains]]\n\
          rpc_url = \"https://arb.example/rpc\"\n\
          chain_id = 421614\n\
-         payment_pools = [\"{ALT_ADDR_1}\"]\n"
+         payment_pools = [\"{ALT_ADDR_1}\"]\n\
+         gas_token_price_micro_usdc = 4000000000\n"
     )))?;
     anyhow::ensure!(resolved.rpc_url == "https://gov.example/rpc");
     anyhow::ensure!(resolved.chain_id == 11_155_111);
@@ -1200,11 +1202,13 @@ fn split_config_resolves_governance_and_payment_chains() -> anyhow::Result<()> {
                     rpc_url: "https://base.example/rpc".to_owned(),
                     chain_id: 84_532,
                     payment_pools: vec![one, two],
+                    gas_token_price_micro_usdc: super::DEFAULT_GAS_TOKEN_PRICE_MICRO_USDC,
                 },
                 ResolvedPaymentChain {
                     rpc_url: "https://arb.example/rpc".to_owned(),
                     chain_id: 421_614,
                     payment_pools: vec![one],
+                    gas_token_price_micro_usdc: 4_000_000_000,
                 },
             ],
         "{:?}",
@@ -1360,6 +1364,7 @@ fn payment_chain_fields_expand_env() -> anyhow::Result<()> {
                 rpc_url: Some("${HOME}/rpc".to_owned()),
                 chain_id: Some(84_532),
                 payment_pools: vec!["${HOME}/pool".to_owned()],
+                gas_token_price_micro_usdc: None,
             }],
             ..Default::default()
         }),
@@ -4910,7 +4915,6 @@ fn resolve_blockchain_cli_rpc_url_overrides_file() -> anyhow::Result<()> {
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
         receipt_poll_interval_ms: None,
-        redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
@@ -4943,7 +4947,6 @@ fn resolve_blockchain_uses_file_rpc_url_when_cli_absent() -> anyhow::Result<()> 
         capacity_bond_address: Some(GOOD_ADDR.to_string()),
         rpc_watchdog_interval_sec: None,
         receipt_poll_interval_ms: None,
-        redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
@@ -5238,7 +5241,6 @@ fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Resul
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(1),
         receipt_poll_interval_ms: None,
-        redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
@@ -5258,42 +5260,22 @@ fn resolve_blockchain_rejects_small_nonzero_watchdog_interval() -> anyhow::Resul
     Ok(())
 }
 
+/// A zero gas-token price would price every redemption's gas at nothing, so
+/// the resolver refuses it and names the payment chain's field.
 #[test]
-fn resolve_blockchain_rejects_zero_redeem_threshold() -> anyhow::Result<()> {
-    let dir = data_dir_with_keystore()?;
-    let cli = BlockchainArgs {
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: Some("https://example/rpc".to_string()),
-        eth_keystore: None,
-        keystore_password_file: None,
-        capacity_bond_address: Some(GOOD_ADDR.to_string()),
-        content_blacklist_address: None,
-        chain_id: None,
-    };
-    let file = types::BlockchainConfig {
-        content_blacklist_poll_interval_sec: None,
-        origin_assignment_address: None,
-        publisher_registry_address: None,
-        rpc_url: None,
-        eth_keystore: None,
-        capacity_bond_address: None,
-        rpc_watchdog_interval_sec: None,
-        receipt_poll_interval_ms: None,
-        redeem_threshold_micro_usdc: Some(0),
-        redeem_interval_secs: None,
-        buyer_working_deposit_micro_usdc: None,
-        buyer_max_approve: None,
-        content_blacklist_address: None,
-        chain_id: None,
-        ..Default::default()
-    };
-    let Err(err) = resolve_blockchain(&cli, Some(&file), dir.path()) else {
-        anyhow::bail!("expected error when redeem threshold is 0");
+fn resolve_blockchain_rejects_a_zero_gas_token_price() -> anyhow::Result<()> {
+    let Err(err) = resolve_blockchain_toml(&blockchain_toml(&format!(
+        "[[blockchain.payment_chains]]\n\
+         rpc_url = \"https://arb.example/rpc\"\n\
+         chain_id = 421614\n\
+         payment_pools = [\"{ALT_ADDR_1}\"]\n\
+         gas_token_price_micro_usdc = 0\n"
+    ))) else {
+        anyhow::bail!("expected an error for a zero gas token price");
     };
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("redeem_threshold_micro_usdc"),
+        msg.contains("blockchain.payment_chains[0].gas_token_price_micro_usdc"),
         "error should name the field: {msg}"
     );
     Ok(())
@@ -5512,7 +5494,6 @@ fn resolve_blockchain_accepts_zero_watchdog_interval() -> anyhow::Result<()> {
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(0),
         receipt_poll_interval_ms: None,
-        redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
@@ -5547,7 +5528,6 @@ fn resolve_blockchain_accepts_min_watchdog_interval() -> anyhow::Result<()> {
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: Some(MIN_RPC_WATCHDOG_INTERVAL_SEC),
         receipt_poll_interval_ms: None,
-        redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: None,
         buyer_max_approve: None,
@@ -5609,7 +5589,6 @@ fn buyer_working_deposit_zero_is_rejected() -> anyhow::Result<()> {
         capacity_bond_address: None,
         rpc_watchdog_interval_sec: None,
         receipt_poll_interval_ms: None,
-        redeem_threshold_micro_usdc: None,
         redeem_interval_secs: None,
         buyer_working_deposit_micro_usdc: Some(0),
         buyer_max_approve: None,

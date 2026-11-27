@@ -472,7 +472,9 @@ enum ServeRejectReason {
     UnknownLane,
     OwnerMismatch,
     /// The pool's on-chain remaining deposit, minus the node's refundable floor
-    /// `M`, can no longer price one chunk (ADR 003 §Pool solvency). It is
+    /// `M`, can no longer price one chunk (ADR 003 §Pool solvency), or the pool
+    /// is over its stranded-value cap and the request would open a new lane
+    /// (ADR 003 §Redemption floor). It is
     /// reachable only past the lane-ownership proof (a known lane keyed to a
     /// verified signer holding an owner-signed capability), so its audience is the
     /// proven requester — never an unauthenticated prober — and it ships the wire

@@ -137,12 +137,6 @@ pub struct ResolvedBlockchain {
     /// Defaults to 7000 ms (`DEFAULT_RECEIPT_POLL_INTERVAL_MS`); the resolver
     /// enforces a minimum (see `MIN_RECEIPT_POLL_INTERVAL_MS`).
     pub receipt_poll_interval_ms: u64,
-    /// Per-chunk redemption floor (base units, `µUSDC`). The seller
-    /// settlement path submits an on-chain redemption transaction for a
-    /// chunk of lanes only once the aggregate un-redeemed value across that
-    /// chunk's lanes reaches this floor; every lane in a submitted chunk
-    /// settles. Defaults to 0.05 USDC (`50_000` `µUSDC`) when unset.
-    pub redeem_threshold_micro_usdc: u64,
     /// Maximum vouchers per `redeemMany` transaction (the redemption chunk size).
     /// Defaults to `300` (`DEFAULT_REDEEM_MAX_VOUCHERS_PER_TX`); the resolver
     /// rejects `0`.
@@ -181,6 +175,10 @@ pub struct ResolvedPaymentChain {
     /// The accepted `PaymentPool` contracts on this chain, in configured
     /// order, none twice.
     pub payment_pools: Vec<alloy::primitives::Address>,
+    /// The price of one whole gas token of this chain in `µUSDC`, which the
+    /// redeemer prices its gas with (ADR 003 § Redemption floor). Defaults to
+    /// [`super::DEFAULT_GAS_TOKEN_PRICE_MICRO_USDC`]; the resolver rejects `0`.
+    pub gas_token_price_micro_usdc: u64,
 }
 
 /// Resolved cache fields.

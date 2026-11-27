@@ -151,19 +151,20 @@ const MIN_RECEIPT_POLL_INTERVAL_MS: u64 = 250;
 /// provider rejects a range.
 pub const DEFAULT_GET_LOGS_MAX_BLOCK_SPAN: u64 = 10_000;
 
-/// Default accrued-claim redemption threshold: 0.05 USDC (`50_000` `µUSDC`).
-/// One first-time `redeemMany` lane costs ~63.4k gas, about $0.002 on
-/// Arbitrum One at a 0.01 gwei base fee and $3,000 ETH, so 0.05 USDC keeps a
-/// lane's gas near 5% of what it redeems with room for a 10x fee spike, while
-/// a lane that ends below the threshold leaves at most 0.05 USDC unredeemed.
-const DEFAULT_REDEEM_THRESHOLD_MICRO_USDC: u64 = 50_000;
+/// Default price of one whole gas token (ETH) in `µUSDC`: 5,000 USDC. The
+/// redeemer prices a `redeemMany`'s gas in USDC with it, so its redeem floor
+/// follows the live gas price (ADR 003 § Redemption floor). The default sits
+/// above the gas token's market price, so the floor errs high and a claim
+/// never redeems at a loss. It is node policy that the operator sets, not an
+/// oracle.
+pub const DEFAULT_GAS_TOKEN_PRICE_MICRO_USDC: u64 = 5_000_000_000;
 /// Default redemption chunk size: 300 vouchers per `redeemMany` transaction.
 /// The benchmarks in `contracts/test/PaymentPool.t.sol` pin two marginals for
-/// one added cold-lane voucher: ~34.5k gas when the signer is already
-/// registered (`test_redeemMany_gas_N…`), and ~63.4k gas when the signer is
+/// one added cold-lane voucher: ~35.0k gas when the signer is already
+/// registered (`test_redeemMany_gas_N…`), and ~63.8k gas when the signer is
 /// first-time and its capability registers in the same call
 /// (`test_redeemMany_gas_firstTime_N…`). A high-fan-out node serving one-time
-/// payers hits the first-time case on every lane, so ~63.4k is the sizing
+/// payers hits the first-time case on every lane, so ~63.8k is the sizing
 /// figure. Registration cost is bounded: the node only redeems capabilities
 /// whose owner signature it verified off-chain against an EOA pool owner
 /// (`ClientHandler::intake_capability` rejects contract/ERC-1271 owners), so no
@@ -1234,10 +1235,23 @@ fn resolve_payment_chains(
                 payment_pools.push(address);
             }
         }
+        let price_field = format!("blockchain.payment_chains[{i}].gas_token_price_micro_usdc");
+        let gas_token_price_micro_usdc = entry
+            .gas_token_price_micro_usdc
+            .unwrap_or(DEFAULT_GAS_TOKEN_PRICE_MICRO_USDC);
+        // A zero price prices every redemption's gas at nothing, so the
+        // redeemer would submit claims that cost more gas than they pay.
+        bag.check_with(gas_token_price_micro_usdc > 0, price_field.as_str(), || {
+            format!(
+                "{price_field} must be > 0: the redeemer prices its gas in USDC with it, and \
+                 a 0 price redeems claims worth less than their gas"
+            )
+        });
         out.push(ResolvedPaymentChain {
             rpc_url,
             chain_id,
             payment_pools,
+            gas_token_price_micro_usdc,
         });
     }
     // Every stream answer lists the pools a node accepts, and a receiver keeps
@@ -1551,23 +1565,6 @@ fn resolve_blockchain_into(
         },
     );
 
-    let redeem_threshold_micro_usdc = file
-        .and_then(|b| b.redeem_threshold_micro_usdc)
-        .unwrap_or(DEFAULT_REDEEM_THRESHOLD_MICRO_USDC);
-    // A `0` threshold would withdraw on every accepted voucher — burning gas
-    // per MB and reverting on-chain (`NothingToWithdraw`) for any zero-delta
-    // re-hint. Reject it; operators wanting aggressive redemption set a small
-    // positive value (base units, µUSDC).
-    bag.check_with(
-        redeem_threshold_micro_usdc > 0,
-        "blockchain.redeem_threshold_micro_usdc",
-        || {
-            "blockchain.redeem_threshold_micro_usdc must be > 0 (a 0 threshold \
-             withdraws on every voucher, burning gas and reverting on zero-delta)"
-                .to_string()
-        },
-    );
-
     let redeem_interval_secs = file
         .and_then(|b| b.redeem_interval_secs)
         .unwrap_or(DEFAULT_REDEEM_INTERVAL_SECS);
@@ -1664,7 +1661,6 @@ fn resolve_blockchain_into(
         chain_id,
         rpc_watchdog_interval_sec,
         receipt_poll_interval_ms,
-        redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,
         buyer_working_deposit_micro_usdc,
