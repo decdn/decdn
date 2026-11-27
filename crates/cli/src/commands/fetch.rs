@@ -1687,8 +1687,8 @@ pub(crate) async fn fetch_on(
 /// `NotFound` because the chain held no record of it, and drops its row if
 /// the chain still shows none, so the next run opens or adopts a pool
 /// ([`RunFunding::retire_stale_pool`], ADR 003 § Funding recovery). A pass
-/// that a pool replacement or an interrupt ended reads nothing
-/// ([`retire_allowed`]).
+/// that a pool replacement ended reads nothing ([`retire_allowed`]). A Ctrl-C
+/// drops the pass before this step runs.
 async fn retire_on_failure<P>(
     result: anyhow::Result<()>,
     funding: &RunFunding,
@@ -1699,7 +1699,7 @@ where
     P: alloy::providers::Provider + Clone,
 {
     let err = match result {
-        Err(err) if retire_allowed(&err) && err.downcast_ref::<Interrupted>().is_none() => err,
+        Err(err) if retire_allowed(&err) => err,
         other => return other,
     };
     match funding.retire_stale_pool(contract, store).await {
