@@ -605,7 +605,6 @@ fn mk_lane(
     outstanding: u64,
     deposit: u64,
     secs_since: Option<u64>,
-    eligible: bool,
 ) -> LaneSnapshot {
     LaneSnapshot {
         pool: "eip155:84532:0xb0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
@@ -620,21 +619,16 @@ fn mk_lane(
         unredeemed_micro_usdc: outstanding / 2,
         deposit_micro_usdc: deposit,
         seconds_since_last_voucher: secs_since,
-        settlement_eligible: eligible,
     }
 }
 
 #[test]
 fn write_lanes_table_empty_emits_sentinel() -> anyhow::Result<()> {
-    let resp = LanesResponse {
-        lanes: Vec::new(),
-        redeem_threshold_micro_usdc: 1_000_000,
-    };
+    let resp = LanesResponse { lanes: Vec::new() };
     let mut buf = Vec::<u8>::new();
     write_lanes_table(&mut buf, &resp)?;
     let s = String::from_utf8(buf)?;
-    // Summary line still prints the threshold, then the sentinel.
-    assert!(s.contains("redeem_threshold=1.000000"), "{s}");
+    // Summary line still prints the lane count, then the sentinel.
     assert!(s.contains("lanes=0"), "{s}");
     assert!(s.contains("(no open lanes)"), "{s}");
     // No table header when there are no rows.
@@ -661,7 +655,6 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
         "fixture must be a mixed-case EIP-55 address: {counterparty}"
     );
     let resp = LanesResponse {
-        redeem_threshold_micro_usdc: 1_000_000,
         lanes: vec![
             mk_lane(
                 &format!("0x{}", "a".repeat(64)),
@@ -669,7 +662,6 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
                 2_500_000,
                 10_000_000,
                 Some(90),
-                true,
             ),
             mk_lane(
                 &format!("0x{}", "c".repeat(64)),
@@ -677,7 +669,6 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
                 0,
                 5_000_000,
                 None,
-                false,
             ),
         ],
     };
@@ -687,8 +678,7 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
     assert!(s.contains("lanes=2"), "{s}");
     assert!(s.contains("LANE"), "header missing: {s}");
     assert!(s.contains("OUTSTANDING"), "header missing: {s}");
-    assert!(s.contains("ELIGIBLE"), "header missing: {s}");
-    // First row: USDC-formatted amounts, 90s → "1m ago", eligible "yes".
+    // First row: USDC-formatted amounts, 90s → "1m ago".
     assert!(s.contains("2.500000"), "outstanding USDC missing: {s}");
     assert!(s.contains("10.000000"), "deposit USDC missing: {s}");
     assert!(s.contains("1m ago"), "last-voucher age missing: {s}");
@@ -707,7 +697,7 @@ fn write_lanes_table_renders_header_and_rows() -> anyhow::Result<()> {
         s.contains(&cp_preview),
         "checksummed counterparty preview missing: {s}"
     );
-    // Second row: no activity → "never", not eligible → "no".
+    // Second row: no activity → "never".
     assert!(s.contains("never"), "never sentinel missing: {s}");
     // Each row names the PaymentPool contract: its chain id and a short
     // address.
@@ -736,21 +726,13 @@ fn short_pool_keeps_the_chain_and_a_short_address() {
 fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
     let funder = format!("0x{}", "1".repeat(40));
     let delegate = format!("0x{}", "2".repeat(40));
-    let mut delegated = mk_lane(
-        &format!("0x{}", "a".repeat(64)),
-        &funder,
-        1,
-        2,
-        Some(1),
-        false,
-    );
+    let mut delegated = mk_lane(&format!("0x{}", "a".repeat(64)), &funder, 1, 2, Some(1));
     delegated.voucher_signer = delegate.clone();
 
     let mut buf = Vec::<u8>::new();
     write_lanes_table(
         &mut buf,
         &LanesResponse {
-            redeem_threshold_micro_usdc: 1_000_000,
             lanes: vec![delegated],
         },
     )?;
@@ -778,17 +760,11 @@ fn write_lanes_table_renders_the_voucher_signer_column() -> anyhow::Result<()> {
 #[test]
 fn write_lanes_table_renders_an_unknown_counterparty() -> anyhow::Result<()> {
     let signer = format!("0x{}", "2".repeat(40));
-    let mut lane = mk_lane(&format!("0x{}", "a".repeat(64)), &signer, 1, 0, None, false);
+    let mut lane = mk_lane(&format!("0x{}", "a".repeat(64)), &signer, 1, 0, None);
     lane.counterparty = None;
 
     let mut buf = Vec::<u8>::new();
-    write_lanes_table(
-        &mut buf,
-        &LanesResponse {
-            redeem_threshold_micro_usdc: 1_000_000,
-            lanes: vec![lane],
-        },
-    )?;
+    write_lanes_table(&mut buf, &LanesResponse { lanes: vec![lane] })?;
     let s = String::from_utf8(buf)?;
     let row = s
         .lines()
@@ -816,13 +792,9 @@ fn lanes_json_renders_an_unknown_counterparty_as_null() -> anyhow::Result<()> {
         1,
         0,
         None,
-        false,
     );
     lane.counterparty = None;
-    let pretty = serde_json::to_string_pretty(&LanesResponse {
-        redeem_threshold_micro_usdc: 1_000_000,
-        lanes: vec![lane],
-    })?;
+    let pretty = serde_json::to_string_pretty(&LanesResponse { lanes: vec![lane] })?;
     let value: serde_json::Value = serde_json::from_str(&pretty)?;
     let c0 = value["lanes"]
         .as_array()
@@ -868,14 +840,12 @@ fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
     let counterparty =
         alloy::primitives::address!("0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed").to_string();
     let resp = LanesResponse {
-        redeem_threshold_micro_usdc: 1_000_000,
         lanes: vec![mk_lane(
             &format!("0x{}", "a".repeat(64)),
             &counterparty,
             2_500_000,
             10_000_000,
             Some(42),
-            true,
         )],
     };
 
@@ -893,19 +863,16 @@ fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
     // derive `PartialEq`, so assert the reconstructed fields directly
     // rather than comparing whole structs.)
     let back: LanesResponse = serde_json::from_str(&pretty)?;
-    assert_eq!(back.redeem_threshold_micro_usdc, 1_000_000);
     assert_eq!(back.lanes.len(), 1);
     let bc = back.lanes.first().expect("one lane");
     assert_eq!(bc.counterparty.as_deref(), Some(counterparty.as_str()));
     assert_eq!(bc.outstanding_micro_usdc, 2_500_000);
     assert_eq!(bc.deposit_micro_usdc, 10_000_000);
     assert_eq!(bc.seconds_since_last_voucher, Some(42));
-    assert!(bc.settlement_eligible);
 
     // Each wire key is present with the expected value, including the
     // checksummed counterparty verbatim (mixed-case preserved).
     let value: serde_json::Value = serde_json::from_str(&pretty)?;
-    assert_eq!(value["redeem_threshold_micro_usdc"], 1_000_000);
     let chans = value["lanes"].as_array().expect("lanes array");
     assert_eq!(chans.len(), 1);
     let c0 = &chans[0];
@@ -913,7 +880,6 @@ fn lanes_json_pretty_roundtrips_and_carries_fields() -> anyhow::Result<()> {
     assert_eq!(c0["outstanding_micro_usdc"], 2_500_000);
     assert_eq!(c0["deposit_micro_usdc"], 10_000_000);
     assert_eq!(c0["seconds_since_last_voucher"], 42);
-    assert_eq!(c0["settlement_eligible"], true);
     Ok(())
 }
 

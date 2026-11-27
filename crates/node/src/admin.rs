@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256};
 use decdn_cache::{CacheEngine, CacheError};
 use decdn_common::admin::{
     AdminRpcServer, BUYER_POOL_STORE_ERROR_CODE, BUYER_POOL_UNAVAILABLE_CODE, BucketStat,
@@ -248,10 +248,6 @@ pub struct LaneStatusHandles {
     /// Read for `seconds_since_last_voucher`; a lane reads back `None` until
     /// this process accepts a voucher or preimage for it.
     pub lane_activity: LaneActivityClock,
-    /// Configured redemption threshold in micro-USDC
-    /// (`blockchain.redeem_threshold_micro_usdc`). A lane whose accrued
-    /// claim has reached this is reported `settlement_eligible`.
-    pub redeem_threshold_micro_usdc: u64,
 }
 
 /// One accepted pool's lane handles for `admin_v1_lanes`.
@@ -284,10 +280,7 @@ impl std::fmt::Debug for AdminPool {
 impl std::fmt::Debug for LaneStatusHandles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LaneStatusHandles")
-            .field(
-                "redeem_threshold_micro_usdc",
-                &self.redeem_threshold_micro_usdc,
-            )
+            .field("pools", &self.pools)
             .finish_non_exhaustive()
     }
 }
@@ -873,10 +866,7 @@ impl AdminRpcServer for AdminRpcImpl {
         // lanes is a legitimate state, and the CLI renders the
         // empty-table sentinel for it.
         let Some(ch) = self.state.lanes.as_ref() else {
-            return Ok(LanesResponse {
-                lanes: Vec::new(),
-                redeem_threshold_micro_usdc: 0,
-            });
+            return Ok(LanesResponse { lanes: Vec::new() });
         };
 
         // `load_all` on the redb-backed store is blocking I/O (the store
@@ -926,7 +916,6 @@ impl AdminRpcServer for AdminRpcImpl {
             )
         })?;
 
-        let threshold = U256::from(ch.redeem_threshold_micro_usdc);
         // Read each live lane's last-voucher age off the handler's registry
         // (issue #1733); lanes with no voucher since restart are absent from the
         // map and read back as `None`.
@@ -942,16 +931,12 @@ impl AdminRpcServer for AdminRpcImpl {
             lanes.extend(build_lane_snapshots(
                 pool.deployment,
                 &states,
-                threshold,
                 &pool_ages,
                 &owners,
             ));
         }
         sort_lane_snapshots(&mut lanes);
-        Ok(LanesResponse {
-            lanes,
-            redeem_threshold_micro_usdc: ch.redeem_threshold_micro_usdc,
-        })
+        Ok(LanesResponse { lanes })
     }
 
     async fn pools(&self) -> RpcResult<BuyerPoolsResponse> {
@@ -1230,7 +1215,6 @@ fn pending_redeem(
 fn build_lane_snapshots(
     deployment: decdn_incentive::Deployment,
     states: &[LaneState],
-    threshold: U256,
     ages: &HashMap<LaneKey, u64>,
     owners: &HashMap<B256, Address>,
 ) -> Vec<LaneSnapshot> {
@@ -1262,11 +1246,6 @@ fn build_lane_snapshots(
                 unredeemed_micro_usdc: u64::try_from(state.unredeemed()).unwrap_or(u64::MAX),
                 deposit_micro_usdc: 0,
                 seconds_since_last_voucher: ages.get(&state.key()).copied(),
-                // The full claim, not `owed − paid_cumulative`, against the
-                // threshold (documented on the DTO field). The redeemer gates
-                // on the unredeemed value summed per chunk instead, so this
-                // flag is a bar, not a prediction of the next redemption.
-                settlement_eligible: outstanding >= threshold,
             }
         })
         .collect();

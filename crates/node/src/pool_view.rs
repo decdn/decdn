@@ -163,6 +163,16 @@ pub trait PoolView: Send + Sync + std::fmt::Debug {
         let _ = (pool_id, signer);
         None
     }
+
+    /// Whether the node refuses new lanes on `pool_id`: the pool's lanes that
+    /// expired below the final-claim floor left more than one floor of value
+    /// unredeemed on this node (ADR 003 § Redemption floor). A read from memory
+    /// that never blocks. The default refuses nothing: test doubles hold no
+    /// redeemer.
+    fn refuses_new_lanes(&self, pool_id: B256) -> bool {
+        let _ = pool_id;
+        false
+    }
 }
 
 /// One held `getPool` read.
@@ -192,12 +202,16 @@ pub struct PoolProjection {
     /// Pools a read found `Closed`, waiting for the settlement service to
     /// forget their lanes.
     closed: Arc<Mutex<HashSet<B256>>>,
+    /// Pools over their stranded-value cap, which take no new lane: the
+    /// redeemer publishes the set after each sweep ([`Self::set_stranded`]).
+    stranded: Arc<ArcSwap<HashSet<B256>>>,
 }
 
 impl std::fmt::Debug for PoolProjection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PoolProjection")
             .field("pools", &self.pools.load().len())
+            .field("stranded", &self.stranded.load().len())
             .field(
                 "closed",
                 &self
@@ -299,12 +313,30 @@ impl PoolProjection {
         }
         self.update(|pools| pools.retain(|pool_id, entry| !stale((pool_id, entry))));
     }
+
+    /// Replace the set of pools over their stranded-value cap. A pool in the
+    /// set takes no new lane ([`PoolView::refuses_new_lanes`]).
+    pub fn set_stranded(&self, pools: HashSet<B256>) {
+        if **self.stranded.load() != pools {
+            self.stranded.store(Arc::new(pools));
+        }
+    }
+
+    /// Whether `pool_id` is over its stranded-value cap. Never blocks.
+    #[must_use]
+    pub fn is_stranded(&self, pool_id: B256) -> bool {
+        self.stranded.load().contains(&pool_id)
+    }
 }
 
 #[async_trait::async_trait]
 impl PoolView for PoolProjection {
     async fn status(&self, pool_id: B256) -> Option<PoolStatus> {
         self.snapshot(pool_id)
+    }
+
+    fn refuses_new_lanes(&self, pool_id: B256) -> bool {
+        self.is_stranded(pool_id)
     }
 }
 

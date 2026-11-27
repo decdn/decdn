@@ -358,6 +358,8 @@ fn build_config(
                 rpc_url: rpc_url.clone(),
                 chain_id: CHAIN_ID,
                 payment_pools: vec![addrs.payment_pool],
+                gas_token_price_micro_usdc:
+                    decdn_common::config::DEFAULT_GAS_TOKEN_PRICE_MICRO_USDC,
             }],
             cctp_sweep_receiver_address: None,
             rpc_url,
@@ -366,7 +368,6 @@ fn build_config(
             capacity_bond_address: addrs.capacity_bond.to_string(),
             rpc_watchdog_interval_sec: 30,
             receipt_poll_interval_ms: 250,
-            redeem_threshold_micro_usdc: 1_000_000,
             redeem_max_vouchers_per_tx: 300,
             redeem_interval_secs: 300,
             buyer_working_deposit_micro_usdc: 10_000_000,

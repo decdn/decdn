@@ -88,7 +88,6 @@ fn default_config_template_covers_every_wired_field() {
         rpc_watchdog_interval_sec,
         receipt_poll_interval_ms,
         get_logs_max_block_span,
-        redeem_threshold_micro_usdc,
         redeem_max_vouchers_per_tx,
         redeem_interval_secs,
         buyer_working_deposit_micro_usdc,
@@ -100,6 +99,7 @@ fn default_config_template_covers_every_wired_field() {
         rpc_url: payment_rpc_url,
         chain_id: payment_chain_id,
         payment_pools,
+        gas_token_price_micro_usdc,
     } = &config::types::PaymentChainConfig::default();
     let blockchain = [
         ("rpc_url =", rpc_url.is_none()),
@@ -108,6 +108,10 @@ fn default_config_template_covers_every_wired_field() {
         ("payment_pools =", payment_pools.is_empty()),
         ("rpc_url =", payment_rpc_url.is_none()),
         ("chain_id =", payment_chain_id.is_none()),
+        (
+            "gas_token_price_micro_usdc =",
+            gas_token_price_micro_usdc.is_none(),
+        ),
         (
             "cctp_sweep_receiver_address =",
             cctp_sweep_receiver_address.is_none(),
@@ -146,10 +150,6 @@ fn default_config_template_covers_every_wired_field() {
         (
             "get_logs_max_block_span =",
             get_logs_max_block_span.is_none(),
-        ),
-        (
-            "redeem_threshold_micro_usdc =",
-            redeem_threshold_micro_usdc.is_none(),
         ),
         (
             "redeem_max_vouchers_per_tx =",

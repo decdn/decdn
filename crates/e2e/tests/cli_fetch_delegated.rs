@@ -62,7 +62,7 @@ use decdn_e2e::assert as e2e_assert;
 use decdn_e2e::bindings::PaymentPool;
 use decdn_e2e::chain::ChainFixture;
 use decdn_e2e::cli::{decdn_command, ensure_decdn_cli_built};
-use decdn_e2e::node::{NodeFixture, REDEEM_THRESHOLD_MICRO_USDC};
+use decdn_e2e::node::{NodeFixture, REDEEM_FLOOR_MICRO_USDC};
 use decdn_e2e::poll;
 use decdn_incentive::buyer_pool::BuyerPoolStore;
 use decdn_incentive::buyer_pool_redb::RedbBuyerPoolStore;
@@ -806,7 +806,7 @@ async fn run_raise() -> anyhow::Result<()> {
     );
     // The chain must pay what the node accepted, up to the unredeemed tail the
     // redeemer holds back: it submits a chunk only once its unredeemed value
-    // reaches the redeem threshold, so a payment folded after the last
+    // reaches the redeem floor, so a payment folded after the last
     // redemption can stay below it. The paid figure must also pass A's cap,
     // which a registration still holding A's terms would never pay. Each round
     // re-reads the node's figure, so a payment the node folds after the first
@@ -822,7 +822,7 @@ async fn run_raise() -> anyhow::Result<()> {
         )
         .await?;
         let tail = owed.saturating_sub(lane.amount);
-        Ok((lane.amount > registered.cap && tail < REDEEM_THRESHOLD_MICRO_USDC).then_some(()))
+        Ok((lane.amount > registered.cap && tail < REDEEM_FLOOR_MICRO_USDC).then_some(()))
     })
     .await?;
     if settled.is_none() {
@@ -838,7 +838,7 @@ async fn run_raise() -> anyhow::Result<()> {
         anyhow::bail!(
             "the chain pays {} µUSDC on the delegate's lane but the node is owed {owed} µUSDC; \
              every payment the node accepted must redeem on-chain, but for a tail below the \
-             {REDEEM_THRESHOLD_MICRO_USDC} µUSDC redeem threshold, and past capability A's cap \
+             {REDEEM_FLOOR_MICRO_USDC} µUSDC redeem floor, and past capability A's cap \
              of {} µUSDC",
             lane.amount,
             registered.cap

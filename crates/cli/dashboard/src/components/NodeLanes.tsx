@@ -1,6 +1,5 @@
 import type { LanesResponse, Part } from "../api";
 import { formatDuration, formatUsdc, shortHex } from "../format";
-import { partValue } from "../view";
 import { Cell, Empty, PartPanel, Table } from "./Panel";
 
 /** The lanes the node serves against, as it accrued them. */
@@ -8,15 +7,10 @@ export function NodeLanes(props: {
   part: Part<LanesResponse>;
   stale: number | null;
 }) {
-  const read = partValue(props.part);
   return (
     <PartPanel
       title="Lanes the node is paid on"
-      note={
-        read
-          ? `Redeems once the lanes owe ${formatUsdc(read.redeem_threshold_micro_usdc)} USDC`
-          : null
-      }
+      note="Redeems once the lanes owe more than their gas"
       part={props.part}
       stale={props.stale}
     >
@@ -32,7 +26,6 @@ export function NodeLanes(props: {
               "Owed",
               "Unredeemed",
               "Last voucher",
-              "Over threshold",
             ]}
           >
             {l.lanes.map((lane) => (
@@ -53,7 +46,6 @@ export function NodeLanes(props: {
                     ? "not since start"
                     : `${formatDuration(lane.seconds_since_last_voucher)} ago`}
                 </Cell>
-                <Cell>{lane.settlement_eligible ? "Yes" : "No"}</Cell>
               </tr>
             ))}
           </Table>

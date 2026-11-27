@@ -1652,6 +1652,26 @@ fn open_pools() -> PoolProjection {
     projection
 }
 
+/// Floors that hold a chunk to `floor` whatever its lane count, with a
+/// final-claim floor of `0`, so a final claim always clears.
+fn flat(floor: u64) -> RedeemFloors {
+    flat_at(U256::from(floor))
+}
+
+/// [`flat`] for a `U256` floor.
+fn flat_at(floor: U256) -> RedeemFloors {
+    // At 5e16 µUSDC per token a chunk's floor equals its cost in wei:
+    // `CHUNK_COST_MULTIPLE × 5e16 / 1e18 = 1`.
+    RedeemFloors::from_costs(floor, U256::ZERO, 50_000_000_000_000_000)
+}
+
+/// Floors at 1 `µUSDC` per wei: a chunk of `n` claims must pay
+/// `CHUNK_COST_MULTIPLE × (tx + n × claim)`, and a final claim
+/// `FINAL_CLAIM_COST_MULTIPLE × claim`.
+fn priced(tx: U256, claim: U256) -> RedeemFloors {
+    RedeemFloors::from_costs(tx, claim, 1_000_000_000_000_000_000)
+}
+
 /// Build a [`PlannedLane`] for a given pool/signer, with an optional
 /// capability registration, for `group_by_pool` tests.
 fn planned(pool: u8, signer: u8, unredeemed: u64, register: bool) -> PlannedLane {
@@ -1671,6 +1691,7 @@ fn planned(pool: u8, signer: u8, unredeemed: u64, register: bool) -> PlannedLane
         },
         owed: U256::from(unredeemed),
         unredeemed: U256::from(unredeemed),
+        final_claim: false,
         voucher: PaymentPool::LaneVoucher {
             signer: signer_addr,
             cumulative: unredeemed,
@@ -2280,7 +2301,7 @@ async fn a_sub_floor_plan_set_reads_nothing_from_the_chain() -> Result<()> {
         &store,
         vec![planned(1, 0, 10, false)],
         SELLER,
-        U256::from(1_000_000u64),
+        &flat(1_000_000),
         300,
         true,
         &metrics,
@@ -2331,7 +2352,7 @@ async fn a_set_that_clears_the_floor_in_total_reads_every_lane() -> Result<()> {
             planned(1, 2, 300_000, false),
         ],
         SELLER,
-        U256::from(500_000u64),
+        &flat(500_000),
         2,
         true,
         &metrics,
@@ -2372,7 +2393,7 @@ async fn a_zero_floor_still_reads_every_lane() -> Result<()> {
         &store,
         vec![planned(1, 0, 1, false), planned(1, 1, 1, false)],
         SELLER,
-        U256::ZERO,
+        &flat(0),
         300,
         false,
         &metrics,
@@ -2404,7 +2425,7 @@ fn shutdown_service<P: Provider + Clone + 'static>(
     contract: PaymentPool::PaymentPoolInstance<P>,
     store: Arc<dyn PoolStateStore>,
     self_address: Address,
-    redeem_threshold: U256,
+    floors: RedeemFloors,
     metrics: Arc<Metrics>,
 ) -> PoolSettlementService<P> {
     let (redeem_tx, _redeem_rx) = mpsc::channel(1);
@@ -2414,8 +2435,9 @@ fn shutdown_service<P: Provider + Clone + 'static>(
         store,
         paid: PaidWatermarks::default(),
         self_address,
-        redeem_threshold,
+        floors: Arc::new(FloorSource::fixed(floors)),
         redeem_max_vouchers_per_tx: 300,
+        margin_secs: capability_expiry_margin_secs(300),
         metrics,
         pool_view: open_pools(),
         recorder: test_recorder(),
@@ -2486,8 +2508,8 @@ impl PoolStateStore for FailingFlushStore {
     }
 }
 
-/// `final_redeem_sweep` applies the configured floor: a lane whose
-/// unredeemed value is below `redeem_threshold` is left alone at shutdown.
+/// `final_redeem_sweep` applies the redemption floors: a lane whose
+/// unredeemed value is below the chunk floor is left alone at shutdown.
 /// The floor gate returns before the pre-submit `getWatermarks` read, so the
 /// queued response stays unconsumed and no `redeemMany` is built.
 #[tokio::test]
@@ -2499,7 +2521,7 @@ async fn shutdown_sweep_leaves_a_sub_floor_lane_unread() -> Result<()> {
         contract,
         store,
         me,
-        owed + U256::from(1u64),
+        flat_at(owed + U256::from(1u64)),
         Arc::clone(&metrics),
     );
 
@@ -2521,15 +2543,15 @@ async fn shutdown_sweep_leaves_a_sub_floor_lane_unread() -> Result<()> {
     Ok(())
 }
 
-/// `final_redeem_sweep` passes a lane owed exactly `redeem_threshold` on to
-/// the pre-submit reconcile. The chain reports the lane settled, so nothing
+/// `final_redeem_sweep` passes a lane owed exactly the chunk floor on to the
+/// pre-submit reconcile. The chain reports the lane settled, so nothing
 /// reaches `redeemMany`.
 #[tokio::test]
 async fn shutdown_sweep_reconciles_a_lane_at_the_floor() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let (store, me, owed) = store_with_one_owed_lane()?;
     let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(u64::try_from(owed)?)]]);
-    let svc = shutdown_service(contract, store, me, owed, Arc::clone(&metrics));
+    let svc = shutdown_service(contract, store, me, flat_at(owed), Arc::clone(&metrics));
 
     svc.shutdown(Duration::from_secs(5)).await;
 
@@ -2556,7 +2578,7 @@ async fn shutdown_sweep_submits_redeem_many_for_an_unsettled_lane() -> Result<()
     let (store, me, owed) = store_with_one_owed_lane()?;
     let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-    let svc = shutdown_service(contract, store, me, owed, Arc::clone(&metrics));
+    let svc = shutdown_service(contract, store, me, flat_at(owed), Arc::clone(&metrics));
 
     svc.shutdown(Duration::from_secs(5)).await;
 
@@ -2589,7 +2611,7 @@ async fn shutdown_sweep_redeems_despite_a_failed_flush() -> Result<()> {
     let (me, owed) = seed_one_owed_lane(store.as_ref())?;
     let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
     asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
-    let svc = shutdown_service(contract, store, me, owed, Arc::clone(&metrics));
+    let svc = shutdown_service(contract, store, me, flat_at(owed), Arc::clone(&metrics));
 
     svc.shutdown(Duration::from_secs(5)).await;
 
@@ -2792,7 +2814,7 @@ impl PoolStateStore for CountingLoadStore {
 fn spawn_redeemer<P: Provider + Clone + 'static>(
     contract: PaymentPool::PaymentPoolInstance<P>,
     store: Arc<dyn PoolStateStore>,
-    floor: U256,
+    floors: RedeemFloors,
     interval: Duration,
     metrics: Arc<Metrics>,
 ) -> (mpsc::Sender<LaneKey>, JoinHandle<()>, u64) {
@@ -2803,7 +2825,7 @@ fn spawn_redeemer<P: Provider + Clone + 'static>(
         store,
         PaidWatermarks::default(),
         Address::from([20u8; 20]),
-        floor,
+        Arc::new(FloorSource::fixed(floors)),
         300,
         interval,
         margin,
@@ -2882,7 +2904,7 @@ async fn sub_floor_lanes_are_redeemed_together_at_their_serve_cutoff() -> Result
     let (tx, handle, margin) = spawn_redeemer(
         contract,
         Arc::clone(&store) as Arc<dyn PoolStateStore>,
-        floor,
+        flat_at(floor),
         Duration::from_hours(1),
         Arc::clone(&metrics),
     );
@@ -2920,20 +2942,25 @@ async fn sub_floor_lanes_are_redeemed_together_at_their_serve_cutoff() -> Result
     Ok(())
 }
 
-/// Lanes persisted before the loop starts keep their cutoff sweep. A set
-/// that stays below the floor at the cutoff is swept once and left
-/// unredeemed: the sweep reads nothing from the chain.
+/// Lanes persisted before the loop starts keep their cutoff sweep. Final
+/// claims that each pay less than the final-claim floor cost more gas than
+/// they pay: the cutoff sweep leaves them unredeemed and reads nothing from
+/// the chain.
 #[tokio::test]
-async fn a_sub_floor_set_at_its_serve_cutoff_reads_nothing() -> Result<()> {
+async fn final_claims_below_their_floor_at_the_serve_cutoff_read_nothing() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let store = CountingLoadStore::new(usize::MAX);
     let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0), lane(0)]]);
     let expiry = unix_now() + hour_tick_margin() + 2;
     let (_, total) = record_lanes(store.as_ref(), 1..=2, expiry)?;
+    let lane_value = expiring_lane(1, 0).owed();
+    // The final-claim floor is three lanes' value: above each lane.
+    let floors = priced(U256::ZERO, lane_value);
+    assert!(lane_value < floors.final_claim());
     let (tx, handle, _) = spawn_redeemer(
         contract,
         Arc::clone(&store) as Arc<dyn PoolStateStore>,
-        total + U256::from(1u64),
+        floors,
         Duration::from_hours(1),
         Arc::clone(&metrics),
     );
@@ -2953,6 +2980,114 @@ async fn a_sub_floor_set_at_its_serve_cutoff_reads_nothing() -> Result<()> {
     Ok(())
 }
 
+/// #2836: a lone lane below the chunk floor is redeemed at its serve cutoff,
+/// before its capability expires, once its final claim clears the
+/// final-claim floor. Before the cutoff the same lane, a hint away, defers.
+#[tokio::test]
+async fn a_sub_floor_lane_is_redeemed_at_its_serve_cutoff_when_its_final_claim_clears() -> Result<()>
+{
+    let metrics = Arc::new(Metrics::new());
+    let store = CountingLoadStore::new(usize::MAX);
+    let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0)]]);
+    // The redeemMany send fails at its first RPC call, so the send is metered.
+    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+    let lane_value = expiring_lane(1, 0).owed();
+    // A one-lane chunk must pay 20 × (lane + lane / 3): far above the lane.
+    // The final claim needs 3 × (lane / 3): at most the lane.
+    let floors = priced(lane_value, lane_value / U256::from(3u64));
+    assert!(
+        lane_value < floors.chunk(1),
+        "the lane is below the chunk floor"
+    );
+    assert!(lane_value >= floors.final_claim(), "the final claim clears");
+    let (tx, handle, margin) = spawn_redeemer(
+        contract,
+        Arc::clone(&store) as Arc<dyn PoolStateStore>,
+        floors,
+        Duration::from_hours(1),
+        Arc::clone(&metrics),
+    );
+    await_until("the startup scan", || Ok(store.loads() == 1)).await?;
+
+    let expiry = unix_now() + margin + 2;
+    let wake = expiry - margin + 1;
+    let (hinted, _) = record_lanes(store.as_ref(), 1..=1, expiry)?;
+    // The hint lands before the cutoff: the claim is not final, the lane is
+    // below the chunk floor, so the hint reads nothing.
+    tx.send(hinted).await?;
+
+    await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
+    assert!(
+        unix_now() >= wake,
+        "the lane redeems at its cutoff, not at the hint"
+    );
+    assert!(unix_now() < expiry, "the lane redeems before its expiry");
+    ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 1"])?;
+    assert_eq!(asserter.read_q().len(), 0, "the lane was read and sent");
+
+    drop(tx);
+    handle.await?;
+    Ok(())
+}
+
+/// #2836: a lane below the final-claim floor at its expiry adds its value to
+/// its pool's stranded value, and a pool over one floor of stranded value
+/// refuses new lanes. A lane worth its gas, or one not yet expired, adds
+/// nothing.
+#[test]
+fn an_expired_sub_floor_lane_strands_its_value_on_its_pool() {
+    let paid = PaidWatermarks::default();
+    let me = Address::from([20u8; 20]);
+    let lane_value = expiring_lane(1, 0).owed();
+    let final_floor = lane_value + U256::from(1u64);
+    let now = 1_000_000;
+    // Two expired lanes on pool 1 below the floor, one expired lane worth its
+    // gas, and one live lane.
+    let mut states: Vec<LaneState> = (1..=2).map(|s| expiring_lane(s, now - 1)).collect();
+    let rich = LaneState::hydrate(
+        PoolId::from([1u8; 32]),
+        Address::from([3u8; 20]),
+        me,
+        U256::from(10_000_000u64),
+        now - 1,
+        final_floor * U256::from(2u64),
+        U256::from(1_048_576u64),
+        Some(sig_with_v(0)),
+        decdn_incentive::LaneChain::NONE,
+    );
+    states.push(rich);
+    states.push(expiring_lane(4, now + 10_000));
+
+    let stranded = stranded_by_pool(&states, &paid, me, final_floor, now);
+    let pool = expiring_lane(1, 0).pool_id;
+    assert_eq!(
+        stranded.get(&pool).copied(),
+        Some(lane_value * U256::from(2u64))
+    );
+
+    let view = PoolProjection::new();
+    publish_stranded(&view, &states, &paid, me, final_floor, now);
+    assert!(
+        view.is_stranded(pool),
+        "two sub-floor lanes exceed one floor"
+    );
+    assert!(crate::pool_view::PoolView::refuses_new_lanes(&view, pool));
+
+    // One stranded lane does not exceed one floor.
+    publish_stranded(
+        &view,
+        states.get(..1).unwrap_or_default(),
+        &paid,
+        me,
+        final_floor,
+        now,
+    );
+    assert!(
+        !view.is_stranded(pool),
+        "one sub-floor lane is within the cap"
+    );
+}
+
 /// A lane whose cutoff passed while the node was down, with time left
 /// before the landing slack, is swept at once on start rather than after
 /// the first self-tick.
@@ -2968,7 +3103,7 @@ async fn a_cutoff_passed_before_start_is_swept_at_once() -> Result<()> {
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
-        total,
+        flat_at(total),
         Duration::from_hours(1),
         Arc::clone(&metrics),
     );
@@ -2983,17 +3118,24 @@ async fn a_cutoff_passed_before_start_is_swept_at_once() -> Result<()> {
 
 /// A hint handled after its lane's cutoff, with no sweep since, makes the
 /// cutoff sweep due at once rather than leaving the lane to the next tick.
+/// The hinted lane's claim is final and clears the final-claim floor, so the
+/// hint itself reads and sends it; the cutoff sweep then reads and sends
+/// both lanes, an hour before the next tick.
 #[tokio::test]
 async fn a_hint_after_an_unscanned_cutoff_sweeps_at_once() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let store = CountingLoadStore::new(usize::MAX);
-    let (contract, asserter) = mocked_getwatermarks_pool(&[vec![lane(0), lane(0)]]);
-    asserter.push_failure(alloy_json_rpc::ErrorPayload::internal_error());
+    let (contract, asserter) = mocked_redeem_pool(&[
+        Some(vec![lane(0)]),
+        None,
+        Some(vec![lane(0), lane(0)]),
+        None,
+    ]);
     let lane_value = expiring_lane(1, 0).owed();
     let (tx, handle, margin) = spawn_redeemer(
         contract,
         Arc::clone(&store) as Arc<dyn PoolStateStore>,
-        lane_value * U256::from(2u64),
+        flat_at(lane_value * U256::from(2u64)),
         Duration::from_hours(1),
         Arc::clone(&metrics),
     );
@@ -3004,8 +3146,20 @@ async fn a_hint_after_an_unscanned_cutoff_sweeps_at_once() -> Result<()> {
     let (hinted, _) = record_lanes(store.as_ref(), 1..=2, expiry)?;
     tx.send(hinted).await?;
 
-    await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 1").await?;
-    ensure_metric_lines(&metrics, &["decdn_redemption_reconcile_ok_total 1"])?;
+    await_metric_line(&metrics, "decdn_onchain_tx_send_failed_total 2").await?;
+    ensure_metric_lines(
+        &metrics,
+        &[
+            "decdn_redemption_reconcile_ok_total 2",
+            "decdn_redemption_reconcile_failures_total 0",
+        ],
+    )?;
+    assert_eq!(store.loads(), 2, "the startup scan and one cutoff sweep");
+    assert_eq!(
+        asserter.read_q().len(),
+        0,
+        "the hint and the sweep each read and sent"
+    );
 
     drop(tx);
     handle.await?;
@@ -3025,7 +3179,7 @@ async fn a_failed_load_at_the_cutoff_does_not_spin() -> Result<()> {
     let (tx, handle, _) = spawn_redeemer(
         contract,
         Arc::clone(&store) as Arc<dyn PoolStateStore>,
-        total,
+        flat_at(total),
         Duration::from_hours(1),
         Arc::clone(&metrics),
     );
@@ -3051,7 +3205,7 @@ async fn the_self_tick_sweeps_a_lane_without_a_hint() -> Result<()> {
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
-        total,
+        flat_at(total),
         Duration::from_secs(1),
         Arc::clone(&metrics),
     );
@@ -3082,7 +3236,7 @@ async fn a_chain_fault_parks_the_lane_until_the_next_sweep() -> Result<()> {
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
-        total,
+        flat_at(total),
         Duration::from_hours(1),
         Arc::clone(&metrics),
     );
@@ -3154,7 +3308,7 @@ async fn a_failed_sweep_keeps_the_lane_parked() -> Result<()> {
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
-        total,
+        flat_at(total),
         Duration::from_secs(3),
         Arc::clone(&metrics),
     );
@@ -3208,7 +3362,7 @@ async fn a_clean_sweep_releases_a_parked_lane() -> Result<()> {
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
-        total,
+        flat_at(total),
         Duration::from_secs(3),
         Arc::clone(&metrics),
     );
@@ -3273,7 +3427,7 @@ async fn a_chain_fault_parks_only_its_own_lane() -> Result<()> {
     let (tx, handle, _) = spawn_redeemer(
         contract,
         store,
-        expiring_lane(1, 0).owed(),
+        flat_at(expiring_lane(1, 0).owed()),
         Duration::from_hours(1),
         Arc::clone(&metrics),
     );
@@ -3313,7 +3467,7 @@ async fn a_failed_strict_flush_skips_the_submit_without_a_chain_fault() -> Resul
         &store,
         vec![planned(1, 0, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         true,
         &metrics,
@@ -3356,7 +3510,7 @@ async fn a_lane_on_an_unknown_pool_past_its_close_deadline_is_not_submitted() ->
             &store,
             vec![planned(1, 0, 1_000, false)],
             SELLER,
-            U256::from(1u64),
+            &flat(1),
             300,
             true,
             &metrics,
@@ -3393,7 +3547,7 @@ async fn a_failed_pre_redeem_pool_read_holds_the_lane() -> Result<()> {
         &store,
         vec![planned(1, 0, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         true,
         &metrics,
@@ -3439,7 +3593,7 @@ async fn a_lane_on_an_unknown_open_pool_is_seeded_and_kept() -> Result<()> {
         &store,
         vec![planned(1, 0, 500, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         true,
         &metrics,
@@ -3492,7 +3646,7 @@ async fn a_faulted_pool_read_leaves_known_pools_to_redeem() -> Result<()> {
         &store,
         vec![planned(1, 0, 500, false), planned(9, 0, 500, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         true,
         &metrics,
@@ -3563,7 +3717,7 @@ async fn a_redeem_send_with_no_answer_is_possibly_broadcast() -> Result<()> {
         &store,
         vec![planned(1, 0, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         false,
         &metrics,
@@ -3622,7 +3776,7 @@ async fn redeem_after_failed_sends(
         &store,
         (0..lanes).map(|i| planned(1, i, 1_000, false)).collect(),
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         false,
         &metrics,
@@ -3717,7 +3871,7 @@ async fn a_reverted_multi_claim_chunk_halves_and_lands_the_healthy_claim() -> Re
         &store,
         vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         false,
         &metrics,
@@ -3779,7 +3933,7 @@ async fn an_estimate_reverting_multi_claim_chunk_halves_and_lands_the_healthy_cl
         &store,
         vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         false,
         &metrics,
@@ -3837,7 +3991,7 @@ async fn a_reverted_chunk_whose_halves_both_land_is_not_a_fault() -> Result<()> 
         &store,
         vec![planned(1, 0, 1_000, false), planned(1, 1, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         false,
         &metrics,
@@ -3942,7 +4096,7 @@ async fn a_full_chunk_isolates_one_poisoned_claim_in_one_sweep_under_a_floor() -
         &store,
         plans,
         SELLER,
-        U256::from(1_000_000u64),
+        &flat(1_000_000),
         CLAIMS,
         false,
         &metrics,
@@ -4110,7 +4264,7 @@ async fn a_redeem_whose_gas_fill_fails_is_refused() -> Result<()> {
         &store,
         vec![planned(1, 0, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         false,
         &metrics,
@@ -4147,7 +4301,7 @@ async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Resul
         &store,
         vec![planned(1, 0, 1_000, false)],
         SELLER,
-        U256::from(1u64),
+        &flat(1),
         300,
         true,
         &metrics,
@@ -4170,7 +4324,7 @@ async fn a_failed_read_stays_a_chain_fault_past_a_failed_strict_flush() -> Resul
 fn chunk_redemptions_caps_vouchers_per_chunk() {
     // 5 lanes, cap 2 => 3 chunks (2 + 2 + 1). All above floor.
     let plans = (0..5).map(|i| planned(1, i, 1_000_000, false)).collect();
-    let chunks = chunk_redemptions(plans, U256::from(1u64), 2);
+    let chunks = chunk_redemptions(plans, &flat(1), 2);
     assert_eq!(chunks.len(), 3);
     assert!(chunks.iter().all(|c| c.len() <= 2));
     assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 5);
@@ -4180,7 +4334,7 @@ fn chunk_redemptions_caps_vouchers_per_chunk() {
 fn chunk_redemptions_drops_below_floor_chunk() {
     // One dust lane, floor 1 USDC => nothing submitted (defers).
     let plans = vec![planned(1, 0, 10, false)];
-    let chunks = chunk_redemptions(plans, U256::from(1_000_000u64), 300);
+    let chunks = chunk_redemptions(plans, &flat(1_000_000), 300);
     assert!(chunks.is_empty());
 }
 
@@ -4188,7 +4342,7 @@ fn chunk_redemptions_drops_below_floor_chunk() {
 fn chunk_redemptions_zero_floor_keeps_everything() {
     // A zero floor keeps even a pure-dust chunk.
     let plans = vec![planned(1, 0, 1, false), planned(1, 1, 1, false)];
-    let chunks = chunk_redemptions(plans, U256::ZERO, 300);
+    let chunks = chunk_redemptions(plans, &flat(0), 300);
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks.first().map(Vec::len), Some(2));
 }
@@ -4203,7 +4357,7 @@ fn chunk_redemptions_spreads_value_so_dust_rides_along() {
         planned(1, 2, 5, false),         // dust
         planned(1, 3, 5, false),         // dust
     ];
-    let chunks = chunk_redemptions(plans, U256::from(500_000u64), 2);
+    let chunks = chunk_redemptions(plans, &flat(500_000), 2);
     assert_eq!(chunks.len(), 2);
     // Every submitted chunk clears the floor (dust rode along with a whale).
     assert!(
@@ -4217,7 +4371,75 @@ fn chunk_redemptions_spreads_value_so_dust_rides_along() {
 
 #[test]
 fn chunk_redemptions_empty_input_is_empty() {
-    assert!(chunk_redemptions(Vec::new(), U256::ZERO, 300).is_empty());
+    assert!(chunk_redemptions(Vec::new(), &flat(0), 300).is_empty());
+}
+
+/// The chunk floor grows with the lane count: each lane adds its own gas.
+/// Two lanes that each clear a one-lane chunk's floor can fail a two-lane
+/// chunk's.
+#[test]
+fn chunk_redemptions_prices_each_lane_into_the_chunk_floor() {
+    // A chunk of n lanes needs 20 × (10 + 10n): 400 for one, 600 for two.
+    let floors = priced(U256::from(10u64), U256::from(10u64));
+    let one = chunk_redemptions(vec![planned(1, 0, 500, false)], &floors, 300);
+    assert_eq!(one.len(), 1, "500 clears a one-lane chunk's 400");
+    let two = chunk_redemptions(
+        vec![planned(1, 0, 250, false), planned(1, 1, 250, false)],
+        &floors,
+        300,
+    );
+    assert!(two.is_empty(), "500 misses a two-lane chunk's 600");
+}
+
+/// A final claim that clears the final-claim floor carries its chunk, though
+/// the chunk is below the chunk floor. A final claim below it joins no
+/// chunk: it pays less than its own gas.
+#[test]
+fn chunk_redemptions_sends_a_final_claim_on_the_final_claim_floor() {
+    // Chunk floor 20 × (100 + 10n), final-claim floor 3 × 10 = 30.
+    let floors = priced(U256::from(100u64), U256::from(10u64));
+    let mut clears = planned(1, 0, 30, false);
+    clears.final_claim = true;
+    let mut dust = planned(1, 1, 29, false);
+    dust.final_claim = true;
+    let rider = planned(1, 2, 5, false);
+    let chunks = chunk_redemptions(vec![clears, dust, rider], &floors, 300);
+    assert_eq!(chunks.len(), 1);
+    let sent: Vec<u8> = chunks
+        .iter()
+        .flatten()
+        .filter_map(|lane| lane.key.signer.0.first().copied())
+        .collect();
+    assert!(sent.contains(&0), "the final claim that clears is sent");
+    assert!(sent.contains(&2), "a live lane rides along");
+    assert!(!sent.contains(&1), "a final claim below its floor is not");
+}
+
+/// The planner marks a lane final once its capability is inside the expiry
+/// margin, and not before.
+#[test]
+fn plan_lanes_marks_a_lane_inside_its_expiry_margin_final() {
+    let me = Address::from([20u8; 20]);
+    let mut st = signed_lane_state(1, 10, 20, None);
+    st.registered_until = u64::MAX;
+    let margin = 420;
+    let paid = PaidWatermarks::default();
+    let projection = PoolProjection::new();
+    let metrics = Arc::new(Metrics::new());
+    let cutoff = st.expiry - margin;
+    let before = plan_lanes(
+        &paid,
+        me,
+        vec![st.clone()],
+        &metrics,
+        &projection,
+        margin,
+        cutoff - 1,
+    );
+    assert!(before.iter().all(|lane| !lane.final_claim));
+    let at = plan_lanes(&paid, me, vec![st], &metrics, &projection, margin, cutoff);
+    assert_eq!(at.len(), 1);
+    assert!(at.iter().all(|lane| lane.final_claim));
 }
 
 /// A 65-byte `r‖s‖v` signature with a low `s` and the recovery byte set to
@@ -4422,12 +4644,20 @@ fn plan_lanes_skips_an_expired_capability() {
 
     let metrics = Arc::new(Metrics::new());
     let live_now = expiry - REDEEM_LANDING_SLACK_SECS - 1;
-    let plans = plan_lanes(&paid, me, vec![st.clone()], &metrics, &projection, live_now);
+    let plans = plan_lanes(
+        &paid,
+        me,
+        vec![st.clone()],
+        &metrics,
+        &projection,
+        0,
+        live_now,
+    );
     assert_eq!(plans.len(), 1, "a live capability plans");
     assert_eq!(skipped_expired(&metrics), 0);
 
     let late_now = expiry - REDEEM_LANDING_SLACK_SECS;
-    let plans = plan_lanes(&paid, me, vec![st], &metrics, &projection, late_now);
+    let plans = plan_lanes(&paid, me, vec![st], &metrics, &projection, 0, late_now);
     assert!(
         plans.is_empty(),
         "an expiring capability pays 0 and is skipped"
@@ -4447,7 +4677,7 @@ fn plan_lanes_never_plans_a_zero_expiry_lane() {
     let projection = PoolProjection::new();
     let metrics = Arc::new(Metrics::new());
 
-    let plans = plan_lanes(&paid, me, vec![st], &metrics, &projection, 0);
+    let plans = plan_lanes(&paid, me, vec![st], &metrics, &projection, 0, 0);
     assert!(plans.is_empty(), "a zero-expiry lane is never planned");
     assert_eq!(skipped_expired(&metrics), 1);
 }
@@ -4466,7 +4696,15 @@ fn plan_lanes_drops_an_expired_lane_with_nothing_owed_silently() {
     let metrics = Arc::new(Metrics::new());
 
     for _ in 0..3 {
-        let plans = plan_lanes(&paid, me, vec![st.clone()], &metrics, &projection, late_now);
+        let plans = plan_lanes(
+            &paid,
+            me,
+            vec![st.clone()],
+            &metrics,
+            &projection,
+            0,
+            late_now,
+        );
         assert!(
             plans.is_empty(),
             "a fully redeemed lane has nothing to plan"
@@ -4762,7 +5000,7 @@ mod redeem_schedule {
             store,
             PaidWatermarks::default(),
             Address::from([20u8; 20]),
-            U256::from(1u64),
+            Arc::new(FloorSource::fixed(flat(1))),
             300,
             interval,
             capability_expiry_margin_secs(interval.as_secs()),
@@ -4811,7 +5049,7 @@ mod redeem_schedule {
             store.clone(),
             PaidWatermarks::default(),
             Address::from([20u8; 20]),
-            U256::MAX,
+            Arc::new(FloorSource::fixed(flat(u64::MAX))),
             300,
             interval,
             margin,
@@ -4910,7 +5148,7 @@ mod settlement_ledger_rows {
             &store,
             vec![planned(1, 0, 1_000, false)],
             SELLER,
-            U256::from(1u64),
+            &flat(1),
             300,
             false,
             &metrics,

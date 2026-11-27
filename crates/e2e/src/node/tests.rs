@@ -46,8 +46,8 @@ fn render_config_emits_parseable_toml() {
         Some(addrs.capacity_bond.to_string().as_str())
     );
     assert_eq!(
-        doc["blockchain"]["redeem_threshold_micro_usdc"].as_integer(),
-        i64::try_from(REDEEM_THRESHOLD_MICRO_USDC).ok()
+        doc["blockchain"]["payment_chains"][0]["gas_token_price_micro_usdc"].as_integer(),
+        i64::try_from(GAS_TOKEN_PRICE_MICRO_USDC).ok()
     );
     assert_eq!(doc["cache"]["origin"]["kind"].as_str(), Some("fs"));
     assert!(doc["cache"]["origin"].get("path").is_some());

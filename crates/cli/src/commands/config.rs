@@ -154,6 +154,11 @@ pub fn write_validate_summary<W: std::io::Write>(
         for pool in &chain.payment_pools {
             writeln!(w, "    payment_pool:           {pool}")?;
         }
+        writeln!(
+            w,
+            "    gas_token_price_micro_usdc: {}",
+            chain.gas_token_price_micro_usdc
+        )?;
     }
     writeln!(
         w,
@@ -215,11 +220,6 @@ pub fn write_validate_summary<W: std::io::Write>(
         w,
         "  receipt_poll_interval_ms: {}",
         resolved.blockchain.receipt_poll_interval_ms
-    )?;
-    writeln!(
-        w,
-        "  redeem_threshold_micro_usdc: {}",
-        resolved.blockchain.redeem_threshold_micro_usdc
     )?;
     writeln!(
         w,
@@ -991,7 +991,6 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rpc_watchdog_interval_sec = 30     # 0 disables the connectivity watchdog
 # receipt_poll_interval_ms = 7000    # pending-tx receipt polling cadence (#1011); default 7000ms, min 250ms (lower for a local anvil)
 # get_logs_max_block_span = 10000    # max blocks per eth_getLogs request of the CLI's chain scans (`decdn receipt settle`, `decdn node earnings --address`); set to your RPC provider's range limit; default 10000, must be > 0
-# redeem_threshold_micro_usdc = 50000            # seller redeems accrued vouchers on-chain at this µUSDC balance (#327); default 0.05 USDC
 # redeem_max_vouchers_per_tx = 300  # max vouchers per redeemMany tx; the redeemer chunks a sweep to stay under the block gas limit (default 300)
 # redeem_interval_secs = 300                      # redeemer self-tick sweep cadence, the backstop beside the per-voucher hints (#327/#751); default 300s, must be > 0
 # buyer_working_deposit_micro_usdc = 10000000    # deposit when OPENING a pool and refill target on reuse or mid-transfer shortfall; must be > 0; default 10 USDC
@@ -1008,6 +1007,7 @@ const DEFAULT_CONFIG: &str = r#"# deCDN node configuration
 # rpc_url = ""                       # REQUIRED: payment-chain JSON-RPC URL
 # chain_id = 84532                   # REQUIRED: payment-chain EIP-155 id (voucher and capability domains)
 # payment_pools = [""]               # REQUIRED: one or more 0x-prefixed PaymentPool addresses
+# gas_token_price_micro_usdc = 5000000000  # price of one gas token (ETH) in µUSDC; the redeemer prices its gas with it and redeems only claims worth their gas (ADR 003); set at or above market; default 5,000 USDC, must be > 0
 
 [cache]
 # cache_dir = "~/.decdn/cache"

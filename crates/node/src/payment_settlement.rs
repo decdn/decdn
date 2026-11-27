@@ -26,7 +26,7 @@
 //!   pool with a live lane, with a `getAuthorizations` read of that pool's live
 //!   signers. The redeemer reads `getPool` before a submit for a pool it holds
 //!   no fresh read of. A read that finds a pool `Closed` forgets its lanes.
-//! - **Redemption (per-chunk floor + on-shutdown).** On a redeem hint (a
+//! - **Redemption (gas-priced floors + on-shutdown).** On a redeem hint (a
 //!   [`LaneKey`]) emitted by the voucher-accept path, the node reads the lane's
 //!   owed voucher and its cached paid watermark and plans the lane for
 //!   redemption — with no chain read. A signer this node has not yet registered
@@ -35,16 +35,19 @@
 //!   so later passes attach nothing. A low-frequency
 //!   self-tick sweeps every persisted lane, packs the planned lanes into
 //!   chunks, and submits a chunk — one `redeemMany` — only once the aggregate
-//!   unredeemed value across that chunk's lanes clears a configurable floor,
-//!   so a dropped hint never strands a lane whose chunk has cleared the floor.
-//!   The same sweep also runs at each serve cutoff: one second after the voucher
-//!   and preimage paths start to refuse a lane whose capability expiry is near.
-//!   The lane's claim is final there, and the sweep has about one redeem interval
-//!   to start the redemption and the landing slack to land it before the
-//!   contract stops paying the capability. On a restart, a lane whose cutoff
-//!   passed while the node was down is swept at once. A value that stays below
-//!   the floor is not redeemed by the cutoff sweep; a later sweep before the
-//!   landing slack can still pack it with other lanes.
+//!   unredeemed value across that chunk's lanes clears the chunk floor, the
+//!   gas of the chunk priced at the chain's live gas price
+//!   ([`crate::redeem_floor`]), so a dropped hint never strands a lane whose
+//!   chunk has cleared the floor. The same sweep also runs at each serve
+//!   cutoff: one second after the voucher and preimage paths start to refuse a
+//!   lane whose capability expiry is near. The lane's claim is final there, and
+//!   it redeems once it clears the lower final-claim floor, batched or alone.
+//!   The sweep has about one redeem interval to start the redemption and the
+//!   landing slack to land it before the contract stops paying the capability.
+//!   On a restart, a lane whose cutoff passed while the node was down is swept
+//!   at once. A final claim below its floor is never redeemed; its value counts
+//!   toward its pool's stranded value, and a pool over one floor of stranded
+//!   value takes no new lane (ADR 003 § Redemption floor).
 //!   The node flushes the lane store durable after planning a chunk and before
 //!   submitting it, so post-crash on-disk `owed ≥ submitted`.
 //! - **Redeem before reclaim.** A pool is owner-owned and owner-closed; the node
@@ -53,7 +56,7 @@
 //!   no force-redeem on close: the self-tick sweep runs far inside the 48h grace
 //!   floor (`redeem_interval_secs` is capped well below it at config load), so it
 //!   redeems every lane worth the gas before the owner can `reclaim`. A lane below
-//!   the per-chunk floor is left for the owner to reclaim — spending more gas than
+//!   the redemption floors is left for the owner to reclaim — spending more gas than
 //!   it recovers is not worth it — and a node offline for the whole grace window
 //!   forfeits its unredeemed vouchers, a node-ops failure, not a protocol gap.
 //!   The pre-submit pool read gives the redeemer the pool's lifecycle, so it
@@ -75,7 +78,9 @@ use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::TransactionReceipt;
 use anyhow::{Context, Result};
-use decdn_common::config::{REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs};
+use decdn_common::config::{
+    REDEEM_LANDING_SLACK_SECS, capability_expiry_margin_secs, inside_capability_expiry_margin,
+};
 use decdn_common::redact::{sanitize_err_chain, sanitize_error_sources};
 use decdn_incentive::payment_pool::{PaymentPool, to_pool_u64};
 use decdn_incentive::sig_canon::is_high_s;
@@ -94,6 +99,7 @@ use crate::handlers::client::ClientHandler;
 use crate::metrics::Metrics;
 use crate::onchain_tx::{TxOutcome, send_and_await_receipt};
 use crate::pool_view::{Lifecycle, POOL_REFRESH_INTERVAL, PoolProjection, PoolStatus};
+use crate::redeem_floor::{FloorSource, RedeemFloors};
 use crate::settlement_ledger::SettlementRecorder;
 use decdn_incentive::payment_pool::SignerAuthorization;
 
@@ -454,8 +460,11 @@ pub struct PoolSettlementService<P: Provider + Clone + 'static> {
     store: Arc<dyn PoolStateStore>,
     paid: PaidWatermarks,
     self_address: Address,
-    redeem_threshold: U256,
+    /// The payment chain's redemption floors, shared with the redeemer task.
+    floors: Arc<FloorSource<P>>,
     redeem_max_vouchers_per_tx: usize,
+    /// The voucher path's capability-expiry margin, in seconds.
+    margin_secs: u64,
     metrics: Arc<Metrics>,
     pool_view: PoolProjection,
     /// Writes the settlement ledger row for every `redeemMany` that lands
@@ -508,7 +517,7 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
         store: Arc<dyn PoolStateStore>,
         ledger: Arc<dyn SettlementLedger>,
         handler: Arc<ClientHandler>,
-        redeem_threshold: U256,
+        gas_token_price_micro_usdc: u64,
         redeem_max_vouchers_per_tx: usize,
         redeem_interval: Duration,
         metrics: Arc<Metrics>,
@@ -573,15 +582,20 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
 
         let refresher = tokio::spawn(pool_refresh_loop(view, handler, deployment, closed));
 
+        let floors = Arc::new(FloorSource::live(
+            contract.provider().clone(),
+            gas_token_price_micro_usdc,
+        ));
+        let margin_secs = capability_expiry_margin_secs(redeem_interval.as_secs());
         let redeemer = tokio::spawn(redeemer_loop(
             contract.clone(),
             Arc::clone(&store),
             paid.clone(),
             self_address,
-            redeem_threshold,
+            Arc::clone(&floors),
             redeem_max_vouchers_per_tx,
             redeem_interval,
-            capability_expiry_margin_secs(redeem_interval.as_secs()),
+            margin_secs,
             redeem_rx,
             Arc::clone(&metrics),
             pool_view.clone(),
@@ -595,8 +609,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             store,
             paid,
             self_address,
-            redeem_threshold,
+            floors,
             redeem_max_vouchers_per_tx,
+            margin_secs,
             metrics,
             pool_view,
             recorder,
@@ -638,8 +653,8 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
     async fn final_redeem_sweep(&self) {
         // Shutdown redeems regardless of a flush failure (`strict_flush` false):
         // forfeiting the claim across the stop is worse than a bounded re-serve
-        // risk. It still applies the configured per-chunk floor, so sub-floor
-        // dust stays unredeemed across the stop.
+        // risk. It still applies the redemption floors, so sub-floor dust stays
+        // unredeemed across the stop.
         let Some(states) = load_lanes(self.store.as_ref()) else {
             return;
         };
@@ -651,8 +666,9 @@ impl<P: Provider + Clone + 'static> PoolSettlementService<P> {
             states,
             &self.paid,
             self.self_address,
-            self.redeem_threshold,
+            &self.floors,
             self.redeem_max_vouchers_per_tx,
+            self.margin_secs,
             false,
             &self.metrics,
             &self.pool_view,
@@ -1107,6 +1123,10 @@ impl<P: Provider + Clone + 'static> crate::pool_view::PoolView for ResolvingPool
         self.projection.snapshot(pool_id)
     }
 
+    fn refuses_new_lanes(&self, pool_id: B256) -> bool {
+        self.projection.is_stranded(pool_id)
+    }
+
     async fn signer_spent_cached(&self, pool_id: B256, signer: Address) -> Option<u64> {
         // The mid-stream signer cap-headroom re-check: the held read, whatever
         // its age, never a fresh `getAuthorization`. The settlement service
@@ -1392,22 +1412,24 @@ async fn pool_refresh_loop<P: Provider + Clone + 'static>(
 }
 
 /// Redemption task: chunk lanes' accrued claims and `redeemMany` a chunk once
-/// its aggregate unredeemed value clears the floor, driven by three sources —
-/// advisory hints ([`LaneKey`]) from the voucher-accept path, a low-frequency
-/// self-tick that sweeps every lane into chunked `redeemMany` transactions so a
-/// dropped hint can never strand a lane whose chunk has cleared the floor, and a
-/// sweep at the earliest serve cutoff of a lane with a finite capability expiry
-/// and value owed ([`serve_cutoff_wake`]). Ends cleanly when every hint sender
-/// is dropped.
+/// it clears the redemption floors (`floors`, [`chunk_clears`]), driven by
+/// three sources — advisory hints ([`LaneKey`]) from the voucher-accept path, a
+/// low-frequency self-tick that sweeps every lane into chunked `redeemMany`
+/// transactions so a dropped hint can never strand a lane whose chunk has
+/// cleared the floor, and a sweep at the earliest serve cutoff of a lane with a
+/// finite capability expiry and value owed ([`serve_cutoff_wake`]). Ends
+/// cleanly when every hint sender is dropped.
 ///
 /// The cutoff sweep is what makes a delegated lane's final claim redeemable. The
 /// claim stops growing at the serve cutoff, and the sweep then has about one
 /// redeem interval of room before [`capability_expired`] skips the lane. A
-/// self-tick alone leaves no room for delay: the last tick before the expiry can
-/// fall just before the landing slack, and the loop is serial, so a receipt wait
-/// that delays that tick forfeits the lane. The cutoff sweep waits behind an
-/// in-flight redemption too, but the interval absorbs that wait.
-/// `margin_secs` is the voucher path's capability-expiry margin.
+/// final claim redeems once it clears the final-claim floor, batched with other
+/// claims or alone. A self-tick alone leaves no room for delay: the last tick
+/// before the expiry can fall just before the landing slack, and the loop is
+/// serial, so a receipt wait that delays that tick forfeits the lane. The
+/// cutoff sweep waits behind an in-flight redemption too, but the interval
+/// absorbs that wait. `margin_secs` is the voucher path's capability-expiry
+/// margin.
 ///
 /// A lane whose hint-path redemption hits a chain fault (an RPC fault or a
 /// revert) is parked: each later hint for it is dropped and counted into
@@ -1425,7 +1447,7 @@ async fn redeemer_loop<P: Provider + Clone>(
     store: Arc<dyn PoolStateStore>,
     paid: PaidWatermarks,
     self_address: Address,
-    redeem_threshold: U256,
+    floors: Arc<FloorSource<P>>,
     max_vouchers: usize,
     redeem_interval: Duration,
     margin_secs: u64,
@@ -1468,7 +1490,7 @@ async fn redeemer_loop<P: Provider + Clone>(
                     }
                     let outcome = redeem_one(
                         &contract, &store, &paid, self_address, margin_secs, swept_at,
-                        redeem_threshold, max_vouchers, key, &metrics, &pool_view, &recorder,
+                        &floors, max_vouchers, key, &metrics, &pool_view, &recorder,
                     )
                     .await;
                     if outcome.chain_fault {
@@ -1520,8 +1542,9 @@ async fn redeemer_loop<P: Provider + Clone>(
             states,
             &paid,
             self_address,
-            redeem_threshold,
+            &floors,
             max_vouchers,
+            margin_secs,
             true,
             &metrics,
             &pool_view,
@@ -1540,9 +1563,9 @@ async fn redeemer_loop<P: Provider + Clone>(
 
 /// One lane planned for redemption: its pool, its persistence key (so a landed
 /// registration can be written back to `registered_until`), its full claim value
-/// and its unredeemed value (for the per-chunk floor), the highest voucher to
-/// submit, and — on the signer's first redemption — the owner-signed capability
-/// to register.
+/// and its unredeemed value (for the redemption floors), whether its claim is
+/// final, the highest voucher to submit, and — on the signer's first
+/// redemption — the owner-signed capability to register.
 struct PlannedLane {
     pool_id: PoolId,
     key: LaneKey,
@@ -1552,6 +1575,10 @@ struct PlannedLane {
     /// already reaches this, and recomputes `unredeemed` from the fresh read.
     owed: U256,
     unredeemed: U256,
+    /// The lane's capability is inside the voucher path's expiry margin, so its
+    /// claim grows no more ([`lane_cutoff_wake`]). A final claim redeems on the
+    /// final-claim floor ([`RedeemFloors::final_claim`]), batched or alone.
+    final_claim: bool,
     voucher: PaymentPool::LaneVoucher,
     register: Option<PaymentPool::CapabilityReg>,
 }
@@ -1625,19 +1652,37 @@ fn group_by_pool(lanes: &[PlannedLane]) -> Vec<PaymentPool::PoolBatch> {
         .collect()
 }
 
+/// Whether a final claim pays less than its own gas: below the final-claim
+/// floor. Such a claim cannot grow, so the redeemer never submits it.
+fn final_below_floor(plan: &PlannedLane, floors: &RedeemFloors) -> bool {
+    plan.final_claim && plan.unredeemed < floors.final_claim()
+}
+
+/// Whether a chunk of planned lanes is worth one `redeemMany`: it carries a
+/// final claim that clears the final-claim floor, or its unredeemed value
+/// clears the chunk floor for its lane count ([`RedeemFloors::chunk`]).
+fn chunk_clears(chunk: &[PlannedLane], floors: &RedeemFloors) -> bool {
+    let final_floor = floors.final_claim();
+    chunk
+        .iter()
+        .any(|plan| plan.final_claim && plan.unredeemed >= final_floor)
+        || sum_unredeemed(chunk) >= floors.chunk(chunk.len())
+}
+
 /// Partition planned lanes into gas-bounded redemption chunks (each an
 /// independent `redeemMany`). Every returned chunk has at most `max_vouchers`
-/// lanes and an aggregate unredeemed value `>= floor`; a chunk that cannot clear
-/// the floor is dropped and its lanes defer to a later sweep (a zero floor
-/// keeps every chunk). The chunk count is the minimum that
-/// respects `max_vouchers`, and high-value lanes are dealt round-robin across the
-/// chunks so dust rides alongside real value instead of segregating into a
-/// below-floor chunk.
+/// lanes and clears the redemption floors ([`chunk_clears`]); a chunk that
+/// cannot clear them is dropped and its lanes defer to a later sweep. A final
+/// claim below the final-claim floor ([`final_below_floor`]) joins no chunk.
+/// The chunk count is the minimum that respects `max_vouchers`, and high-value
+/// lanes are dealt round-robin across the chunks so dust rides alongside real
+/// value instead of segregating into a below-floor chunk.
 fn chunk_redemptions(
     mut plans: Vec<PlannedLane>,
-    floor: U256,
+    floors: &RedeemFloors,
     max_vouchers: usize,
 ) -> Vec<Vec<PlannedLane>> {
+    plans.retain(|plan| !final_below_floor(plan, floors));
     if plans.is_empty() {
         return Vec::new();
     }
@@ -1654,13 +1699,7 @@ fn chunk_redemptions(
     }
     buckets
         .into_iter()
-        .filter(|bucket| {
-            let sum = bucket
-                .iter()
-                .map(|l| l.unredeemed)
-                .fold(U256::ZERO, |a, b| a + b);
-            sum >= floor
-        })
+        .filter(|bucket| chunk_clears(bucket, floors))
         .collect()
 }
 
@@ -1726,7 +1765,7 @@ pub(crate) const fn capability_expired(expiry: u64, now: u64) -> bool {
 ///
 /// The serve cutoff is `expiry − margin_secs`. From that second on, the voucher
 /// and preimage paths refuse the lane's proofs with `CapabilityExpired`
-/// ([`inside_capability_expiry_margin`](decdn_common::config::inside_capability_expiry_margin)),
+/// ([`inside_capability_expiry_margin`]),
 /// so the lane's claim is final. The wake
 /// is one second after the cutoff, because those paths read a coarse clock that
 /// can lag the wall clock by up to one refresh. A sweep at the wake has one
@@ -1979,6 +2018,7 @@ fn plan_lane(
         key,
         owed,
         unredeemed,
+        final_claim: false,
         voucher,
         register,
     }))
@@ -1996,7 +2036,9 @@ fn plan_lane(
 /// A lane with value owed whose capability expires within
 /// [`REDEEM_LANDING_SLACK_SECS`] of `now` is skipped and metered: the contract
 /// pays 0 for an expired capability, so its redemption would only spend gas. A
-/// lane with nothing owed is dropped silently, expired or not.
+/// lane with nothing owed is dropped silently, expired or not. A planned lane
+/// whose capability is inside the `margin_secs` expiry margin is marked
+/// [`PlannedLane::final_claim`].
 #[allow(clippy::cognitive_complexity, clippy::too_many_arguments)]
 fn plan_lanes(
     paid: &PaidWatermarks,
@@ -2004,6 +2046,7 @@ fn plan_lanes(
     states: Vec<LaneState>,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
+    margin_secs: u64,
     now: u64,
 ) -> Vec<PlannedLane> {
     // Hold/drop lanes whose pool cannot pay, read from the event-fed projection.
@@ -2046,7 +2089,10 @@ fn plan_lanes(
                     "redeemer: skipping a lane with value owed whose capability has expired"
                 );
             }
-            Ok(Some(lane)) => plans.push(lane),
+            Ok(Some(mut lane)) => {
+                lane.final_claim = inside_capability_expiry_margin(st.expiry, margin_secs, now);
+                plans.push(lane);
+            }
             Ok(None) => {}
             Err(err) => {
                 metrics.redemption_failure();
@@ -2080,14 +2126,16 @@ struct HintOutcome {
     chain_fault: bool,
 }
 
-/// Hint-path redemption: plan one lane and, if it clears the per-chunk `floor`,
-/// submit it as a one-lane `redeemMany`. A sub-floor hint defers to the next
-/// sweep, which packs it with other lanes, and reads nothing from the chain.
+/// Hint-path redemption: plan one lane and, if it clears the redemption
+/// floors, submit it as a one-lane `redeemMany`. A sub-floor hint defers to the
+/// next sweep, which packs it with other lanes, and reads nothing from the
+/// chain beyond the gas quote `floors` holds for [`QUOTE_TTL`](crate::redeem_floor::QUOTE_TTL).
 /// Returns the lane's [`serve_cutoff_wake`] against the last sweep scan at
 /// `swept_at`, so a lane first seen between sweeps gets its cutoff sweep, even
 /// when the hint waited behind redemption work until after the cutoff. Also
-/// returns whether the redemption hit a chain fault. A lane the store cannot
-/// load is a local fault, not a chain fault.
+/// returns whether the redemption hit a chain fault, a gas quote the node
+/// cannot read included. A lane the store cannot load is a local fault, not a
+/// chain fault.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_one<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -2096,7 +2144,7 @@ async fn redeem_one<P: Provider + Clone>(
     self_address: Address,
     margin_secs: u64,
     swept_at: u64,
-    floor: U256,
+    floors: &FloorSource<P>,
     max_vouchers: usize,
     key: LaneKey,
     metrics: &Arc<Metrics>,
@@ -2114,7 +2162,27 @@ async fn redeem_one<P: Provider + Clone>(
     };
     let now = unix_now();
     let wake = serve_cutoff_wake(&st, paid, self_address, margin_secs, swept_at, now);
-    let plans = plan_lanes(paid, self_address, vec![st], metrics, pool_view, now);
+    let plans = plan_lanes(
+        paid,
+        self_address,
+        vec![st],
+        metrics,
+        pool_view,
+        margin_secs,
+        now,
+    );
+    if plans.is_empty() {
+        return HintOutcome {
+            wake,
+            chain_fault: false,
+        };
+    }
+    let Some(floors) = floors.floors().await else {
+        return HintOutcome {
+            wake,
+            chain_fault: true,
+        };
+    };
     // Hint path: require the durability floor and skip the submit on a failed
     // flush (`strict_flush`); the lane defers to the next sweep.
     let chain_fault = redeem_planned_lanes(
@@ -2122,7 +2190,7 @@ async fn redeem_one<P: Provider + Clone>(
         store,
         plans,
         self_address,
-        floor,
+        &floors,
         max_vouchers,
         true,
         metrics,
@@ -2142,15 +2210,76 @@ fn load_lanes(store: &dyn PoolStateStore) -> Option<Vec<LaneState>> {
         .ok()
 }
 
+/// Per pool, the value this node's lanes left unredeemed when their capability
+/// expired below the final-claim floor (ADR 003 § Redemption floor). Such a
+/// lane paid less than its own gas, so the redeemer never submitted it, and
+/// the contract pays nothing for it now. The lanes stay in the store until
+/// their pool is reclaimed, so the sum is read from the store as it stands.
+/// A lane that expired above the floor is not counted: it was worth its gas,
+/// and its loss is the node's own fault, not the pool's.
+fn stranded_by_pool(
+    states: &[LaneState],
+    paid: &PaidWatermarks,
+    self_address: Address,
+    final_floor: U256,
+    now: u64,
+) -> HashMap<PoolId, U256> {
+    let mut stranded: HashMap<PoolId, U256> = HashMap::new();
+    for st in states {
+        if st.provider != self_address || !capability_expired(st.expiry, now) {
+            continue;
+        }
+        let unredeemed = st.owed().saturating_sub(lane_paid(paid, st));
+        if unredeemed.is_zero() || unredeemed >= final_floor {
+            continue;
+        }
+        let sum = stranded.entry(st.pool_id).or_default();
+        *sum = sum.saturating_add(unredeemed);
+    }
+    stranded
+}
+
+/// Publish to `pool_view` the pools whose stranded value exceeds one
+/// final-claim floor. Each such pool takes no new lane at admission, so a pool
+/// owner that keeps signers just under the floor pays an `openPool` for each
+/// further pool.
+fn publish_stranded(
+    pool_view: &PoolProjection,
+    states: &[LaneState],
+    paid: &PaidWatermarks,
+    self_address: Address,
+    final_floor: U256,
+    now: u64,
+) {
+    let over: HashSet<PoolId> = stranded_by_pool(states, paid, self_address, final_floor, now)
+        .into_iter()
+        .filter(|(_, sum)| *sum > final_floor)
+        .map(|(pool_id, sum)| {
+            if !pool_view.is_stranded(pool_id) {
+                warn!(
+                    %pool_id,
+                    stranded = %sum,
+                    floor = %final_floor,
+                    "pool left more than one redeem floor stranded on expired lanes; \
+                     refusing new lanes on it"
+                );
+            }
+            pool_id
+        })
+        .collect();
+    pool_view.set_stranded(over);
+}
+
 /// Sweep: plan every lane in `states` (per-lane error isolation through the
-/// planning phase), then chunk the survivors under the per-chunk floor +
+/// planning phase), then chunk the survivors under the redemption floors +
 /// voucher-count cap and submit each chunk as its own `redeemMany`. Value is
 /// spread across chunks so dust settles alongside real value; a chunk that
-/// cannot clear the floor defers to a later sweep.
+/// cannot clear the floors defers to a later sweep. The sweep also publishes
+/// the pools over their stranded-value cap ([`publish_stranded`]).
 ///
 /// Returns whether the sweep hit a chain fault, as [`redeem_planned_lanes`]
-/// reports it. The periodic sweep in [`redeemer_loop`] releases the parked
-/// lanes only when it returns `false`.
+/// reports it, or a gas quote the node cannot read. The periodic sweep in
+/// [`redeemer_loop`] releases the parked lanes only when it returns `false`.
 #[allow(clippy::too_many_arguments)]
 async fn redeem_sweep<P: Provider + Clone>(
     contract: &PaymentPool::PaymentPoolInstance<P>,
@@ -2158,14 +2287,35 @@ async fn redeem_sweep<P: Provider + Clone>(
     states: Vec<LaneState>,
     paid: &PaidWatermarks,
     self_address: Address,
-    floor: U256,
+    floors: &FloorSource<P>,
     max_vouchers: usize,
+    margin_secs: u64,
     strict_flush: bool,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
     recorder: &SettlementRecorder,
 ) -> bool {
-    let plans = plan_lanes(paid, self_address, states, metrics, pool_view, unix_now());
+    let now = unix_now();
+    let floors = floors.floors().await;
+    if let Some(floors) = floors {
+        publish_stranded(
+            pool_view,
+            &states,
+            paid,
+            self_address,
+            floors.final_claim(),
+            now,
+        );
+    }
+    let plans = plan_lanes(
+        paid,
+        self_address,
+        states,
+        metrics,
+        pool_view,
+        margin_secs,
+        now,
+    );
     // Publish the pending-redemption total once per sweep. This is the whole
     // planned set, before the per-chunk floor defers any dust — a lane below the
     // floor is still owed and rides a later sweep, so counting it here is what
@@ -2181,12 +2331,17 @@ async fn redeem_sweep<P: Provider + Clone>(
     }
     // A sweep is the retry for every lane, so it parks nothing itself. The
     // caller decides from the chain-fault flag whether parked lanes go free.
+    // With no gas quote there is no floor, so nothing redeems, and the sweep
+    // reports the fault: the parked lanes stay parked.
+    let Some(floors) = floors else {
+        return !plans.is_empty();
+    };
     redeem_planned_lanes(
         contract,
         store,
         plans,
         self_address,
-        floor,
+        &floors,
         max_vouchers,
         strict_flush,
         metrics,
@@ -2760,7 +2915,7 @@ fn reconcile_plans(plans: Vec<PlannedLane>, onchain_paid: &[U256]) -> (Vec<Plann
             continue;
         }
         // Recompute against the fresh on-chain paid so a lagging cache cannot push
-        // this lane over the per-chunk floor on value the chain has already paid.
+        // this lane over a redemption floor on value the chain has already paid.
         plan.unredeemed = plan.owed.saturating_sub(onchain);
         kept.push(plan);
     }
@@ -2825,23 +2980,24 @@ async fn resolve_unknown_pools<P: Provider + Clone>(
     (kept, read_failed)
 }
 
-/// Chunk planned lanes under the per-chunk floor + voucher-count cap and submit
-/// each chunk. Every caller passes the configured
-/// `blockchain.redeem_threshold_micro_usdc`, which config keeps above zero, so a
-/// sub-floor chunk defers on every path — the hint, the self-tick sweep, and the
-/// graceful-shutdown sweep alike. The floor is per CHUNK, and value is spread
-/// so dust rides alongside larger lanes: a sub-floor lane stays unredeemed
-/// only until its chunk's aggregate clears the floor, or until the pool owner
-/// reclaims it.
+/// Chunk planned lanes under the redemption floors + voucher-count cap and
+/// submit each chunk ([`chunk_redemptions`]). A sub-floor chunk defers on every
+/// path — the hint, the self-tick sweep, and the graceful-shutdown sweep alike.
+/// The chunk floor is per CHUNK, and value is spread so dust rides alongside
+/// larger lanes: a sub-floor lane stays unredeemed only until its chunk clears
+/// the floor, or until its claim is final. A final claim that clears the
+/// final-claim floor carries its chunk; a final claim below it pays less than
+/// its own gas, so it is dropped before any chain read and never submitted.
 ///
-/// The floor gates the on-chain read too: when the whole set's cached
-/// `unredeemed` is below the floor, it returns before
-/// [`reconcile_onchain_watermarks`]. The cached paid watermark can only lag the
-/// chain, so a fresh read can only lower `unredeemed`, and no chunk after the
-/// read can hold more than the whole set. The gate is on the total, not per
-/// chunk, because a lane the read drops can shrink the chunk count and re-pack
-/// lanes from a failing chunk into one that clears. A sub-floor hint therefore
-/// costs no `eth_call`. At `floor == 0` the gate always passes.
+/// The floors gate the on-chain read too: unless a final claim clears its
+/// floor, the set returns before [`reconcile_onchain_watermarks`] when its
+/// cached `unredeemed` total is below the floor of a one-lane chunk. The cached
+/// paid watermark can only lag the chain, so a fresh read can only lower
+/// `unredeemed`; no chunk after the read can hold more than the whole set, and
+/// no chunk's floor is below the one-lane floor. The gate is on the total, not
+/// per chunk, because a lane the read drops can shrink the chunk count and
+/// re-pack lanes from a failing chunk into one that clears. A sub-floor hint
+/// therefore costs no `eth_call`.
 ///
 /// Floors the redeemed watermark first: flushes the lane store durable AFTER the
 /// lanes were planned (their cumulative amounts already read) and BEFORE any
@@ -2864,15 +3020,18 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     store: &Arc<dyn PoolStateStore>,
     plans: Vec<PlannedLane>,
     signer: Address,
-    floor: U256,
+    floors: &RedeemFloors,
     max_vouchers: usize,
     strict_flush: bool,
     metrics: &Arc<Metrics>,
     pool_view: &PoolProjection,
     recorder: &SettlementRecorder,
 ) -> bool {
-    // Apply the floor on the cached total before any chain read.
-    if plans.is_empty() || sum_unredeemed(&plans) < floor {
+    // Apply the floors on the cached values before any chain read.
+    let mut plans = plans;
+    plans.retain(|plan| !final_below_floor(plan, floors));
+    let final_clears = plans.iter().any(|plan| plan.final_claim);
+    if plans.is_empty() || (!final_clears && sum_unredeemed(&plans) < floors.chunk(1)) {
         return false;
     }
     // Every submitted lane's pool must be known to the projection and able to
@@ -2886,7 +3045,7 @@ async fn redeem_planned_lanes<P: Provider + Clone>(
     let (plans, read_failed) = reconcile_onchain_watermarks(contract, plans, metrics).await;
     record_reconciled_paid(store.as_ref(), &owed, &plans, read_failed);
     let read_failed = read_failed || resolve_failed;
-    let chunks = chunk_redemptions(plans, floor, max_vouchers);
+    let chunks = chunk_redemptions(plans, floors, max_vouchers);
     if chunks.is_empty() {
         return read_failed;
     }

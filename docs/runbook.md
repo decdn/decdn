@@ -814,13 +814,15 @@ chain's record.
 **Before repointing:**
 
 1. While the node still points at the old deployment, set
-   `blockchain.redeem_threshold_micro_usdc = 1` and restart it. The redeemer
+   `gas_token_price_micro_usdc = 1` on the old deployment's
+   `[[blockchain.payment_chains]]` entry and restart it. The redeemer
    submits a chunk only when the chunk's aggregate unredeemed total clears
-   this floor, and every redeem path uses it, graceful shutdown included. At
-   the default (0.05 USDC), a batch of small lanes can sit under the floor and
-   `decdn_unredeemed_usdc` may never reach 0. With the floor at 1 µUSDC, the
-   self-tick (`blockchain.redeem_interval_secs`) redeems every lane whose
-   pool can still pay — accepting that dust redeems at a gas loss.
+   its gas-priced floor, and every redeem path uses it, graceful shutdown
+   included. At the default price, a batch of small lanes can sit under the
+   floor and `decdn_unredeemed_usdc` may never reach 0. At 1 µUSDC per gas
+   token every floor rounds to 1 µUSDC, so the self-tick
+   (`blockchain.redeem_interval_secs`) redeems every lane whose pool can
+   still pay, and dust redeems at a gas loss.
 2. Wait at least two `redeem_interval_secs` after the restart (the gauge
    shows its initial 0 until the first sweep runs), then wait for
    `decdn_unredeemed_usdc` to read 0 — near-zero is enough on a node that is
@@ -833,7 +835,7 @@ chain's record.
    and confirm the log has no `shutdown redeem deadline elapsed` warning;
    if it has one, start the node on the old config and stop it again.
 3. Update the config (new deployment, and restore
-   `redeem_threshold_micro_usdc`) and restart. The boot logs one WARN per dropped lane
+   `gas_token_price_micro_usdc`) and restart. The boot logs one WARN per dropped lane
    with its `pool_id`, `signer`, `provider`, and unredeemed value — the last
    record of each claim — plus a summary WARN with `dropped_lanes`,
    `undecodable_lanes`, and `forfeited_micro_usdc`. Capture these lines if

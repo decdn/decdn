@@ -127,9 +127,12 @@ const ADMIN_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f46
 const RATE_PER_MB: u64 = 10; // µUSDC per MiB (within deliveryFloor/ceiling)
 const MIB: usize = 1024 * 1024;
 
-// The redeem threshold sits below the seller stream's ~15 µUSDC claim so the
-// delivered voucher crosses it and the redeemer submits `redeem`.
-const REDEEM_THRESHOLD_MICRO_USDC: u64 = 10;
+// 1 µUSDC per gas token prices anvil's gas at a fraction of a µUSDC, so every
+// redeem floor rounds up to `REDEEM_FLOOR_MICRO_USDC`, below the seller
+// stream's ~15 µUSDC claim: the delivered voucher crosses it and the redeemer
+// submits `redeem`.
+const GAS_TOKEN_PRICE_MICRO_USDC: u64 = 1;
+const REDEEM_FLOOR_MICRO_USDC: u64 = 1;
 
 const DEPOSIT_MICRO_USDC: u64 = 10_000_000; // 10 USDC (ADR 003 recommended minimum)
 const TOPUP_MICRO_USDC: u64 = 2_000_000; // 2 USDC added via topUp in the buyer path
@@ -729,7 +732,7 @@ async fn run_e2e() -> anyhow::Result<()> {
         Arc::clone(&store),
         Arc::clone(&ledger),
         Arc::clone(&handler),
-        U256::from(REDEEM_THRESHOLD_MICRO_USDC),
+        GAS_TOKEN_PRICE_MICRO_USDC,
         300,
         Duration::from_secs(300),
         Arc::clone(&metrics),
@@ -950,11 +953,11 @@ async fn run_e2e() -> anyhow::Result<()> {
     // symmetrically. Pinning `amount` against a value derived from the payment
     // side — not from another decode — is what makes the swap observable.
     anyhow::ensure!(
-        watermark_after_first.amount >= REDEEM_THRESHOLD_MICRO_USDC
+        watermark_after_first.amount >= REDEEM_FLOOR_MICRO_USDC
             && watermark_after_first.amount < watermark_after_first.bytesDelivered,
-        "Lane.amount must be the micro-USDC paid (>= the redeem threshold {}), well below the \
+        "Lane.amount must be the micro-USDC paid (>= the redeem floor {}), well below the \
          byte count: amount={} bytesDelivered={}",
-        REDEEM_THRESHOLD_MICRO_USDC,
+        REDEEM_FLOOR_MICRO_USDC,
         watermark_after_first.amount,
         watermark_after_first.bytesDelivered
     );

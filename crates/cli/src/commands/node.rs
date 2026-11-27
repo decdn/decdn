@@ -1016,24 +1016,19 @@ pub async fn lanes(args: &cli::LanesArgs, global_config: Option<&Path>) -> anyho
 /// Write the lane table to `w`. Pure function (takes `&mut impl
 /// Write`) so the formatting is unit-testable without an HTTP hop,
 /// mirroring [`write_status`]. A summary line
-/// carries the redemption threshold as a stable `key=value` token; the
+/// carries the lane count as a stable `key=value` token; the
 /// per-lane table follows. USDC amounts are rendered from micro-USDC.
 fn write_lanes_table(w: &mut impl io::Write, resp: &LanesResponse) -> io::Result<()> {
-    writeln!(
-        w,
-        "redeem_threshold={} lanes={}",
-        format_usdc(resp.redeem_threshold_micro_usdc),
-        resp.lanes.len(),
-    )?;
+    writeln!(w, "lanes={}", resp.lanes.len())?;
     if resp.lanes.is_empty() {
         return writeln!(w, "(no open lanes)");
     }
     // Fixed-column layout: pool contract | lane preview | counterparty
     // preview | voucher signer preview | outstanding | unredeemed | deposit |
-    // last-voucher age | eligible.
+    // last-voucher age.
     writeln!(
         w,
-        "{:<22} {:<14} {:<14} {:<14} {:>12} {:>12} {:>12} {:>12} ELIGIBLE",
+        "{:<22} {:<14} {:<14} {:<14} {:>12} {:>12} {:>12} {:>12}",
         "POOL",
         "LANE",
         "COUNTERPARTY",
@@ -1072,11 +1067,10 @@ fn write_lane_row(w: &mut impl io::Write, c: &LaneSnapshot) -> io::Result<()> {
         // (covered by `format_age_units`).
         Some(secs) => format_age(secs.saturating_mul(1_000_000)),
     };
-    let eligible = if c.settlement_eligible { "yes" } else { "no" };
     writeln!(
         w,
         "{pool:<22} {lane:<14} {counterparty:<14} {signer:<14} {:>12} {:>12} {:>12} \
-         {last_voucher:>12} {eligible}",
+         {last_voucher:>12}",
         format_usdc(c.outstanding_micro_usdc),
         format_usdc(c.unredeemed_micro_usdc),
         format_usdc(c.deposit_micro_usdc),

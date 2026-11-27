@@ -286,9 +286,7 @@ fn node_up() -> NodeSection {
                 unredeemed_micro_usdc: 41_000,
                 deposit_micro_usdc: 5_000_000,
                 seconds_since_last_voucher: Some(12),
-                settlement_eligible: true,
             }],
-            redeem_threshold_micro_usdc: 100_000,
         }),
         earnings: ok(EarningsResponse {
             operator_address: Some(OPERATOR.to_owned()),

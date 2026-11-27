@@ -53,6 +53,7 @@ pub mod pool_store;
 pub mod pool_view;
 pub(crate) mod prune_guard;
 pub mod rate_limit;
+pub mod redeem_floor;
 pub(crate) mod rpc_metrics;
 pub mod runtime;
 pub mod selection;
