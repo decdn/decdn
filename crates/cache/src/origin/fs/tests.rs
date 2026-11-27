@@ -719,3 +719,178 @@ async fn a_dangling_outboard_symlink_is_permanent() -> anyhow::Result<()> {
     let err = origin.fetch_outboard(hash, 1 << 20).await.err();
     ensure_permanent("fetch_outboard", err, "symlink whose target does not exist")
 }
+
+/// Make a FIFO at `path` with the system `mkfifo`; the crate forbids the
+/// `unsafe` a `libc::mkfifo` call needs.
+#[cfg(unix)]
+fn make_fifo(path: &Path) -> anyhow::Result<()> {
+    let status = std::process::Command::new("mkfifo").arg(path).status()?;
+    anyhow::ensure!(
+        status.success(),
+        "mkfifo {} failed: {status}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Seed a data object, its outboard and a size proof object, then resolve
+/// each one as a read does before its open. Returns the resolved paths in
+/// the order data, outboard, size proof.
+#[cfg(unix)]
+async fn seed_and_resolve(origin: &FilesystemOrigin) -> anyhow::Result<[PathBuf; 3]> {
+    let hash = seed_blob_with_outboard(origin.base(), &vec![5u8; 64 * 1024]).await?;
+    tokio::fs::write(origin.size_proof_path_for(hash), b"proof").await?;
+    let mut resolved = Vec::with_capacity(3);
+    for path in [
+        origin.path_for(hash),
+        origin.obao4_path_for(hash),
+        origin.size_proof_path_for(hash),
+    ] {
+        let (canonical, _) = origin
+            .resolve_regular(&path)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("{} did not resolve", path.display()))?;
+        resolved.push(canonical);
+    }
+    resolved
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("expected three resolved paths"))
+}
+
+/// Drive the open-and-read half of all three reads on paths resolved before
+/// a swap. Each must refuse with `needle` within five seconds.
+#[cfg(unix)]
+async fn ensure_every_read_refuses(
+    base: &Path,
+    paths: &[PathBuf; 3],
+    needle: &str,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let limit = Duration::from_secs(5);
+    let [data, outboard, proof] = paths;
+    let range = timeout(limit, read_range(base, data, first_bytes(1024)))
+        .await
+        .map_err(|_| anyhow::anyhow!("read_range blocked on the swapped path"))?;
+    ensure_permanent("read_range", range.err(), needle)?;
+    let outboard = timeout(limit, read_outboard(base, outboard, 1 << 20))
+        .await
+        .map_err(|_| anyhow::anyhow!("read_outboard blocked on the swapped path"))?;
+    ensure_permanent("read_outboard", outboard.err(), needle)?;
+    let proof = timeout(limit, read_size_proof(base, proof))
+        .await
+        .map_err(|_| anyhow::anyhow!("read_size_proof blocked on the swapped path"))?;
+    ensure_permanent("read_size_proof", proof.err(), needle)
+}
+
+/// A FIFO renamed over a path after the resolve and before the open neither
+/// blocks the open nor is read: the open returns at once, and the check on
+/// the opened file refuses it. A blocked open would pin a blocking-pool
+/// thread that no timeout frees.
+///
+/// The test owns its runtime and bounds its shutdown. A `#[tokio::test]`
+/// runtime waits for every blocking-pool thread when it drops, so a blocked
+/// open would hang the test instead of reporting the timeout error.
+#[cfg(unix)]
+#[test]
+fn a_fifo_swapped_in_after_resolve_is_refused_without_blocking() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
+        let origin = FilesystemOrigin::new(tmp.path()).await?;
+        let paths = seed_and_resolve(&origin).await?;
+        for (i, path) in paths.iter().enumerate() {
+            let fifo = origin.base().join(format!("fifo-{i}"));
+            make_fifo(&fifo)?;
+            tokio::fs::rename(&fifo, path).await?;
+        }
+        ensure_every_read_refuses(origin.base(), &paths, "not a regular file").await
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
+}
+
+/// A symlink out of the base put in place of a path after the resolve is
+/// not followed: the open beneath the base handle refuses it, so no byte of
+/// the target is read.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlink_swapped_in_after_resolve_is_refused() -> anyhow::Result<()> {
+    let outside = tempfile::tempdir()?;
+    let secret = outside.path().join("secret");
+    tokio::fs::write(&secret, vec![7u8; 4096]).await?;
+
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let paths = seed_and_resolve(&origin).await?;
+    for path in &paths {
+        tokio::fs::remove_file(path).await?;
+        tokio::fs::symlink(&secret, path).await?;
+    }
+    ensure_every_read_refuses(origin.base(), &paths, "leads outside base").await
+}
+
+/// A shard directory swapped for a symlink out of the base after the resolve
+/// does not redirect the open: every component resolves beneath the base
+/// handle, not only the leaf. The outside directory holds copies of the
+/// shard's files under the same names, so a redirected open would succeed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shard_directory_swapped_in_after_resolve_is_refused() -> anyhow::Result<()> {
+    let outside = tempfile::tempdir()?;
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let paths = seed_and_resolve(&origin).await?;
+    let [data, _, _] = &paths;
+    let shard = data
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no shard directory", data.display()))?;
+    let decoy = outside.path().join("shard");
+    tokio::fs::create_dir(&decoy).await?;
+    for path in &paths {
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?;
+        tokio::fs::copy(path, decoy.join(name)).await?;
+    }
+    tokio::fs::remove_dir_all(shard).await?;
+    tokio::fs::symlink(&decoy, shard).await?;
+    ensure_every_read_refuses(origin.base(), &paths, "leads outside base").await
+}
+
+/// A path removed after the resolve and before the open is an absence, not
+/// a fault: a delete or re-import racing a read reports a miss.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_removed_after_resolve_reads_as_absent() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let origin = FilesystemOrigin::new(tmp.path()).await?;
+    let paths = seed_and_resolve(&origin).await?;
+    for path in &paths {
+        tokio::fs::remove_file(path).await?;
+    }
+    let [data, outboard, proof] = &paths;
+    let base = origin.base();
+    anyhow::ensure!(
+        matches!(
+            read_range(base, data, first_bytes(1024)).await?,
+            OriginRangeFetch::NotFound
+        ),
+        "read_range: expected NotFound"
+    );
+    anyhow::ensure!(
+        matches!(
+            read_outboard(base, outboard, 1 << 20).await?,
+            OutboardFetch::NotFound
+        ),
+        "read_outboard: expected NotFound"
+    );
+    anyhow::ensure!(
+        read_size_proof(base, proof).await?.is_none(),
+        "read_size_proof: expected None"
+    );
+    Ok(())
+}
