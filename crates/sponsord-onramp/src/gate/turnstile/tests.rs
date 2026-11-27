@@ -24,7 +24,8 @@ async fn success_json_passes_and_sends_the_remote_ip() {
         .and(path("/siteverify"))
         .and(body_string_contains("remoteip=203.0.113.7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true, "hostname": "up.example.org", "action": TURNSTILE_ACTION
+            "success": true, "hostname": "up.example.org", "action": TURNSTILE_ACTION,
+            "cdata": CLIENT.to_string()
         })))
         .mount(&server)
         .await;
@@ -38,7 +39,8 @@ async fn a_wrong_hostname_is_refused() {
     Mock::given(method("POST"))
         .and(path("/siteverify"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true, "hostname": "evil.example.com", "action": TURNSTILE_ACTION
+            "success": true, "hostname": "evil.example.com", "action": TURNSTILE_ACTION,
+            "cdata": CLIENT.to_string()
         })))
         .mount(&server)
         .await;
@@ -51,11 +53,51 @@ async fn a_wrong_action_is_refused() {
     Mock::given(method("POST"))
         .and(path("/siteverify"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true, "hostname": "up.example.org", "action": "login"
+            "success": true, "hostname": "up.example.org", "action": "login",
+            "cdata": CLIENT.to_string()
         })))
         .mount(&server)
         .await;
     assert!(!gate(&server).verify(CLIENT, "token", None).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_token_whose_cdata_names_another_client_is_refused() {
+    let other = Address::repeat_byte(0xbb);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/siteverify"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "hostname": "up.example.org", "action": TURNSTILE_ACTION,
+            "cdata": other.to_string()
+        })))
+        .mount(&server)
+        .await;
+    assert!(!gate(&server).verify(CLIENT, "token", None).await.unwrap());
+    // The same answer funds the client the token was minted for.
+    assert!(gate(&server).verify(other, "token", None).await.unwrap());
+}
+
+#[tokio::test]
+async fn missing_empty_or_malformed_cdata_is_refused() {
+    for cdata in [None, Some(""), Some("not-an-address")] {
+        let mut body = serde_json::json!({
+            "success": true, "hostname": "up.example.org", "action": TURNSTILE_ACTION
+        });
+        if let Some(cdata) = cdata {
+            body["cdata"] = cdata.into();
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/siteverify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+        assert!(
+            !gate(&server).verify(CLIENT, "token", None).await.unwrap(),
+            "{body}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -139,6 +181,7 @@ async fn page_carries_sitekey_client_and_escaped_brand() {
     let html = gate(&server).page(CLIENT);
     assert!(html.contains("data-sitekey=\"KEY\""));
     assert!(html.contains(&format!("data-action=\"{TURNSTILE_ACTION}\"")));
+    assert!(html.contains(&format!("data-cdata=\"{CLIENT}\"")));
     assert!(html.contains(&CLIENT.to_string()));
     assert!(html.contains("Acme &lt;Models&gt;"));
     assert!(!html.contains("{{"));

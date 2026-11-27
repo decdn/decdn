@@ -108,6 +108,7 @@ These placeholders are substituted:
 | `{{CLIENT}}` | The download key's address (hex) |
 | `{{SITEKEY}}` | `ONRAMP_TURNSTILE_SITEKEY` |
 | `{{ACTION}}` | The gate's Turnstile action. Required: set `data-action="{{ACTION}}"` on the widget. The onramp refuses to start with a template that lacks it |
+| `{{CDATA}}` | The download key's address, for the widget's Turnstile cdata. Required: set `data-cdata="{{CDATA}}"` on the widget, which binds the token to that key. The onramp refuses to start with a template that lacks it |
 | `{{BRAND_NAME}}` | `ONRAMP_BRAND_NAME`, HTML-escaped |
 
 Once the widget passes, the page must `POST /v1/fund` with

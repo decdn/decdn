@@ -92,8 +92,10 @@ WORKDIR /home/decdn
 
 # The binary defaults to loopback; inside a container that is unreachable.
 ENV SPONSORD_BIND=0.0.0.0:8090
-# HTTP API (/v1/capabilities, /v1/info, /healthz, /metrics). Keep this comment
-# on its own line: a trailing comment after EXPOSE is a parse error.
+# HTTP API (/v1/capabilities, /v1/info, /healthz, /metrics). /metrics needs no
+# token and reports pool balances: keep this port on a private container
+# network and never publish it publicly. Keep this comment on its own line: a
+# trailing comment after EXPOSE is a parse error.
 EXPOSE 8090
 ENTRYPOINT ["sponsord"]
 

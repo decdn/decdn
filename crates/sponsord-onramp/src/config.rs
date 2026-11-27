@@ -324,7 +324,8 @@ impl OnrampConfig {
     ///
     /// A secret or template file cannot be read, a URL is malformed or carries
     /// characters the installer scripts can't hold, the sitekey isn't a
-    /// plain token, a Turnstile gate template has no `{{ACTION}}`, or a
+    /// plain token, a Turnstile gate template lacks `{{ACTION}}` or
+    /// `{{CDATA}}`, or a
     /// release pin is malformed.
     pub fn from_args(args: Args) -> anyhow::Result<Self> {
         let releases_base = base_url("ONRAMP_RELEASES_BASE", &args.releases_base)?;
@@ -354,15 +355,18 @@ impl OnrampConfig {
                             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
                     "ONRAMP_TURNSTILE_SITEKEY must be letters, digits, '_' and '-'"
                 );
-                // Siteverify reports the widget's `data-action`, and the gate
-                // refuses every token whose action is not its own.
-                anyhow::ensure!(
-                    gate_template
-                        .as_deref()
-                        .is_none_or(|t| t.contains("{{ACTION}}")),
-                    "ONRAMP_GATE_TEMPLATE must set data-action=\"{{{{ACTION}}}}\" on the Turnstile \
-                     widget, or the gate refuses every token"
-                );
+                // Siteverify reports the widget's `data-action` and
+                // `data-cdata`, and the gate refuses every token whose action
+                // is not its own or whose cdata names another client.
+                for (placeholder, attr) in [("{{ACTION}}", "action"), ("{{CDATA}}", "cdata")] {
+                    anyhow::ensure!(
+                        gate_template
+                            .as_deref()
+                            .is_none_or(|t| t.contains(placeholder)),
+                        "ONRAMP_GATE_TEMPLATE must set data-{attr}=\"{placeholder}\" on the \
+                         Turnstile widget, or the gate refuses every token"
+                    );
+                }
                 // A browser reaches the gate page at this host, so it is the
                 // hostname Turnstile reports for the widget's token.
                 let expected_hostname = reqwest::Url::parse(&public_url)?

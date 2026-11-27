@@ -28,7 +28,13 @@ Anyone who gets capabilities can spend, at most:
   every time it falls below the low-water mark, so a drained pool is
   refilled from the wallet until the wallet runs out (or its gas does). Fund
   the wallet with what you are willing to lose, and watch
-  `sponsord_pool_topups_total`. While the daemon runs, a top-up whose
+  `sponsord_pool_topups_total`;
+- **per unit of time:** the keeper's top-up rate. It checks the pool once
+  per `SPONSORD_POOL_WATCH_INTERVAL_SECS` and sends at most one refill per
+  check, so the treasury pays at most `SPONSORD_POOL_REFILL_MICRO_USDC` per
+  interval ($100 an hour by default). The daemon checks right away when it
+  starts, so each restart can add one refill. This rate is the treasury's
+  spend bound. Lower the refill or lengthen the interval to tighten it. While the daemon runs, a top-up whose
   receipt could not be read holds the next one until it mines or can no
   longer mine, so one refill is not sent twice. A top-up whose submit
   returned no tx hash is held too; one the node shows no transaction of is
@@ -38,12 +44,27 @@ Anyone who gets capabilities can spend, at most:
   a second refill (see [the operator guide, §5](operator.md#5-monitor)).
 
 How many capabilities they can get is bounded by the gate, and on the onramp
-by the per-address rate limits (`ONRAMP_FUND_RATE_PER_MIN`).
+by the per-address rate limits (`ONRAMP_FUND_RATE_PER_MIN`). These limits
+slow one source down, but they do not bound spend: a campaign that brings
+many addresses (a botnet, or the visitors of a site that sends them through
+the gate) passes each per-address limit, and every capability it gets can
+spend its full cap. The keeper's top-up rate is what bounds the treasury.
+
+The Turnstile gate binds each token to one download key: the gate page sets
+the widget's cdata to the key in its URL, and the onramp refuses a token
+whose cdata names another key. A solved check therefore funds only the key
+the page was opened for. The onramp also forbids framing of every page it
+serves, so another site cannot embed the gate.
 
 ## Hardening checklist
 
 - Keep `sponsord` unreachable from the internet; only the onramp (or your
-  gate) talks to it. It binds to localhost by default.
+  gate) talks to it. It binds to localhost by default. The container image
+  binds `0.0.0.0:8090` so that other containers can reach it, and on that
+  port `GET /metrics` needs no token and reports pool balances and issue
+  counts. Never publish that port to a public interface (no
+  `-p 8090:8090`); keep it on a private container network, as
+  `deploy/sponsord/compose.yaml` does.
 - Give secrets as files (`*_FILE`, systemd credentials, Docker secrets), not
   environment variables. `Debug` output never prints them.
 - Behind a reverse proxy, set `ONRAMP_CLIENT_IP_HEADER` only if the proxy is
@@ -70,6 +91,9 @@ another by identity. `decdn`'s data dir, `~/.decdn/sponsored/decdn/`, is
 shared across downloads and holds only public facts about nodes (addresses,
 latency, recent failures); sponsored pulls write no buyer-channel rows there.
 `decdn` verifies every byte against the content hash, so
-a malicious node or onramp can't change what is downloaded; a malicious
-onramp could only point the installer at a different pool or chain, or pin
-a different `decdn` release.
+a malicious node can't change what is downloaded.
+
+The onramp serves the installer itself, and users run it with `curl | sh`
+(or `irm | iex`). Whoever controls the onramp therefore runs arbitrary code
+on every machine that runs its installer. Protect the onramp host and its
+TLS certificate as you would a software release channel.
