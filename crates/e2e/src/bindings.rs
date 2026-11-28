@@ -155,7 +155,8 @@ alloy::sol! {
     /// `VETTER_ROLE` holder approves publishers via `setVetted`; `GOVERNANCE_ROLE`
     /// admins `VETTER_ROLE` (the Timelock post-handoff). The `ChainFixture` vets a
     /// publisher by impersonating the Timelock to grant itself `VETTER_ROLE` and
-    /// then calling `setVetted`. There is no self-service request path.
+    /// then calling `setVetted`. A publisher may also submit a vetter-signed
+    /// approval with `claimVetting`, which this fixture does not use.
     #[sol(rpc)]
     contract ManualVettingPolicy {
         function VETTER_ROLE() external view returns (bytes32);

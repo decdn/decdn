@@ -10,7 +10,8 @@ contract ManualVettingPolicyTest is Test {
     ManualVettingPolicy internal policy;
 
     address internal admin = address(0xA11CE);
-    address internal vetter = address(0xF00D);
+    uint256 internal vetterKey = 0xF00D;
+    address internal vetter;
     address internal publisher = address(0xBEEF);
     address internal stranger = address(0x5747A);
 
@@ -18,7 +19,88 @@ contract ManualVettingPolicyTest is Test {
     bytes32 internal constant VETTER_ROLE = keccak256("VETTER_ROLE");
 
     function setUp() public {
+        vetter = vm.addr(vetterKey);
         policy = new ManualVettingPolicy(admin, vetter);
+    }
+
+    function _vettingSig(uint256 key, address who, uint256 nonce) internal view returns (bytes memory) {
+        bytes32 structHash = keccak256(abi.encode(policy.VETTING_TYPEHASH(), who, nonce));
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("ManualVettingPolicy"),
+                keccak256("1"),
+                block.chainid,
+                address(policy)
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(key, keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash)));
+        return abi.encodePacked(r, s, v);
+    }
+
+    /// The publisher (not the vetter) submits the vetter's signature and pays
+    /// the gas; the event names the signer as the vetter.
+    function test_claimVetting_vetsAndEmitsSigner() public {
+        bytes memory sig = _vettingSig(vetterKey, publisher, 0);
+        vm.expectEmit(true, true, true, true);
+        emit ManualVettingPolicy.PublisherVetted(publisher, true, vetter);
+        vm.prank(publisher);
+        policy.claimVetting(publisher, sig);
+        assertTrue(policy.isVetted(publisher));
+    }
+
+    /// The signature binds the publisher: anyone may relay it, but it vets
+    /// only the address it names.
+    function test_claimVetting_bindsPublisher() public {
+        bytes memory sig = _vettingSig(vetterKey, publisher, 0);
+        vm.prank(stranger);
+        vm.expectRevert(ManualVettingPolicy.InvalidVettingSignature.selector);
+        policy.claimVetting(stranger, sig);
+
+        vm.prank(stranger);
+        policy.claimVetting(publisher, sig);
+        assertTrue(policy.isVetted(publisher));
+        assertFalse(policy.isVetted(stranger));
+    }
+
+    function test_claimVetting_rejectsNonVetterSigner() public {
+        bytes memory sig = _vettingSig(0xBAD, publisher, 0);
+        vm.expectRevert(ManualVettingPolicy.InvalidVettingSignature.selector);
+        policy.claimVetting(publisher, sig);
+    }
+
+    function test_claimVetting_rejectsMalformedSignature() public {
+        vm.expectRevert(ManualVettingPolicy.InvalidVettingSignature.selector);
+        policy.claimVetting(publisher, hex"1234");
+    }
+
+    /// An un-vet voids every signature issued before it, so a revoked
+    /// publisher cannot replay its old signature. A fresh signature over the
+    /// new nonce vets it again.
+    function test_claimVetting_unvetVoidsOutstandingSignature() public {
+        bytes memory sig = _vettingSig(vetterKey, publisher, 0);
+        policy.claimVetting(publisher, sig);
+
+        vm.prank(vetter);
+        policy.setVetted(publisher, false);
+        assertEq(policy.nonces(publisher), 1);
+
+        vm.expectRevert(ManualVettingPolicy.InvalidVettingSignature.selector);
+        policy.claimVetting(publisher, sig);
+        assertFalse(policy.isVetted(publisher));
+
+        policy.claimVetting(publisher, _vettingSig(vetterKey, publisher, 1));
+        assertTrue(policy.isVetted(publisher));
+    }
+
+    /// Revoking the signer's VETTER_ROLE voids its unclaimed signatures.
+    function test_claimVetting_rejectsSignerWithRevokedRole() public {
+        bytes memory sig = _vettingSig(vetterKey, publisher, 0);
+        vm.prank(admin);
+        policy.revokeRole(VETTER_ROLE, vetter);
+        vm.expectRevert(ManualVettingPolicy.InvalidVettingSignature.selector);
+        policy.claimVetting(publisher, sig);
     }
 
     function test_isVetted_falseByDefault() public view {

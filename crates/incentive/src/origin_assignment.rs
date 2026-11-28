@@ -16,7 +16,8 @@
 //! and no authorized origins, so `getOrigins(0)` is always empty.
 //!
 //! Vetting is not a CLI flow: a `VETTER_ROLE` holder on the installed policy
-//! (an operator, multisig, or governance) vets a wallet out-of-band, after
+//! (an operator, a sign-up service, a multisig, or governance) vets a wallet
+//! out-of-band, directly or with a signature the publisher submits, after
 //! which it may seat origins immediately. `OriginAssignment::vettingPolicy`
 //! exposes the installed policy address for tooling that wants to read it.
 

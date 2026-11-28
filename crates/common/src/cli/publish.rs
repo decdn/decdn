@@ -3,8 +3,8 @@
 //! `namespace create` (`PublisherRegistry.createNamespace`), and then `assign` /
 //! `revoke` (`OriginAssignment.addOrigin` / `removeOrigin`), which a vetted
 //! publisher self-serves with no waiting. Vetting itself is granted out-of-band
-//! by a `VETTER_ROLE` holder on the installed vetting policy (an operator,
-//! multisig, or governance), not through this CLI. `assign` submits one
+//! by a `VETTER_ROLE` holder on the installed vetting policy (an operator, a
+//! sign-up service, a multisig, or governance), not through this CLI. `assign` submits one
 //! `addOrigin` per operator, so it is N transactions rather than one. Content is
 //! bound to a namespace off-chain at fetch time, so there is no per-hash
 //! on-chain claim. `point` leaves the chain alone: it signs a namespace

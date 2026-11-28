@@ -3,7 +3,8 @@
 //! Submits the `PublisherRegistry` / `OriginAssignment` writes that create
 //! namespaces and then seat or unseat a publisher's authorized origins. Vetting
 //! is not a CLI step: a `VETTER_ROLE` holder on the installed vetting policy (an
-//! operator, multisig, or governance) vets the wallet out-of-band, after which
+//! operator, a sign-up service, a multisig, or governance) vets the wallet
+//! out-of-band, directly or with a signature the publisher submits, after which
 //! `assign` and `revoke` take effect in the transaction that carries them
 //! (ADR 011 § Origin Assignment Authority).
 //! Content is bound to a namespace off-chain by the requester at fetch time
