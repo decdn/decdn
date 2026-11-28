@@ -155,14 +155,23 @@ alloy::sol! {
     /// `VETTER_ROLE` holder approves publishers via `setVetted`; `GOVERNANCE_ROLE`
     /// admins `VETTER_ROLE` (the Timelock post-handoff). The `ChainFixture` vets a
     /// publisher by impersonating the Timelock to grant itself `VETTER_ROLE` and
-    /// then calling `setVetted`. A publisher may also submit a vetter-signed
-    /// approval with `claimVetting`, which this fixture does not use.
+    /// then calling `setVetted`. [`ChainFixture::sign_vetting`] signs the
+    /// `Vetting` approval a publisher submits with `claimVetting` instead.
+    ///
+    /// [`ChainFixture::sign_vetting`]: crate::chain::ChainFixture::sign_vetting
     #[sol(rpc)]
     contract ManualVettingPolicy {
         function VETTER_ROLE() external view returns (bytes32);
         function grantRole(bytes32 role, address account) external;
         function setVetted(address publisher, bool vetted) external;
         function isVetted(address publisher) external view returns (bool);
+        function nonces(address publisher) external view returns (uint256);
+    }
+
+    /// The EIP-712 approval `ManualVettingPolicy.claimVetting` accepts.
+    struct Vetting {
+        address publisher;
+        uint256 nonce;
     }
 
     /// `ContentBlacklist` origin/operator blacklist writes (ADR 011 § Hash

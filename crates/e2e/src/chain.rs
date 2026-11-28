@@ -35,7 +35,7 @@ use decdn_node::chain_events::snapshot::SNAPSHOT_LAG_MARGIN_BLOCKS;
 
 use crate::bindings::{
     AccessControl, CapacityBond, ContentBlacklist, ContentBlacklistOrigin, Erc20,
-    ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry,
+    ManualVettingPolicy, OriginAssignment, PaymentPoolParams, PublisherRegistry, Vetting,
 };
 
 /// The single chain id every anvil-e2e chain runs on: the one-time protocol
@@ -904,6 +904,33 @@ impl ChainFixture {
             .await
             .context("setVetted receipt")?;
         crate::ensure_mined(&receipt, "setVetted")
+    }
+
+    /// Sign the EIP-712 `Vetting` approval for `publisher` that
+    /// `ManualVettingPolicy.claimVetting` accepts, as a sign-up service holding
+    /// `VETTER_ROLE` would. The deployer signs: the deploy seats it as the
+    /// genesis `VETTER_ROLE` holder (`INITIAL_VETTER`). Returns the 65-byte
+    /// signature; the publisher submits it with `decdn publish vet`.
+    pub async fn sign_vetting(&self, publisher: Address) -> anyhow::Result<Bytes> {
+        use alloy::signers::SignerSync as _;
+        use alloy::sol_types::SolStruct as _;
+
+        let policy = ManualVettingPolicy::new(self.addrs.manual_vetting_policy, &self.admin);
+        let nonce = policy
+            .nonces(publisher)
+            .call()
+            .await
+            .context("read ManualVettingPolicy.nonces")?;
+        let domain = alloy::sol_types::eip712_domain! {
+            name: "ManualVettingPolicy",
+            version: "1",
+            chain_id: self.chain_id,
+            verifying_contract: self.addrs.manual_vetting_policy,
+        };
+        let digest = Vetting { publisher, nonce }.eip712_signing_hash(&domain);
+        let vetter: PrivateKeySigner = DEPLOYER_KEY.parse().context("parse deployer key")?;
+        let sig = vetter.sign_hash_sync(&digest).context("sign Vetting")?;
+        Ok(Bytes::from(sig.as_bytes()))
     }
 
     /// The bytes `operator` was paid for: the served bytes the fixture

@@ -991,3 +991,66 @@ fn the_gateway_url_is_an_origin() {
         assert!(pointer_endpoint(&bad.parse().unwrap()).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn vetting_signature_must_be_65_bytes_of_hex() {
+    let ok = format!("0x{}", "ab".repeat(65));
+    assert_eq!(parse_vetting_signature(&ok).unwrap().len(), 65);
+
+    let short = format!("0x{}", "ab".repeat(64));
+    let err = parse_vetting_signature(&short).unwrap_err().to_string();
+    assert!(err.contains("expected 65 bytes, got 64"), "{err}");
+
+    let err = parse_vetting_signature("0xzz").unwrap_err().to_string();
+    assert!(err.contains("expected 0x-prefixed hex"), "{err}");
+}
+
+#[test]
+fn vet_output_names_the_publisher_and_policy() {
+    let dry = VetOutcome {
+        publisher: None,
+        origin_assignment: Address::repeat_byte(0x02),
+        vetting_policy: None,
+        status: VetStatus::DryRun,
+    };
+    let mut buf = Vec::new();
+    write_vet_outcome(&mut buf, &dry, false).unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert!(s.contains("status=dry_run submitted=false"), "{s}");
+    assert!(!s.contains("publisher="), "{s}");
+    assert!(!s.contains("vetting_policy="), "{s}");
+
+    let done = VetOutcome {
+        publisher: Some(Address::repeat_byte(0xCD)),
+        vetting_policy: Some(Address::repeat_byte(0x33)),
+        status: VetStatus::Vetted(B256::repeat_byte(0x55)),
+        ..dry
+    };
+    let mut buf = Vec::new();
+    write_vet_outcome(&mut buf, &done, false).unwrap();
+    let s = String::from_utf8(buf).unwrap();
+    assert!(s.contains("publisher=0xcdcd"), "{s}");
+    assert!(s.contains("vetting_policy=0x3333"), "{s}");
+    assert!(s.contains("status=vetted tx=0x5555"), "{s}");
+
+    let mut buf = Vec::new();
+    write_vet_outcome(&mut buf, &done, true).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+    assert_eq!(v["status"], serde_json::json!("vetted"));
+    assert_eq!(v["submitted"], serde_json::json!(true));
+    assert_eq!(
+        v["vetting_policy"],
+        serde_json::json!(format!("{:#x}", Address::repeat_byte(0x33)))
+    );
+}
+
+#[test]
+fn vet_status_labels_and_hashes_match_their_states() {
+    let hash = B256::repeat_byte(0x55);
+    assert_eq!(VetStatus::Reverted(hash).label(), "reverted");
+    assert_eq!(VetStatus::Reverted(hash).tx(), Some(hash));
+    assert_eq!(VetStatus::InFlight(hash).label(), "unknown");
+    assert_eq!(VetStatus::MaybeBroadcast.submitted(), None);
+    assert_eq!(VetStatus::Failed.submitted(), Some(false));
+    assert_eq!(VetStatus::Failed.tx(), None);
+}

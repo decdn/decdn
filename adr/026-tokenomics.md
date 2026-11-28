@@ -156,7 +156,7 @@ App Incentives (19% / 190M TOKEN) funds demand-side adoption — publishers serv
 **Sub-programs (governance norm, not on-chain enforced).** The 15/4 split below is a DAO-rebalanceable norm within the 19% envelope.
 
 1. **Publisher Rebates (~15pp / 150M TOKEN indicative).** Quarterly TOKEN rebate to enrolled publishers whose USDC fee contributions exceed a minimum threshold. Mechanism:
-   - Publishers self-identify by signing a rebate-program agreement and completing light KYC.
+   - Publishers enroll by signing a rebate-program agreement from their vetted publisher wallet.
    - Each quarter, Treasury multisig audits served-bytes attributed to each enrolled publisher using `FeeRouter` accounting data.
    - Rebate paid in TOKEN, denominated as a DAO-tunable fraction of the publisher's quarterly USDC FeeRouter contribution.
    - Indicative quarterly budget: (190M × 15/19) / 16 quarters ≈ 9.375M / quarter; unused budget rolls forward.

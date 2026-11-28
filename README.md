@@ -302,15 +302,16 @@ and a node that misses the blob pulls it from one of the seated operators' origi
 ([ADR 005 § Namespace routing](adr/005-protocol.md#namespace-routing)).
 
 ```bash
+decdn publish vet --signature 0x<approval>           # once per publisher wallet
 decdn publish namespace create                     # prints the namespace id
 decdn publish assign <namespace-id> <0xOPERATOR>...
 ```
 
 The installed vetting policy decides who may seat origins
 ([ADR 011 § Vetting policies](adr/011-content-takedown.md#vetting-policies)). The testnet
-runs the manual policy, so a `VETTER_ROLE` holder must vet the publisher's address before
-`assign` succeeds. That step happens out-of-band, not through the CLI: the vetter either vets
-the address directly or gives the publisher a signed approval to submit with `claimVetting`.
+runs the manual policy: a `VETTER_ROLE` holder, such as a publisher sign-up service, gives
+the publisher a signed approval for its wallet address. `publish vet` submits it from that
+wallet, which pays the gas. `assign` succeeds only after that.
 
 <details>
 <summary><b>Local devnet</b></summary>

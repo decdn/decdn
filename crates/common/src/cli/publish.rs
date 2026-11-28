@@ -1,10 +1,12 @@
 //! CLI argument parsing for `decdn publish` — the origin-publisher control
-//! plane (issues #1029 / #1491, ADR 002 / ADR 011). Three write commands:
-//! `namespace create` (`PublisherRegistry.createNamespace`), and then `assign` /
-//! `revoke` (`OriginAssignment.addOrigin` / `removeOrigin`), which a vetted
-//! publisher self-serves with no waiting. Vetting itself is granted out-of-band
-//! by a `VETTER_ROLE` holder on the installed vetting policy (an operator, a
-//! sign-up service, a multisig, or governance), not through this CLI. `assign` submits one
+//! plane (issues #1029 / #1491, ADR 002 / ADR 011). Four write commands:
+//! `namespace create` (`PublisherRegistry.createNamespace`), `vet`
+//! (`ManualVettingPolicy.claimVetting`), and then `assign` / `revoke`
+//! (`OriginAssignment.addOrigin` / `removeOrigin`), which a vetted publisher
+//! self-serves with no waiting. A `VETTER_ROLE` holder on the installed vetting
+//! policy (an operator, a sign-up service, a multisig, or governance) decides
+//! off-chain whether to vet a wallet; `vet` submits the signed approval it
+//! gives the publisher. `assign` submits one
 //! `addOrigin` per operator, so it is N transactions rather than one. Content is
 //! bound to a namespace off-chain at fetch time, so there is no per-hash
 //! on-chain claim. `point` leaves the chain alone: it signs a namespace
@@ -43,10 +45,13 @@ pub struct PublishArgs {
 pub enum PublishCommand {
     /// Create a new namespace owned by the signer (`createNamespace`).
     Namespace(NamespaceArgs),
+    /// Vet the signer as a publisher with a signed approval from a vetter
+    /// (`claimVetting` on the installed vetting policy). The signer pays the
+    /// gas; effective immediately.
+    Vet(VetArgs),
     /// Seat authorized origins for a namespace (`addOrigin` per operator).
-    /// Requires a signer the installed vetting policy has vetted; effective
-    /// immediately. Vetting is granted out-of-band by a `VETTER_ROLE` holder
-    /// (an operator, multisig, or governance), not through this CLI.
+    /// Requires a signer the installed vetting policy has vetted (see `vet`);
+    /// effective immediately.
     Assign(AssignArgs),
     /// Unseat one authorized origin from a namespace (`removeOrigin`).
     Revoke(RevokeArgs),
@@ -76,6 +81,20 @@ pub enum NamespaceCommand {
 #[derive(Args, Debug)]
 pub struct NamespaceCreateArgs {
     /// Chain coordinates and the publisher contract addresses.
+    #[command(flatten)]
+    pub chain: PublishChainArgs,
+}
+
+/// `decdn publish vet --signature <hex>` flags.
+#[derive(Args, Debug)]
+pub struct VetArgs {
+    /// The 65-byte EIP-712 `Vetting` signature a vetter issued for the
+    /// signer's address, as `0x`-prefixed hex.
+    #[arg(long, value_name = "HEX")]
+    pub signature: String,
+
+    /// Chain coordinates and the `OriginAssignment` address, which names the
+    /// installed vetting policy.
     #[command(flatten)]
     pub chain: PublishChainArgs,
 }

@@ -15,11 +15,13 @@
 //! `InactiveOriginPruned` remove one. Namespace 0 has no publisher
 //! and no authorized origins, so `getOrigins(0)` is always empty.
 //!
-//! Vetting is not a CLI flow: a `VETTER_ROLE` holder on the installed policy
-//! (an operator, a sign-up service, a multisig, or governance) vets a wallet
-//! out-of-band, directly or with a signature the publisher submits, after
-//! which it may seat origins immediately. `OriginAssignment::vettingPolicy`
-//! exposes the installed policy address for tooling that wants to read it.
+//! A `VETTER_ROLE` holder on the installed policy (an operator, a sign-up
+//! service, a multisig, or governance) decides off-chain whether to vet a
+//! wallet. It either vets the wallet directly or gives the publisher a signed
+//! `Vetting` approval, which the publisher submits through
+//! [`ManualVettingPolicy`]'s `claimVetting` (`decdn publish vet`). Once vetted,
+//! the wallet may seat origins immediately. `OriginAssignment::vettingPolicy`
+//! exposes the installed policy address.
 
 // The `sol!`-generated bindings include macro-emitted code that uses
 // patterns workspace clippy denies (raw indexing into ABI fixed-size
@@ -72,9 +74,8 @@ mod sol_types {
             /// false. A passthrough to `vettingPolicy().isVetted(publisher)`.
             function isVettedPublisher(address publisher) external view returns (bool);
 
-            /// The installed vetting authority (an `IVettingPolicy`). Exposed for
-            /// tooling that wants to read the policy address; vetting itself is a
-            /// `VETTER_ROLE` action on that policy, not a CLI flow.
+            /// The installed vetting authority (an `IVettingPolicy`). `decdn
+            /// publish vet` reads it to find where to submit a signed approval.
             function vettingPolicy() external view returns (address);
 
             // -----------------------------------------------------------------
@@ -122,7 +123,27 @@ mod sol_types {
                 address indexed pruner
             );
         }
+
+        /// The genesis vetting policy (`contracts/src/ManualVettingPolicy.sol`).
+        /// Only the publisher-side signed-approval path is mirrored.
+        #[sol(rpc)]
+        contract ManualVettingPolicy {
+            /// Vet `publisher` with an EIP-712 `Vetting(publisher, nonce)`
+            /// signature from a current `VETTER_ROLE` holder, where `nonce` is
+            /// the publisher's current `nonces` value. Permissionless; reverts
+            /// `InvalidVettingSignature` on any other signature.
+            function claimVetting(address publisher, bytes calldata signature) external;
+
+            /// Whether `publisher` is vetted.
+            function isVetted(address publisher) external view returns (bool);
+
+            /// Per-publisher signature nonce. An un-vet increments it.
+            function nonces(address publisher) external view returns (uint256);
+
+            /// A signature is not a live `Vetting` approval from a vetter.
+            error InvalidVettingSignature();
+        }
     }
 }
 
-pub use sol_types::OriginAssignment;
+pub use sol_types::{ManualVettingPolicy, OriginAssignment};

@@ -49,7 +49,7 @@ pub use pool::{
 pub use probe::ProbeArgs;
 pub use publish::{
     AssignArgs, NamespaceArgs, NamespaceCommand, NamespaceCreateArgs, PointArgs, PublishArgs,
-    PublishChainArgs, PublishCommand, RevokeArgs,
+    PublishChainArgs, PublishCommand, RevokeArgs, VetArgs,
 };
 pub use quote::QuoteArgs;
 pub use receipt::{ReceiptArgs, ReceiptCommand, ReceiptSettleArgs, ReceiptVerifyArgs};

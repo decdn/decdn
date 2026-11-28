@@ -1,11 +1,11 @@
 //! `decdn publish` — origin-publisher control plane (issues #1029 / #1491).
 //!
 //! Submits the `PublisherRegistry` / `OriginAssignment` writes that create
-//! namespaces and then seat or unseat a publisher's authorized origins. Vetting
-//! is not a CLI step: a `VETTER_ROLE` holder on the installed vetting policy (an
-//! operator, a sign-up service, a multisig, or governance) vets the wallet
-//! out-of-band, directly or with a signature the publisher submits, after which
-//! `assign` and `revoke` take effect in the transaction that carries them
+//! namespaces and then seat or unseat a publisher's authorized origins. A
+//! `VETTER_ROLE` holder on the installed vetting policy (an operator, a sign-up
+//! service, a multisig, or governance) decides off-chain whether to vet the
+//! wallet and gives the publisher a signed approval, which `vet` submits. After
+//! that, `assign` and `revoke` take effect in the transaction that carries them
 //! (ADR 011 § Origin Assignment Authority).
 //! Content is bound to a namespace off-chain by the requester at fetch time
 //! (ADR 002 § Hash-to-namespace association), so there is no per-hash on-chain
@@ -26,14 +26,14 @@ use std::io;
 use std::io::Write as _;
 use std::path::Path;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolEvent;
 use anyhow::Context;
 use decdn_client::uri::{DecdnUri, UriTarget};
 use decdn_common::cli;
-use decdn_incentive::origin_assignment::OriginAssignment;
+use decdn_incentive::origin_assignment::{ManualVettingPolicy, OriginAssignment};
 use decdn_incentive::publisher_registry::PublisherRegistry;
 use decdn_incentive::tx::SendOutcome;
 
@@ -50,6 +50,7 @@ pub async fn publish_dispatch(
         cli::PublishCommand::Namespace(ns) => match &ns.command {
             cli::NamespaceCommand::Create(a) => namespace_create(a, global_config).await,
         },
+        cli::PublishCommand::Vet(a) => vet(a, global_config).await,
         cli::PublishCommand::Assign(a) => assign(a, global_config).await,
         cli::PublishCommand::Revoke(a) => revoke(a, global_config).await,
         cli::PublishCommand::Point(a) => point(a, global_config).await,
@@ -546,8 +547,8 @@ fn single_tx_receipt(decoded: Option<String>, tx: Option<B256>) -> String {
 /// The `addOrigin` failure hint: every guard the contract applies, led by the one
 /// a publisher hits first. `removeOrigin` has its own, since none of the operator
 /// guards below apply to unseating.
-const ADD_ORIGIN_HINT: &str = "the signer must be a vetted publisher (a VETTER_ROLE holder on \
-     the installed vetting policy vets it out-of-band) and own the namespace; the operator must \
+const ADD_ORIGIN_HINT: &str = "the signer must be a vetted publisher (see `decdn publish vet`) \
+     and own the namespace; the operator must \
      be an active bonded node, not blacklisted, not already seated, and must fit under \
      maxOriginsPerNamespace";
 
@@ -815,6 +816,195 @@ async fn assign(args: &cli::AssignArgs, global_config: Option<&Path>) -> anyhow:
         write_err,
         "failed to write assign output",
         &receipt,
+    )
+}
+
+// -------------------------------------------------------------------------
+// vet
+// -------------------------------------------------------------------------
+
+/// The length of an ECDSA signature as `r || s || v`.
+const SIGNATURE_LEN: usize = 65;
+
+/// Parse a `Vetting` signature: `0x`-prefixed hex of exactly
+/// [`SIGNATURE_LEN`] bytes. Failing here saves the gas of a claim that is
+/// certain to revert.
+pub(crate) fn parse_vetting_signature(s: &str) -> anyhow::Result<Bytes> {
+    let sig: Bytes = s
+        .parse()
+        .with_context(|| format!("invalid --signature {s:?}: expected 0x-prefixed hex"))?;
+    anyhow::ensure!(
+        sig.len() == SIGNATURE_LEN,
+        "invalid --signature: expected {SIGNATURE_LEN} bytes, got {}",
+        sig.len()
+    );
+    Ok(sig)
+}
+
+/// The outcome of `publish vet`'s single `claimVetting` transaction. Same
+/// states as [`RevokeStatus`]. No state needs a retry warning: a claim that
+/// already landed makes a re-run change nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VetStatus {
+    /// `--dry-run`: nothing was sent, and no keystore was loaded.
+    DryRun,
+    /// Nothing was sent: the vetting policy lookup failed, or the node
+    /// rejected the send before broadcast.
+    Failed,
+    /// The send failed in transport, so the transaction may or may not have
+    /// been broadcast, and no hash was captured.
+    MaybeBroadcast,
+    /// Broadcast, but the receipt was unreadable.
+    InFlight(B256),
+    /// Mined, but the call reverted: the signer is not vetted.
+    Reverted(B256),
+    /// `claimVetting` confirmed. The signer is vetted.
+    Vetted(B256),
+}
+
+impl VetStatus {
+    /// The transaction hash, for any state that has one.
+    const fn tx(self) -> Option<B256> {
+        match self {
+            Self::InFlight(hash) | Self::Reverted(hash) | Self::Vetted(hash) => Some(hash),
+            Self::DryRun | Self::Failed | Self::MaybeBroadcast => None,
+        }
+    }
+
+    /// Whether the transaction was broadcast; `None` when that is unknown.
+    const fn submitted(self) -> Option<bool> {
+        match self {
+            Self::MaybeBroadcast => None,
+            Self::InFlight(_) | Self::Reverted(_) | Self::Vetted(_) => Some(true),
+            Self::DryRun | Self::Failed => Some(false),
+        }
+    }
+
+    /// The `status=` token in the receipt.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Failed => "failed",
+            Self::MaybeBroadcast => "maybe_broadcast",
+            Self::InFlight(_) => "unknown",
+            Self::Reverted(_) => "reverted",
+            Self::Vetted(_) => "vetted",
+        }
+    }
+}
+
+/// Receipt for `publish vet`.
+pub(crate) struct VetOutcome {
+    /// The signer, which the approval vets. `None` on a dry run.
+    pub(crate) publisher: Option<Address>,
+    pub(crate) origin_assignment: Address,
+    /// The installed vetting policy the claim went to. `None` on a dry run or
+    /// when the lookup failed.
+    pub(crate) vetting_policy: Option<Address>,
+    pub(crate) status: VetStatus,
+}
+
+pub(crate) fn write_vet_outcome(
+    w: &mut impl io::Write,
+    o: &VetOutcome,
+    json: bool,
+) -> io::Result<()> {
+    let tx = o.status.tx();
+    if json {
+        let value = serde_json::json!({
+            "submitted": o.status.submitted(),
+            "tx": tx.map(|h| format!("{h:#x}")),
+            "publisher": o.publisher.map(|a| format!("{a:#x}")),
+            "origin_assignment": format!("{:#x}", o.origin_assignment),
+            "vetting_policy": o.vetting_policy.map(|a| format!("{a:#x}")),
+            "status": o.status.label(),
+        });
+        return writeln!(w, "{value}");
+    }
+    if let Some(p) = o.publisher {
+        writeln!(w, "publisher={p:#x}")?;
+    }
+    writeln!(w, "origin_assignment={:#x}", o.origin_assignment)?;
+    if let Some(p) = o.vetting_policy {
+        writeln!(w, "vetting_policy={p:#x}")?;
+    }
+    match tx {
+        Some(h) => writeln!(w, "status={} tx={h:#x}", o.status.label()),
+        None => writeln!(
+            w,
+            "status={} submitted={}",
+            o.status.label(),
+            submitted_token(o.status.submitted())
+        ),
+    }
+}
+
+async fn vet(args: &cli::VetArgs, global_config: Option<&Path>) -> anyhow::Result<()> {
+    let (resolved, oa_addr) = assignment_ctx(&args.chain, global_config)?;
+    let signature = parse_vetting_signature(&args.signature)?;
+
+    let mut publisher = None;
+    let mut vetting_policy = None;
+    let mut status = VetStatus::DryRun;
+    let mut chain_err = None;
+    if !args.chain.common.dry_run {
+        let (signer, provider) = signer_and_provider(&resolved, &args.chain).await?;
+        publisher = Some(signer.address());
+        status = VetStatus::Failed;
+        match OriginAssignment::new(oa_addr, &provider)
+            .vettingPolicy()
+            .call()
+            .await
+            .context("read OriginAssignment.vettingPolicy")
+        {
+            Err(err) => chain_err = Some(err),
+            Ok(policy_addr) => {
+                vetting_policy = Some(policy_addr);
+                let policy = ManualVettingPolicy::new(policy_addr, &provider);
+                let mut send = SendOutcome::NotSent;
+                match decdn_incentive::tx::send_for_receipt(
+                    policy.claimVetting(signer.address(), signature),
+                    "claimVetting",
+                    Some(
+                        "the signature must be a live Vetting approval for this signer's address                          from a current VETTER_ROLE holder on the installed vetting policy; an                          un-vet voids earlier approvals, so ask the vetter for a new one",
+                    ),
+                    &mut send,
+                )
+                .await
+                {
+                    Ok(receipt) => status = VetStatus::Vetted(receipt.transaction_hash),
+                    Err(err) => {
+                        status = match send {
+                            SendOutcome::InFlight(hash) => VetStatus::InFlight(hash),
+                            SendOutcome::Reverted(hash) => VetStatus::Reverted(hash),
+                            SendOutcome::MaybeBroadcast => VetStatus::MaybeBroadcast,
+                            SendOutcome::Rejected
+                            | SendOutcome::Confirmed(_)
+                            | SendOutcome::NotSent => VetStatus::Failed,
+                        };
+                        chain_err = Some(err);
+                    }
+                }
+            }
+        }
+    }
+
+    let outcome = VetOutcome {
+        publisher,
+        origin_assignment: oa_addr,
+        vetting_policy,
+        status,
+    };
+    let mut out = io::stdout().lock();
+    let write_err = write_vet_outcome(&mut out, &outcome, args.chain.common.json)
+        .and_then(|()| out.flush())
+        .err();
+    drop(out);
+    propagate(
+        chain_err,
+        write_err,
+        "failed to write vet output",
+        &single_tx_receipt(None, outcome.status.tx()),
     )
 }
 

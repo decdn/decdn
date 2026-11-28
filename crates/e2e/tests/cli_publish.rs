@@ -8,9 +8,10 @@
 //! 2. `publish assign <id> <operator>` **fails closed while the publisher is
 //!    unvetted** — origin seating is gated on the wallet, not on a per-set
 //!    governance vote.
-//! 3. Vetting is not a CLI step. A `VETTER_ROLE` holder on the genesis
-//!    `ManualVettingPolicy` vets the wallet out-of-band (the fixture drives it
-//!    via `ManualVettingPolicy.setVetted`), after which the wallet may seat origins.
+//! 3. A `VETTER_ROLE` holder on the genesis `ManualVettingPolicy` signs a
+//!    `Vetting` approval off-chain (the fixture signs as the genesis vetter), and
+//!    `publish vet` submits it from the publisher's wallet, after which the
+//!    wallet may seat origins.
 //! 4. `publish assign <id> <operator>` now seats the origin **instantly** —
 //!    `getOrigins` reflects it with no further governance action — and
 //!    `publish revoke` unseats it just as immediately. The node's origin
@@ -135,13 +136,23 @@ async fn run() -> anyhow::Result<()> {
         "the publisher must start unvetted",
     );
 
-    // ---- 3. Vetting is not a CLI step: a `VETTER_ROLE` holder on the genesis
-    // `ManualVettingPolicy` vets the wallet out-of-band, which the fixture drives.
-    // Once vetted, the publisher may seat origins.
-    chain.vet_publisher(operator).await?;
+    // ---- 3. A `VETTER_ROLE` holder on the genesis `ManualVettingPolicy` signs
+    // a `Vetting` approval off-chain, and `publish vet` submits it from the
+    // publisher's own wallet. Once vetted, the publisher may seat origins.
+    let signature = chain.sign_vetting(operator).await?;
+    let vet = run_publish(
+        &node,
+        &["vet", "--signature", &signature.to_string(), "--json"],
+    )
+    .await?;
+    let vet_stdout = String::from_utf8_lossy(&vet.stdout);
+    assert!(
+        vet_stdout.contains("\"status\":\"vetted\""),
+        "publish vet must report vetted, got {vet_stdout}",
+    );
     assert!(
         assignment.isVettedPublisher(operator).call().await?,
-        "the publisher must be vetted after the VETTER_ROLE holder approves it",
+        "the publisher must be vetted after submitting the vetter's approval",
     );
 
     // ---- 4. Seat then unseat, both instant.
